@@ -53,6 +53,9 @@ const (
 	configPathEnv      = "ABLY_SERVER_CONFIG"
 	addrFileEnv        = "ABLY_SERVER_ADDR_FILE"
 	enableStatsStubEnv = "ABLY_SERVER_ENABLE_STATS_STUB"
+	busEnv             = "ABLY_SERVER_BUS"
+	natsURLEnv         = "ABLY_SERVER_NATS_URL"
+	natsInlineMaxEnv   = "ABLY_SERVER_NATS_INLINE_MAX_BYTES"
 )
 
 // Opts bundles Run's inputs so the production main() and tests
@@ -114,6 +117,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	natsInlineMaxDefault, err := config.DefaultInt(opts.Getenv(natsInlineMaxEnv), file.NATSInlineMaxBytes, postgres.DefaultNATSInlineMaxBytes)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
 	fs.SetOutput(opts.Out)
@@ -124,6 +132,9 @@ func Run(ctx context.Context, opts Opts) int {
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
+	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPostgres), "cluster-mode cross-node bus: postgres (LISTEN/NOTIFY) or nats; Postgres stays the store either way (env: "+busEnv+")")
+	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222 (env: "+natsURLEnv+")")
+	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -192,7 +203,13 @@ func Run(ctx context.Context, opts Opts) int {
 		logger.Info("tracing enabled")
 	}
 
-	store, err := openStorage(ctx, *mode, *dataDir, *postgresDSN)
+	store, err := openStorage(ctx, *mode, *dataDir, clusterOptions{
+		dsn:           *postgresDSN,
+		bus:           *bus,
+		natsURL:       *natsURL,
+		natsInlineMax: *natsInlineMax,
+		logger:        logger,
+	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
 		return 1
@@ -206,7 +223,11 @@ func Run(ctx context.Context, opts Opts) int {
 			logger.Error("close storage", "err", err)
 		}
 	}()
-	logger.Info("storage ready", "mode", *mode)
+	if *mode == "cluster" {
+		logger.Info("storage ready", "mode", *mode, "bus", *bus)
+	} else {
+		logger.Info("storage ready", "mode", *mode)
+	}
 
 	m := metrics.New()
 	manager := core.NewManager(store)
@@ -463,8 +484,9 @@ func writeAddrFile(path, addr string) error {
 //
 //   - memory: in-process, no persistence.
 //   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
-//   - cluster: postgres at postgresDSN (auto-migrates schema on Open;
-//     spawns the LISTEN/NOTIFY broker — see DESIGN.md §7.2).
+//   - cluster: postgres at cluster.dsn (auto-migrates schema on Open),
+//     with cluster.bus as the cross-node bus: the LISTEN/NOTIFY broker
+//     by default (DESIGN.md §7.2) or NATS (§7.3).
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
@@ -589,7 +611,17 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storage.Storage, error) {
+// clusterOptions carries the cluster-mode storage settings: the Postgres
+// DSN and the cross-node bus (DESIGN.md §7.2, §7.3).
+type clusterOptions struct {
+	dsn           string
+	bus           string
+	natsURL       string
+	natsInlineMax int
+	logger        *logging.Logger
+}
+
+func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptions) (storage.Storage, error) {
 	switch mode {
 	case "memory":
 		return memory.New(memory.Options{}), nil
@@ -602,10 +634,28 @@ func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storag
 		}
 		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
 	case "cluster":
-		if postgresDSN == "" {
+		if cluster.dsn == "" {
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
 		}
-		return postgres.Open(ctx, postgres.Options{DSN: postgresDSN})
+		switch cluster.bus {
+		case postgres.BusPostgres:
+			// The default: no NATS settings apply. The logger is passed only
+			// for the NATS bus so the default path is exactly as before.
+			return postgres.Open(ctx, postgres.Options{DSN: cluster.dsn})
+		case postgres.BusNATS:
+			if cluster.natsURL == "" {
+				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
+			}
+			return postgres.Open(ctx, postgres.Options{
+				DSN:                cluster.dsn,
+				Bus:                postgres.BusNATS,
+				NATSURL:            cluster.natsURL,
+				NATSInlineMaxBytes: cluster.natsInlineMax,
+				Logger:             cluster.logger,
+			})
+		default:
+			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s)", cluster.bus, postgres.BusPostgres, postgres.BusNATS)
+		}
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}

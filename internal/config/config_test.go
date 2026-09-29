@@ -242,6 +242,40 @@ func TestDefaultBool(t *testing.T) {
 	}
 }
 
+func TestDefaultInt(t *testing.T) {
+	n, err := DefaultInt("", 0, 7)
+	if err != nil || n != 7 {
+		t.Errorf("DefaultInt(empty, 0, 7) = %v, %v; want 7, nil (fallback)", n, err)
+	}
+	n, err = DefaultInt("", 42, 7)
+	if err != nil || n != 42 {
+		t.Errorf("DefaultInt(empty, 42, 7) = %v, %v; want 42, nil (file wins over fallback)", n, err)
+	}
+	n, err = DefaultInt("9", 42, 7)
+	if err != nil || n != 9 {
+		t.Errorf("DefaultInt(9, 42, 7) = %v, %v; want 9, nil (env wins over file)", n, err)
+	}
+	if _, err := DefaultInt("not-a-number", 0, 7); err == nil {
+		t.Error("DefaultInt with malformed env value error = nil, want an error")
+	}
+}
+
+func TestLoadParsesBusKeys(t *testing.T) {
+	path := writeTOML(t, `
+mode = "cluster"
+bus = "nats"
+nats-url = "nats://nats:4222"
+nats-inline-max-bytes = 65536
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.Bus != "nats" || f.NATSURL != "nats://nats:4222" || f.NATSInlineMaxBytes != 65536 {
+		t.Errorf("Load() bus keys = %q, %q, %d; want nats, nats://nats:4222, 65536", f.Bus, f.NATSURL, f.NATSInlineMaxBytes)
+	}
+}
+
 // exampleConfigPath locates config.example.toml at the repo root,
 // relative to this test file's own location, so the test works
 // regardless of the working directory `go test` is invoked from.
