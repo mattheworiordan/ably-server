@@ -10,23 +10,22 @@
 //
 // The publish path:
 //
-//   - ChannelStore.Store persists the cm and emits a NOTIFY on
-//     channel "ably_channel" inside the same transaction (PG buffers
-//     NOTIFYs until commit, so listeners only see it if the publish
-//     committed).
+//   - ChannelStore.Store persists the cm and emits a NOTIFY inside the
+//     same transaction (PG buffers NOTIFYs until commit, so listeners
+//     only see it if the publish committed). The NOTIFY goes to the Ably
+//     channel's own Postgres notification channel (pgChannelName), not
+//     to one global channel.
 //   - A LISTEN goroutine inside Storage, running on a dedicated
-//     pgx.Conn, receives every NOTIFY (including the publisher's
-//     own), fetches the canonical cm by (channel, channel_serial),
-//     looks up the channelStore that was registered for that channel
-//     via Channel(name, appender), and calls appender.Append(cm).
+//     pgx.Conn, LISTENs only on the channels this node has bound via
+//     Channel(name, appender). It receives each NOTIFY for those
+//     channels (including the publisher's own), fetches the canonical cm
+//     by (channel, channel_serial) and calls appender.Append(cm). The
+//     bus mechanics live in bus.go.
 //
-// There is no self-dedup at the broker level: the publish path does
-// not call the appender directly; the appender is the sole writer to
-// the live linked list, always via the LISTEN round-trip. NOTIFYs for
-// channels that no one on this node has opened (no Channel(name,…)
-// call yet) are silently dropped — local subscribers materialise the
-// channel via ATTACH, which calls core.Manager.GetChannel(name) and
-// in turn registers an appender here.
+// Channels no one on this node has bound are never LISTENed, so their
+// NOTIFYs never reach this node — local subscribers materialise the
+// channel via ATTACH, which calls core.Manager.GetChannel(name) and in
+// turn binds it here.
 //
 // Concurrent writers serialise per channel via a per-channel
 // pg_advisory_xact_lock inside Store's transaction, so the row
@@ -37,12 +36,12 @@ package postgres
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -64,10 +63,6 @@ var migrationsFS embed.FS
 // opt-in, so collisions with other applications would only matter if
 // someone else's code also picked this exact key on the same DB.
 const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
-
-// notifyChannelName is the LISTEN channel used by the publish/subscribe
-// broker — distinct concept from an Ably channel.
-const notifyChannelName = "ably_channel"
 
 // listenReconnectBaseDelay / listenReconnectMaxDelay bound the capped
 // exponential backoff the LISTEN goroutine applies between re-dial
@@ -100,14 +95,6 @@ var (
 // with an 'infinity' lease they are never reaped.
 const fixtureNodeID = "__fixtures__"
 
-// notifyPayload is the JSON-encoded NOTIFY body. Keeping it JSON
-// avoids ambiguity in the face of Ably channel names that contain
-// arbitrary characters (including ':' and '@').
-type notifyPayload struct {
-	Channel string `json:"channel"`
-	Serial  string `json:"serial"`
-}
-
 // Options configures the Postgres backend.
 type Options struct {
 	// DSN is the libpq-style connection string (e.g.
@@ -126,16 +113,27 @@ type Options struct {
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
-	pool   *pgxpool.Pool
-	dsn    string // retained so the LISTEN goroutine can re-dial on drop
-	series string // per-process seriesId, embedded in every minted channelSerial
-	node   string // per-process node id, owning presence rows for the liveness lease (§12.5)
-	logger *logging.Logger
+	pool      *pgxpool.Pool
+	dsn       string // retained so the LISTEN goroutine can re-dial on drop
+	series    string // per-process seriesId, embedded in every minted channelSerial
+	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
+	namespace string // current_schema(), mixed into every Postgres notification channel name
+	logger    *logging.Logger
 
-	mu       sync.Mutex
-	channels map[string]*channelStore
+	mu       sync.RWMutex
+	channels map[string]*channelStore // every store handed out, by Ably channel name
+	bound    map[string]*channelStore // stores with an appender, by Postgres channel name: the LISTEN set
+
+	// listenMu guards the LISTEN requests queued for the LISTEN goroutine
+	// and the cancel func that interrupts its WaitForNotification.
+	listenMu      sync.Mutex
+	listenPending []*listenRequest
+	waitCancel    context.CancelFunc
+
+	stats busCounters
 
 	initialListenConn *pgx.Conn // first LISTEN conn, dialed by Open; owned by listenLoop thereafter
+	loopCtx           context.Context
 	cancel            context.CancelFunc
 	wg                sync.WaitGroup
 	closeOnce         sync.Once
@@ -165,12 +163,22 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
 
+	// The schema this Storage works in namespaces its notification
+	// channels: NOTIFY is per database, not per schema (see
+	// pgChannelName).
+	var namespace string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&namespace); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: current_schema: %w", err)
+	}
+
 	// Dedicated LISTEN connection. pgxpool doesn't expose the long-
 	// lived single-conn semantics LISTEN needs, so we acquire a
 	// separate raw conn for the broker goroutine. Dialing it here lets
 	// Open fail fast on a bad DSN; the goroutine re-dials fresh conns
-	// itself when this one drops.
-	listenConn, err := dialAndListen(ctx, opts.DSN)
+	// itself when this one drops. It LISTENs on nothing yet: each
+	// channel is LISTENed when this node first binds it (Channel).
+	listenConn, err := dialListenConn(ctx, opts.DSN)
 	if err != nil {
 		pool.Close()
 		return nil, err
@@ -181,18 +189,21 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		logger = logging.Default()
 	}
 
+	loopCtx, cancel := context.WithCancel(context.Background())
 	s := &Storage{
 		pool:              pool,
 		dsn:               opts.DSN,
 		series:            serial.NewSeriesID(),
 		node:              serial.NewSeriesID(),
+		namespace:         namespace,
 		logger:            logger,
 		channels:          make(map[string]*channelStore),
+		bound:             make(map[string]*channelStore),
 		initialListenConn: listenConn,
+		loopCtx:           loopCtx,
+		cancel:            cancel,
 	}
 
-	loopCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
 	s.wg.Add(3)
 	go s.listenLoop(loopCtx)
 	go s.presenceLeaseBumpLoop(loopCtx)
@@ -200,54 +211,82 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	return s, nil
 }
 
-// dialAndListen opens a fresh raw pgx.Conn and issues the broker LISTEN
-// on it. Used both for the initial conn in Open and for every
-// post-drop re-dial in the LISTEN goroutine.
-func dialAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: dial LISTEN conn: %w", err)
-	}
-	if _, err := conn.Exec(ctx, `LISTEN `+pgx.Identifier{notifyChannelName}.Sanitize()); err != nil {
-		_ = conn.Close(context.Background())
-		return nil, fmt.Errorf("storage/postgres: LISTEN: %w", err)
-	}
-	return conn, nil
-}
-
 // Channel returns the ChannelStore for name, binding it to appender on
 // first access. Subsequent calls with the same name return the same
-// instance and ignore the new appender. The internal LISTEN goroutine
-// looks up channelStores in this map by name to dispatch notifications.
+// instance and ignore the new appender.
 //
-// On first creation the channels row is upserted via ensure_channel
-// (creating it with a fresh seed serial if absent), and the resulting
-// channelSerial — the watermark — is handed to appender.Initialize
-// before this call returns.
+// Binding with a non-nil appender makes this node LISTEN on the
+// channel's own Postgres notification channel (DESIGN.md §7.2). The
+// LISTEN is active before the watermark is read: a publish that commits
+// after the read then always reaches this node, and one that committed
+// before it sorts at or below the watermark, which seeds the
+// per-channel de-dup high-water mark. The channels row is upserted via
+// ensure_channel (creating it with a fresh seed serial if absent), and
+// the watermark is handed to appender.Initialize before this call
+// returns.
+//
+// There is no release hook: core.Manager keeps a Channel for the life of
+// the process, so a bound channel stays LISTENed until Close.
 func (s *Storage) Channel(ctx context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	if cs, ok := s.channels[name]; ok {
 		s.mu.Unlock()
 		return cs, nil
 	}
-	cs := &channelStore{pool: s.pool, series: s.series, node: s.node, name: name, appender: appender}
+	cs := s.newChannelStore(name, appender)
 	s.channels[name] = cs
+	if appender != nil {
+		s.bound[cs.pgChan] = cs
+	}
 	s.mu.Unlock()
 
 	if appender == nil {
 		return cs, nil
 	}
+
+	// fail unwinds a bind that never finished: drop the store so a retry
+	// can start again, and release anything waiting on its readiness.
+	fail := func(err error) (storage.ChannelStore, error) {
+		s.mu.Lock()
+		if s.channels[name] == cs {
+			delete(s.channels, name)
+		}
+		if s.bound[cs.pgChan] == cs {
+			delete(s.bound, cs.pgChan)
+		}
+		s.mu.Unlock()
+		cs.abandon()
+		return nil, err
+	}
+
+	if err := s.listen(ctx, cs.pgChan); err != nil {
+		return fail(fmt.Errorf("storage/postgres: LISTEN for %q: %w", name, err))
+	}
 	var current, initial string
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
-		// Unwind: the channelStore exists in the map but was never
-		// Initialize'd. Remove it so a retry can re-attempt.
-		s.mu.Lock()
-		delete(s.channels, name)
-		s.mu.Unlock()
-		return nil, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
+		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
 	}
+	cs.hwmMu.Lock()
+	cs.lastSeen = current
+	cs.hwmMu.Unlock()
 	appender.Initialize(current, initial)
+	close(cs.ready)
 	return cs, nil
+}
+
+// newChannelStore builds the per-channel facet for name. Only a store
+// with an appender joins the bound (LISTEN) set; see Channel.
+func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
+	return &channelStore{
+		s:        s,
+		pool:     s.pool,
+		series:   s.series,
+		node:     s.node,
+		name:     name,
+		pgChan:   pgChannelName(s.namespace, name),
+		appender: appender,
+		ready:    make(chan struct{}),
+	}
 }
 
 // Close stops the background goroutines (LISTEN broker and, in cluster
@@ -270,121 +309,6 @@ func (s *Storage) Close() error {
 // (DESIGN.md §2.2).
 func (s *Storage) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
-}
-
-// listenLoop dispatches NOTIFY events to the registered channelStore
-// for each channel, surviving dropped LISTEN connections (DESIGN.md
-// §7.2). It runs consume() on the current conn until a
-// WaitForNotification error; unless that error is Close() cancelling
-// the context, it re-dials a fresh conn with capped-exponential
-// backoff, re-LISTENs, reconciles each channel's missed cms from
-// history, and resumes. It exits only when the storage is Close()d.
-//
-// A NOTIFY for an unregistered channel is dropped: local attachments
-// materialise the channelStore on demand via Storage.Channel, so
-// events that arrive before any local interest are intentionally lost
-// (the canonical cm is still in storage and picked up by a subsequent
-// ATTACH+resume via History).
-func (s *Storage) listenLoop(ctx context.Context) {
-	defer s.wg.Done()
-
-	conn := s.initialListenConn
-	for {
-		err := s.consume(ctx, conn)
-		_ = conn.Close(context.Background())
-		if ctx.Err() != nil {
-			return // Close(): expected shutdown
-		}
-		s.logger.Warn("storage/postgres: LISTEN connection lost; reconnecting", "err", err)
-
-		conn = s.redial(ctx)
-		if conn == nil {
-			return // ctx cancelled during backoff
-		}
-		// Re-LISTEN is already done by redial; reconcile before resuming
-		// so any cm minted during the gap is replayed exactly once
-		// (deliver() dedups against a subsequent buffered NOTIFY).
-		s.reconcile(ctx)
-		s.logger.Info("storage/postgres: LISTEN reconnected and reconciled")
-	}
-}
-
-// consume runs the steady-state WaitForNotification dispatch on conn,
-// returning the error that ended it (a dropped conn, or ctx
-// cancellation on Close).
-func (s *Storage) consume(ctx context.Context, conn *pgx.Conn) error {
-	for {
-		n, err := conn.WaitForNotification(ctx)
-		if err != nil {
-			return err
-		}
-
-		var p notifyPayload
-		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
-			continue // malformed; nothing actionable
-		}
-
-		s.mu.Lock()
-		cs, ok := s.channels[p.Channel]
-		s.mu.Unlock()
-		if !ok || cs.appender == nil {
-			continue
-		}
-
-		cm, err := s.loadChannelMessage(ctx, p.Channel, p.Serial)
-		if err != nil {
-			continue // best-effort; nothing we can do without the cm
-		}
-		cs.deliver(cm)
-	}
-}
-
-// redial re-establishes the LISTEN connection with capped exponential
-// backoff, retrying until it succeeds or ctx is cancelled (Close). A
-// nil return means ctx was cancelled.
-func (s *Storage) redial(ctx context.Context) *pgx.Conn {
-	delay := listenReconnectBaseDelay
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(delay):
-		}
-
-		conn, err := dialAndListen(ctx, s.dsn)
-		if err == nil {
-			return conn
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		s.logger.Warn("storage/postgres: LISTEN re-dial failed; backing off", "err", err, "delay", delay)
-		if delay *= 2; delay > listenReconnectMaxDelay {
-			delay = listenReconnectMaxDelay
-		}
-	}
-}
-
-// reconcile replays, per registered channel, every cm minted past the
-// channel's last-delivered serial — the cms whose NOTIFY was lost while
-// the LISTEN conn was down (DESIGN.md §7.2). Each is delivered through
-// cs.deliver, whose high-water mark makes replay idempotent against the
-// normal NOTIFY path.
-func (s *Storage) reconcile(ctx context.Context) {
-	s.mu.Lock()
-	stores := make([]*channelStore, 0, len(s.channels))
-	for _, cs := range s.channels {
-		if cs.appender != nil {
-			stores = append(stores, cs)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, cs := range stores {
-		if err := cs.reconcileFromHistory(ctx); err != nil {
-			s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
-		}
-	}
 }
 
 // presenceLeaseBumpLoop refreshes the liveness lease for every presence
@@ -472,7 +396,7 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 		// shape (§12.5): action + connectionId + clientId, no id (a
 		// fresh publish, must not collide with the ENTER's idempotency
 		// key).
-		cs := &channelStore{pool: s.pool, series: s.series, node: s.node, name: o.channel}
+		cs := s.newChannelStore(o.channel, nil)
 		leave := &protocol.PresenceMessage{
 			Action:       protocol.PresenceLeave,
 			ClientID:     o.clientID,
@@ -695,11 +619,19 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error 
 // call serialises against other writers to the same channel via that
 // row's lock.
 type channelStore struct {
+	s        *Storage
 	pool     *pgxpool.Pool
 	series   string
 	node     string
 	name     string
+	pgChan   string // this channel's Postgres notification channel (pgChannelName)
 	appender storage.Appender
+
+	// ready is closed once the bind has finished: Initialize has run and
+	// lastSeen holds the bind-time watermark. abandoned marks a bind that
+	// failed (ready is closed too, so nothing waits on it forever).
+	ready     chan struct{}
+	abandoned atomic.Bool
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender. It is the per-channel de-dup high-water mark that makes
@@ -883,19 +815,13 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		}
 	}
 
-	// NOTIFY inside the tx: PG buffers the payload until commit, so
-	// listeners only see it if the publish actually lands. The
-	// LISTEN goroutine on every node (including this one) routes
-	// the cm to the channel's appender (DESIGN.md §7.2).
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_notify($1, $2)`,
-		notifyChannelName, string(body),
-	); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	// NOTIFY inside the tx, on this channel's own notification channel:
+	// PG buffers the payload until commit, so listeners only see it if
+	// the publish actually lands. The LISTEN goroutine on every node that
+	// holds the channel (including this one) routes the cm to the
+	// channel's appender (DESIGN.md §7.2).
+	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1001,12 +927,8 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
@@ -1245,12 +1167,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1362,12 +1280,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
