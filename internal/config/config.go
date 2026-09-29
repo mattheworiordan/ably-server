@@ -34,6 +34,7 @@ type File struct {
 	Keys          []KeyEntry `toml:"keys"`
 	DataDir       string     `toml:"data-dir"`
 	PostgresDSN   string     `toml:"postgres-dsn"`
+	NATSURL       string     `toml:"nats-url"` // experimental jetstream mode (DESIGN.md §6.4)
 	ShutdownGrace string     `toml:"shutdown-grace"`
 	LogLevel      string     `toml:"log-level"`
 	LogFormat     string     `toml:"log-format"`

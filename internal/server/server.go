@@ -36,6 +36,7 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
+	"github.com/ably/ably-server/internal/storage/natsjs"
 	"github.com/ably/ably-server/internal/storage/postgres"
 	"github.com/ably/ably-server/internal/tracing"
 )
@@ -43,6 +44,7 @@ import (
 const (
 	keysEnv            = "ABLY_SERVER_KEYS"
 	postgresDSNEnv     = "ABLY_SERVER_POSTGRES_DSN"
+	natsURLEnv         = "ABLY_SERVER_NATS_URL"
 	logFormatEnv       = "ABLY_SERVER_LOG_FORMAT"
 	debugListenEnv     = "ABLY_SERVER_DEBUG_LISTEN"
 	modeEnv            = "ABLY_SERVER_MODE"
@@ -121,9 +123,10 @@ func Run(ctx context.Context, opts Opts) int {
 	listen := fs.String("listen", config.Default(opts.Getenv(listenEnv), file.Listen, ":8080"), "address for HTTP/WS listener (env: "+listenEnv+")")
 	var keysFlags multiFlag
 	fs.Var(&keysFlags, "keys", "API key in appId.keyId:keySecret format; repeatable (env: "+keysEnv+", comma-separated)")
-	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
+	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, cluster, or jetstream (experimental) (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
+	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for jetstream mode, e.g. nats://127.0.0.1:4222 (env: "+natsURLEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -192,7 +195,7 @@ func Run(ctx context.Context, opts Opts) int {
 		logger.Info("tracing enabled")
 	}
 
-	store, err := openStorage(ctx, *mode, *dataDir, *postgresDSN)
+	store, err := openStorage(ctx, *mode, *dataDir, *postgresDSN, *natsURL)
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
 		return 1
@@ -465,6 +468,8 @@ func writeAddrFile(path, addr string) error {
 //   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
 //   - cluster: postgres at postgresDSN (auto-migrates schema on Open;
 //     spawns the LISTEN/NOTIFY broker — see DESIGN.md §7.2).
+//   - jetstream: NATS JetStream at natsURL (experimental; creates its
+//     streams and KV buckets on Open — see DESIGN.md §6.4).
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
@@ -589,7 +594,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storage.Storage, error) {
+func openStorage(ctx context.Context, mode, dataDir, postgresDSN, natsURL string) (storage.Storage, error) {
 	switch mode {
 	case "memory":
 		return memory.New(memory.Options{}), nil
@@ -606,8 +611,13 @@ func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storag
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
 		}
 		return postgres.Open(ctx, postgres.Options{DSN: postgresDSN})
+	case "jetstream":
+		if natsURL == "" {
+			return nil, fmt.Errorf("--nats-url is required when --mode=jetstream (env: %s)", natsURLEnv)
+		}
+		return natsjs.Open(ctx, natsjs.Options{URL: natsURL})
 	default:
-		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
+		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster, jetstream)", mode)
 	}
 }
 

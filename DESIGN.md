@@ -1048,6 +1048,46 @@ default. The TTL value, the per-channel message cap, and whether operators
 can override either are still being decided (see the retention note at the
 top of §6).
 
+### 6.4 JetStream backend (experimental)
+
+> **Spike.** `--mode=jetstream --nats-url=nats://…` selects
+> `internal/storage/natsjs`, a feasibility spike that proves the storage
+> boundary is not tied to Postgres. It passes the shared contract suite
+> but is not a supported deployment mode; its known gaps are listed in the
+> package and in the spike report.
+
+All state lives in NATS JetStream, so N stateless ably-server nodes share
+one JetStream cluster the way cluster mode shares one Postgres:
+
+- **Log.** Channels hash across `Shards` streams (`<prefix>_LOG_<k>`),
+  each its own replicated Raft group with its own leader. A channel's cms
+  go to one subject per kind, `<prefix>.log.<k>.<base64url(channel)>.{m,p,a}`,
+  so kind-filtered history reads are subject-filtered server-side. The
+  payload is the msgpack cm (plus annotation summary snapshots); the
+  channelSerial also rides in an `Ably-Serial` header.
+- **Ordering.** Serials are minted by the §8 generator, never taken from
+  stream sequences. Every append is a compare-and-set: it carries
+  `Nats-Expected-Last-Subject-Sequence` for the channel's wildcard subject,
+  and its serial is minted as the successor of the channel's last serial.
+  If another node appended first, JetStream rejects the publish and the
+  writer re-reads the head and rebuilds. Stream order, serial order and
+  delivery order are therefore one per-channel order across nodes, which
+  replaces the Postgres channels-row lock.
+- **Idempotency.** A client-supplied id rides in `Nats-Msg-Id`
+  (namespaced by channel); the stream's duplicate window returns the
+  original's sequence atomically with the append.
+- **Projections.** The latest-version view, the versions and annotations
+  indexes and the summary are derived from the log on read: each mutation
+  cm carries the complete merged version and each annotation cm its
+  post-fold summary. The presence set outlives log retention, so it lives
+  in a KV bucket, folded last-writer-wins by presence serial; each
+  channel's immutable initial serial lives in a second bucket.
+- **Delivery.** A channel bound with an Appender gets an ordered consumer
+  on its subjects, starting after the watermark handed to `Initialize`,
+  with the per-channel serial de-duplication of §7.2. The consumer
+  re-syncs itself after a disconnect, so there is no separate reconcile.
+- **Retention.** Stream `MaxAge` and `MaxMsgsPerSubject`.
+
 ## 7. Pub/Sub
 
 Pub/sub turns a *publish* (originating from any node, via WS or REST)
@@ -1324,11 +1364,12 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 `ABLY_SERVER_LOG_FORMAT`):
 
 ```
---mode {memory|disk|cluster}  default: memory
+--mode {memory|disk|cluster|jetstream}  default: memory (jetstream is experimental, §6.4)
 --listen :8080                HTTP/WS bind
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only
+--nats-url  nats://…          jetstream mode only
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -1347,7 +1388,7 @@ reader polling the path never sees a partial address.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
-(`mode`, `listen`, `data-dir`, `postgres-dsn`, `shutdown-grace`,
+(`mode`, `listen`, `data-dir`, `postgres-dsn`, `nats-url`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub` —
 `shutdown-grace` as a duration string, e.g. `"10s"`). API keys are
 declared as structured

@@ -16,7 +16,8 @@
 # All entries in this file are commented out; an all-commented copy
 # of this file parses to the same zero-value config as an empty file.
 
-# Storage backend: memory, disk, or cluster (env: ABLY_SERVER_MODE).
+# Storage backend: memory, disk, cluster, or jetstream (experimental)
+# (env: ABLY_SERVER_MODE).
 # mode = "memory"
 
 # Address for the HTTP/WS listener (env: ABLY_SERVER_LISTEN).
@@ -28,6 +29,11 @@
 # libpq DSN for cluster mode (env: ABLY_SERVER_POSTGRES_DSN). Required
 # when --mode=cluster and not supplied by a flag or env var.
 # postgres-dsn = "postgres://user:pw@host:5432/db?sslmode=disable"
+
+# NATS server URL for the experimental jetstream mode, which keeps all
+# state in NATS JetStream (env: ABLY_SERVER_NATS_URL). Required when
+# --mode=jetstream and not supplied by a flag or env var.
+# nats-url = "nats://127.0.0.1:4222"
 
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
