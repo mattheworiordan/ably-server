@@ -1,0 +1,79 @@
+# Three-node cluster on one Postgres for benchmarking the scaled
+# Postgres bus (DESIGN.md §7.2: per-channel LISTEN, inline payloads,
+# per-channel workers, publisher fast path, optional coalesced notify).
+#
+#   docker compose -f bench/docker-compose.pgscaled.yml up -d --build --wait
+#   docker compose -f bench/docker-compose.pgscaled.yml down -v
+#
+# Host ports: nodes 8281, 8282, 8283; Postgres 5434 (user/password/db
+# "ably"). All nodes share the key app.key:secret.
+#
+# Bus mode is chosen per run with environment variables (compose
+# recreates the nodes when they change):
+#
+#   PGBUS_NOTIFY_MODE=publish     one NOTIFY per write, inside its
+#                                 transaction (default)
+#   PGBUS_NOTIFY_MODE=coalesced   writes commit without NOTIFY; each node
+#                                 sends at most one wake-up per channel
+#                                 per PGBUS_NOTIFY_WINDOW (default 50ms)
+#   PGBUS_POOL_MAX_CONNS=16       pgxpool size per node
+#
+# The image tag is distinct from the root docker-compose.yml's
+# ably-server:local so the two stacks never overwrite each other.
+
+name: ablypg
+
+x-ably-node: &ably-node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: ably-server:pgscaled
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    ABLY_SERVER_KEYS: app.key:secret
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable&pool_max_conns=${PGBUS_POOL_MAX_CONNS:-16}
+    ABLY_SERVER_POSTGRES_NOTIFY_MODE: ${PGBUS_NOTIFY_MODE:-publish}
+    ABLY_SERVER_POSTGRES_NOTIFY_WINDOW: ${PGBUS_NOTIFY_WINDOW:-50ms}
+  command:
+    - --mode=cluster
+    - --listen=:8080
+    - --log-level=info
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  node1:
+    <<: *ably-node
+    ports:
+      - "8281:8080"
+
+  node2:
+    <<: *ably-node
+    ports:
+      - "8282:8080"
+
+  node3:
+    <<: *ably-node
+    ports:
+      - "8283:8080"
