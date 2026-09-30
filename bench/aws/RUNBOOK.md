@@ -13,58 +13,132 @@ the scripts those values with environment variables (table below).
 ## 1. What it builds and what it costs
 
 One Availability Zone in the default VPC. One security group (all traffic
-inside the group, SSH from your address only). One cluster placement group.
-Everything talks over private addresses. There is no load balancer.
+inside the group, SSH from your address only). No placement group unless you
+ask for one (`USE_PLACEMENT_GROUP=1`; some roles may not create it).
+Everything talks over private addresses. There is no load balancer and there
+is no EC2 key pair: each box gets your public key through its user-data.
 
 | Part | Script | Size at 1x | Size at 2x |
 |---|---|---|---|
 | ably-server nodes | `40-nodes.sh` | 10 x c7i.2xlarge | 10 to 20 x c7i.2xlarge |
 | NATS core cluster | `30-nats.sh` | 3 x c7i.2xlarge | 3 x c7i.2xlarge |
-| Postgres | `20-postgres.sh` | RDS for PostgreSQL 17, db.r7g.4xlarge, io2 (one repeat on gp3), Single-AZ | same |
+| Postgres | `20-postgres.sh` | 1 x r7i.4xlarge (16 vCPU, 128 GB) with a 1000 GB io2 data volume, PostgreSQL 17 in Docker (one repeat on gp3) | same |
 | Load generators | `50-loadgen.sh` | 3 x c7i.8xlarge | 6 x c7i.8xlarge |
 | REST publishers | `50-loadgen.sh` | 2 x c7i.4xlarge | 3 x c7i.4xlarge |
 | Conductor, Prometheus, Grafana | `50-loadgen.sh`, `55-observability.sh` | 1 x c7i.2xlarge | 1 x c7i.2xlarge |
 | pgbench driver (run 0a only) | `25-pgdriver.sh` | 1 x c7i.4xlarge | - |
 
+| Count | 1x | 2x | What it is |
+|---|---|---|---|
+| Instances | 20 (plus 1 for run 0a) | 34 (plus 1) | 10 + 3 + 1 + 3 + 2 + 1 for 1x; 20 + 3 + 1 + 6 + 3 + 1 for 2x; the repeat on gp3 and run 8 add Postgres instances |
+| vCPUs | about 290 | about 480 | including the driver and two Postgres instances |
+
+### Postgres runs on EC2 here, not on RDS
+
+The plan named RDS for PostgreSQL. The account's permission set for this work
+denies every `rds:*` action (even the read-only ones), so `20-postgres.sh`
+runs PostgreSQL 17 (the official `postgres:17` image, host networking) in
+Docker on one r7i.4xlarge with its data on a separate EBS volume formatted as
+xfs. The database listens on its private address only and accepts
+scram-sha-256 logins from the subnet. Its settings are rendered from
+`templates/postgresql.conf` (`synchronous_commit=on`, statements over 50 ms
+logged, `pg_stat_statements` preloaded, `wal_compression=on`,
+`checkpoint_timeout=15min`, `max_wal_size=16GB`, `shared_buffers` 25 percent
+and `effective_cache_size` 75 percent of RAM, `max_connections` from
+`MAX_NODES x DB_POOL_SIZE + 300`). The settings in force are read back from the
+server and recorded in STATE for every database that is created.
+
+What an operator should read across to RDS:
+
+- Carries over. EBS io2 and gp3 are the storage RDS for PostgreSQL itself uses,
+  so the commit latency and the IOPS ceiling measured here are those of EBS
+  plus Postgres. The instance has the same vCPU and memory as the
+  db.r7g.4xlarge the plan named (Intel, since the images and the AMI are amd64,
+  instead of Graviton).
+  Durability settings, WAL and checkpoint settings are what an RDS parameter
+  group would carry.
+- Does not carry over. There is no managed failover, backup or patching (the
+  plan already states that a Multi-AZ failover is stated, not tested). RDS
+  applies its own defaults to settings this file does not name; the file here
+  lists every non-default value, and `70-collect.sh` copies it into the results.
+  There is no Performance Insights: use `pg_stat_statements` and the
+  postgres_exporter series instead.
+- Two choices that matter for the comparison. gp3 is provisioned at 12000 IOPS
+  and 500 MB/s (`PG_IOPS`, `PG_THROUGHPUT_MBPS`), the baseline RDS documents for a
+  gp3 volume of 400 GB and over, not the EBS default of 3000 IOPS and 125 MB/s
+  (which would make gp3 look far worse than it is on RDS). The r7i.4xlarge can
+  drive at most 40000 IOPS and 10000 Mbps to EBS with a baseline of 20000 IOPS
+  (`aws ec2 describe-instance-types`, read when this was written), so the
+  20000 IOPS io2 volume sits at the instance baseline.
+
+### No stop and start: terminate and re-create
+
+The role may not stop or start instances, and it may not delete a standalone
+volume. So every EBS volume is created inside the `RunInstances` call with
+`DeleteOnTermination`, instances are launched with terminate-on-shutdown, and
+"between runs" means terminate and re-create: `80-terminate.sh --yes`, then run
+`20`, `25`, `30`, `40`, `50` again (about ten minutes). Everything on a box,
+the Postgres data included, goes when its instance does: run `70-collect.sh`
+first. This also means nothing bills while the fleet is down.
+
 ### Hourly cost (approximate on-demand list prices)
 
 The prices are in `lib.sh` (`price_of`) and can be overridden with
 `PRICE_<type>` (dots become underscores, for example `PRICE_c7i_2xlarge=0.36`).
-Check them against the AWS pricing pages before you rely on them. The io2
-line is the least certain: provisioned IOPS are billed per IOPS-month and
-dominate the database price (`IO2_USD_PER_IOPS_MONTH`, `IO2_USD_PER_GB_MONTH`).
+They are us-east-1 list prices; eu-west-1 is usually about 10 percent higher
+(`PRICE_FACTOR=1.1` scales every price). Check them against the AWS pricing
+pages before you rely on them. The role cannot read Cost Explorer or the
+pricing API, so these are estimates, not your bill. EBS: io2 bills provisioned
+IOPS per month and dominates the database volume price
+(`IO2_USD_PER_IOPS_MONTH`, `IO2_USD_PER_GB_MONTH`); gp3 bills IOPS above 3000 and
+throughput above 125 MB/s.
 
 | Fleet | What is running | About USD per hour |
 |---|---|---|
-| Run 0a | RDS (db.r7g.4xlarge, 1000 GB, 20000 io2 IOPS) and the pgbench driver | 5.5 |
-| Smoke | 2 nodes, 1 generator, 1 publisher, conductor, 3 NATS, RDS io2 | 9 |
-| 1x | 10 nodes, 3 NATS, 3 generators, 2 publishers, conductor, RDS io2 | 15 |
-| 2x | 20 nodes, 3 NATS, 6 generators, 3 publishers, conductor, RDS io2 | 25 |
-| Run 8 (shards) | the 1x fleet plus up to 3 extra RDS instances | 15 plus 5 per shard |
-| Stopped fleet | disks, RDS storage and provisioned IOPS | 0.2 to 4, depending on IOPS |
+| Run 0a | r7i.4xlarge with 1000 GB io2 at 20000 IOPS (3.0) and the pgbench driver | 3.7 |
+| Run 0a, io2 and gp3 together | the above plus a second r7i.4xlarge with 1000 GB gp3 (12000 IOPS, 500 MB/s) | 5.0 |
+| Smoke | 2 nodes, 1 generator, 1 publisher, conductor, 3 NATS, Postgres io2 | 7.3 |
+| 1x | 10 nodes, 3 NATS, 3 generators, 2 publishers, conductor, Postgres io2 | 13.8 |
+| 2x | 20 nodes, 3 NATS, 6 generators, 3 publishers, conductor, Postgres io2 | 22.4 |
+| Run 8 (shards) | the 1x fleet plus up to 3 extra Postgres instances | 13.8 plus 3.0 per shard |
+| Fleet terminated | nothing (each volume is deleted with its instance) | 0 |
 
-`bench/aws/cost-estimate.sh` prints the rate of what STATE says is running and
-an estimate of the spend so far. The estimate is local arithmetic, not your
-bill.
+Against the RDS plan, run 0a costs about 1.8 USD an hour less (the old figure
+was 5.5) and the 1x fleet about 1.2 less (15 before), because an r7i.4xlarge
+plus an EBS io2 volume is cheaper than db.r7g.4xlarge plus RDS io2 storage.
+The 60 GB root volume of each box (about 0.007 USD an hour) is not counted.
+
+`bench/aws/cost-estimate.sh` prints the rate of what is running (it asks EC2
+which boxes still exist, because the dead-man switch terminates boxes behind
+your back) and an estimate of the spend so far. The estimate is local
+arithmetic, not your bill.
 
 ### Safety rails
 
-- `00-preflight.sh` probes the permissions the proof needs, then checks that a
-  billing alarm exists (it creates one) and refuses to go on without it.
-  The default warning is USD 750 and the cap is USD 1500 (`BUDGET_ALARM_USD`,
-  `BUDGET_CAP_USD`).
-- `60-run.sh` and `65-run-0a.sh` refuse to start without `RUN_TIME_LIMIT`, and
-  refuse when the estimated spend plus the run would pass the cap
+The guards that act are local: the spend estimate with `spend_gate` and
+`budget_guard`, and `FLEET_MAX_UPTIME_H`. The billing alarm is a late backstop.
+
+- **The local estimate is the primary spend guard.** Every script that adds to
+  the fleet refuses once the estimated spend has reached `BUDGET_CAP_USD`;
+  `60-run.sh` and `65-run-0a.sh` refuse when the estimate plus the run would pass it
   (`OVERRIDE_BUDGET_GUARD=1` exists; use it only after a decision by whoever owns the budget).
+- **Dead-man switch: `FLEET_MAX_UPTIME_H` (default 10).** Every box powers itself
+  off that many hours after it boots. Boxes are launched to terminate on shutdown,
+  so a forgotten fleet stops billing for compute and disks alike. It also ends a
+  run that needed longer, Postgres included: set the value for the day you plan.
+- **Billing alarm.** `00-preflight.sh` creates CloudWatch billing alarms (with an
+  SNS topic) at `BUDGET_ALARM_USD` (default 750) and `BUDGET_CAP_USD` (1500) and refuses to go
+  on without a way to make them (`BUDGET_METHOD=cloudwatch`, the default). The
+  role can create an AWS Budget but cannot read one (no `budgets:ViewBudget`), so
+  `BUDGET_METHOD=budgets` creates it and cannot confirm it; preflight says so. Billing
+  data lags by hours and the metric needs "Receive Billing Alerts" switched on in the
+  account's billing preferences, so treat the alarm as a backstop: until its first data
+  point it shows INSUFFICIENT_DATA. Confirm the SNS subscription e-mail.
 - Every run is detached on its box under `timeout(1)`, so a hung run ends. That
   ends the conductor (or pgbench), not the fleet: the generators and publishers
-  keep running and billing until you stop them (`AUTO_STOP_AFTER_RUN=1` does it).
-- `10` to `50`, `60` and `65` refuse to run until `00-preflight.sh` has passed,
-  and `20` to `50` refuse once the spend estimate has reached the cap.
-- Dead-man switch: every box is launched to stop (not terminate) itself
-  `FLEET_MAX_UPTIME_H` hours (default 10) after it boots; `80-start.sh` arms it
-  again. It stops compute only: the database needs `80-stop.sh`.
-- `80-stop.sh` between runs, `90-teardown.sh --yes` at the end of every working day.
+  keep running and billing until you terminate them (`AUTO_TERMINATE_AFTER_RUN=1` collects the run and then terminates everything).
+- `10` to `50`, `60` and `65` refuse to run until `00-preflight.sh` has passed.
+- `80-terminate.sh --yes` between runs, `90-teardown.sh --yes` at the end of every working day.
 
 ## 2. Prerequisites
 
@@ -73,19 +147,24 @@ On the machine that runs the scripts: bash 4.4 or newer (on macOS,
 and Docker with buildx (for `build-push.sh`). `shellcheck` if you run the tests.
 
 In the AWS account, the role you sign in with needs to be allowed to:
-create and terminate EC2 instances, security groups, placement groups and key pairs;
-create and delete RDS instances, parameter groups and subnet groups (and use Performance Insights);
+launch EC2 instances with EBS volumes (io2 and gp3) in the block-device mapping,
+terminate them, and create security groups;
 create ECR repositories and push images;
-create a Budget (or a CloudWatch alarm and an SNS topic);
+create CloudWatch alarms and an SNS topic (or a Budget);
 create an IAM role and instance profile (or be given an existing instance
 profile with ECR read access in `INSTANCE_PROFILE_NAME`).
-`00-preflight.sh` tells you which of these is denied before anything is created.
+It does not need RDS, EC2 key pairs, placement groups, stop or start, or
+standalone volume create and delete. `00-preflight.sh` tells you which
+needed action is denied before anything is created.
 
 The account also needs on-demand vCPU quota for the fleet. The 2x fleet is
-about 430 vCPUs of the "Running On-Demand Standard instances" quota
-(`L-1216C47A`); the 1x fleet is about 240. Preflight reads the quota and
-refuses when it is too low. There must be a default VPC in the region, or set
-`VPC_ID` and `SUBNET_ID`.
+about 480 vCPUs of the "Running On-Demand Standard instances" quota
+(`L-1216C47A`, which counts the r7i Postgres boxes too); the 1x fleet is about
+290. Preflight reads the quota and refuses when it is too low; a role that may
+not read quotas (`servicequotas:*`) gets a warning with the number instead, and a
+short quota then shows as `VcpuLimitExceeded` when a script launches boxes
+(use `FLEET_PROFILE=1x` or ask for an increase). There must be a default VPC
+in the region, or set `VPC_ID` and `SUBNET_ID`.
 
 ## 3. Environment variables
 
@@ -101,9 +180,9 @@ Required before anything else:
 | `AWS_ACCOUNT_ID` | The 12 digit account the fleet may use. `00-preflight.sh` stops if your credentials belong to another account. |
 | `AWS_REGION` | The region. One region, one zone. |
 | `ADMIN_CIDR` | Your public address as a /32 (`$(curl -s https://checkip.amazonaws.com)/32`). The only source allowed to SSH in. `0.0.0.0/0` is refused. |
-| `SSH_PUBLIC_KEY_PATH` | Public key to import as the EC2 key pair. The private key is the same path without `.pub` (or set `SSH_PRIVATE_KEY_PATH`). |
+| `SSH_PUBLIC_KEY_PATH` | An OpenSSH public key (`ssh-ed25519` or `ssh-rsa` line). There is no EC2 key pair: every box appends this key to `ec2-user`'s `authorized_keys` in its user-data. The private key is the same path without `.pub` (or set `SSH_PRIVATE_KEY_PATH`). |
 | `ALARM_EMAIL` | Receives the budget warnings. |
-| `RDS_PASSWORD` | 16 or more characters, letters, digits, `_` and `-` only. Needed by `20-postgres.sh`. Other scripts read the DSN from STATE. |
+| `PG_PASSWORD` (or `RDS_PASSWORD`) | 16 or more characters, letters, digits, `_` and `-` only. The Postgres superuser password. Needed by `20-postgres.sh`. Other scripts read the DSN from STATE. |
 | `RUN_TIME_LIMIT` | Hard limit for a run: `300`, `45m` or `2h`. Needed by `60-run.sh` and `65-run-0a.sh`. |
 
 Optional, with defaults:
@@ -116,22 +195,23 @@ Optional, with defaults:
 | `LOG_FILE` | `.../LOG.md` next to the state file | One line per completed step. |
 | `RESULTS_DIR` | `.../results` next to the state file | Raw results per run. |
 | `BUDGET_ALARM_USD`, `BUDGET_CAP_USD` | 750, 1500 | Warning and cap. |
-| `BUDGET_SCOPE` | `account` | `account` counts everything in the account (other spend there can trip the alarm). `tag` counts only spend tagged `Project=$PROJECT_TAG`, but sees nothing until the `Project` cost allocation tag is activated in Billing (up to a day). Either way Budgets data lags by hours: the local spend estimate is the day-to-day guard. |
-| `BUDGET_METHOD` | `auto` | `auto` uses Budgets when the role may create one, else CloudWatch billing alarms with SNS. `cloudwatch` forces the second. |
+| `BUDGET_METHOD` | `cloudwatch` | `cloudwatch`: CloudWatch billing alarms with an SNS topic (the role can create and read them). `budgets`: an AWS Budget (created, but the role cannot read it back; preflight warns). `auto`: CloudWatch, else Budgets. The local estimate and `FLEET_MAX_UPTIME_H` are the guards that act either way. |
+| `BUDGET_SCOPE` | `account` | Budgets only. `account` counts everything in the account. `tag` counts only spend tagged `Project=$PROJECT_TAG`, but sees nothing until the `Project` cost allocation tag is activated in Billing (up to a day). |
+| `PRICE_FACTOR` | 1 | Scales every price in the local cost estimate (`1.1` for eu-west-1). `PRICE_<type>` overrides one instance price. |
 | `FLEET_PROFILE` | `2x` | Sizes the vCPU quota check (`2x` or `1x`); vCPUs already in use in the account are subtracted. |
-| `FLEET_MAX_UPTIME_H` | 10 | Dead-man switch: each box stops itself this many hours after it boots. `SKIP_REARM=1` makes `80-start.sh` skip re-arming it. |
-| `USE_PLACEMENT_GROUP` | 1 | `0` launches without the cluster placement group (for capacity errors). |
+| `FLEET_MAX_UPTIME_H` | 10 | Dead-man switch: each box powers itself off, and so terminates, this many hours after it boots. |
+| `USE_PLACEMENT_GROUP` | 0 | `1` tries to create a cluster placement group and launches the fleet in it; a denial is a warning and the fleet launches without one. |
 | `BILLING_REGION` | `us-east-1` | The one region that holds billing metrics; CloudWatch billing alarms and their SNS topic live there. |
 | `ECR_REPO_SERVER`, `ECR_REPO_LOADGEN` | `$PROJECT_TAG/ably-server`, `$PROJECT_TAG/ably-loadgen` | ECR repository names. Teardown with `TEARDOWN_ALL=1` deletes only repositories tagged for the project. |
 | `INSTANCE_PROFILE_NAME` | (created) | An existing instance profile with ECR read access. |
 | `VPC_ID`, `SUBNET_ID` | (default VPC) | Use these instead of the default VPC. |
 | `NODE_COUNT`, `NATS_COUNT`, `LOADGEN_COUNT`, `PUBLISHER_COUNT` | 10, 3, 3, 2 | Fleet sizes. |
 | `NODE_INSTANCE_TYPE`, `NATS_INSTANCE_TYPE`, `LOADGEN_INSTANCE_TYPE`, `PUBLISHER_INSTANCE_TYPE`, `CONDUCTOR_INSTANCE_TYPE`, `PGDRIVER_INSTANCE_TYPE` | c7i.2xlarge, c7i.2xlarge, c7i.8xlarge, c7i.4xlarge, c7i.2xlarge, c7i.4xlarge | Instance types. |
-| `RDS_INSTANCE_CLASS`, `RDS_STORAGE`, `RDS_STORAGE_GB`, `RDS_IOPS` | db.r7g.4xlarge, io2, 1000, 20000 (io2) | Database size. gp3 uses its baseline unless `RDS_IOPS` is set. |
-| `RDS_ENGINE_VERSION` | `17` | Pin an exact minor version (for example `17.x`) before you quote a number. The engine version that was actually created is recorded in STATE. |
-| `RDS_FORCE_SSL` | `0` | Plain connections inside the VPC (TLS is out of scope for the proof). `1` requires TLS and switches the DSN to `sslmode=require`. |
+| `PG_INSTANCE_TYPE` | `r7i.4xlarge` | The Postgres box (x86_64; 16 vCPU, 128 GB). `shared_buffers` and `effective_cache_size` follow its memory. |
+| `PG_STORAGE`, `PG_STORAGE_GB`, `PG_IOPS`, `PG_THROUGHPUT_MBPS` | io2, 1000, 20000 (io2) or 12000 (gp3), 500 (gp3 only) | The EBS data volume. The old names `RDS_STORAGE`, `RDS_STORAGE_GB`, `RDS_IOPS` still work; the `PG_` name wins when both are set. gp3 defaults to RDS's documented baseline for this size, not the EBS default of 3000 and 125. |
+| `PG_IMAGE` | `postgres:17` | The database image (`RDS_ENGINE_VERSION=17.x` selects `postgres:17`). The server version and the image id that were actually started are recorded in STATE. |
 | `DB_POOL_SIZE`, `MAX_NODES` | 50, 20 | Size `max_connections` (`MAX_NODES x DB_POOL_SIZE + 300`). |
-| `SHARDS` | 1 | Run 8: number of RDS instances per storage type. |
+| `SHARDS` | 1 | Run 8: number of Postgres instances per storage type. |
 | `ACTIVE_STORAGE` | first created | Which storage type the nodes use (`io2` or `gp3`). |
 | `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag, for the shipped image in run 1a). |
 | `SERVER_TAG`, `LOADGEN_TAG` | from STATE | Image tags in ECR. |
@@ -144,9 +224,9 @@ Optional, with defaults:
 | `RECONFIGURE`, `SCALE_DOWN` | 0 | Re-apply the image and flags to live boxes (`40-nodes.sh`, `50-loadgen.sh`), or remove nodes above `NODE_COUNT`. |
 | `DURATION_S`, `WARMUP_S`, `CLIENTS`, `VARIANTS`, `CHANNELS`, `PAYLOAD_BYTES` | 60, 10, `1 8 32 128`, all, 200000, 600 | Run 0a settings (`pgbench/run.sh`). |
 | `IMAGE_TAG`, `IMAGE_PLATFORM`, `PUSH`, `ALLOW_DIRTY` | git sha, `linux/amd64`, 1, 0 | `build-push.sh`. |
-| `KEEP_SNAPSHOT`, `KEEP_KEY_PAIR`, `TEARDOWN_ALL` | 0 | `90-teardown.sh` options. |
-| `STOP_RDS` | 1 | `80-stop.sh`: set to 0 to leave Postgres running. |
-| `AUTO_STOP_AFTER_RUN`, `OVERRIDE_BUDGET_GUARD`, `FORCE_NO_ALARM` | 0 | See the safety rails. |
+| `TEARDOWN_ALL` | 0 | `90-teardown.sh`: also delete the ECR repositories and the billing alarms. |
+| `KEEP_POSTGRES` | 0 | `80-terminate.sh`: terminate everything except the Postgres instances. |
+| `AUTO_TERMINATE_AFTER_RUN`, `OVERRIDE_BUDGET_GUARD`, `FORCE_NO_ALARM` | 0 | See the safety rails. |
 | `SKIP_BOOT_WAIT`, `SKIP_OBSERVABILITY`, `KEEP_WORK_DIR` | 0 | Skip waiting for cloud-init, skip `55-observability.sh`, keep rendered user-data for inspection. |
 | `DRY_RUN` | 0 | `1` prints every aws, ssh and scp call and runs nothing. |
 
@@ -219,7 +299,7 @@ A dry run writes a scratch state file (`$TMPDIR/<tag>-dryrun-STATE.json`,
 ### 5.1 Preflight, network, images
 
     bench/aws/00-preflight.sh       # credentials, account, permissions, vCPU quota, ECR repositories, billing alarm
-    bench/aws/10-network.sh         # security group, placement group, key pair, instance profile
+    bench/aws/10-network.sh         # security group, instance profile (a placement group only with USE_PLACEMENT_GROUP=1; no key pair)
     bench/aws/build-push.sh         # builds ably-server and ably-loadgen for linux/amd64 and pushes them
 
 `build-push.sh` refuses to push from a dirty working tree, so a pushed tag
@@ -233,12 +313,18 @@ Confirm the budget e-mail subscription that AWS sends to `ALARM_EMAIL`.
 
 ### 5.2 Run 0a: Postgres alone (first real numbers, before any node exists)
 
-    RDS_STORAGE=io2 bench/aws/20-postgres.sh          # about 15 minutes to create
-    bench/aws/25-pgdriver.sh
+    PG_STORAGE=io2 bench/aws/20-postgres.sh           # about 10 minutes: boot, Docker pull, initdb, pg_isready over SSH
+    bench/aws/25-pgdriver.sh                          # the pgbench box
     RUN_TIME_LIMIT=1h bench/aws/65-run-0a.sh io2      # about 40 minutes
-    RDS_STORAGE=gp3 bench/aws/20-postgres.sh          # a second instance; both exist side by side
+    PG_STORAGE=gp3 bench/aws/20-postgres.sh           # a second instance; both exist side by side (5.0 USD an hour together)
     RUN_TIME_LIMIT=1h bench/aws/65-run-0a.sh gp3
     bench/aws/pgbench/summarise.sh "$RESULTS_DIR"/0a-io2-*/out/results-io2.csv "$RESULTS_DIR"/0a-gp3-*/out/results-gp3.csv > summary-0a.md
+
+`20-postgres.sh` does not finish until `pg_isready` answers over SSH and the
+server reports `synchronous_commit=on` and `pg_stat_statements` preloaded; it
+stops with an error otherwise. If you are not sure the gp3 run is needed this
+hour, run io2 first, collect, and create the gp3 instance later: each instance
+is 1.1 to 3.0 USD an hour (box plus volume).
 
 The variants, what each measures, and the pass check for the SQL itself are
 in `pgbench/run.sh` and `pgbench/*.sql`. The numbers to read: the `trivial`
@@ -246,12 +332,14 @@ row at one client is the ACK latency floor; `shipped` is the current write
 path; `batch30` and `batch100` show how far batching moves one primary. The
 summary also prints WAL bytes per message.
 
-Stop or delete what you do not need next: `bench/aws/80-stop.sh`, or
+Nothing on the boxes survives a terminate: `65-run-0a.sh` has already copied
+the CSV, raw output and tables into `results/`. Then delete what you do not
+need next: `bench/aws/80-terminate.sh --yes` (keeps the security group), or
 `bench/aws/90-teardown.sh --yes` to delete everything.
 
 ### 5.3 The fleet
 
-    RDS_STORAGE=io2 bench/aws/20-postgres.sh          # skip if it already exists
+    PG_STORAGE=io2 bench/aws/20-postgres.sh           # skip if it already exists
     bench/aws/30-nats.sh                              # three NATS servers on fixed addresses
     BUS=nats bench/aws/40-nodes.sh                    # NODE_COUNT nodes
     bench/aws/50-loadgen.sh                           # generators, publishers, conductor, Prometheus, Grafana
@@ -299,11 +387,11 @@ these settings; change the settings, then run the scenario:
 | 1a shipped bus | build the `main` image (5.1), then `BUS=none SERVER_TAG=<main tag> RECONFIGURE=1 bench/aws/40-nodes.sh` |
 | 1b small size | `BUS=postgres RECONFIGURE=1 bench/aws/40-nodes.sh` |
 | 2, 3 large size | `BUS=nats RECONFIGURE=1 bench/aws/40-nodes.sh` (raise `NODE_COUNT` for 2x, and `LOADGEN_COUNT`, `PUBLISHER_COUNT` with `50-loadgen.sh`) |
-| 4 storage | `RDS_STORAGE=gp3 ACTIVE_STORAGE=gp3 bench/aws/20-postgres.sh`, then `RECONFIGURE=1 bench/aws/40-nodes.sh` |
-| 5 failure injection | the scenario kills a node or a NATS server through the conductor; to do it by hand, `aws ec2 stop-instances` on one tagged box |
+| 4 storage | `PG_STORAGE=gp3 ACTIVE_STORAGE=gp3 bench/aws/20-postgres.sh`, then `RECONFIGURE=1 bench/aws/40-nodes.sh` |
+| 5 failure injection | the scenario kills a node or a NATS server through the conductor; to do it by hand, `ssh` to the box and `docker kill` the container (the role cannot stop instances) |
 | 6 presence | the presence scenario, `RUN_TIME_LIMIT=30m` |
 | 7 node curve | `NODE_COUNT=5 SCALE_DOWN=1 bench/aws/40-nodes.sh`, then 10, then 20; re-run `55-observability.sh` after each change |
-| 8 shard curve | `SHARDS=3 RDS_STORAGE=io2 bench/aws/20-postgres.sh` and `RECONFIGURE=1` with the sharding flag in `ABLY_SERVER_EXTRA_FLAGS` |
+| 8 shard curve | `SHARDS=3 PG_STORAGE=io2 bench/aws/20-postgres.sh` and `RECONFIGURE=1` with the sharding flag in `ABLY_SERVER_EXTRA_FLAGS` |
 
 Watch a run from your machine through an SSH tunnel (the UIs listen on the
 conductor's loopback only):
@@ -319,23 +407,31 @@ conductor's loopback only):
 
 It gathers a Prometheus snapshot and range exports of the series in
 `observability/export-series.txt`, container logs and docker stats samples
-from every box, `pg_stat_statements` from each database, RDS Performance
-Insights load, and a copy of STATE with the secrets removed, into
+from every box, `pg_stat_statements` from each database, the `postgresql.conf`
+in force, and a copy of STATE with the secrets removed, into
 `results/<run-id>/collect/`. Each step is best effort and logs a warning when
 it cannot finish. Results and raw logs stay out of the repository.
 
-### 5.7 Stop, start, teardown
+### 5.7 Between runs, and teardown
 
-    bench/aws/80-stop.sh            # stop every instance and the database (disks and storage still bill)
-    bench/aws/80-start.sh           # start them again; private addresses stay, public ones change
-    bench/aws/90-teardown.sh --yes  # delete everything tagged Project=$PROJECT_TAG, then verify
+The role cannot stop or start instances, so there is no stop and start. Between
+runs, terminate and re-create:
 
-RDS restarts by itself after seven days stopped. The budget and the ECR
-repositories survive a teardown on purpose (set `TEARDOWN_ALL=1` to remove
-them). `KEEP_SNAPSHOT=1` takes a final database snapshot.
+    bench/aws/70-collect.sh <run-id>   # first: nothing on a box survives
+    bench/aws/80-terminate.sh --yes    # every instance and its disks; keeps the security group, images and STATE
+    # later: 20-postgres.sh, 25-pgdriver.sh (run 0a), 30-nats.sh, 40-nodes.sh, 50-loadgen.sh again (about ten minutes)
+    bench/aws/90-teardown.sh --yes     # everything tagged Project=$PROJECT_TAG, then verify
+
+`KEEP_POSTGRES=1 bench/aws/80-terminate.sh --yes` leaves the database boxes and
+their data up (they keep billing, 3.0 USD an hour each). The billing alarms and
+the ECR repositories survive a teardown on purpose (set `TEARDOWN_ALL=1` to remove
+them). The role cannot delete a standalone volume, so the scripts never create
+one: every volume is deleted with its instance, and `90-teardown.sh` would report
+any volume that is still there.
 
 End every working day with `90-teardown.sh --yes`, or write in `LOG_FILE`
-that the fleet is up, what it costs an hour and why.
+that the fleet is up, what it costs an hour and why. The dead-man switch
+(`FLEET_MAX_UPTIME_H`) ends it after ten hours either way.
 
 ## 6. If something is left running
 
@@ -347,10 +443,9 @@ that the fleet is up, what it costs an hour and why.
          --query 'ResourceTagMappingList[].ResourceARN' --output text
 
    Terminated instances can stay in that list for about an hour.
-4. To delete by hand: `aws ec2 terminate-instances`, `aws rds delete-db-instance --skip-final-snapshot --delete-automated-backups`, then the security group, placement group and key pair.
+4. To delete by hand: `aws ec2 terminate-instances` (the volumes go with the instances), then the security group, then the IAM role and instance profile.
 5. A resource with no tag is not found by any of this. The scripts tag every
-   instance, volume, security group, placement group, key pair, RDS instance,
-   parameter group, subnet group and IAM role they create.
+   instance, volume, security group, placement group (if any) and IAM role they create.
 
 ## 7. The load generator commands
 
@@ -388,26 +483,35 @@ scrape config assumes the generators serve metrics on port 9101.
 
 ## 8. What the boxes run (for reproducing)
 
-Amazon Linux 2023 (the latest AMI from the public SSM parameter, pinned in STATE
-on first use), Docker from the distribution, chrony with Amazon Time Sync,
-`fs.nr_open` and `nofile` at 1M, the ephemeral port range 1024 to 65535.
-Images: `nats:2.11`, `natsio/prometheus-nats-exporter:0.15.0`,
-`prom/node-exporter:v1.8.2`, `prom/prometheus:v2.55.1`, `grafana/grafana:11.3.0`,
-`quay.io/prometheuscommunity/postgres-exporter:v0.15.0`, `postgres:17-alpine`
-(pgbench and psql), plus the two images this repository builds. The Postgres
-parameters (`synchronous_commit=on`, `log_min_duration_statement=50`,
-`pg_stat_statements`, `max_connections`) are set in `20-postgres.sh`. The
-instance types, versions and flags of every run are recorded in STATE
-(`.deployment`, `.loadgen`, `.postgres`, `.runs`).
+Amazon Linux 2023 (the latest AMI from the public SSM parameter, or from
+`ec2 describe-images` when that parameter is not readable; pinned in STATE on first
+use), Docker from the distribution, chrony with Amazon Time Sync, `fs.nr_open`
+and `nofile` at 1M, the ephemeral port range 1024 to 65535, the operator's SSH
+key in `ec2-user`'s `authorized_keys`. Images: `nats:2.11`,
+`natsio/prometheus-nats-exporter:0.15.0`, `prom/node-exporter:v1.8.2`,
+`prom/prometheus:v2.55.1`, `grafana/grafana:11.3.0`,
+`quay.io/prometheuscommunity/postgres-exporter:v0.15.0`, `postgres:17` (the
+database), `postgres:17-alpine` (pgbench and psql), plus the two images this
+repository builds. The Postgres box mounts its EBS data volume (xfs, `noatime`)
+at `/data/pg`; the settings are in `templates/postgresql.conf` and
+`templates/postgres.sh`, rendered by `20-postgres.sh` (nothing here is an RDS
+default: see section 1). The instance types, versions and flags of every run
+are recorded in STATE (`.deployment`, `.loadgen`, `.postgres` with the server
+version, image id and settings read back from the database, `.runs`).
 
 ## 9. Troubleshooting
 
-- **`InsufficientInstanceCapacity` in a cluster placement group.** Retry, or start the fleet in an order that launches the biggest boxes first, or remove the placement group from STATE and the scripts (the latency difference is small).
-- **A box is not reachable over SSH.** Check `ADMIN_CIDR` still matches your address (it changes with the network you are on) and re-run `10-network.sh` after fixing it; the rule is added, not replaced, so remove the old rule by hand.
+- **`InsufficientInstanceCapacity`.** Retry, or try another `AZ` (and re-run `10-network.sh`). With `USE_PLACEMENT_GROUP=1`, set it back to 0 (the latency difference is small).
+- **`VcpuLimitExceeded` when launching.** The on-demand vCPU quota is lower than the fleet needs (preflight could not read it). Use `FLEET_PROFILE=1x` sizes, terminate what is not needed, or ask for an increase of quota `L-1216C47A`.
+- **A box is not reachable over SSH.** Check `ADMIN_CIDR` still matches your address (it changes with the network you are on) and re-run `10-network.sh` after fixing it; the rule is added, not replaced, so remove the old rule by hand. The key is the one in `SSH_PUBLIC_KEY_PATH` when the box was launched, and the private key must match it (`SSH_PRIVATE_KEY_PATH`); there is no key pair to swap afterwards, only a new box.
+- **`20-postgres.sh` times out waiting for Postgres.** `ssh` in (`ssh ec2-user@<ip>`), read `/var/log/bench-userdata.log`, then `docker logs postgres`, `lsblk` and `df -h /data/pg`. A data volume that never appears, a full disk, or a bad `postgresql.conf` are the usual causes. To start again, `80-terminate.sh --yes` (the volume goes with the instance) and re-run.
+- **A box vanished.** The dead-man switch (`FLEET_MAX_UPTIME_H`) powers it off after that many hours and the box terminates with its disks, the database included. `cost-estimate.sh` notices; re-create what you need.
 - **A box came up but the container is not running.** `ssh` in and read `/var/log/bench-userdata.log` and `docker logs`. `RECONFIGURE=1` re-applies the role part.
 - **ECR pull denied.** The instance profile is missing or not yet propagated; wait a minute, then `RECONFIGURE=1 bench/aws/40-nodes.sh`.
-- **`00-preflight.sh` reports a denied action.** Sign in with a role that has it, or ask for it. Nothing was created.
+- **`00-preflight.sh` reports a denied action.** Sign in with a role that has it, or ask for it. Nothing was created. Actions this design does not need (RDS, key pairs, placement groups, stop and start, standalone volumes, Cost Explorer, `budgets:ViewBudget`, service quotas) are not probed or are informational.
+- **Preflight says the terminate permission is only weakly checked.** `ec2:TerminateInstances` cannot be proven without an instance; `80-terminate.sh` and `90-teardown.sh` are the real test, so try them on the smoke fleet first.
 - **`10-network.sh` or `30-nats.sh` fails on an address.** NATS servers take fixed private addresses from `NATS_IP_OFFSET` in the subnet; if another instance already holds one, pick another offset.
-- **The database password and the API key are in EC2 user-data.** Anyone who can describe instance attributes in the account can read them, and they appear in `docker inspect` on the box. The bench database is throwaway and only reachable inside the security group; do not reuse the password anywhere.
+- **The database password and the API key are in EC2 user-data.** Anyone who can describe instance attributes in the account can read them, and they appear in `docker inspect` on the box (the Postgres password is in the container's environment). The bench database is throwaway and only reachable inside the security group; do not reuse the password anywhere.
+- **Untagged IAM role, instance profile or ECR repository.** Tagging on create needs `iam:TagRole`, `iam:TagInstanceProfile` and `ecr:TagResource`. When the role lacks one, the script logs a warning and creates the resource untagged; `90-teardown.sh` still removes the IAM entities by name from STATE (a denied IAM delete is a warning: the role and profile cost nothing), and leaves an untagged ECR repository alone.
 - **Teardown says a read failed.** Teardown refuses to treat a failed read as "nothing there". Fix the sign-in or permission and run it again; STATE is kept until it verifies clean.
-- **STATE.json was lost.** `90-teardown.sh --yes` still works. To continue instead, re-run `10-network.sh`, `20-postgres.sh` (with `RDS_PASSWORD`), `30-nats.sh`, `40-nodes.sh` and `50-loadgen.sh`: they find existing resources by tag and name and refill STATE.
+- **STATE.json was lost.** `90-teardown.sh --yes` still works. To continue instead, re-run `10-network.sh`, `20-postgres.sh` (with `PG_PASSWORD`), `30-nats.sh`, `40-nodes.sh` and `50-loadgen.sh`: they find existing resources by tag and name and refill STATE.

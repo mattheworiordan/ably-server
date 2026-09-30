@@ -111,11 +111,21 @@ fi
 # ---- 4. IAM role and instance profile, only when 10-network.sh created them
 if [ "$(state_get '.network.created_profile')" = true ]; then
   role="${PROJECT_TAG}-instance"
-  aws_w_tolerate 'NoSuchEntity' "" iam remove-role-from-instance-profile --instance-profile-name "$role" --role-name "$role"
-  aws_w_tolerate 'NoSuchEntity' "" iam delete-instance-profile --instance-profile-name "$role"
-  aws_w_tolerate 'NoSuchEntity' "" iam detach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-  aws_w_tolerate 'NoSuchEntity' "" iam detach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-  aws_w_tolerate 'NoSuchEntity' "" iam delete-role --role-name "$role"
+  # A role that may not delete IAM entities leaves them behind: they cost nothing, so warn and go on.
+  iam_del() {
+    local rc=0
+    AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam "$@" || rc=$?
+    if [ "$rc" = 3 ]; then
+      log "WARNING: iam $1 is denied; delete the role and instance profile $role by hand (they cost nothing)"
+    elif [ "$rc" != 0 ]; then
+      die "iam $1 failed"
+    fi
+  }
+  iam_del remove-role-from-instance-profile --instance-profile-name "$role" --role-name "$role"
+  iam_del delete-instance-profile --instance-profile-name "$role"
+  iam_del detach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+  iam_del detach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  iam_del delete-role --role-name "$role"
 fi
 
 # ---- 5. Optional: ECR repositories (only ones tagged for the project) and the budget

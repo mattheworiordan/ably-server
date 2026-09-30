@@ -115,8 +115,16 @@ else
     cat >"$wd/trust.json" <<'JSON'
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
 JSON
-    aws_w "" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" \
-      --tags "${IAM_TAGS[@]}" >/dev/null
+    # Tagging on create needs iam:TagRole; without it, create the role untagged (STATE finds it at teardown).
+    rc=0
+    aws_w_soft "" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" \
+      --tags "${IAM_TAGS[@]}" >/dev/null || rc=$?
+    if [ "$rc" = 3 ]; then
+      log "WARNING: creating the role with tags was denied (iam:TagRole); creating it without tags"
+      aws_w "" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" >/dev/null
+    elif [ "$rc" != 0 ]; then
+      die "iam create-role failed"
+    fi
     aws_w "" iam attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
     aws_w "" iam attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
     log "created IAM role $role"
@@ -125,7 +133,14 @@ JSON
   fi
   have=$(AWS_R_QUIET=1 aws_r "" iam get-instance-profile --instance-profile-name "$role" --query InstanceProfile.InstanceProfileName) || have=""
   if [ -z "$have" ]; then
-    aws_w "" iam create-instance-profile --instance-profile-name "$role" --tags "${IAM_TAGS[@]}" >/dev/null
+    rc=0
+    aws_w_soft "" iam create-instance-profile --instance-profile-name "$role" --tags "${IAM_TAGS[@]}" >/dev/null || rc=$?
+    if [ "$rc" = 3 ]; then
+      log "WARNING: creating the instance profile with tags was denied (iam:TagInstanceProfile); creating it without tags"
+      aws_w "" iam create-instance-profile --instance-profile-name "$role" >/dev/null
+    elif [ "$rc" != 0 ]; then
+      die "iam create-instance-profile failed"
+    fi
     aws_w "" iam add-role-to-instance-profile --instance-profile-name "$role" --role-name "$role"
     is_dry || sleep 10 # IAM is eventually consistent
     log "created instance profile $role"

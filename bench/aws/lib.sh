@@ -318,7 +318,8 @@ aws_w_tolerate() {
 
 # aws_w_soft <fake> args...: a write the caller can live without. Returns 0 on
 # success, 3 when the role is not authorised (a warning is logged by the
-# caller), 1 on any other failure (the error text is printed).
+# caller), 1 on any other failure (the error text is printed). An error that
+# matches AWS_SOFT_OK (a regex, for example NoSuchEntity) counts as success.
 aws_w_soft() {
   local fake=$1 out
   shift
@@ -334,6 +335,10 @@ aws_w_soft() {
   fi
   if printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|explicit deny|is not permitted'; then
     return 3
+  fi
+  if [ -n "${AWS_SOFT_OK:-}" ] && printf '%s' "$out" | grep -Eq "$AWS_SOFT_OK"; then
+    log "already in place ($AWS_SOFT_OK): aws $1 $2"
+    return 0
   fi
   printf '%s\n' "$out" >&2
   return 1

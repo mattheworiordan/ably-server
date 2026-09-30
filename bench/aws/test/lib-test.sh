@@ -171,6 +171,13 @@ case "$*" in
   *"ec2 describe-images"*) echo ami-from-describe-images ;;
   *"ec2 describe-instances"*) [ "$FAKE_LIST" = fail ] && { echo "Throttling" >&2; exit 254; }
     echo '[{"id":"i-a","name":"node-1","role":"node","type":"c7i.2xlarge","private_ip":"10.0.0.1","public_ip":"1.1.1.1","state":"running"}]' ;;
+  *"iam delete-role"*)
+    case "$FAKE_IAM" in
+      deny) echo "An error occurred (AccessDenied) when calling the DeleteRole operation: not authorized" >&2; exit 254 ;;
+      gone) echo "An error occurred (NoSuchEntity) when calling the DeleteRole operation: gone" >&2; exit 254 ;;
+      other) echo "An error occurred (Throttling)" >&2; exit 254 ;;
+      *) exit 0 ;;
+    esac ;;
   *) echo "fake aws: unexpected call: $*" >&2; exit 97 ;;
 esac
 FAKE
@@ -178,7 +185,7 @@ chmod +x "$tmp/fakeaws/aws"
 real() { # <state json> <bash snippet>: sources lib in real mode with the fake aws
   printf '%s\n' "$1" >"$tmp/real-state.json"
   env -i PATH="$tmp/fakeaws:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/real-state.json" PROJECT_TAG=test-scale AWS_REGION=test-region-1 \
-    FAKE_SSM="${FAKE_SSM:-ok}" FAKE_LIST="${FAKE_LIST:-ok}" bash -c 'source "$0"; '"$2" "$HERE/../lib.sh" 2>/dev/null
+    FAKE_SSM="${FAKE_SSM:-ok}" FAKE_LIST="${FAKE_LIST:-ok}" FAKE_IAM="${FAKE_IAM:-ok}" bash -c 'source "$0"; '"$2" "$HERE/../lib.sh" 2>/dev/null
 }
 check "ami from ssm" ami-from-ssm "$(real '{}' 'resolve_ami')"
 check "ami falls back to describe-images when ssm is denied" ami-from-describe-images "$(FAKE_SSM=deny real '{}' 'resolve_ami')"
@@ -187,6 +194,14 @@ two='{"instances":{"node-1":{"id":"i-a","running":true,"type":"c7i.2xlarge"},"pg
 running_flags='jq -r "[.instances[\"node-1\"].running, .instances.pg.running, .postgres.instances.pg.running] | map(tostring) | join(\" \")" "$STATE_FILE"'
 check "refresh marks a vanished instance and its database not running" "true false false" "$(real "$two" "refresh_instances; $running_flags")"
 check "refresh keeps state when the listing fails" "true true true" "$(FAKE_LIST=fail real "$two" "refresh_instances || true; $running_flags")"
+
+soft() { real '{}' "rc=0; $1 >/dev/null || rc=\$?; echo \$rc"; }
+check "soft write: success" 0 "$(FAKE_IAM=ok soft 'aws_w_soft "" iam delete-role --role-name r')"
+check "soft write: denied is 3" 3 "$(FAKE_IAM=deny soft 'aws_w_soft "" iam delete-role --role-name r')"
+check "soft write: other failure is 1" 1 "$(FAKE_IAM=other soft 'aws_w_soft "" iam delete-role --role-name r')"
+check "soft write: other failure is 1 even when an unrelated pattern is ok" 1 "$(FAKE_IAM=other soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
+check "soft write: a tolerated error is success" 0 "$(FAKE_IAM=gone soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
+check "soft write: denied beats a tolerated pattern" 3 "$(FAKE_IAM=deny soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
 
 if [ "$fails" -gt 0 ]; then
   echo "$fails check(s) failed" >&2

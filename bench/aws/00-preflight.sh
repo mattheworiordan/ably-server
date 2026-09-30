@@ -167,8 +167,16 @@ done
 for repo in "$ECR_REPO_SERVER" "$ECR_REPO_LOADGEN"; do
   have=$(aws_r "" ecr describe-repositories --repository-names "$repo" --query 'repositories[0].repositoryName') || have=""
   if [ -z "$have" ]; then
-    aws_w "" ecr create-repository --repository-name "$repo" \
-      --tags "Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$repo" >/dev/null
+    # Tagging on create needs ecr:TagResource; without it, create the repository untagged.
+    rc=0
+    aws_w_soft "" ecr create-repository --repository-name "$repo" \
+      --tags "Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$repo" >/dev/null || rc=$?
+    if [ "$rc" = 3 ]; then
+      log "WARNING: creating the ECR repository with tags was denied (ecr:TagResource); creating it without tags"
+      aws_w "" ecr create-repository --repository-name "$repo" >/dev/null
+    elif [ "$rc" != 0 ]; then
+      die "ecr create-repository failed for $repo"
+    fi
     log "created ECR repository $repo"
   else
     log "ECR repository $repo exists"

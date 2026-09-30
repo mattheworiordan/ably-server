@@ -10,7 +10,7 @@
 #
 # Needs: RUN_TIME_LIMIT (300, 45m, 2h). Scenario: a path, or a name (with or
 # without .toml) resolved against SCENARIO_DIR (default: bench/scenarios).
-# Optional: CONDUCTOR_CMD (see below), AUTO_STOP_AFTER_RUN=1, OVERRIDE_BUDGET_GUARD=1.
+# Optional: CONDUCTOR_CMD (see below), AUTO_TERMINATE_AFTER_RUN=1, OVERRIDE_BUDGET_GUARD=1.
 #
 # CONDUCTOR_CMD is the command run inside the ably-loadgen image. Tokens
 # {RUN_ID} and {SCENARIO} are replaced. The default is provisional until the
@@ -124,5 +124,10 @@ _state_update '.runs |= map(if .id == $id then . + {status:$st,exit_code:$rc,fin
   --arg id "$run_id" --arg st "$status" --arg rc "$rc" --arg at "$(date -u +%FT%TZ)"
 cost_checkpoint
 log_line 60-run "run $run_id finished: $status (exit $rc); results in $RESULTS_DIR/$run_id" "70-collect.sh $run_id; then judge against the pass criteria (plan section 8)"
-if [ "${AUTO_STOP_AFTER_RUN:-0}" = 1 ]; then "$BENCH_AWS_DIR/80-stop.sh"; fi
+# AUTO_TERMINATE_AFTER_RUN=1 (alias AUTO_STOP_AFTER_RUN): collect, then terminate the fleet. Nothing survives
+# a terminate (there is no stop in this account), so the collection comes first and must succeed.
+if [ "${AUTO_TERMINATE_AFTER_RUN:-${AUTO_STOP_AFTER_RUN:-0}}" = 1 ]; then
+  "$BENCH_AWS_DIR/70-collect.sh" "$run_id"
+  "$BENCH_AWS_DIR/80-terminate.sh" --yes
+fi
 [ "$status" = ok ] || exit 1
