@@ -1629,6 +1629,14 @@ with annotation summary snapshots. A cm whose encoding exceeds
 `--nats-inline-max-bytes` (default 256 KiB) goes as a pointer, and
 receivers read it by serial. The publish transaction emits no NOTIFY.
 
+The namespace is the schema's name only, not the database's identity:
+two deployments on different Postgres servers that use the same schema
+name (the default `public`, say) and share one NATS cluster hear each
+other's channels, and a node could deliver the other deployment's cms.
+Give each deployment its own NATS cluster, or its own schema name. (A
+per-deployment id in the namespace, stored once in the schema, would
+remove the limit; it is not built.)
+
 **Receive fan-in.** A node holds one NATS subscription per bound channel,
 so it receives only its own channels, but the subscriptions do not each
 get a goroutine (nats.go's async `Subscribe` would start one per
