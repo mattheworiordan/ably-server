@@ -91,7 +91,11 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	c.enqueuePublish(ctx, func() {
 		if _, _, err := ch.PublishPresence(ctx, presence); err != nil {
 			c.logger.Warn("presence publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
-			c.nack(ctx, msgSerial, nil)
+			// The retriable storage failures carry their codes, as for a
+			// publish: 42910 when the node is at its presence in-flight
+			// bound or a lane queue is full, 50003 when a batch failed
+			// (DESIGN.md §6.3, §12.5).
+			c.nack(ctx, msgSerial, publishErrorInfo(err))
 			return
 		}
 		c.queue(ctx, &protocol.ProtocolMessage{
@@ -100,20 +104,6 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 			Count:     1,
 		})
 	})
-}
-
-// presentSnapshot copies members for a SYNC frame, stamping each with
-// action PRESENT (DESIGN.md §12.4). The stored members keep their
-// enter/update action — Members may return pointers into live backend
-// state, so we must copy rather than mutate.
-func presentSnapshot(members []*protocol.PresenceMessage) []*protocol.PresenceMessage {
-	out := make([]*protocol.PresenceMessage, len(members))
-	for i, m := range members {
-		cp := *m
-		cp.Action = protocol.PresencePresent
-		out[i] = &cp
-	}
-	return out
 }
 
 // presenceID mints the Ably-form id a genuine presence message carries:

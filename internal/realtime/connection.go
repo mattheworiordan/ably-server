@@ -535,6 +535,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// and Attach, the stream is on the freshly bound Channel (DESIGN.md
 	// §5.1).
 	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
+	a.outShared = c.queueShared
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)
@@ -808,6 +809,37 @@ func (c *connection) queue(ctx context.Context, msg *protocol.ProtocolMessage) b
 		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", err)
 		return false
 	}
+	return c.push(ctx, f)
+}
+
+// memoizer keeps one value per key; *core.PresenceSnapshot is one.
+type memoizer interface {
+	Memo(key any, build func() any) any
+}
+
+// queueShared is queue for a frame that every connection sends
+// unchanged, such as a channel's SYNC snapshot (DESIGN.md §12.4): its
+// encoding in this connection's wire format is kept on memo, so the
+// frame is encoded once per format however many attaches it is served
+// to. The encoded bytes are shared read-only between connections.
+func (c *connection) queueShared(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
+	type encoded struct {
+		f   outFrame
+		err error
+	}
+	e := memo.Memo(c.format, func() any {
+		f, err := c.encode(msg)
+		return encoded{f, err}
+	}).(encoded)
+	if e.err != nil {
+		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", e.err)
+		return false
+	}
+	return c.push(ctx, e.f)
+}
+
+// push queues an encoded frame (see queue).
+func (c *connection) push(ctx context.Context, f outFrame) bool {
 	switch err := c.out.push(ctx, f); {
 	case err == nil:
 		return true

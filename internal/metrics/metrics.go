@@ -39,6 +39,10 @@ type Metrics struct {
 	channelReleaseErrors prometheus.Counter
 
 	slowConsumerDisconnects *prometheus.CounterVec
+
+	presenceSyncs     *prometheus.CounterVec
+	presenceSyncByKey sync.Map // snapshot label -> prometheus.Counter
+	presenceSeeds     prometheus.Counter
 }
 
 // New builds a Metrics with its own registry (so instances are isolated
@@ -103,6 +107,14 @@ func New() *Metrics {
 			Name: "ably_slow_consumer_disconnects_total",
 			Help: "Total WebSocket connections disconnected for not reading fast enough, by reason (queue_full: the outbound queue stayed at its byte limit for the write timeout; write_timeout: a frame write missed its deadline).",
 		}, []string{"reason"}),
+		presenceSyncs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_presence_syncs_total",
+			Help: "Presence SYNC snapshots served on attach or client SYNC, by how the snapshot was obtained (DESIGN.md §12.4): cached (the channel's current snapshot), stale (a snapshot within the refresh window plus the presence events after it), built (rebuilt from the local member set), store (read from the store: --presence-sync-source=store), fallback (read from the store because seeding the local set failed).",
+		}, []string{"snapshot"}),
+		presenceSeeds: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_presence_sync_seeds_total",
+			Help: "Local presence member sets seeded from the store: at most one per channel bind (DESIGN.md §12.4).",
+		}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -120,6 +132,8 @@ func New() *Metrics {
 		m.channelEvictions,
 		m.channelReleaseErrors,
 		m.slowConsumerDisconnects,
+		m.presenceSyncs,
+		m.presenceSeeds,
 	)
 	return m
 }
@@ -258,4 +272,25 @@ func (m *Metrics) SlowConsumerDisconnect(reason string) {
 		return
 	}
 	m.slowConsumerDisconnects.WithLabelValues(reason).Inc()
+}
+
+// PresenceSync records one SYNC snapshot served, by how it was obtained
+// (the ably_presence_syncs_total snapshot label).
+func (m *Metrics) PresenceSync(snapshot string) {
+	if m == nil {
+		return
+	}
+	c, ok := m.presenceSyncByKey.Load(snapshot)
+	if !ok {
+		c, _ = m.presenceSyncByKey.LoadOrStore(snapshot, m.presenceSyncs.WithLabelValues(snapshot))
+	}
+	c.(prometheus.Counter).Inc()
+}
+
+// PresenceSeed records a local member set seeded from the store.
+func (m *Metrics) PresenceSeed() {
+	if m == nil {
+		return
+	}
+	m.presenceSeeds.Inc()
 }

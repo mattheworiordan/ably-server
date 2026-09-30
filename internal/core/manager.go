@@ -45,6 +45,15 @@ type Options struct {
 
 	// Logger receives Release failures. Nil means logging.Default().
 	Logger *logging.Logger
+
+	// PresenceSyncSource is where an attach's SYNC snapshot comes from:
+	// PresenceSyncLocal (the empty default) or PresenceSyncStore
+	// (DESIGN.md §12.4).
+	PresenceSyncSource string
+
+	// PresenceSyncRefresh bounds how often a busy channel's SYNC snapshot
+	// is rebuilt. Zero means DefaultPresenceSyncRefresh.
+	PresenceSyncRefresh time.Duration
 }
 
 // Manager owns the set of active Channels in this process. It pairs
@@ -60,6 +69,8 @@ type Manager struct {
 	sweepEvery  time.Duration
 	metrics     *metrics.Metrics
 	logger      *logging.Logger
+	syncSource  string
+	syncRefresh time.Duration
 
 	// now reads the Manager's monotonic clock in nanoseconds. A field so
 	// tests can drive eviction without sleeping.
@@ -104,12 +115,20 @@ func newManager(store storage.Storage, opts Options, now func() int64) *Manager 
 		sweepEvery:  opts.SweepInterval,
 		metrics:     opts.Metrics,
 		logger:      opts.Logger,
+		syncSource:  opts.PresenceSyncSource,
+		syncRefresh: opts.PresenceSyncRefresh,
 		now:         now,
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
 	if m.logger == nil {
 		m.logger = logging.Default()
+	}
+	if m.syncSource == "" {
+		m.syncSource = PresenceSyncLocal
+	}
+	if m.syncRefresh <= 0 {
+		m.syncRefresh = DefaultPresenceSyncRefresh
 	}
 	for i := range m.shards {
 		m.shards[i].channels = make(map[string]*Channel)
@@ -201,6 +220,7 @@ func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error)
 		}
 		ch := newChannel(name)
 		ch.mgr = m
+		ch.syncSource, ch.syncRefresh, ch.metrics = m.syncSource, m.syncRefresh, m.metrics
 		ch.lastUsed = m.now()
 		sh.channels[name] = ch
 		sh.mu.Unlock()

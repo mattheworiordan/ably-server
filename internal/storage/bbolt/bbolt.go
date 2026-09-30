@@ -862,18 +862,23 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 
 // Members returns the in-memory membership set (sorted by Serial) plus
 // the channel's current watermark — the last channelSerial persisted in
-// the log, or empty if the channel has no cms.
+// the log, or empty if the channel has no cms. The watermark is read
+// under cs.mu, which StorePresence holds from mint to fold, so every
+// presence cm at or below it is in the set and none above it is: the
+// exact as-of point a node's local member set seeds from (DESIGN.md
+// §12.4). A message publish racing the read may advance the watermark
+// past the last presence cm, which changes no member.
 func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
 
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
 	for _, p := range cs.members {
 		out = append(out, p)
 	}
-	cs.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
 
 	var asOf string

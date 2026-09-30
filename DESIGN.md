@@ -1319,7 +1319,11 @@ one transaction. This is how one Postgres primary carries tens of
 thousands of writes a second: the cost of a commit is shared by every
 publish in it. It is on by default (`--publish-lanes=4`) with every bus
 (§7.2); `--publish-lanes=0` commits every publish in its own transaction.
-Presence, mutations and annotations are not batched.
+A presence operation (`StorePresence`, §12.2) joins the same lanes and
+batches (`--presence-batching`, default true), so ENTERs and LEAVEs from
+many rooms share one commit and a room's row lock is taken once per
+batch, not once per operation (§12.5). Mutations and annotations are not
+batched.
 
 The policy is leading edge, not a fixed window. A node has
 `--publish-lanes` lanes (default 4); a channel's name hashes
@@ -1357,7 +1361,9 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   are then checked under the locks in one set-based lookup, and one
   channelSerial is minted per publish in queue order.
 - **Round trip 2**: one multi-row `INSERT` into each of `channel_messages`
-  and `messages`, the bus's in-transaction hook for every cm (queued into
+  and `messages` (message publishes only), the presence operations of the
+  batch folded into the `presence` table (below), the bus's
+  in-transaction hook for every cm (queued into
   the same round trip: one `pg_notify` per cm for `pgnotify` and
   transactional `postgres`, nothing for coalesced `postgres` and `nats`),
   and `COMMIT`. Statements are prepared (pgx caches them). After the
@@ -1388,6 +1394,24 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   if the client retries one whose COMMIT did land. Publishes caught by
   shutdown get the same error.
 - ACKs are per publish, sent when its batch commits.
+- **Presence in a batch.** Each presence publish is a cm like a message
+  publish: it gets one channelSerial in queue order, names its
+  predecessor for the chaining buses, and its ids are checked for
+  idempotency (a genuine presence op always carries its server-stamped
+  id; a synthesised LEAVE has none and is not checked). Its operations
+  are folded in batch order to one final state per member key, last
+  writer wins: an ENTER then a LEAVE of one member in the same batch
+  removes it, a LEAVE then an ENTER keeps it with the ENTER's data. The
+  fold is then one `DELETE` for the members that left and one
+  `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node and fresh
+  lease, or the fixture sentinel and an `'infinity'` lease, §12.5), both
+  in member-key order. Every writer of a room's `presence` rows holds the
+  room's channels row lock, so two batches never contend on them; the
+  lease bump and the reaper, which do not, skip rows locked by a writer
+  (`FOR UPDATE SKIP LOCKED`), so neither can deadlock with a batch.
+  A retried batch re-checks presence ids like message ids; a synthesised
+  LEAVE, having none, may be stored twice if the first attempt's COMMIT
+  landed, which delivers a second LEAVE for a member already gone.
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -1403,7 +1427,9 @@ Series (§10): `ably_publish_batch_size` (histogram),
 `ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
-`ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`).
+`ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`, and
+`presence_inflight` for an unbatched presence write refused over its
+in-flight bound, §12.5).
 
 ### 6.4 Channel sharding
 
@@ -2021,6 +2047,9 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
+--presence-sync-source local  where an attach's presence SYNC comes from: local (the node's member set) or store (§12.4)
+--presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
+--presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2039,7 +2068,8 @@ Configuration may also be supplied via an optional TOML config file
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`, `publish-queue-max` —
+`publish-batch-max`, `publish-linger-max`, `publish-queue-max`,
+`presence-sync-source`, `presence-batching`, `presence-max-inflight` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
 retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
@@ -2154,6 +2184,14 @@ name = "persisted:presence_fixtures"
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
     `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`
     (counters) and `ably_publish_lane_queue_depth{lane}` (gauge).
+  - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
+    the SYNC snapshots served, by how each was obtained: `cached` (the
+    channel's current snapshot), `stale` (a snapshot within the refresh
+    window, followed by the operations it misses), `built` (rebuilt from
+    the node's member set), `store` (`--presence-sync-source=store`),
+    `fallback` (a store read because seeding the member set failed); and
+    `ably_presence_sync_seeds_total` (counter), the member sets seeded from
+    the store, at most one per channel bind.
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
@@ -2378,7 +2416,49 @@ that enters or leaves in the window between the snapshot's as-of serial
 and the live attach point arrives again on the cursor — a duplicate
 ENTER is idempotent and a later LEAVE supersedes a stale PRESENT — so no
 server-side coordination beyond taking the snapshot at-or-after the
-attach point is required.
+attach point is required. A snapshot from before the attach point is
+also served, within a short refresh window (below), but then together
+with the operations it misses up to the attach point, sent as one
+`PRESENCE` frame straight after the `SYNC`. That frame carries the attach
+point as its `channelSerial`, since the client has now seen everything up
+to there; the operations in it keep their own serials, which is what the
+merge compares.
+
+**Where the snapshot comes from** (`--presence-sync-source`, default
+`local`). In `local` mode a node serves `SYNC` from its own copy of the
+channel's member set, held by the node's `core.Channel` (§5.1) as a cache
+of the store's set as of a serial:
+
+- It is **seeded** from `Members` the first time a `SYNC` needs it after
+  the channel is bound: one store read per bind, shared by concurrent
+  attaches. `Members` returns the set and its as-of serial from one
+  snapshot of the store, so the set is exactly the fold of every cm up to
+  that serial. The cms the node delivers while the read is in flight are
+  buffered and folded on top: those at or below the as-of serial are
+  already in the seed and are skipped, those after it are applied.
+- It is then **maintained** from every presence cm the node delivers on
+  the channel, which arrive in channelSerial order (§7.2) and include
+  other nodes' operations and the reaper's synthesised LEAVEs: ENTER,
+  UPDATE and PRESENT upsert the member, LEAVE and ABSENT remove it. A cm
+  at or below the set's serial (delivered twice) is skipped, and so is an
+  operation older, by member serial, than the member's current state
+  (last writer wins, the rule the SDK merge applies).
+- The encoded `SYNC` frame is **cached**: the snapshot is built once and
+  encoded once per wire format, then shared by every attach until a
+  presence cm changes the set. While members keep changing, a snapshot
+  younger than the refresh window (50 ms) is served with the operations
+  since (above) rather than rebuilt for every attach; an older one is
+  rebuilt. A client-initiated `SYNC` (RTP19) always gets a current
+  snapshot.
+- Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
+  If the seed read fails, that `SYNC` is read from the store and the next
+  one tries to seed again.
+
+In `store` mode every `SYNC` reads `Members` from the store, as before the
+local set existed. Either way the store's set stays authoritative (§12.5):
+`GET .../presence` and the delayed-LEAVE checks always read the store.
+Series: `ably_presence_syncs_total{snapshot}`,
+`ably_presence_sync_seeds_total` (§10).
 
 ### 12.5 Membership set & liveness
 
@@ -2393,9 +2473,26 @@ into it transactionally and `Members` reads it (§6). Per backend:
   persists, as ordinary cms on the messages stream.
 - **cluster (Postgres)** — the `presence` table (§6.3), upserted/deleted
   in the same transaction as the stream insert so the set is globally
-  authoritative across nodes. A node serves sync and `GET .../presence`
-  straight from `Members` (a `SELECT` against this table); it need never
-  have witnessed the original ENTERs.
+  authoritative across nodes. `Members` reads it and the channel's
+  watermark in one `REPEATABLE READ` snapshot (one round trip), so the set
+  is exact as of the serial it returns. `GET .../presence` is served
+  straight from `Members`; a node need never have witnessed the original
+  ENTERs. `SYNC` is served from the node's member set, seeded from
+  `Members` once per channel bind and maintained from delivered cms
+  (§12.4); it is a cache of this table, never a second source of truth.
+  Presence writes join the publish lanes' batches (`--presence-batching`,
+  default true; §6.3 "Presence in a batch"), so one room's row lock is
+  taken once per batch rather than once per ENTER or LEAVE. A presence
+  write committed in its own transaction (`--presence-batching=false`, or
+  `--publish-lanes=0`) holds a pool connection for the whole transaction,
+  including any wait on the room's row lock, so those writes are bounded
+  per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
+  16 when batching is off): one beyond the bound is refused at once with
+  Ably error **42910** (a NACK; the client should back off and retry) and
+  counted in `ably_publish_nacks_total{reason="presence_inflight"}`, so a
+  convoy on one hot room cannot starve the pool that `SYNC` seeds, binds
+  and publishes need. Every retriable presence write failure NACKs with
+  its code, as a publish does (42910, 50003).
 
 **Static fixture members.** Members seeded from the config file's
 `[[channels]]` presence entries (§9) are the one exception to
@@ -2453,6 +2550,11 @@ RETURNING …` — Postgres row locking means exactly one node's `RETURNING`
 yields a given row, and that node synthesises the LEAVE for it through
 the normal publish path (a fresh presence publish → NOTIFY → every
 node's appender). This bounds orphan visibility to one lease window.
+Both loops skip rows a presence write holds locked (`FOR UPDATE SKIP
+LOCKED`): that write is renewing or removing the row anyway, a row
+skipped once is handled on the next round, well inside the lease window,
+and a loop that waited could deadlock with a batched write holding
+several members' rows (§6.3).
 
 ### 12.6 REST
 

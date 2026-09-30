@@ -58,6 +58,13 @@ type Batching struct {
 	// QueueMax bounds each lane's queue; beyond it a publish fails with
 	// storage.ErrOverloaded. Zero means DefaultPublishQueueMax.
 	QueueMax int
+
+	// PresenceUnbatched commits every presence operation in its own
+	// transaction even when publishes are batched, as before presence
+	// batching existed. The zero value routes presence through the lanes
+	// with messages (DESIGN.md §6.3, §12.5); the server's
+	// --presence-batching=false sets it.
+	PresenceUnbatched bool
 }
 
 func (b Batching) enabled() bool { return b.Lanes > 0 }
@@ -75,15 +82,22 @@ func (b Batching) resolve() Batching {
 	return b
 }
 
-// pending is one publish waiting in a lane for its batch to commit.
+// pending is one publish waiting in a lane for its batch to commit: a
+// message publish (msgs) or a presence operation (presence), never both.
 type pending struct {
 	channel string
 	cs      *channelStore // nil in lane unit tests
 	msgs    []*protocol.Message
 	batchID string
+	// presence is a presence publish's operations, folded into the
+	// presence table in the batch's transaction (DESIGN.md §12.5);
+	// static marks fixture members, stored with a non-expiring lease.
+	presence []*protocol.PresenceMessage
+	static   bool
 	// checkIDs is true when the ids were supplied by the client, so the
 	// publish must be checked for idempotency; server-generated ids are
-	// unique by construction and skip the lookup.
+	// unique by construction and skip the lookup. Presence ids are always
+	// checked, as StorePresence does unbatched.
 	checkIDs bool
 
 	ctx       context.Context
@@ -113,6 +127,17 @@ type pendingResult struct {
 
 func newPending(ctx context.Context, channel string) *pending {
 	return &pending{channel: channel, ctx: ctx, done: make(chan struct{})}
+}
+
+// ids returns the publish's non-empty item ids, in item order: the ids
+// the idempotency lookup and the in-batch duplicate check compare. A
+// message publish's ids are all stamped (storage.StampMessageIDs); a
+// synthesised presence event (a teardown or reaper LEAVE) has none.
+func (p *pending) ids() []string {
+	if p.presence != nil {
+		return nonEmptyPresenceIDs(p.presence)
+	}
+	return nonEmptyIDs(p.msgs)
 }
 
 // finish records the result and releases the waiting caller.
@@ -465,7 +490,7 @@ func newWriteMetrics() *writeMetrics {
 		}),
 		nacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ably_publish_nacks_total",
-			Help: "Publishes refused by the batching layer, by reason (queue_full, commit_failed).",
+			Help: "Publishes refused by the batching layer, by reason (queue_full, commit_failed), and unbatched presence writes refused over the in-flight bound (presence_inflight).",
 		}, []string{"reason"}),
 	}
 }

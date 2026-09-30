@@ -75,6 +75,10 @@ const (
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
+
+	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
+	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
+	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -197,6 +201,16 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	presenceBatchingDefault, err := config.DefaultBoolPtr(opts.Getenv(presenceBatchingEnv), file.PresenceBatching, true)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	presenceMaxInflightDefault, err := config.DefaultInt(opts.Getenv(presenceMaxInflightEnv), file.PresenceMaxInflight, 0)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -245,6 +259,9 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
+	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
+	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
+	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction at once per database before new ones are refused with 42910; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -264,6 +281,11 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
+		return 2
+	}
+	syncSource, err := core.ParsePresenceSyncSource(*presenceSyncSource)
+	if err != nil {
+		fmt.Fprintln(opts.Out, "--presence-sync-source:", err)
 		return 2
 	}
 	if *channelIdleTimeout < 0 {
@@ -351,7 +373,10 @@ func Run(ctx context.Context, opts Opts) int {
 			BatchMax:  *publishBatchMax,
 			LingerMax: *publishLingerMax,
 			QueueMax:  *publishQueueMax,
+
+			PresenceUnbatched: !*presenceBatching,
 		},
+		presenceMaxInflight: *presenceMaxInflight,
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -385,13 +410,15 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	manager := core.NewManagerWithOptions(store, core.Options{
-		IdleTimeout: *channelIdleTimeout,
-		Metrics:     m,
-		Logger:      logger,
+		IdleTimeout:        *channelIdleTimeout,
+		Metrics:            m,
+		Logger:             logger,
+		PresenceSyncSource: syncSource,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
+	logger.Info("presence path", "syncSource", syncSource, "batching", *presenceBatching, "maxInflight", *presenceMaxInflight)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
@@ -814,6 +841,8 @@ type clusterOptions struct {
 	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
 	batching         postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted        func(channel string) bool // persisted-namespace resolver
+
+	presenceMaxInflight int // unbatched presence writes in flight (DESIGN.md §12.5)
 }
 
 // options returns the postgres.Options every bus shares.
@@ -824,6 +853,8 @@ func (c clusterOptions) options() postgres.Options {
 		Retention: c.retention,
 		Persisted: c.persisted,
 		Batching:  c.batching,
+
+		PresenceMaxInflight: c.presenceMaxInflight,
 	}
 }
 
