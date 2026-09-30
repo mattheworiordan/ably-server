@@ -74,7 +74,7 @@ jq --arg run "$run_id" '
    nats: (.nats.urls // ""),
    generators: [members("loadgen")[] | {agent: (. + ":'"$LOADGEN_AGENT_PORT"'"), metrics: ("http://" + . + ":'"$LOADGEN_METRICS_PORT"'/metrics")}],
    publishers: [members("publisher")[] | {agent: (. + ":'"$LOADGEN_AGENT_PORT"'"), metrics: ("http://" + . + ":'"$LOADGEN_METRICS_PORT"'/metrics")}],
-   postgres: {shards: [.postgres.active_storage as $a | (.postgres.instances // {}) | to_entries[] | .value | select(.storage == $a) | {id, storage, shard, endpoint}]},
+   postgres: {shards: [.postgres.active_storage as $a | (.postgres.instances // {}) | to_entries[] | .value | select(.storage == $a) | {id, storage, shard, endpoint, port: (.port // 5432)}]},
    prometheus: "http://127.0.0.1:9090"}' "$ACTIVE_STATE" >"$BENCH_WORK_DIR/inventory.json"
 
 _state_update '.runs += [{id:$id,scenario:$sc,started_at:$at,status:"running",limit_s:($lim|tonumber),bus:(.deployment.bus // ""),server_image:(.deployment.server_image // ""),loadgen_image:(.loadgen.image // ""),nodes:($n|tonumber),est_spend_before_usd:($acc|tonumber)}]' \
@@ -88,7 +88,7 @@ scp_to "$cname" "$scenario" "$idir/$scenario_file"
 
 # Docker stats sampler on every server-side box; it stops itself after the limit.
 stat_limit=$((limit_s + 120))
-for name in $(state_get '.instances // {} | to_entries[] | select(.value.role == "node" or .value.role == "nats" or .value.role == "loadgen" or .value.role == "publisher") | .key'); do
+for name in $(state_get '.instances // {} | to_entries[] | select(.value.role == "node" or .value.role == "nats" or .value.role == "loadgen" or .value.role == "publisher" or .value.role == "postgres") | .key'); do
   ssh_do "$name" "nohup timeout $stat_limit sh -c 'while true; do docker stats --no-stream --format \"{{json .}}\" >> /var/tmp/docker-stats-$run_id.jsonl; sleep 10; done' >/dev/null 2>&1 </dev/null &"
 done
 

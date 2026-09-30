@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# 00-preflight: check credentials, account, quotas, ECR repositories and the
-# billing alarm before anything is created. Creates the ECR repositories and
-# the billing alarm when they are missing. Refuses to continue without an alarm.
+# 00-preflight: check credentials, account, permissions, quotas, ECR repositories
+# and the billing alarm before anything is created. Creates the ECR repositories
+# and the billing alarm when they are missing. Refuses to continue without an alarm.
 #
 #   bench/aws/00-preflight.sh
 #
-# Needs: AWS_ACCOUNT_ID, AWS_REGION, ALARM_EMAIL (when the alarm must be created).
-# Optional: BUDGET_ALARM_USD (750), BUDGET_CAP_USD (1500), BUDGET_SCOPE (account|tag),
+# Needs: AWS_ACCOUNT_ID, AWS_REGION, SSH_PUBLIC_KEY_PATH, ALARM_EMAIL (when the
+#        alarm must be created).
+# Optional: BUDGET_METHOD (cloudwatch|budgets|auto; default cloudwatch), BUDGET_ALARM_USD (750),
+#           BUDGET_CAP_USD (1500), BUDGET_SCOPE (account|tag; budgets only),
 #           FLEET_PROFILE (2x|1x, sizes the vCPU check), FORCE_NO_ALARM=1 (see RUNBOOK).
 SCRIPT_NAME=00-preflight
 # shellcheck source=lib.sh
@@ -52,16 +54,27 @@ check_perm() { # <action> <allowed-regex> <aws args...>
   PERM_LAST=$verdict
 }
 ami=$(resolve_ami)
-check_perm ec2:RunInstances 'DryRunOperation' ec2 run-instances --dry-run --image-id "$ami" --instance-type "$NODE_INSTANCE_TYPE" --min-count 1 --max-count 1
+log "AMI $ami (Amazon Linux 2023, x86_64)"
+ssh_pubkey >/dev/null # the boxes authorise this key in user-data (no EC2 key pair exists)
+check_perm ec2:RunInstances 'DryRunOperation' ec2 run-instances --dry-run --image-id "$ami" --instance-type "$NODE_INSTANCE_TYPE" --count 1
+# The Postgres box: an EBS data volume of each type, inside the RunInstances call (the role
+# may create volumes only that way, and may not delete a standalone one).
+check_perm "ec2:RunInstances with an io2 data volume" 'DryRunOperation' ec2 run-instances --dry-run --image-id "$ami" \
+  --instance-type "$PG_INSTANCE_TYPE" --count 1 --placement "AvailabilityZone=$AZ" \
+  --block-device-mappings "$(data_volume_mapping "$PG_STORAGE_GB" io2 20000)"
+check_perm "ec2:RunInstances with a gp3 data volume" 'DryRunOperation' ec2 run-instances --dry-run --image-id "$ami" \
+  --instance-type "$PG_INSTANCE_TYPE" --count 1 --placement "AvailabilityZone=$AZ" \
+  --block-device-mappings "$(data_volume_mapping "$PG_STORAGE_GB" gp3 12000 500)"
 check_perm ec2:CreateSecurityGroup 'DryRunOperation|InvalidVpc|InvalidGroup' ec2 create-security-group --dry-run --group-name "${PROJECT_TAG}-probe" --description probe
-check_perm ec2:CreatePlacementGroup 'DryRunOperation' ec2 create-placement-group --dry-run --group-name "${PROJECT_TAG}-probe" --strategy cluster
-if is_dry || [ -r "$SSH_PUBLIC_KEY_PATH" ]; then
-  check_perm ec2:ImportKeyPair 'DryRunOperation' ec2 import-key-pair --dry-run --key-name "${PROJECT_TAG}-probe" --public-key-material "fileb://$SSH_PUBLIC_KEY_PATH"
-else
-  log "permission not probed: ec2:ImportKeyPair (cannot read SSH_PUBLIC_KEY_PATH; 10-network.sh needs it)"
+if [ "$USE_PLACEMENT_GROUP" = 1 ]; then
+  # Optional: 10-network.sh falls back to no placement group when this is denied.
+  check_perm ec2:CreatePlacementGroup 'DryRunOperation' ec2 create-placement-group --dry-run --group-name "${PROJECT_TAG}-probe" --strategy cluster
+  if [ "$PERM_LAST" = DENIED ]; then log "  (not required: 10-network.sh will launch without a placement group)"; fi
 fi
-check_perm ec2:TerminateInstances 'DryRunOperation|InvalidInstanceID' ec2 terminate-instances --dry-run --instance-ids i-00000000000000000
-check_perm rds:CreateDBInstance 'InvalidParameter|Invalid|Validation' rds create-db-instance --db-instance-identifier "${PROJECT_TAG}-probe" --db-instance-class db.t3.micro --engine preflight-invalid-engine
+# A well-formed id for an instance that does not exist: AWS answers NotFound for it, which shows
+# the call was well-formed, not that it is authorised (there is no instance to be authorised on).
+# 90-teardown.sh is the real test of this permission.
+check_perm ec2:TerminateInstances 'DryRunOperation|InvalidInstanceID.NotFound' ec2 terminate-instances --dry-run --instance-ids i-12345678
 check_perm ecr:CreateRepository 'InvalidParameter|Invalid' ecr create-repository --repository-name "INVALID NAME"
 check_perm cloudwatch:PutMetricAlarm 'InvalidParameter|Validation' cloudwatch put-metric-alarm --alarm-name "${PROJECT_TAG}-probe" --namespace probe --metric-name probe --statistic Maximum --period 7 --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanThreshold --region "$BILLING_REGION"
 perm_cw=$PERM_LAST
@@ -70,32 +83,48 @@ perm_sns=$PERM_LAST
 check_perm budgets:CreateBudget 'InvalidParameter|Invalid|Validation' budgets create-budget --account-id "$AWS_ACCOUNT_ID" \
   --budget "BudgetName=${PROJECT_TAG}-probe,BudgetLimit={Amount=-1,Unit=USD},TimeUnit=MONTHLY,BudgetType=COST"
 perm_budgets=$PERM_LAST
-check_perm budgets:ViewBudget '.' budgets describe-budgets --account-id "$AWS_ACCOUNT_ID" --max-results 1
-check_perm ce:GetCostAndUsage '.' ce get-cost-and-usage --time-period "Start=$(date_ago 2),End=$(date_ago 0)" --granularity DAILY --metrics UnblendedCost
+if [ "${BUDGET_METHOD:-cloudwatch}" != cloudwatch ]; then
+  # Only the Budgets path reads the budget back; a role that cannot (ViewBudget) still creates it
+  # (see budget_exists below), so a denial here is informational.
+  check_perm budgets:ViewBudget '.' budgets describe-budgets --account-id "$AWS_ACCOUNT_ID" --max-results 1
+fi
 if [ -z "${INSTANCE_PROFILE_NAME:-}" ]; then
   check_perm iam:CreateRole 'InvalidParameter|Invalid|Validation|MalformedPolicy' iam create-role --role-name "invalid name!" --assume-role-policy-document '{}'
   [ "$PERM_LAST" = ALLOWED ] || log "  (set INSTANCE_PROFILE_NAME to an existing instance profile with ECR read access to avoid creating a role)"
 fi
-# Hard requirements: fleet, database, images. The billing alarm needs Budgets, or CloudWatch plus SNS.
+# Hard requirements: the fleet (including both Postgres volume types), the security group and images.
+# Not required: rds:* (Postgres runs on EC2), key pairs (SSH key goes in user-data), placement groups,
+# Stop/Start (boxes are terminated and re-created), DeleteVolume (volumes are deleted with their instance).
 hard=()
-for a in ec2:RunInstances ec2:CreateSecurityGroup ec2:CreatePlacementGroup ec2:ImportKeyPair ec2:TerminateInstances rds:CreateDBInstance ecr:CreateRepository; do
-  case " ${perm_denied[*]:-} " in *" $a "*) hard+=("$a") ;; esac
+for a in ec2:RunInstances "ec2:RunInstances with an io2 data volume" "ec2:RunInstances with a gp3 data volume" ec2:CreateSecurityGroup ec2:TerminateInstances ecr:CreateRepository; do
+  for d in "${perm_denied[@]:-}"; do
+    if [ "$d" = "$a" ]; then hard+=("$a"); fi
+  done
 done
 if [ "${#hard[@]}" -gt 0 ]; then
   die "the current role is denied: ${hard[*]}. Sign in with a role that allows them (RUNBOOK, 'Sign in'); nothing has been created."
 fi
+# Billing alarm. CloudWatch billing alarms with SNS are the default: the Operator role can create
+# them and read them back; Budgets can be created but not viewed there.
 alarm_method=none
-if [ "$perm_budgets" = ALLOWED ] && [ "${BUDGET_METHOD:-auto}" != cloudwatch ]; then
-  alarm_method=budgets
-elif [ "$perm_cw" = ALLOWED ] && [ "$perm_sns" = ALLOWED ]; then
-  alarm_method=cloudwatch
-fi
+case "${BUDGET_METHOD:-cloudwatch}" in
+  cloudwatch) if [ "$perm_cw" = ALLOWED ] && [ "$perm_sns" = ALLOWED ]; then alarm_method=cloudwatch; fi ;;
+  budgets) if [ "$perm_budgets" = ALLOWED ]; then alarm_method=budgets; fi ;;
+  auto)
+    if [ "$perm_cw" = ALLOWED ] && [ "$perm_sns" = ALLOWED ]; then
+      alarm_method=cloudwatch
+    elif [ "$perm_budgets" = ALLOWED ]; then
+      alarm_method=budgets
+    fi
+    ;;
+  *) die "BUDGET_METHOD must be cloudwatch, budgets or auto (got ${BUDGET_METHOD})" ;;
+esac
 if [ "$alarm_method" = none ] && [ "${FORCE_NO_ALARM:-0}" != 1 ]; then
-  die "the current role can create neither a Budget nor a CloudWatch billing alarm with an SNS topic (budgets:CreateBudget, cloudwatch:PutMetricAlarm, sns:CreateTopic). Refusing to continue without a billing alarm (RUNBOOK, 'Billing alarm')."
+  die "BUDGET_METHOD=${BUDGET_METHOD:-cloudwatch} cannot be used with this role (cloudwatch needs cloudwatch:PutMetricAlarm and sns:CreateTopic; budgets needs budgets:CreateBudget). Refusing to continue without a billing alarm (RUNBOOK, 'Billing alarm')."
 fi
 [ "${#perm_unknown[@]}" -eq 0 ] || log "WARNING: could not classify: ${perm_unknown[*]} (check them by hand if a later step fails)"
 state_set '.preflight.alarm_method' "$alarm_method"
-log "billing alarm method: $alarm_method"
+log "billing alarm method: $alarm_method (a late backstop: billing data lags by hours. The guards that act are the local estimate, spend_gate and budget_guard, and the FLEET_MAX_UPTIME_H=${FLEET_MAX_UPTIME_H} dead-man switch on every box)"
 
 # 3. vCPU quota for the fleet.
 if [ "$FLEET_PROFILE" = 2x ]; then
@@ -103,19 +132,23 @@ if [ "$FLEET_PROFILE" = 2x ]; then
 else
   nodes=10 loadgens=3 publishers=2
 fi
+# Postgres runs on EC2 now, so its instances count against the same quota: the SHARDS
+# instances of the active storage type plus one of the other type (run 0a and run 4).
+pg_count=$((SHARDS + 1))
 need_vcpus=$((nodes * $(vcpus_of "$NODE_INSTANCE_TYPE") +
   NATS_COUNT * $(vcpus_of "$NATS_INSTANCE_TYPE") +
   loadgens * $(vcpus_of "$LOADGEN_INSTANCE_TYPE") +
   publishers * $(vcpus_of "$PUBLISHER_INSTANCE_TYPE") +
   $(vcpus_of "$CONDUCTOR_INSTANCE_TYPE") +
-  $(vcpus_of "$PGDRIVER_INSTANCE_TYPE")))
-quota=$(aws_r "$need_vcpus" service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query Quota.Value) || quota=""
+  $(vcpus_of "$PGDRIVER_INSTANCE_TYPE") +
+  pg_count * $(vcpus_of "$PG_INSTANCE_TYPE")))
+quota=$(AWS_R_QUIET=1 aws_r "$need_vcpus" service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query Quota.Value) || quota=""""
 # vCPUs already in use by other standard-family instances in this account and region.
 in_use=$(aws_r "" ec2 describe-instances --filters Name=instance-state-name,Values=pending,running \
   --query 'Reservations[].Instances[].[InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore]') || in_use=""
 in_use=$(awk '$1 !~ /^(inf|trn|hpc|dl|vt|g|p|f|x|u|mac)/ && NF >= 3 { n += $2 * $3 } END { print n + 0 }' <<<"$in_use")
 if [ -z "$quota" ]; then
-  log "WARNING: could not read the on-demand vCPU quota (L-1216C47A); check it by hand. The $FLEET_PROFILE fleet needs $need_vcpus vCPUs."
+  log "WARNING: could not read the on-demand vCPU quota (L-1216C47A; servicequotas:* is denied to this role). The $FLEET_PROFILE fleet needs $need_vcpus vCPUs. If it is short, RunInstances fails with VcpuLimitExceeded: then use FLEET_PROFILE=1x or ask for an increase."
 elif awk -v q="$quota" -v u="$in_use" -v n="$need_vcpus" 'BEGIN{exit !(q - u >= n)}'; then
   log "vCPU quota $quota, $in_use in use: room for the $FLEET_PROFILE fleet ($need_vcpus vCPUs)"
 else
@@ -124,7 +157,7 @@ fi
 state_set_json '.preflight.need_vcpus' "$need_vcpus"
 
 # 4. Instance types offered in the chosen Availability Zone.
-for t in "$NODE_INSTANCE_TYPE" "$LOADGEN_INSTANCE_TYPE" "$PUBLISHER_INSTANCE_TYPE"; do
+for t in "$NODE_INSTANCE_TYPE" "$LOADGEN_INSTANCE_TYPE" "$PUBLISHER_INSTANCE_TYPE" "$PG_INSTANCE_TYPE"; do
   offered=$(aws_r "$t" ec2 describe-instance-type-offerings --location-type availability-zone \
     --filters "Name=location,Values=$AZ" "Name=instance-type,Values=$t" --query 'InstanceTypeOfferings[0].InstanceType') || offered=""
   [ -n "$offered" ] || log "WARNING: $t is not offered in $AZ; set AZ to another zone"
@@ -146,10 +179,13 @@ done
 # chosen above (AWS Budgets, or CloudWatch EstimatedCharges alarms with an SNS topic).
 init_work_dir
 wd=$BENCH_WORK_DIR
+# budget_exists: 0 when it exists, 1 when not, 2 when the role cannot read budgets
+# (budgets:ViewBudget is denied to the Operator role).
 budget_exists() {
-  local b
-  b=$(AWS_R_QUIET=1 aws_r "" budgets describe-budget --account-id "$AWS_ACCOUNT_ID" --budget-name "$BUDGET_NAME" --query Budget.BudgetName) || return 1
-  [ -n "$b" ]
+  local b rc=0
+  b=$(AWS_R_QUIET=1 aws_r_soft "" budgets describe-budget --account-id "$AWS_ACCOUNT_ID" --budget-name "$BUDGET_NAME" --query Budget.BudgetName) || rc=$?
+  if [ "$rc" = 3 ]; then return 2; fi
+  [ "$rc" = 0 ] && [ -n "$b" ]
 }
 cw_alarm_exists() { # <alarm name>
   local a
@@ -170,7 +206,7 @@ create_budget() {
     def n($type; $pct): {Notification:{NotificationType:$type,ComparisonOperator:"GREATER_THAN",Threshold:$pct,ThresholdType:"PERCENTAGE"},
                          Subscribers:[{SubscriptionType:"EMAIL",Address:$e}]};
     [n("ACTUAL";$p), n("ACTUAL";100), n("FORECASTED";100)]' >"$wd/budget-notifications.json"
-  aws_w "" budgets create-budget --account-id "$AWS_ACCOUNT_ID" \
+  aws_w_tolerate DuplicateRecordException "" budgets create-budget --account-id "$AWS_ACCOUNT_ID" \
     --budget "file://$wd/budget.json" --notifications-with-subscribers "file://$wd/budget-notifications.json"
   log "Budgets data lags by hours and forecasts need history: treat the budget as a backstop and rely on cost-estimate.sh and the spend gate day to day"
   if [ "$BUDGET_SCOPE" = tag ]; then log "scope tag: the Project cost allocation tag must be activated in Billing (up to 24 h) or this budget sees no spend"; fi
@@ -198,15 +234,28 @@ create_cw_alarms() { # billing metrics live in one region only
   log "created CloudWatch billing alarms at \$$BUDGET_ALARM_USD and \$$BUDGET_CAP_USD (whole account, not just this project) -> $topic. Confirm the email subscription."
 }
 alarm_ok=0
+alarm_verified=1
 case "$alarm_method" in
   budgets)
-    if budget_exists; then
+    brc=0
+    budget_exists || brc=$?
+    if [ "$brc" = 0 ]; then
       log "billing alarm $BUDGET_NAME exists"
       alarm_ok=1
     else
       require_env ALARM_EMAIL
       create_budget
-      if is_dry || budget_exists; then alarm_ok=1; fi
+      brc=0
+      budget_exists || brc=$?
+      if is_dry || [ "$brc" = 0 ]; then
+        alarm_ok=1
+      elif [ "$brc" = 2 ]; then
+        # budgets:ViewBudget is denied: the budget cannot be read back. The create call above did not fail
+        # (a duplicate counts as success), so the budget exists, but nothing here can confirm it.
+        log "WARNING: budgets:ViewBudget is denied, so $BUDGET_NAME cannot be read back. The create call succeeded; confirm the budget in the console. The local spend estimate and FLEET_MAX_UPTIME_H are the guards that act."
+        alarm_ok=1
+        alarm_verified=0
+      fi
     fi
     ;;
   cloudwatch)
@@ -228,6 +277,7 @@ if [ "$alarm_ok" != 1 ]; then
     die "no billing alarm is in place after create; refusing to continue (RUNBOOK, 'Billing alarm')"
   fi
 fi
+state_set_json '.preflight.alarm_verified' "$([ "$alarm_verified" = 1 ] && echo true || echo false)"
 state_set_json '.budget.alarm_usd' "$BUDGET_ALARM_USD"
 state_set_json '.budget.cap_usd' "$BUDGET_CAP_USD"
 state_set '.budget.name' "$BUDGET_NAME"

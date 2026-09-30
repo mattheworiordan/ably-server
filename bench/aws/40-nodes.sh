@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 40-nodes: NODE_COUNT ably-server nodes in the placement group. Boot installs
+# 40-nodes: NODE_COUNT ably-server nodes (in the placement group when there is one). Boot installs
 # Docker and chrony, raises fd limits and the port range, pulls the image from
 # ECR and starts it with --mode=cluster. /metrics is on the debug listener.
 # Create or reuse; RECONFIGURE=1 re-applies image, bus and flags to live nodes;

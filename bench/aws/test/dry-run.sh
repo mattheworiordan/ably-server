@@ -32,7 +32,7 @@ export LOG_FILE="$tmp/LOG.md" RESULTS_DIR="$tmp/results"
 export KEEP_WORK_DIR=0 SKIP_BOOT_WAIT=0
 : >"$tmp/bench.pub"
 
-DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh build-push.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 65-run-0a.sh 70-collect.sh 80-stop.sh 80-start.sh 90-teardown.sh"
+DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh build-push.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 65-run-0a.sh 70-collect.sh 80-terminate.sh 90-teardown.sh"
 read -r -a SEQUENCE <<<"${SEQUENCE:-$DEFAULT_SEQUENCE}"
 out="$tmp/calls.txt"
 : >"$out"
@@ -47,7 +47,7 @@ for s in "${SEQUENCE[@]}"; do
     60-run.sh) args=(smoke-1pct) ;;
     65-run-0a.sh) args=(io2) ;;
     70-collect.sh) args=(run-TEST) ;;
-    90-teardown.sh) args=(--yes) ;;
+    80-terminate.sh | 90-teardown.sh) args=(--yes) ;;
   esac
   rc=0
   "$AWS_DIR/$s" "${args[@]}" >/dev/null 2>"$tmp/stderr.$s" || rc=$?
@@ -74,6 +74,46 @@ if [ "$(grep -c 'put-metric-alarm --alarm-name test-scale-billing-' "$cw_out")" 
   status=1
 else
   echo "cloudwatch alarm path calls us-east-1 only"
+fi
+
+# The default billing guard is CloudWatch (Budgets can be created but not read by the Operator role),
+# and the optional Budgets path tolerates an existing budget.
+default_out="$tmp/default-alarm.txt"
+"$AWS_DIR/00-preflight.sh" 2>&1 >/dev/null | grep -E '^DRYRUN aws (budgets|cloudwatch put-metric-alarm)' >"$default_out" || true
+if grep -q 'budgets create-budget --account-id 111111111111 --budget <' "$default_out" ||
+  [ "$(grep -c 'put-metric-alarm --alarm-name test-scale-billing-' "$default_out")" != 2 ]; then
+  echo "FAIL: the default preflight should create CloudWatch billing alarms and no budget:" >&2
+  cat "$default_out" >&2
+  status=1
+else
+  echo "default billing guard is CloudWatch"
+fi
+bud_out="$tmp/budgets.txt"
+BUDGET_METHOD=budgets "$AWS_DIR/00-preflight.sh" 2>&1 >/dev/null | grep -E '^DRYRUN aws (budgets|cloudwatch put-metric-alarm)' >"$bud_out" || true
+if ! grep -q 'budgets create-budget --account-id 111111111111 --budget .*budget.json' "$bud_out" || grep -q 'put-metric-alarm --alarm-name test-scale-billing-' "$bud_out"; then
+  echo "FAIL: BUDGET_METHOD=budgets should create a budget and no CloudWatch billing alarm:" >&2
+  cat "$bud_out" >&2
+  status=1
+else
+  echo "budgets path creates a budget"
+fi
+
+# A placement group is attempted only on request; by default no script mentions one at launch.
+pg_default=$(grep -c 'create-placement-group' "$out" || true)
+pg_on=$(USE_PLACEMENT_GROUP=1 "$AWS_DIR/10-network.sh" 2>&1 >/dev/null | grep -c 'DRYRUN aws ec2 create-placement-group' || true)
+if [ "$pg_default" != 0 ] || [ "$pg_on" != 1 ] || grep -q -- '--key-name\|import-key-pair\|create-key-pair\|--placement GroupName' "$out"; then
+  echo "FAIL: placement groups and key pairs: default calls=$pg_default, with USE_PLACEMENT_GROUP=1 calls=$pg_on (want 0 and 1), or a key pair / group name was used" >&2
+  status=1
+else
+  echo "no placement group or key pair by default; the group is attempted with USE_PLACEMENT_GROUP=1"
+fi
+# Nothing may call RDS, stop or start an instance, or delete a standalone volume: the role is denied all of them.
+if grep -Eq 'aws (rds|budgets describe|ce |servicequotas) |ec2 (stop-instances|start-instances|delete-volume|create-volume|attach-volume)' "$out"; then
+  echo "FAIL: a call the Operator role is denied (or that a volume-deletion-free design avoids) was printed:" >&2
+  grep -E 'aws (rds|budgets describe|ce |servicequotas) |ec2 (stop-instances|start-instances|delete-volume|create-volume|attach-volume)' "$out" >&2
+  status=1
+else
+  echo "no rds, stop/start, or standalone volume calls"
 fi
 
 # Normalise volatile text.

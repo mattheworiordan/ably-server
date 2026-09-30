@@ -24,4 +24,9 @@ render node IMAGE=example/ably-server:abc 'ENV_ARGS=-e GOMEMLIMIT=13GiB' API_KEY
 render loadgen IMAGE=example/ably-loadgen:abc 'CMD=ably-loadgen serve --listen=:9100'
 INSTALL_COMPOSE=1 render conductor IMAGE=example/ably-loadgen:abc PGBENCH_IMAGE=postgres:17-alpine 'DSNS=postgres://u:p@h:5432/db,postgres://u:p@h2:5432/db'
 render pgdriver PGBENCH_IMAGE=postgres:17-alpine
+render postgres "POSTGRESQL_CONF=$(render_postgres_conf PRIVATE_IP_AT_BOOT 1300 131072)" CLIENT_CIDR=172.31.16.0/20 DATA_DEVICE=/dev/sdf \
+  DB_USER=ably DB_NAME=ably PG_IMAGE=postgres:17 PG_PASSWORD=Secretpassword0123456789
+# the operator's key is written to ec2-user's authorized_keys by every role
+grep -q "ssh-ed25519 AAAAdryrunkey dry-run" "$tmp/postgres.sh" || { echo "FAIL: the SSH public key is not in the user-data"; exit 1; }
+echo "ok   the SSH public key is in the user-data"
 echo "user-data lint passed"

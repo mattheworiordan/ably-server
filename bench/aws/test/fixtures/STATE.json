@@ -57,6 +57,14 @@
       "private_ip": "10.0.1.51",
       "public_ip": "198.51.100.51",
       "running": true
+    },
+    "fixture-pg-io2": {
+      "id": "i-0007",
+      "role": "postgres",
+      "type": "r7i.4xlarge",
+      "private_ip": "10.0.1.61",
+      "public_ip": "198.51.100.61",
+      "running": true
     }
   },
   "postgres": {
@@ -66,12 +74,15 @@
         "id": "fixture-pg-io2",
         "storage": "io2",
         "shard": 1,
-        "class": "db.r7g.4xlarge",
         "storage_gb": 1000,
         "iops": 20000,
-        "endpoint": "pg.example.internal",
-        "dsn": "postgres://ably:fixturepassword@pg.example.internal:5432/ably?sslmode=disable",
-        "running": true
+        "endpoint": "10.0.1.61",
+        "dsn": "postgres://ably:fixturepassword@10.0.1.61:5432/ably?sslmode=disable",
+        "running": true,
+        "type": "r7i.4xlarge",
+        "private_ip": "10.0.1.61",
+        "port": 5432,
+        "managed": "ec2-docker"
       }
     }
   },

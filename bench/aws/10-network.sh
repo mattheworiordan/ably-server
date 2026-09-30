@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # 10-network: default VPC, one Availability Zone, one security group
-# (all traffic inside the group, SSH from ADMIN_CIDR only), a cluster
-# placement group, an EC2 key pair and an instance profile that may pull
-# from ECR. Create or reuse. Ids go into STATE.
+# (all traffic inside the group, SSH from ADMIN_CIDR only) and an instance
+# profile that may pull from ECR. Optionally a cluster placement group
+# (USE_PLACEMENT_GROUP=1; off by default, and skipped with a warning when the
+# role may not create one). There is no EC2 key pair: every box authorises
+# the public key in SSH_PUBLIC_KEY_PATH through its user-data. Create or
+# reuse. Ids go into STATE.
 #
-# Needs: AWS_REGION, ADMIN_CIDR, SSH_PUBLIC_KEY_PATH.
-# Optional: AZ, VPC_ID, SUBNET_ID, INSTANCE_PROFILE_NAME (use an existing profile
-#           with ECR read access instead of creating one).
+# Needs: AWS_REGION, ADMIN_CIDR, SSH_PUBLIC_KEY_PATH (an OpenSSH public key).
+# Optional: AZ, VPC_ID, SUBNET_ID, USE_PLACEMENT_GROUP, INSTANCE_PROFILE_NAME
+#           (use an existing profile with ECR read access instead of creating one).
 SCRIPT_NAME=10-network
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -17,7 +20,7 @@ require_env AWS_REGION ADMIN_CIDR SSH_PUBLIC_KEY_PATH
 case "$ADMIN_CIDR" in
   0.0.0.0/0 | ::/0) die "ADMIN_CIDR must not be open to the world; use your own address, e.g. \$(curl -s https://checkip.amazonaws.com)/32" ;;
 esac
-is_dry || [ -r "$SSH_PUBLIC_KEY_PATH" ] || die "cannot read SSH_PUBLIC_KEY_PATH=$SSH_PUBLIC_KEY_PATH"
+ssh_pubkey >/dev/null # dies unless SSH_PUBLIC_KEY_PATH holds a usable public key
 state_init
 require_preflight
 
@@ -64,31 +67,35 @@ aws_w_tolerate InvalidPermission.Duplicate "" ec2 authorize-security-group-ingre
 aws_w_tolerate InvalidPermission.Duplicate "" ec2 authorize-security-group-ingress --group-id "$sg" \
   --protocol tcp --port 22 --cidr "$ADMIN_CIDR" >/dev/null
 
-# Cluster placement group.
+# Cluster placement group: optional. Off by default (the Operator role is not
+# allowed to create one). With USE_PLACEMENT_GROUP=1 it is attempted, and a
+# denial is a warning: the fleet then launches without it.
 pg="${PROJECT_TAG}-cluster"
-have=$(aws_r "" ec2 describe-placement-groups --filters "Name=group-name,Values=$pg" --query 'PlacementGroups[0].GroupName')
-if [ -z "$have" ]; then
-  aws_w "" ec2 create-placement-group --group-name "$pg" --strategy cluster \
-    --tag-specifications "$(tag_spec placement-group "$pg" network)" >/dev/null
-  log "created placement group $pg"
+state_set '.network.placement_group' ""
+if [ "$USE_PLACEMENT_GROUP" = 1 ]; then
+  have=$(aws_r "" ec2 describe-placement-groups --filters "Name=group-name,Values=$pg" --query 'PlacementGroups[0].GroupName')
+  if [ -z "$have" ]; then
+    rc=0
+    aws_w_soft "" ec2 create-placement-group --group-name "$pg" --strategy cluster \
+      --tag-specifications "$(tag_spec placement-group "$pg" network)" >/dev/null || rc=$?
+    case "$rc" in
+      0)
+        log "created placement group $pg"
+        have=$pg
+        ;;
+      3) log "WARNING: ec2:CreatePlacementGroup is denied; launching without a placement group (nodes and NATS will not be packed onto one network segment)" ;;
+      *) die "create-placement-group failed" ;;
+    esac
+  else
+    log "reuse placement group $pg"
+  fi
+  if [ -n "$have" ]; then
+    state_set '.network.placement_group' "$pg"
+    state_add_resource placement-group "$pg" network "$pg"
+  fi
 else
-  log "reuse placement group $pg"
+  log "no placement group (USE_PLACEMENT_GROUP=0)"
 fi
-state_set '.network.placement_group' "$pg"
-state_add_resource placement-group "$pg" network "$pg"
-
-# Key pair.
-key="${PROJECT_TAG}-key"
-have=$(aws_r "" ec2 describe-key-pairs --filters "Name=key-name,Values=$key" --query 'KeyPairs[0].KeyName')
-if [ -z "$have" ]; then
-  aws_w "" ec2 import-key-pair --key-name "$key" --public-key-material "fileb://$SSH_PUBLIC_KEY_PATH" \
-    --tag-specifications "$(tag_spec key-pair "$key" network)" >/dev/null
-  log "imported key pair $key"
-else
-  log "reuse key pair $key"
-fi
-state_set '.network.key_name' "$key"
-state_add_resource key-pair "$key" network "$key"
 
 # Instance profile: lets instances pull from ECR (and use SSM Session Manager).
 if [ -n "${INSTANCE_PROFILE_NAME:-}" ]; then
@@ -130,5 +137,5 @@ JSON
 fi
 
 resolve_ami >/dev/null
-log_line 10-network "network ready: default VPC, one zone ($AZ), security group, placement group, key pair, instance profile" "20-postgres.sh"
+log_line 10-network "network ready: default VPC, one zone ($AZ), security group, instance profile; placement group '$(state_get '.network.placement_group')' (empty: none); SSH by key in user-data" "20-postgres.sh"
 log "network complete"

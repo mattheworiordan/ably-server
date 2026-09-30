@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # cost-estimate: what the running fleet costs an hour, and an estimate of
 # what this proof has spent so far, from STATE. Prices are approximate
-# on-demand list prices (lib.sh price_of; override with PRICE_<type>).
-# The real bill is in AWS Billing; this is the local guard that 60-run.sh uses.
+# on-demand list prices (lib.sh price_of; override with PRICE_<type>, scale
+# with PRICE_FACTOR). The real bill is in AWS Billing, which this role cannot
+# read (no Cost Explorer, no ViewBudget): this estimate is the primary spend
+# guard, with FLEET_MAX_UPTIME_H. It asks EC2 which boxes still exist first.
 #
 #   bench/aws/cost-estimate.sh           table
 #   bench/aws/cost-estimate.sh --json    one JSON object
@@ -12,6 +14,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 need_cmd jq
 state_init
+# Learn what still exists (the dead-man switch terminates boxes behind our back).
+if ! is_dry && [ "${NO_AWS:-0}" != 1 ] && command -v aws >/dev/null 2>&1; then
+  refresh_instances || true
+fi
 cost_checkpoint
 rate=$(state_get '.budget.rate_usd_h')
 accrued=$(state_get '.budget.accrued_usd')
@@ -32,8 +38,8 @@ state_get '.instances // {} | to_entries | map(select(.value.running == true)) |
 state_get '.postgres.instances // {} | to_entries[] | select(.value.running == true) | .value' | jq -c . 2>/dev/null |
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    h=$(rds_hourly "$(jq -r .class <<<"$row")" "$(jq -r .storage <<<"$row")" "$(jq -r '.storage_gb // 0' <<<"$row")" "$(jq -r '.iops // 0' <<<"$row")")
-    printf '%-34s %-16s %5s %9s %9s\n' "RDS $(jq -r .id <<<"$row")" "$(jq -r .class <<<"$row")/$(jq -r .storage <<<"$row")" 1 "$h" "$h"
+    h=$(ebs_hourly "$(jq -r .storage <<<"$row")" "$(jq -r '.storage_gb // 0' <<<"$row")" "$(jq -r '.iops // 0' <<<"$row")" "$(jq -r '.throughput_mbps // 125' <<<"$row")")
+    printf '%-34s %-16s %5s %9s %9s\n' "EBS data $(jq -r .id <<<"$row")" "$(jq -r .storage <<<"$row")/$(jq -r '.storage_gb // 0' <<<"$row")GB" 1 "$h" "$h"
   done
 printf '\nrunning fleet:        $%.2f per hour\n' "$rate"
 printf 'spent so far (est.):  $%.2f   alarm $%s   cap $%s\n' "$accrued" "$BUDGET_ALARM_USD" "$BUDGET_CAP_USD"

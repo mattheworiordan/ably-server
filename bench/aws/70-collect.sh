@@ -2,7 +2,7 @@
 # 70-collect: gather everything a run left behind into results/<run-id>/collect/:
 # a Prometheus snapshot and range exports of the named series, container logs
 # and docker stats samples from every box, pg_stat_statements from each Postgres
-# instance, RDS Performance Insights load, and a redacted copy of STATE.
+# instance, the Postgres configuration, and a redacted copy of STATE.
 # Every step is best effort: a failure is logged and the rest continue.
 #
 #   bench/aws/70-collect.sh <run-id> [start-rfc3339 end-rfc3339]
@@ -47,24 +47,16 @@ for id in $(state_get '.postgres.instances // {} | keys[]'); do
     "docker run --rm $PGBENCH_IMAGE psql '$dsn' -c \"\\copy (SELECT queryid, calls, round(total_exec_time::numeric,1) AS total_ms, round(mean_exec_time::numeric,3) AS mean_ms, rows, left(query,200) AS query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 50) TO STDOUT CSV HEADER\" > /opt/bench/results/$run_id/pg_stat_statements-$id.csv"
 done
 
-# 3. RDS Performance Insights: average database load over the run.
+# 3. The Postgres configuration that was in force (the boxes hold nothing once terminated).
 for id in $(state_get '.postgres.instances // {} | keys[]'); do
-  resid=$(aws_r "db-dryrun" rds describe-db-instances --db-instance-identifier "$id" --query 'DBInstances[0].DbiResourceId') || resid=""
-  [ -n "$resid" ] || continue
-  if pi=$(aws_r "{}" pi get-resource-metrics --service-type RDS --identifier "$resid" \
-    --metric-queries '[{"Metric":"db.load.avg"},{"Metric":"db.load.avg","GroupBy":{"Group":"db.wait_event","Limit":10}}]' \
-    --start-time "$start" --end-time "$end" --period-in-seconds 60 --output json); then
-    if ! is_dry; then printf '%s\n' "$pi" >"$out/pi-$id.json"; fi
-    log "collected: performance insights $id"
-  else
-    log "WARNING: could not collect: performance insights $id"
-  fi
+  if ! is_dry; then mkdir -p "$out/postgres"; fi
+  step "postgresql.conf of $id" scp_from "$id" /etc/postgresql/postgresql.conf "$out/postgres/$id.postgresql.conf"
 done
 
 # 4. Container logs, image ids and docker stats from every server-side box.
-for name in $(state_get '.instances // {} | to_entries[] | select(.value.role == "node" or .value.role == "nats" or .value.role == "loadgen" or .value.role == "publisher") | .key'); do
+for name in $(state_get '.instances // {} | to_entries[] | select(.value.role == "node" or .value.role == "nats" or .value.role == "loadgen" or .value.role == "publisher" or .value.role == "postgres") | .key'); do
   role=$(inst_field "$name" role)
-  case "$role" in node) c=ably-server ;; nats) c=nats ;; *) c=loadgen ;; esac
+  case "$role" in node) c=ably-server ;; nats) c=nats ;; postgres) c=postgres ;; *) c=loadgen ;; esac
   step "logs and stats on $name" ssh_do "$name" "rm -rf /tmp/collect && mkdir -p /tmp/collect && docker logs $c --since '$start' 2>&1 | gzip > /tmp/collect/$c.log.gz; docker inspect $c --format '{{.Config.Image}} {{.Image}}' > /tmp/collect/image.txt 2>&1; cp /var/tmp/docker-stats-$run_id.jsonl /tmp/collect/ 2>/dev/null; tar czf /tmp/collect-$name.tgz -C /tmp collect"
   if ! is_dry; then mkdir -p "$out/boxes"; fi
   step "copy logs from $name" scp_from "$name" "/tmp/collect-$name.tgz" "$out/boxes/"

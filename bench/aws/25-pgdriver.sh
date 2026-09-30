@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 25-pgdriver: one driver box for run 0a (pgbench against RDS). It needs
+# 25-pgdriver: one driver box for run 0a (pgbench against the Postgres box). It needs
 # only Docker; pgbench runs from the postgres image. Create or reuse.
 #
 #   bench/aws/25-pgdriver.sh

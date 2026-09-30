@@ -38,7 +38,7 @@ scrape_configs:
       - targets: ['localhost:9090']
 YAML
 job ably-server "$SERVER_DEBUG_PORT" node
-job node "$NODE_EXPORTER_PORT" node nats loadgen publisher conductor pgdriver
+job node "$NODE_EXPORTER_PORT" node nats loadgen publisher conductor pgdriver postgres
 job nats "$NATS_EXPORTER_PORT" nats
 job loadgen "$LOADGEN_METRICS_PORT" loadgen publisher
 if [ "$(jq -r '(.postgres.instances // {}) | length' "$state")" -gt 0 ]; then

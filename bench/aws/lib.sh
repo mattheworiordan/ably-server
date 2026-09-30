@@ -39,8 +39,8 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${ECR_REPO_SERVER:=${PROJECT_TAG}/ably-server}"
 : "${ECR_REPO_LOADGEN:=${PROJECT_TAG}/ably-loadgen}"
 : "${BILLING_REGION:=us-east-1}" # the only region that has billing metrics
-: "${FLEET_MAX_UPTIME_H:=10}"    # dead-man switch: every box stops itself after this long
-: "${USE_PLACEMENT_GROUP:=1}"
+: "${FLEET_MAX_UPTIME_H:=10}"    # dead-man switch: every box terminates itself after this long
+: "${USE_PLACEMENT_GROUP:=0}"    # the Operator role may not create one; 1 tries it and falls back
 : "${DB_NAME:=ably}"
 : "${DB_USER:=ably}"
 : "${SERVER_PORT:=8080}"
@@ -59,10 +59,26 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${PUBLISHER_INSTANCE_TYPE:=c7i.4xlarge}"
 : "${CONDUCTOR_INSTANCE_TYPE:=c7i.2xlarge}"
 : "${PGDRIVER_INSTANCE_TYPE:=c7i.4xlarge}"
-: "${RDS_INSTANCE_CLASS:=db.r7g.4xlarge}"
-: "${RDS_STORAGE:=io2}"
-: "${RDS_STORAGE_GB:=1000}"
-: "${RDS_ENGINE_VERSION:=17}"
+# Postgres runs in Docker on an EC2 instance with an EBS data volume (the
+# account's permission set denies RDS). The RDS_* names from the RDS version
+# of these scripts still work; PG_* are the same settings under their new
+# names and win when both are set.
+_alias() { # <PG name> <RDS name> <default>: sets and exports both
+  local pg=$1 rds=$2 def=${3:-} v
+  if [ -n "${!pg:-}" ]; then v=${!pg}; elif [ -n "${!rds:-}" ]; then v=${!rds}; else v=$def; fi
+  printf -v "$pg" '%s' "$v"
+  printf -v "$rds" '%s' "$v"
+  export "${pg?}" "${rds?}"
+}
+_alias PG_STORAGE RDS_STORAGE io2
+_alias PG_STORAGE_GB RDS_STORAGE_GB 1000
+_alias PG_IOPS RDS_IOPS ""
+_alias PG_PASSWORD RDS_PASSWORD ""
+: "${PG_INSTANCE_TYPE:=r7i.4xlarge}" # 16 vCPU, 128 GB, x86_64, like the db.r7g.4xlarge the plan named
+: "${PG_THROUGHPUT_MBPS:=}"          # gp3 only; default 500 (see 20-postgres.sh)
+if [ -n "${RDS_ENGINE_VERSION:-}" ] && [ -z "${PG_IMAGE:-}" ]; then PG_IMAGE="postgres:${RDS_ENGINE_VERSION%%.*}"; fi
+: "${PG_IMAGE:=postgres:17}"
+: "${PG_DATA_DEVICE:=/dev/sdf}"
 : "${NODE_COUNT:=10}"
 : "${NATS_COUNT:=3}"
 : "${LOADGEN_COUNT:=3}"
@@ -97,7 +113,7 @@ if is_dry; then
   : "${AWS_REGION:=dry-region-1}"
   : "${ADMIN_CIDR:=203.0.113.7/32}"
   : "${SSH_PUBLIC_KEY_PATH:=$HOME/.ssh/bench-dryrun.pub}"
-  : "${RDS_PASSWORD:=dryrunpassword0123456789}"
+  _alias PG_PASSWORD RDS_PASSWORD dryrunpassword0123456789
   : "${ALARM_EMAIL:=alarm@example.invalid}"
   : "${RUN_TIME_LIMIT:=1h}"
 else
@@ -162,15 +178,15 @@ require_env() {
   fi
 }
 
-# RDS disallows / @ " and space; the password is also embedded in shell
-# and DSN text, so keep it to a safe set.
+# The password is embedded in shell and DSN text (user-data, the DSN in STATE),
+# so keep it to a safe set. PG_PASSWORD and RDS_PASSWORD are the same setting.
 check_password() {
   case "${RDS_PASSWORD:-}" in
-    '') die "RDS_PASSWORD is not set" ;;
-    change-me*) die "RDS_PASSWORD is still the placeholder from env.example" ;;
-    *[!A-Za-z0-9_-]*) die "RDS_PASSWORD may contain only letters, digits, _ and -" ;;
+    '') die "PG_PASSWORD (or RDS_PASSWORD) is not set" ;;
+    change-me*) die "PG_PASSWORD is still the placeholder from env.example" ;;
+    *[!A-Za-z0-9_-]*) die "PG_PASSWORD may contain only letters, digits, _ and -" ;;
   esac
-  [ "${#RDS_PASSWORD}" -ge 16 ] || die "RDS_PASSWORD must be at least 16 characters"
+  [ "${#RDS_PASSWORD}" -ge 16 ] || die "PG_PASSWORD must be at least 16 characters"
 }
 
 # ------------------------------------------------------------ call wrapper
@@ -300,9 +316,52 @@ aws_w_tolerate() {
   if [ -n "$out" ]; then printf '%s\n' "$out"; fi
 }
 
-# rds_status_is <instance-id> <status>: true when RDS reports that status.
-rds_status_is() {
-  [ "$(AWS_R_QUIET=1 aws_r "" rds describe-db-instances --db-instance-identifier "$1" --query 'DBInstances[0].DBInstanceStatus')" = "$2" ]
+# aws_w_soft <fake> args...: a write the caller can live without. Returns 0 on
+# success, 3 when the role is not authorised (a warning is logged by the
+# caller), 1 on any other failure (the error text is printed).
+aws_w_soft() {
+  local fake=$1 out
+  shift
+  if is_dry; then
+    aws_w "$fake" "$@"
+    return 0
+  fi
+  local -a reg
+  mapfile -t reg < <(_region_args "$@")
+  if out=$(aws "$@" "${reg[@]}" 2>&1); then
+    if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+    return 0
+  fi
+  if printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|explicit deny|is not permitted'; then
+    return 3
+  fi
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
+# aws_r_soft <fake> args...: a read whose denial is not fatal. Prints the
+# text output; returns 0 (ok, output may be empty), 3 (not authorised) or 1.
+aws_r_soft() {
+  local fake=$1 out
+  shift
+  if is_dry; then
+    aws_r "$fake" "$@"
+    return 0
+  fi
+  local -a extra
+  mapfile -t extra < <(_region_args "$@")
+  local a have_out=0
+  for a in "$@"; do if [ "$a" = --output ]; then have_out=1; fi; done
+  if [ "$have_out" = 0 ]; then extra+=(--output text); fi
+  if out=$(aws "$@" "${extra[@]}" 2>&1); then
+    if [ "$out" = None ]; then out=""; fi
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|explicit deny|is not permitted'; then
+    return 3
+  fi
+  return 1
 }
 
 # ----------------------------------------------------------------- tags
@@ -312,12 +371,6 @@ tag_spec() { # <resource-type> <name> [role]
   local tags="{Key=Project,Value=$PROJECT_TAG},{Key=Name,Value=$name}"
   if [ -n "$role" ]; then tags+=",{Key=Role,Value=$role}"; fi
   printf 'ResourceType=%s,Tags=[%s]' "$rt" "$tags"
-}
-
-# rds_tags <name> [role]: fills the RDS_TAGS array (for --tags).
-rds_tags() {
-  RDS_TAGS=("Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$1")
-  if [ -n "${2:-}" ]; then RDS_TAGS+=("Key=Role,Value=$2"); fi
 }
 
 # iam_tags <name>: fills the IAM_TAGS array (IAM wants Key=,Value= pairs).
@@ -502,21 +555,49 @@ ensure_api_key() {
 
 require_network_state() {
   local f
-  for f in vpc_id subnet_id sg_id key_name ami_id; do
+  for f in vpc_id subnet_id sg_id ami_id; do
     [ -n "$(state_get ".network.$f")" ] || die "STATE has no network.$f; run 10-network.sh first"
   done
 }
 
 # ------------------------------------------------------------- instances
 
+# resolve_ami: the latest Amazon Linux 2023 x86_64 AMI, pinned in STATE on
+# first use. The public SSM parameter first; when ssm:GetParameter is denied,
+# the newest matching image from ec2 describe-images.
 resolve_ami() {
   local ami
   ami=$(state_get '.network.ami_id')
   if [ -z "$ami" ]; then
-    ami=$(aws_r ami-dryrun ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value)
+    ami=$(AWS_R_QUIET=1 aws_r ami-dryrun ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value) || ami=""
+    if [ -z "$ami" ]; then
+      log "SSM parameter not readable; resolving the AMI with ec2 describe-images"
+      ami=$(aws_r "" ec2 describe-images --owners amazon \
+        --filters 'Name=name,Values=al2023-ami-2023.*-kernel-*-x86_64' Name=state,Values=available Name=architecture,Values=x86_64 \
+        --query 'sort_by(Images,&CreationDate)[-1].ImageId')
+    fi
+    [ -n "$ami" ] || die "could not resolve an Amazon Linux 2023 AMI (ssm get-parameter and ec2 describe-images both gave nothing)"
     state_set '.network.ami_id' "$ami"
   fi
   printf '%s' "$ami"
+}
+
+# ssh_pubkey: the first public key line in SSH_PUBLIC_KEY_PATH. There is no EC2
+# key pair: every box appends this key to ec2-user's authorized_keys in user-data.
+ssh_pubkey() {
+  local f=${SSH_PUBLIC_KEY_PATH:-} key=""
+  if [ -n "$f" ] && [ -r "$f" ]; then
+    key=$(grep -m1 -E '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+' "$f" || true)
+  fi
+  if [ -z "$key" ]; then
+    if is_dry; then
+      key='ssh-ed25519 AAAAdryrunkey dry-run'
+    else
+      die "SSH_PUBLIC_KEY_PATH=$f is not a readable OpenSSH public key file (ssh-ed25519, ssh-rsa or ecdsa line); the boxes authorise this key in user-data"
+    fi
+  fi
+  case "$key" in *"'"* | *@@*) die "the public key line contains a quote or @@; use a plain OpenSSH public key" ;; esac
+  printf '%s' "$key"
 }
 
 find_instance() { # <name> -> instance id (non-terminated) or ""
@@ -525,11 +606,26 @@ find_instance() { # <name> -> instance id (non-terminated) or ""
     --query 'Reservations[].Instances[].InstanceId'
 }
 
+# data_volume_mapping <size-gb> <io2|gp3> [iops] [throughput-mbps]: the
+# --block-device-mappings entry for an extra EBS volume. It lives in the
+# RunInstances call with DeleteOnTermination, because the role may create
+# volumes only that way and may not delete standalone ones.
+data_volume_mapping() {
+  local size=$1 vt=$2 iops=${3:-} tp=${4:-} ebs
+  ebs="VolumeSize=$size,VolumeType=$vt"
+  if [ -n "$iops" ]; then ebs+=",Iops=$iops"; fi
+  if [ -n "$tp" ] && [ "$vt" = gp3 ]; then ebs+=",Throughput=$tp"; fi
+  printf 'DeviceName=%s,Ebs={%s,DeleteOnTermination=true}' "$PG_DATA_DEVICE" "$ebs"
+}
+
 # launch_instance <name> <role> <type> <userdata-file> [private-ip] [placement 1|0]
 # Prints the instance id. Reuses an instance with the same Name tag.
+# DATA_VOLUME_SPEC="<size-gb> <io2|gp3> [iops] [throughput]" adds an EBS data
+# volume. A box that shuts itself down is terminated (the role may not start
+# a stopped instance, and a stopped one would keep billing for its disks).
 launch_instance() {
   local name=$1 role=$2 type=$3 ud=$4 pip=${5:-} place=${6:-1}
-  local existing id sg subnet key ami profile
+  local existing id sg subnet ami profile pgroup
   existing=$(find_instance "$name")
   if [ -n "$existing" ]; then
     log "reuse $name ($existing)"
@@ -539,21 +635,27 @@ launch_instance() {
   fi
   sg=$(state_get '.network.sg_id')
   subnet=$(state_get '.network.subnet_id')
-  key=$(state_get '.network.key_name')
   ami=$(state_get '.network.ami_id')
   profile=$(state_get '.network.instance_profile')
+  pgroup=$(state_get '.network.placement_group')
+  local -a bdm=('DeviceName=/dev/xvda,Ebs={VolumeSize=60,VolumeType=gp3,DeleteOnTermination=true}')
+  if [ -n "${DATA_VOLUME_SPEC:-}" ]; then
+    local -a dv
+    read -r -a dv <<<"$DATA_VOLUME_SPEC"
+    bdm+=("$(data_volume_mapping "${dv[0]}" "${dv[1]}" "${dv[2]:-}" "${dv[3]:-}")")
+  fi
   local -a args=(ec2 run-instances
-    --instance-initiated-shutdown-behavior stop
-    --image-id "$ami" --instance-type "$type" --key-name "$key"
+    --instance-initiated-shutdown-behavior terminate
+    --image-id "$ami" --instance-type "$type"
     --security-group-ids "$sg" --subnet-id "$subnet"
     --user-data "file://$ud"
-    --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=60,VolumeType=gp3,DeleteOnTermination=true}'
+    --block-device-mappings "${bdm[@]}"
     --metadata-options 'HttpTokens=required,HttpPutResponseHopLimit=2'
     --tag-specifications "$(tag_spec instance "$name" "$role")" "$(tag_spec volume "$name" "$role")"
     --query 'Instances[0].InstanceId' --output text)
   if [ -n "$profile" ]; then args+=(--iam-instance-profile "Name=$profile"); fi
-  if [ "$place" = 1 ] && [ "$USE_PLACEMENT_GROUP" = 1 ]; then
-    args+=(--placement "GroupName=$(state_get '.network.placement_group'),AvailabilityZone=$AZ")
+  if [ "$place" = 1 ] && [ -n "$pgroup" ]; then
+    args+=(--placement "GroupName=$pgroup,AvailabilityZone=$AZ")
   else
     args+=(--placement "AvailabilityZone=$AZ")
   fi
@@ -577,11 +679,17 @@ launch_instance() {
 
 # refresh_instances: copy addresses and run state of every live project
 # instance into STATE (real runs only; a dry run set fake values at launch).
+# An instance STATE knows that no longer exists (terminated by the dead-man
+# switch, or by hand) is marked not running, so the cost estimate stops
+# counting it. Returns 1, changing nothing, when the listing fails.
 refresh_instances() {
   local json
   json=$(aws_r '[]' ec2 describe-instances --filters "$(project_filter)" Name=instance-state-name,Values=pending,running,stopping,stopped \
     --query 'Reservations[].Instances[].{id:InstanceId,name:Tags[?Key==`Name`]|[0].Value,role:Tags[?Key==`Role`]|[0].Value,type:InstanceType,private_ip:PrivateIpAddress,public_ip:PublicIpAddress,state:State.Name}' \
-    --output json)
+    --output json) || {
+    log "WARNING: could not list the project's instances; STATE left as it was"
+    return 1
+  }
   if is_dry; then return 0; fi
   local row n
   while IFS= read -r row; do
@@ -591,6 +699,9 @@ refresh_instances() {
       "$(jq -r '.private_ip // ""' <<<"$row")" "$(jq -r '.public_ip // ""' <<<"$row")"
     _state_update '.instances[$n].running = ($s == "running" or $s == "pending")' --arg n "$n" --arg s "$(jq -r .state <<<"$row")"
   done < <(jq -c '.[]' <<<"$json")
+  _state_update '(.instances // {}) |= with_entries(if (.value.id as $i | $live | index($i)) then . else .value.running = false end)
+    | if .postgres.instances then (.instances // {}) as $inst | .postgres.instances |= with_entries(.value.running = ($inst[.key].running // false)) else . end' \
+    --argjson live "$(jq -c '[.[].id]' <<<"$json")"
 }
 
 # wait_instances_running <id>...
@@ -672,7 +783,7 @@ render_userdata() {
       "REGION=$AWS_REGION" "ECR_REGISTRY=${ECR_LOGIN_REGISTRY-$ECR_REGISTRY}" \
       "NODE_EXPORTER_IMAGE=$NODE_EXPORTER_IMAGE" "NODE_EXPORTER_PORT=$NODE_EXPORTER_PORT" \
       "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}" \
-      "MAX_UPTIME_MIN=$((FLEET_MAX_UPTIME_H * 60))"
+      "MAX_UPTIME_MIN=$((FLEET_MAX_UPTIME_H * 60))" "SSH_PUBKEY=$(ssh_pubkey)"
     printf '\n'
     render_template "$BENCH_AWS_DIR/templates/$role.sh" "$@"
     printf '\n'
@@ -711,6 +822,22 @@ postgres_dsns() {
   active=$(state_get '.postgres.active_storage')
   [ -n "$active" ] || die "STATE has no postgres.active_storage; run 20-postgres.sh first"
   state_get "[.postgres.instances[] | select(.storage == \"$active\")] | sort_by(.shard) | map(.dsn) | join(\",\")"
+}
+
+# render_postgres_conf <listen-address> <max-connections> <ram-mib>: the
+# postgresql.conf for the Postgres box, to stdout (templates/postgresql.conf).
+render_postgres_conf() {
+  render_template "$BENCH_AWS_DIR/templates/postgresql.conf" "LISTEN_ADDRESS=$1" "MAX_CONNECTIONS=$2" \
+    "SHARED_BUFFERS_MB=$(($3 / 4))" "EFFECTIVE_CACHE_MB=$(($3 * 3 / 4))"
+}
+
+# pg_ready <instance-name> <ip>: pg_isready from inside the container, over SSH.
+pg_ready() {
+  if is_dry; then
+    ssh_do "$1" "docker exec postgres pg_isready -h $2 -p 5432 -U $DB_USER"
+    return 0
+  fi
+  ssh_do "$1" "docker exec postgres pg_isready -h $2 -p 5432 -U $DB_USER" >/dev/null 2>&1
 }
 
 # load_postgres_password: when RDS_PASSWORD is not in the environment, take it
@@ -772,15 +899,21 @@ run_detached() {
 # ------------------------------------------------------------------ cost
 
 # price_of <key>: USD per hour. PRICE_<KEY> overrides (dots become _).
-# These are approximate on-demand list prices (plan section 11 figures);
-# check the AWS pricing pages before relying on them.
+# These are approximate on-demand list prices (us-east-1; plan section 11
+# figures), scaled by PRICE_FACTOR; check the AWS pricing pages before
+# relying on them.
 price_of() {
-  local key=$1 var
+  local key=$1 var p
   var="PRICE_$(printf '%s' "$key" | tr '.-' '__')"
   if [ -n "${!var:-}" ]; then
     printf '%s' "${!var}"
     return 0
   fi
+  p=$(_list_price "$key") || return 1
+  awk -v p="$p" -v f="$PRICE_FACTOR" 'BEGIN { printf "%.4g\n", p*f }'
+}
+_list_price() {
+  local key=$1
   case "$key" in
     c7i.large) echo 0.09 ;;
     c7i.xlarge) echo 0.18 ;;
@@ -789,9 +922,10 @@ price_of() {
     c7i.8xlarge) echo 1.43 ;;
     c7i.12xlarge) echo 2.14 ;;
     c7i.16xlarge) echo 2.86 ;;
-    db.r7g.2xlarge) echo 0.95 ;;
-    db.r7g.4xlarge) echo 1.90 ;;
-    db.r7g.8xlarge) echo 3.80 ;;
+    r7i.2xlarge) echo 0.53 ;;
+    r7i.4xlarge) echo 1.06 ;;
+    r7i.8xlarge) echo 2.12 ;;
+    r7i.12xlarge) echo 3.18 ;;
     *)
       log "WARNING: no price for $key; counting it as 0 (set PRICE_$(printf '%s' "$key" | tr '.-' '__'))"
       echo 0
@@ -815,43 +949,48 @@ vcpus_of() {
   esac
 }
 
-# io2 provisioned IOPS and storage are a real part of the RDS bill.
-: "${IO2_USD_PER_IOPS_MONTH:=0.10}"
+# EBS is a real part of the Postgres bill: io2 bills provisioned IOPS, gp3
+# bills IOPS above 3000 and throughput above 125 MB/s. us-east-1 list prices;
+# PRICE_FACTOR scales every price (eu-west-1 is typically about 10 percent higher).
+: "${IO2_USD_PER_IOPS_MONTH:=0.065}"
 : "${IO2_USD_PER_GB_MONTH:=0.125}"
-: "${GP3_USD_PER_GB_MONTH:=0.12}"
+: "${GP3_USD_PER_GB_MONTH:=0.08}"
+: "${GP3_USD_PER_IOPS_MONTH:=0.005}"
+: "${GP3_USD_PER_MBPS_MONTH:=0.04}"
+: "${PRICE_FACTOR:=1}"
 
-rds_hourly() { # <class> <storage> <gb> <iops>
-  awk -v inst="$(price_of "$1")" -v st="$2" -v gb="$3" -v iops="${4:-0}" \
+# ebs_hourly <io2|gp3> <gb> <iops> [throughput-mbps]: USD per hour of one data volume.
+ebs_hourly() {
+  awk -v st="$1" -v gb="$2" -v iops="${3:-0}" -v tp="${4:-125}" -v f="$PRICE_FACTOR" \
     -v i_iops="$IO2_USD_PER_IOPS_MONTH" -v i_gb="$IO2_USD_PER_GB_MONTH" -v g_gb="$GP3_USD_PER_GB_MONTH" \
-    'BEGIN { s = inst; if (st == "io2") s += (gb*i_gb + iops*i_iops)/730; else s += gb*g_gb/730; printf "%.3f\n", s }'
+    -v g_iops="$GP3_USD_PER_IOPS_MONTH" -v g_tp="$GP3_USD_PER_MBPS_MONTH" \
+    'BEGIN { if (st == "io2") s = gb*i_gb + iops*i_iops;
+             else { s = gb*g_gb; if (iops > 3000) s += (iops-3000)*g_iops; if (tp > 125) s += (tp-125)*g_tp }
+             printf "%.3f\n", s*f/730 }'
 }
 
-# fleet_hourly_rate: USD per hour of everything STATE says is running.
-rds_storage_hourly() { # <storage> <gb> <iops>: what a stopped instance still bills
-  awk -v st="$1" -v gb="$2" -v iops="${3:-0}" \
-    -v i_iops="$IO2_USD_PER_IOPS_MONTH" -v i_gb="$IO2_USD_PER_GB_MONTH" -v g_gb="$GP3_USD_PER_GB_MONTH" \
-    'BEGIN { if (st == "io2") s = (gb*i_gb + iops*i_iops)/730; else s = gb*g_gb/730; printf "%.3f\n", s }'
+# pg_hourly <type> <io2|gp3> <gb> <iops> [throughput]: instance plus data volume.
+pg_hourly() {
+  awk -v a="$(price_of "$1")" -v b="$(ebs_hourly "$2" "$3" "${4:-0}" "${5:-125}")" 'BEGIN { printf "%.3f\n", a + b }'
 }
 
+# fleet_hourly_rate: USD per hour of everything STATE says is running. A
+# Postgres instance counts its data volume only while it runs: the volume is
+# deleted with the instance (there is no stopped state in this account).
 fleet_hourly_rate() {
-  local total=0 type cls st gb iops row
+  local total=0 type st gb iops tp row
   while IFS= read -r type; do
     [ -n "$type" ] || continue
     total=$(awk -v t="$total" -v p="$(price_of "$type")" 'BEGIN{printf "%.4f", t+p}')
   done < <(state_get '.instances // {} | to_entries[] | select(.value.running == true) | .value.type')
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    cls=$(jq -r .class <<<"$row")
     st=$(jq -r .storage <<<"$row")
     gb=$(jq -r '.storage_gb // 0' <<<"$row")
     iops=$(jq -r '.iops // 0' <<<"$row")
-    total=$(awk -v t="$total" -v p="$(rds_hourly "$cls" "$st" "$gb" "$iops")" 'BEGIN{printf "%.4f", t+p}')
+    tp=$(jq -r '.throughput_mbps // 125' <<<"$row")
+    total=$(awk -v t="$total" -v p="$(ebs_hourly "$st" "$gb" "$iops" "$tp")" 'BEGIN{printf "%.4f", t+p}')
   done < <(state_get '.postgres.instances // {} | to_entries[] | select(.value.running == true) | .value' | jq -c . 2>/dev/null || true)
-  # Stopped Postgres instances still bill storage and provisioned IOPS.
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    total=$(awk -v t="$total" -v p="$(rds_storage_hourly "$(jq -r .storage <<<"$row")" "$(jq -r '.storage_gb // 0' <<<"$row")" "$(jq -r '.iops // 0' <<<"$row")")" 'BEGIN{printf "%.4f", t+p}')
-  done < <(state_get '.postgres.instances // {} | to_entries[] | select(.value.running != true) | .value' | jq -c . 2>/dev/null || true)
   printf '%s' "$total"
 }
 
@@ -878,6 +1017,7 @@ cost_checkpoint() {
 # run, at the current fleet rate, would pass BUDGET_CAP_USD.
 budget_guard() {
   local limit_s=$1 rate accrued projected
+  refresh_instances || true # boxes the dead-man switch terminated must stop counting
   cost_checkpoint
   rate=$(fleet_hourly_rate)
   accrued=$(state_get '.budget.accrued_usd')

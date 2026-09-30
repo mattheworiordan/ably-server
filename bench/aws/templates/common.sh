@@ -6,9 +6,17 @@ set -euxo pipefail
 install -m 600 /dev/null /var/log/bench-userdata.log
 exec > >(tee -a /var/log/bench-userdata.log) 2>&1
 
-# Dead-man switch: the box stops itself (it is launched with stop-on-shutdown)
-# after this many minutes, so a forgotten fleet stops billing for compute.
-# 80-start.sh re-arms it after a restart.
+# SSH access. There is no EC2 key pair in this account: authorise the
+# operator's public key for ec2-user here.
+install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh
+echo '@@SSH_PUBKEY@@' >>/home/ec2-user/.ssh/authorized_keys
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+chown ec2-user:ec2-user /home/ec2-user/.ssh/authorized_keys
+restorecon -R /home/ec2-user/.ssh 2>/dev/null || true
+
+# Dead-man switch: the box powers itself off after this many minutes. It is
+# launched with terminate-on-shutdown, so a forgotten fleet stops billing
+# for compute and disks alike (nothing can be restarted afterwards).
 shutdown -h +@@MAX_UPTIME_MIN@@
 
 dnf install -y docker chrony jq

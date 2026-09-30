@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 65-run-0a: run 0a, Postgres alone. Copies bench/aws/pgbench to the driver box
-# (25-pgdriver.sh), runs pgbench against one RDS instance there, detached and
+# (25-pgdriver.sh), runs pgbench against one Postgres instance there, detached and
 # under RUN_TIME_LIMIT, then copies the raw output, CSV and markdown tables to
 # results/0a-<storage>-<timestamp>/ and writes a combined summary.
 #
 #   RUN_TIME_LIMIT=2h bench/aws/65-run-0a.sh io2
-#   RUN_TIME_LIMIT=2h bench/aws/65-run-0a.sh gp3     # after 20-postgres.sh with RDS_STORAGE=gp3
+#   RUN_TIME_LIMIT=2h bench/aws/65-run-0a.sh gp3     # after 20-postgres.sh with PG_STORAGE=gp3
 #
 # The argument names the storage type; its instance must be in STATE
 # (20-postgres.sh). Cells: VARIANTS x CLIENTS at DURATION_S seconds each plus
@@ -37,8 +37,8 @@ fi
 
 id="${PROJECT_TAG}-pg-${storage}"
 dsn=$(state_get ".postgres.instances[\"$id\"].dsn")
-[ -n "$dsn" ] || die "no Postgres instance $id in STATE; run 20-postgres.sh with RDS_STORAGE=$storage"
-[ "$(state_get ".postgres.instances[\"$id\"].running")" = true ] || die "$id is not running (80-start.sh)"
+[ -n "$dsn" ] || die "no Postgres instance $id in STATE; run 20-postgres.sh with PG_STORAGE=$storage"
+[ "$(state_get ".postgres.instances[\"$id\"].running")" = true ] || die "$id is not running (terminated by the dead-man switch?): re-run 20-postgres.sh with PG_STORAGE=$storage"
 parse_dsn "$dsn"
 driver=$(iname pgdriver 1)
 [ -n "$(inst_field "$driver" id)" ] || die "no driver box in STATE; run 25-pgdriver.sh"
@@ -65,7 +65,7 @@ export DURATION_S='$DURATION_S' WARMUP_S='$WARMUP_S' CLIENTS='$CLIENTS' VARIANTS
 exec ./run.sh all
 CMD
 )
-_state_update '.runs += [{id:$id,scenario:"0a",storage:$st,started_at:$at,status:"running",limit_s:($lim|tonumber),rds_class:(.postgres.instances[$pg].class // ""),est_spend_before_usd:($acc|tonumber)}]' \
+_state_update '.runs += [{id:$id,scenario:"0a",storage:$st,started_at:$at,status:"running",limit_s:($lim|tonumber),pg_type:(.postgres.instances[$pg].type // ""),pg_storage_gb:(.postgres.instances[$pg].storage_gb // 0),pg_iops:(.postgres.instances[$pg].iops // 0),pg_engine:(.postgres.instances[$pg].engine_version // ""),est_spend_before_usd:($acc|tonumber)}]' \
   --arg id "$run_id" --arg st "$storage" --arg at "$(date -u +%FT%TZ)" --arg lim "$limit_s" --arg pg "$id" --arg acc "$BUDGET_ACCRUED"
 log_line 65-run-0a "run 0a on $storage started ($run_id): $ncells cells, limit $RUN_TIME_LIMIT" "wait for exit code; results in $RESULTS_DIR/$run_id"
 

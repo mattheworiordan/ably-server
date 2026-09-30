@@ -35,6 +35,10 @@ if [ -x test/pgbench-local.sh ] && [ "${SKIP_DOCKER:-0}" != 1 ]; then
   echo "== pgbench SQL against a local Postgres 17"
   test/pgbench-local.sh
 fi
+if [ -x test/pgserver-local.sh ] && [ "${SKIP_DOCKER:-0}" != 1 ]; then
+  echo "== Postgres role (settings, access, statistics) against a local Docker network"
+  test/pgserver-local.sh
+fi
 if [ "${SKIP_DOCKER:-0}" != 1 ]; then
   echo "== observability stack"
   test/observability-local.sh
