@@ -90,10 +90,19 @@ func TestScenarioRejectsUnknownKeysAndBadValues(t *testing.T) {
 	if _, err := sc.Resolve(1, 1, "bad-tag"); err == nil {
 		t.Error("run tag with '-' accepted")
 	}
-	// More subscribers on one channel than connections is impossible.
+	// More subscribers on one channel than connections is impossible at
+	// full scale, and clamped (and reported) at a smoke scale.
 	sc.Classes[0].Subscribers = 5000
+	sc.Classes[0].ScaleBy = "rate"
 	if _, err := sc.Resolve(1, 1, "t"); err == nil {
 		t.Error("channel with more subscribers than connections accepted")
+	}
+	p, err := sc.Resolve(1, 0.1, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ct := p.Totals(); ct[0].MaxSubscribers != p.Connections || ct[0].Clamped != 1 {
+		t.Errorf("smoke clamp: %+v (connections %d)", ct[0], p.Connections)
 	}
 }
 

@@ -264,8 +264,8 @@ func (s *Scenario) Validate() error {
 	if s.Timing.Ramp.Duration < 0 || s.Timing.Drain.Duration < 0 {
 		return fmt.Errorf("scenario %s: timing durations must be >= 0", s.Name)
 	}
-	if len(s.Classes) == 0 {
-		return fmt.Errorf("scenario %s: at least one [[class]] is required", s.Name)
+	if len(s.Classes) == 0 && !s.Presence.Enabled {
+		return fmt.Errorf("scenario %s: at least one [[class]] or an enabled [presence] is required", s.Name)
 	}
 	seen := map[string]bool{}
 	for i := range s.Classes {
@@ -315,7 +315,7 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("scenario %s: class %s: scale_by must be channels, subscribers or rate", s.Name, c.Name)
 		}
 	}
-	if s.Connections.Count < 1 {
+	if s.Connections.Count < 1 && len(s.Classes) > 0 {
 		return fmt.Errorf("scenario %s: connections.count must be >= 1", s.Name)
 	}
 	if s.Presence.Enabled && (s.Presence.Channels < 1 || s.Presence.MembersPerChannel < 1) {
@@ -330,6 +330,10 @@ type ResolvedClass struct {
 	Index          int
 	ChannelCount   int
 	subScale       float64 // factor applied to subscribers per channel
+	maxSubs        int     // clamp (the connection count) for smoke scales, 0 for none
+	// Clamped counts channels whose subscriber count was clamped to the
+	// connection count (only at a smoke scale below 1).
+	Clamped int
 	RatePerChannel float64 // messages/s per channel
 	StreamCount    int
 	MsgBytes       int
@@ -434,7 +438,14 @@ func (s *Scenario) Resolve(multiplier, scale float64, runTag string) (*Plan, err
 		for j := 0; j < rc.ChannelCount; j++ {
 			n := int64(rc.subscribers(p.Prefix, j))
 			if n > int64(p.Connections) {
-				return nil, fmt.Errorf("class %s channel %d has %d subscribers but only %d connections", c.Name, j, n, p.Connections)
+				if scale >= 1 {
+					return nil, fmt.Errorf("class %s channel %d has %d subscribers but only %d connections", c.Name, j, n, p.Connections)
+				}
+				// A smoke scale shrinks connections below a fixed-size
+				// channel's fan-out: clamp so every connection holds it.
+				rc.maxSubs = p.Connections
+				rc.Clamped++
+				n = int64(p.Connections)
 			}
 			rc.attachments += n
 		}
@@ -469,10 +480,14 @@ func (c *ResolvedClass) subscribers(prefix string, j int) int {
 	case "harmonic":
 		base = min(c.SubscribersMax, max(c.SubscribersMin, int(math.Round(float64(c.SubscribersMax)/float64(j+1)))))
 	}
-	if c.subScale == 1 || base == 0 {
-		return base
+	n := base
+	if c.subScale != 1 && base != 0 {
+		n = max(1, int(math.Round(float64(base)*c.subScale)))
 	}
-	return max(1, int(math.Round(float64(base)*c.subScale)))
+	if c.maxSubs > 0 && n > c.maxSubs {
+		n = c.maxSubs
+	}
+	return n
 }
 
 // Subscribers returns channel j's subscriber count.
@@ -534,6 +549,7 @@ type ClassTotals struct {
 	StreamRate       float64 `json:"stream_rate"`
 	Publisher        string  `json:"publisher"`
 	MessageBytes     int     `json:"message_bytes"`
+	Clamped          int     `json:"clamped,omitempty"`
 }
 
 // Totals computes the plan's derived load.
@@ -551,7 +567,7 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 	var cts []ClassTotals
 	for i := range p.Classes {
 		c := &p.Classes[i]
-		ct := ClassTotals{Name: c.Name, Channels: c.ChannelCount, Attachments: c.attachments, Publisher: c.Publisher, MessageBytes: c.MsgBytes, MinSubscribers: math.MaxInt}
+		ct := ClassTotals{Name: c.Name, Channels: c.ChannelCount, Attachments: c.attachments, Publisher: c.Publisher, MessageBytes: c.MsgBytes, MinSubscribers: math.MaxInt, Clamped: c.Clamped}
 		for j := 0; j < c.ChannelCount; j++ {
 			n := p.Subscribers(c, j)
 			ct.MinSubscribers = min(ct.MinSubscribers, n)

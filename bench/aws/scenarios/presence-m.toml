@@ -1,0 +1,26 @@
+# Short presence run (plan §8 run 6): shape M's presence load for 15
+# minutes. About 500 rooms of 2k members (the plan's 1k to 3k) enter over
+# five minutes, then enter/leave churn at 1.2k events/s with every member
+# also subscribed to presence. SYNC timing on attach to a 3k-member room,
+# member-set checks against the REST presence endpoint and the node kill
+# are driven by the conductor's hooks, not by this file.
+name = "PM"
+shape = "M"
+description = "presence: about 500 rooms of 2k members, enter over 5m, churn at 1.2k events/s"
+bus = "nats"
+nodes = 10
+shards = 1
+message_bytes = 64
+sample_percent = 0
+
+[timing]
+ramp = "5m"
+hold = "15m"
+drain = "30s"
+
+[presence]
+enabled = true
+channels = 500
+members_per_channel = 2000
+events_per_sec = 1200
+subscribe = true
