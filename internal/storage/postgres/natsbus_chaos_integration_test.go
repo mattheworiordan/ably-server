@@ -92,6 +92,9 @@ func TestNATSBusReorderedEnvelopes(t *testing.T) {
 	a2.waitFor(t, 2, 5*time.Second)
 	waitFor(t, 5*time.Second, "the duplicate of cm 0 to be dropped", func() bool { return storeCounters(cs2).duplicates >= 1 })
 	assertSerials(t, "after the reorder", a2.serials(), want[:2])
+	if got := storeCounters(cs2).gapFills; got != 0 {
+		t.Fatalf("gapFills = %d after cm 0 arrived, want 0: the chain, not a log read, must repair the reorder", got)
+	}
 
 	// cm 3 names cm 2 as its predecessor; NATS never carries cm 2. The
 	// node holds cm 3, then reads cm 2 from the log after the hold.
@@ -135,7 +138,7 @@ func TestNATSBusServerKillLosesNoCommittedMessage(t *testing.T) {
 
 	s1 := openNATSNode(t, dsn, srv.URL())
 	s2 := openNATSNode(t, dsn, srv.URL())
-	a1, a2 := &cmRecorder{}, &cmRecorder{}
+	a1 := &cmRecorder{}
 	const channels = 4
 	var chs []storage.ChannelStore
 	var recs []*cmRecorder
@@ -146,7 +149,6 @@ func TestNATSBusServerKillLosesNoCommittedMessage(t *testing.T) {
 		recs = append(recs, r)
 		bindChannel(t, s2, name, r)
 	}
-	_ = a2
 
 	var (
 		mu      sync.Mutex

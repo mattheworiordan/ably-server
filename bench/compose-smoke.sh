@@ -58,7 +58,10 @@ fi
 # Read the whole body first: with pipefail, grep -q exiting at the first
 # match makes curl fail writing the rest (exit 23) once /metrics outgrows
 # the pipe buffer.
-metrics_body="$(curl -fsS "$(debug 1)/metrics")"
+if ! metrics_body="$(curl -fsS "$(debug 1)/metrics")"; then
+  echo "FAIL: node 1 /metrics did not answer" >&2
+  exit 1
+fi
 if ! grep -q "ably_bus_info{bus=\"$bus\"" <<<"$metrics_body"; then
   echo "FAIL: node 1 /metrics does not report ably_bus_info{bus=\"$bus\"}" >&2
   exit 1

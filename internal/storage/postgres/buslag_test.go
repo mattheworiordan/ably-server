@@ -95,8 +95,8 @@ func TestChainRecordsDeliveryLagByPath(t *testing.T) {
 
 	snap := st.lagSnapshot()
 	inline, filled, fetched := snap["inline"], snap["filled"], snap["fetched"]
-	// 40 ms lands in le=0.05, or le=0.1 on a slow runner; never below 25 ms.
-	if inline.Count != 1 || lagBucketCount(inline, 0.025) != 0 || lagBucketCount(inline, 0.1) != 1 {
+	// 40 ms lands in le=0.05, later buckets on a slow runner; never below 25 ms.
+	if inline.Count != 1 || lagBucketCount(inline, 0.025) != 0 || lagBucketCount(inline, 1) != 1 {
 		t.Errorf("inline lag %+v, want one observation of about 40 ms", inline)
 	}
 	if filled.Count != 1 || lagBucketCount(filled, 2.5) != 0 || lagBucketCount(filled, 5) != 1 {

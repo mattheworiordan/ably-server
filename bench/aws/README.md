@@ -342,7 +342,8 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     shards = 1                 # Postgres shards (shard curve parameter)
     message_bytes = 470
     sample_percent = 5         # channels under the serial-continuity check
-    server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline)
+    server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline; absent or "0s" = 60s;
+                                # to measure growth from hold start pass --server-idle-timeout 0)
 
     [timing]
     ramp = "10m"               # connections and publish rates rise linearly

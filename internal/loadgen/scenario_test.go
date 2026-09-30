@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testScenario = `
@@ -311,5 +312,29 @@ events_per_sec = 10
 	}
 	if len(seen) != 20 {
 		t.Fatalf("%d members, want 20", len(seen))
+	}
+}
+
+// TestScenarioServerIdleTimeout: server_idle_timeout reads from TOML and
+// sets the growth baseline; absent (or "0s") it is the server default.
+func TestScenarioServerIdleTimeout(t *testing.T) {
+	sc, err := ParseScenario([]byte(testScenario))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.IdleTimeout(); got != DefaultServerIdleTimeout {
+		t.Errorf("absent: IdleTimeout = %s, want %s", got, DefaultServerIdleTimeout)
+	}
+	for toml, want := range map[string]time.Duration{
+		`server_idle_timeout = "15s"`: 15 * time.Second,
+		`server_idle_timeout = "0s"`:  DefaultServerIdleTimeout,
+	} {
+		sc, err := ParseScenario([]byte(toml + "\n" + testScenario))
+		if err != nil {
+			t.Fatalf("%s: %v", toml, err)
+		}
+		if got := sc.IdleTimeout(); got != want {
+			t.Errorf("%s: IdleTimeout = %s, want %s", toml, got, want)
+		}
 	}
 }
