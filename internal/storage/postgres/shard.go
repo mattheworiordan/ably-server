@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -75,11 +76,17 @@ func jumpHash(key uint64, n int) int {
 // key=value DSN, stays one DSN. A list of more than one DSN therefore
 // needs URL-form DSNs. An empty entry or the same DSN twice is an error:
 // two shards on one schema would both claim it (the shard identity check
-// in OpenSharded refuses that too).
+// in OpenSharded refuses that too). A value that looks like a list of
+// key=value DSNs is refused rather than read as one DSN.
 func SplitDSNs(v string) ([]string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return nil, errors.New("storage/postgres: empty DSN")
+	}
+	if !hasURLScheme(v) && kvListRe.MatchString(v) {
+		// "host=db1 dbname=a,host=db2 dbname=a" would parse as one DSN
+		// (dbname "a,host=db2") and silently run unsharded on db1.
+		return nil, errors.New("storage/postgres: a DSN list needs URL-form DSNs (postgres://...), not key=value ones (DESIGN.md §6.4)")
 	}
 	var out []string
 	start := 0
@@ -107,6 +114,10 @@ func SplitDSNs(v string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// kvListRe spots a list of key=value DSNs: a comma straight followed by a
+// host key. A multi-host key=value DSN (host=h1,h2) never has one.
+var kvListRe = regexp.MustCompile(`,\s*(host|hostaddr)\s*=`)
 
 func hasURLScheme(s string) bool {
 	return strings.HasPrefix(s, "postgres://") || strings.HasPrefix(s, "postgresql://")

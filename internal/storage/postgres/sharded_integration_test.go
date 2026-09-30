@@ -396,7 +396,7 @@ func TestShardedIdentityGuard(t *testing.T) {
 		}
 	}
 	_, err = OpenSharded(ctx, Options{}, []string{b, a})
-	refused("swapped order", err, "this database is shard 0 of 2, but --postgres-dsn lists it as shard 1 of 2")
+	refused("swapped order", err, "this database is shard 1 of 2, but --postgres-dsn lists it as shard 0 of 2")
 	_, err = OpenSharded(ctx, Options{}, []string{a, b, fresh()})
 	refused("grown list", err, "lists it as shard 0 of 3")
 	_, err = Open(ctx, Options{DSN: b})
@@ -426,7 +426,64 @@ func TestShardedIdentityGuard(t *testing.T) {
 	// One database listed twice (two spellings of one DSN) is refused.
 	dup := fresh()
 	_, err = OpenSharded(ctx, Options{}, []string{dup, dup + "&application_name=twice"})
-	refused("one database twice", err, "but --postgres-dsn lists it as shard")
+	refused("one database twice", err, "(or lists it twice)")
+
+	// An empty database in place of one that has served the list records
+	// itself as that shard, but shard 0 knows which database was there.
+	_, err = OpenSharded(ctx, Options{}, []string{a, fresh()})
+	refused("substituted empty database", err, "shard 1 is not the database this list was first opened with")
+
+	// A shard of another list is refused by its list id.
+	other := shardDSNs(t, 2)
+	s, err = OpenSharded(ctx, Options{}, other)
+	if err != nil {
+		t.Fatalf("open other list: %v", err)
+	}
+	_ = s.Close()
+	_, err = OpenSharded(ctx, Options{}, []string{a, other[1]})
+	refused("shard of another list", err, "of another list")
+}
+
+// TestShardedConcurrentFirstOpen opens one fresh list from several nodes
+// at once: every open succeeds, and each database records its own index
+// once.
+func TestShardedConcurrentFirstOpen(t *testing.T) {
+	ctx := context.Background()
+	dsns := shardDSNs(t, 2)
+	const nodes = 6
+	errs := make([]error, nodes)
+	var wg sync.WaitGroup
+	for i := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := OpenSharded(ctx, Options{}, dsns)
+			if err == nil {
+				defer s.Close()
+			}
+			errs[i] = err
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("node %d: %v", i, err)
+		}
+	}
+	for i, dsn := range dsns {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatalf("connect shard %d: %v", i, err)
+		}
+		var rows, index, count int
+		if err := conn.QueryRow(ctx, `SELECT count(*), min(shard_index), min(shard_count) FROM shard_identity`).Scan(&rows, &index, &count); err != nil {
+			t.Fatalf("shard %d identity: %v", i, err)
+		}
+		conn.Close(ctx)
+		if rows != 1 || index != i || count != 2 {
+			t.Errorf("shard %d identity: %d rows, index %d, count %d; want 1 row, %d of 2", i, rows, index, count, i)
+		}
+	}
 }
 
 // TestShardedMetrics registers a two-shard store's collectors on one

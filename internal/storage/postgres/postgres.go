@@ -230,9 +230,10 @@ type Storage struct {
 	// none. Persisted channels' rows from before it sit in the live class.
 	legacyBound string
 
-	shard      shardSlot // place in the shard list (§6.4); {0, 1} when alone
-	busKind    string    // BusPGNotify, BusPostgres or BusNATS
-	notifyMode string    // the BusPostgres notify mode, "" for the other buses
+	shard      shardSlot     // place in the shard list (§6.4); {0, 1} when alone
+	ident      shardIdentity // this shard's recorded identity; zero when alone
+	busKind    string        // BusPGNotify, BusPostgres or BusNATS
+	notifyMode string        // the BusPostgres notify mode, "" for the other buses
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
@@ -311,7 +312,8 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
 	slot := opts.shard.resolve()
-	if err := checkShardIdentity(ctx, pool, slot); err != nil {
+	ident, err := checkShardIdentity(ctx, pool, slot)
+	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
@@ -333,6 +335,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		node:          serial.NewSeriesID(),
 		logger:        logger,
 		shard:         slot,
+		ident:         ident,
 		busKind:       busKind,
 		notifyMode:    string(mode),
 		reconnectBase: listenReconnectBaseDelay,

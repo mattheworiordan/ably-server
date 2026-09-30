@@ -1425,9 +1425,11 @@ shard orders it.
 when a URL starts straight after it, so a single DSN with commas of its
 own (a multi-host URL, or a key=value DSN) stays one DSN; a list of two
 or more therefore needs URL-form DSNs. An empty entry or a repeated DSN
-is refused at startup. The shard count is the list length. One DSN
-behaves exactly as without sharding: the server opens one database as
-before, with no routing layer between the channel and its store.
+is refused at startup, as is a value that looks like a list of key=value
+DSNs. The shard count is the list length. One DSN behaves as without
+sharding: the server opens one database as before, with no routing layer
+between the channel and its store; the only additions are one read at
+startup (below) and the `ably_storage_shards` gauge.
 
 **The hash.** Shard = jump consistent hash (Lamping and Veach, 2014) of
 a 64-bit key: FNV-1a over the channel name's bytes, mixed by the
@@ -1463,16 +1465,28 @@ does once, a sharded node does once per shard, against that shard only.
 | `GET /stats` stub | account-wide | touches no storage |
 | Sandbox per-app schemas (§15) | account-wide | created in and dropped from every shard |
 
-**Shard identity.** A list is fixed for the life of its data. On its
-first open each shard's database records its index and the list length
-in a `shard_identity` table, and every later open compares. A node
-started with the list in another order, with another length, or with one
-database twice is refused at startup, as is a single-DSN node pointed at
-one shard of a list. A database that already holds channels but has no
-identity (it served a single-DSN deployment) cannot join a list, because
-the channels that now hash elsewhere would be stranded. A single-DSN
-node creates no table and writes nothing for this; it only reads, at
-startup, whether the table exists.
+**Shard identity.** A list is fixed for the life of its data, and the
+server checks this at startup. Shard 0 opens first. On its first open
+each shard's database records, in a `shard_identity` table, its index,
+the list length, a list id (minted by shard 0 and carried by every other
+shard) and a random id of its own; once every shard has opened, shard 0
+also records the ids of the databases at every position. Every later
+open compares. So a node is refused at startup when it lists the DSNs in
+another order, lists more or fewer, lists one database twice, lists a
+shard of another list, or lists another database (an empty one, say) at
+a position a database has already served; a single-DSN node pointed at
+one shard of a list is refused too. A database that already holds
+channels but has no identity (it served a single-DSN deployment) cannot
+join a list, because the channels that now hash elsewhere would be
+stranded. A single-DSN node creates no table and writes nothing for
+this; it only reads, at startup, whether the table exists in its schema.
+Stop single-DSN nodes before first starting a list on their database: a
+node already running checks nothing after it starts.
+
+What a failed first start records stays: if one shard cannot be reached,
+the shards that opened keep their identity, and a later start must use
+the same list. To start again with another list while no shard holds
+channels yet, drop `shard_identity` in each shard's schema.
 
 **Not supported: resharding, migration, rebalancing.** The count cannot
 change without moving data, and there is no tool that moves it. A hot

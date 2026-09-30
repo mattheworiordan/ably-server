@@ -85,7 +85,7 @@ func TestIntegrationClusterShardedOrderAndExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range perChannel {
-				if err := restPost(addrs[i%2], name, fmt.Sprintf(`{"name":"m","data":"%d"}`, i)); err != nil {
+				if err := restPost(ctx, addrs[i%2], name, fmt.Sprintf(`{"name":"m","data":"%d"}`, i)); err != nil {
 					t.Errorf("publish %d to %s via node %d: %v", i, name, i%2, err)
 					return
 				}
@@ -147,9 +147,9 @@ func TestIntegrationClusterShardedOrderAndExactlyOnce(t *testing.T) {
 
 // restPost is postPublish for use off the test goroutine: it returns the
 // failure instead of failing the test.
-func restPost(addr, channel, jsonBody string) error {
+func restPost(ctx context.Context, addr, channel, jsonBody string) error {
 	u := &url.URL{Scheme: "http", Host: addr, Path: "/channels/" + channel + "/messages"}
-	req, err := http.NewRequest(http.MethodPost, u.String(), strings.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(jsonBody))
 	if err != nil {
 		return err
 	}

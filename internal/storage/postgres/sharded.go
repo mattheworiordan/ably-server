@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/storage"
 )
 
@@ -36,45 +38,72 @@ type Sharded struct {
 var _ storage.Storage = (*Sharded)(nil)
 
 // OpenSharded opens one Storage per DSN, in list order, with opts
-// applied to each (opts.DSN is ignored). The shards open in parallel; if
-// any fails, the ones that opened are closed and the first error is
-// returned. Each shard's database records its place in the list on first
-// open, and a later open with that database at another index, in a list
-// of another length, is refused.
+// applied to each (opts.DSN is ignored). Shard 0 opens first, then the
+// others in parallel. If any fails, the ones that opened are closed and
+// every shard's error is returned, joined.
+//
+// Each shard's database records its place in the list on first open
+// (checkShardIdentity), and shard 0 records which database is at every
+// position once all of them have opened (checkShardMembers). A later open
+// with the list in another order, of another length, with one database
+// twice, or with another database at some position is refused. A shard
+// that opened during a failed attempt keeps what it recorded (DESIGN.md
+// §6.4 says how to reset it).
 func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, error) {
 	n := len(dsns)
 	if n < 2 {
 		return nil, fmt.Errorf("storage/postgres: OpenSharded needs at least 2 DSNs, got %d (open one with Open)", n)
 	}
-	shards := make([]*Storage, n)
-	errs := make([]error, n)
-	var wg sync.WaitGroup
-	for i, dsn := range dsns {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			o := opts
-			o.DSN = dsn
-			o.shard = shardSlot{index: i, count: n}
-			if o.Logger != nil {
-				o.Logger = o.Logger.With("shard", i)
-			}
-			s, err := Open(ctx, o)
-			if err != nil {
-				errs[i] = fmt.Errorf("shard %d: %w", i, err)
-				return
-			}
-			shards[i] = s
-		}()
+	logger := opts.Logger
+	if logger == nil {
+		logger = logging.Default()
 	}
-	wg.Wait()
-	if err := errors.Join(errs...); err != nil {
+	open := func(i int, listID string) (*Storage, error) {
+		o := opts
+		o.DSN = dsns[i]
+		o.shard = shardSlot{index: i, count: n, listID: listID}
+		o.Logger = logger.With("shard", i)
+		s, err := Open(ctx, o)
+		if err != nil {
+			return nil, fmt.Errorf("shard %d: %w", i, err)
+		}
+		return s, nil
+	}
+
+	shards := make([]*Storage, n)
+	closeAll := func() {
 		for _, s := range shards {
 			if s != nil {
 				_ = s.Close()
 			}
 		}
+	}
+	first, err := open(0, "")
+	if err != nil {
 		return nil, err
+	}
+	shards[0] = first
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 1; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			shards[i], errs[i] = open(i, first.ident.listID)
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		closeAll()
+		return nil, err
+	}
+	members := make([]string, n)
+	for i, sh := range shards {
+		members[i] = sh.ident.memberID
+	}
+	if err := checkShardMembers(ctx, first.pool, members); err != nil {
+		closeAll()
+		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	return &Sharded{shards: shards, gauge: shardsGauge(n)}, nil
 }
@@ -104,16 +133,19 @@ func (s *Sharded) Release(ctx context.Context, name string) error {
 
 // Close closes every shard.
 func (s *Sharded) Close() error {
+	errs := make([]error, len(s.shards))
 	var wg sync.WaitGroup
-	for _, sh := range s.shards {
+	for i, sh := range s.shards {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = sh.Close()
+			if err := sh.Close(); err != nil {
+				errs[i] = fmt.Errorf("shard %d: %w", i, err)
+			}
 		}()
 	}
 	wg.Wait()
-	return nil
+	return errors.Join(errs...)
 }
 
 // Ping reports ready only while every shard is: a node that cannot reach
@@ -213,9 +245,12 @@ func addLag(a, b storage.LagHistogram) storage.LagHistogram {
 }
 
 // shardSlot is a Storage's place in a shard list: index in [0, count).
-// The zero value is a lone Storage (index 0 of 1).
+// listID is shard 0's list id, which every other shard of the list must
+// carry; it is empty for shard 0 and for a lone Storage. The zero value
+// is a lone Storage (index 0 of 1).
 type shardSlot struct {
 	index, count int
+	listID       string
 }
 
 func (sl shardSlot) resolve() shardSlot {
@@ -223,6 +258,12 @@ func (sl shardSlot) resolve() shardSlot {
 		return shardSlot{index: 0, count: 1}
 	}
 	return sl
+}
+
+// shardIdentity is what a shard's database recorded about it: the id of
+// the list it belongs to (minted by shard 0) and its own random id.
+type shardIdentity struct {
+	listID, memberID string
 }
 
 // shardsGauge is ably_storage_shards, the node's shard count.
@@ -234,82 +275,163 @@ func shardsGauge(n int) prometheus.Collector {
 }
 
 // shardIdentityLockKey namespaces the transaction advisory lock that
-// serialises the first write of a database's shard identity; like the
-// partition locks it is combined with hashtext(current_schema()).
+// serialises writes of a database's shard identity; like the partition
+// locks it is combined with hashtext(current_schema()).
 const shardIdentityLockKey int32 = 0x1ab1e5e9
 
+// shardIdentityTable returns the schema-qualified shard_identity name in
+// the connection's current schema, where the multi-shard path creates it,
+// so a lone Storage never reads another schema's table on its
+// search_path.
+func shardIdentityTable(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}) (string, error) {
+	var schema string
+	if err := q.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return "", fmt.Errorf("current_schema: %w", err)
+	}
+	return pgx.Identifier{schema, "shard_identity"}.Sanitize(), nil
+}
+
+// reshardHint ends every identity refusal.
+const reshardHint = "every node must list the same DSNs in the same order, and the list is fixed for the life of the data (resharding is not supported, DESIGN.md §6.4)"
+
 // checkShardIdentity makes sure the database behind pool is shard
-// slot.index of a list of slot.count (DESIGN.md §6.4).
+// slot.index of a list of slot.count (DESIGN.md §6.4), and returns the
+// identity it holds.
 //
 // A lone Storage (count 1) only reads: it refuses a database recorded as
 // a shard of a list of two or more, and otherwise does nothing, so a
 // single-DSN deployment creates no table and runs no write.
 //
-// A shard of a list records (index, count) in shard_identity on its
-// first open and compares on every later one, so a node given the DSNs
-// in another order, a list of another length, or one database twice
-// fails to open instead of routing channels to the wrong database. A
-// database that already holds channels but has no identity (it served a
-// single-DSN deployment, or a list before identities were recorded) is
-// refused: adopting it would strand the channels that now hash
-// elsewhere, and resharding is not supported.
-func checkShardIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlot) error {
+// A shard of a list records its index, the list length, the list id and
+// a random member id in shard_identity on its first open, and compares
+// on every later one. Shard 0 mints the list id; every other shard must
+// be given it (slot.listID), so a database that already belongs to
+// another list is refused. A database that already holds channels but
+// has no identity (it served a single-DSN deployment) is refused:
+// adopting it would strand the channels that now hash elsewhere.
+func checkShardIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlot) (shardIdentity, error) {
 	if slot.count == 1 {
+		tbl, err := shardIdentityTable(ctx, pool)
+		if err != nil {
+			return shardIdentity{}, fmt.Errorf("read shard identity: %w", err)
+		}
 		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT to_regclass('shard_identity') IS NOT NULL`).Scan(&exists); err != nil {
-			return fmt.Errorf("read shard identity: %w", err)
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, tbl).Scan(&exists); err != nil {
+			return shardIdentity{}, fmt.Errorf("read shard identity: %w", err)
 		}
 		if !exists {
-			return nil
+			return shardIdentity{}, nil
 		}
 		var index, count int
-		err := pool.QueryRow(ctx, `SELECT shard_index, shard_count FROM shard_identity`).Scan(&index, &count)
+		err = pool.QueryRow(ctx, `SELECT shard_index, shard_count FROM `+tbl).Scan(&index, &count)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
+			return shardIdentity{}, nil
 		}
 		if err != nil {
-			return fmt.Errorf("read shard identity: %w", err)
+			return shardIdentity{}, fmt.Errorf("read shard identity: %w", err)
 		}
-		if count != 1 {
-			return fmt.Errorf("this database is shard %d of %d; list all %d DSNs in --postgres-dsn, in the original order (resharding is not supported, DESIGN.md §6.4)", index, count, count)
-		}
-		return nil
+		return shardIdentity{}, fmt.Errorf("this database is shard %d of %d; list all %d DSNs in --postgres-dsn; %s", index, count, count, reshardHint)
 	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("shard identity: %w", err)
+		return shardIdentity{}, fmt.Errorf("shard identity: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext(current_schema()))`, shardIdentityLockKey); err != nil {
-		return fmt.Errorf("shard identity lock: %w", err)
+		return shardIdentity{}, fmt.Errorf("shard identity lock: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS shard_identity (
+	tbl, err := shardIdentityTable(ctx, tx)
+	if err != nil {
+		return shardIdentity{}, fmt.Errorf("shard identity: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+tbl+` (
 		one         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
 		shard_index INT NOT NULL,
 		shard_count INT NOT NULL,
+		list_id     TEXT NOT NULL,
+		member_id   TEXT NOT NULL,
+		members     TEXT[],
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`); err != nil {
-		return fmt.Errorf("create shard identity: %w", err)
+		return shardIdentity{}, fmt.Errorf("create shard identity: %w", err)
 	}
-	var index, count int
-	err = tx.QueryRow(ctx, `SELECT shard_index, shard_count FROM shard_identity`).Scan(&index, &count)
+	var (
+		index, count int
+		id           shardIdentity
+	)
+	err = tx.QueryRow(ctx, `SELECT shard_index, shard_count, list_id, member_id FROM `+tbl).Scan(&index, &count, &id.listID, &id.memberID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		var used bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM channels)`).Scan(&used); err != nil {
-			return fmt.Errorf("shard identity: %w", err)
+			return shardIdentity{}, fmt.Errorf("shard identity: %w", err)
 		}
 		if used {
-			return fmt.Errorf("this database already holds channels but is not recorded as a shard; it cannot join a list of %d (resharding is not supported, DESIGN.md §6.4)", slot.count)
+			return shardIdentity{}, fmt.Errorf("this database already holds channels but is not recorded as a shard, so it cannot join a list of %d; %s", slot.count, reshardHint)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO shard_identity (shard_index, shard_count) VALUES ($1, $2)`, slot.index, slot.count); err != nil {
-			return fmt.Errorf("record shard identity: %w", err)
+		id = shardIdentity{listID: slot.listID, memberID: rand.Text()}
+		if slot.index == 0 {
+			id.listID = rand.Text()
+		} else if id.listID == "" {
+			return shardIdentity{}, errors.New("shard identity: no list id for a shard after the first")
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (shard_index, shard_count, list_id, member_id) VALUES ($1, $2, $3, $4)`,
+			slot.index, slot.count, id.listID, id.memberID); err != nil {
+			return shardIdentity{}, fmt.Errorf("record shard identity: %w", err)
 		}
 	case err != nil:
-		return fmt.Errorf("read shard identity: %w", err)
+		return shardIdentity{}, fmt.Errorf("read shard identity: %w", err)
 	case index != slot.index || count != slot.count:
-		return fmt.Errorf("this database is shard %d of %d, but --postgres-dsn lists it as shard %d of %d; the list must keep its original order and length (resharding is not supported, DESIGN.md §6.4)", index, count, slot.index, slot.count)
+		return shardIdentity{}, fmt.Errorf("this database is shard %d of %d, but --postgres-dsn lists it as shard %d of %d (or lists it twice); %s", index, count, slot.index, slot.count, reshardHint)
+	case slot.index > 0 && id.listID != slot.listID:
+		return shardIdentity{}, fmt.Errorf("this database is shard %d of %d of another list (whose shard 0 is not the database listed first); %s", index, count, reshardHint)
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return shardIdentity{}, fmt.Errorf("record shard identity: %w", err)
+	}
+	return id, nil
+}
+
+// checkShardMembers records on shard 0 which database is at every
+// position of the list (each shard's member id, in list order) the first
+// time every shard has opened, and compares on every later open. It
+// catches what the per-shard check cannot: a database with no identity
+// yet (an empty one, say) listed in place of one that has served the
+// list, which would otherwise record itself and split that position's
+// channels between two databases.
+func checkShardMembers(ctx context.Context, pool *pgxpool.Pool, members []string) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("shard members: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext(current_schema()))`, shardIdentityLockKey); err != nil {
+		return fmt.Errorf("shard members lock: %w", err)
+	}
+	tbl, err := shardIdentityTable(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("shard members: %w", err)
+	}
+	var recorded []string
+	if err := tx.QueryRow(ctx, `SELECT members FROM `+tbl).Scan(&recorded); err != nil {
+		return fmt.Errorf("read shard members: %w", err)
+	}
+	if recorded == nil {
+		if _, err := tx.Exec(ctx, `UPDATE `+tbl+` SET members = $1`, members); err != nil {
+			return fmt.Errorf("record shard members: %w", err)
+		}
+		return tx.Commit(ctx)
+	}
+	if len(recorded) != len(members) {
+		return fmt.Errorf("shard 0 records a list of %d databases, not %d; %s", len(recorded), len(members), reshardHint)
+	}
+	for i := range members {
+		if recorded[i] != members[i] {
+			return fmt.Errorf("shard %d is not the database this list was first opened with at that position; %s", i, reshardHint)
+		}
+	}
+	return nil
 }

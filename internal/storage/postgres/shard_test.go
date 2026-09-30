@@ -165,6 +165,8 @@ func TestSplitDSNs(t *testing.T) {
 			want: []string{"postgres://a/db", "postgresql://b/db", "postgres://c:1,d:2/db"},
 		},
 		{in: "", err: "empty DSN"},
+		{in: "host=db1 dbname=ably,host=db2 dbname=ably", err: "needs URL-form DSNs"},
+		{in: "host=db1 dbname=ably, hostaddr=10.0.0.2 dbname=ably", err: "needs URL-form DSNs"},
 		{in: "postgres://a/db,", err: "entry 2 is empty"},
 		{in: ",postgres://a/db", err: "entry 1 is empty"},
 		{in: "postgres://a/db,postgres://b/db,postgres://a/db", err: "entries 1 and 3 are the same"},
