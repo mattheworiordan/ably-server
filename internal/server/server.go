@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 
@@ -66,6 +67,9 @@ const (
 	wsReadBufEnv       = "ABLY_SERVER_WS_READ_BUFFER_SIZE"
 	wsWriteBufEnv      = "ABLY_SERVER_WS_WRITE_BUFFER_SIZE"
 	httpIdleEnv        = "ABLY_SERVER_HTTP_IDLE_TIMEOUT"
+
+	messageRetentionEnv   = "ABLY_SERVER_MESSAGE_RETENTION"
+	persistedRetentionEnv = "ABLY_SERVER_PERSISTED_RETENTION"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -158,6 +162,16 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	messageRetentionDefault, err := config.DefaultDuration(opts.Getenv(messageRetentionEnv), file.MessageRetention, postgres.DefaultMessageRetention)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	persistedRetentionDefault, err := config.DefaultDuration(opts.Getenv(persistedRetentionEnv), file.PersistedRetention, postgres.DefaultPersistedRetention)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -200,6 +214,8 @@ func Run(ctx context.Context, opts Opts) int {
 	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced (env: "+pgNotifyWindowEnv+")")
 	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
 	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks every bound channel against its committed serial and catches up one that fell behind; 0 means the bus default (postgres 2s, nats 5s) (env: "+busSweepEnv+")")
+	messageRetention := fs.Duration("message-retention", messageRetentionDefault, "cluster mode: how long a channel outside any persisted namespace keeps its message log, the continuity window (DESIGN.md §6.3) (env: "+messageRetentionEnv+")")
+	persistedRetention := fs.Duration("persisted-retention", persistedRetentionDefault, "cluster mode: how long a channel in a persisted namespace keeps its message log (DESIGN.md §6.3) (env: "+persistedRetentionEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -296,6 +312,11 @@ func Run(ctx context.Context, opts Opts) int {
 		notifyMaxPending: *pgNotifyMaxPending,
 		sweepInterval:    *busSweep,
 		logger:           logger,
+		retention: postgres.Retention{
+			Message:   *messageRetention,
+			Persisted: *persistedRetention,
+		},
+		persisted: persistedNamespaces(file.Namespaces),
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -317,6 +338,11 @@ func Run(ctx context.Context, opts Opts) int {
 		m.RegisterBus(bs) // ably_bus_* series (DESIGN.md §7.2, §10)
 	} else {
 		logger.Info("storage ready", "mode", *mode)
+	}
+	// Backends with their own series (the Postgres retention sweep,
+	// DESIGN.md §10) register them on the process registry.
+	if c, ok := store.(interface{ Collectors() []prometheus.Collector }); ok {
+		m.Register(c.Collectors()...)
 	}
 
 	manager := core.NewManagerWithOptions(store, core.Options{
@@ -527,10 +553,27 @@ func splitTrim(in []string) []string {
 	return out
 }
 
+// persistedNamespaces returns the retention-class resolver for the
+// Postgres backend (DESIGN.md §6.3, §9): a channel is persisted when the
+// namespace its name starts with (the part before the first ':') is a
+// [[namespaces]] entry with persisted = true.
+func persistedNamespaces(namespaces []config.Namespace) func(string) bool {
+	set := make(map[string]bool)
+	for _, ns := range namespaces {
+		if ns.Persisted && ns.ID != "" {
+			set[ns.ID] = true
+		}
+	}
+	return func(channel string) bool {
+		ns, _, ok := strings.Cut(channel, ":")
+		return ok && set[ns]
+	}
+}
+
 // fixtureSpec validates the config file's [[namespaces]] and [[channels]]
 // sections and builds the presence-fixture spec to seed at startup
-// (DESIGN.md §9, §12.5). Namespaces are validated but otherwise inert
-// (their flags are recorded, not acted on). A namespace with no id, a
+// (DESIGN.md §9, §12.5). Namespaces are only validated here; their
+// persisted flag is applied by persistedNamespaces. A namespace with no id, a
 // channel with no name, or a presence member with no clientId is a
 // malformed section and returns an error. Returns a nil spec when no
 // channels are declared.
@@ -729,6 +772,18 @@ type clusterOptions struct {
 	notifyMaxPending int
 	sweepInterval    time.Duration
 	logger           *logging.Logger
+	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
+	persisted        func(channel string) bool // persisted-namespace resolver
+}
+
+// options returns the postgres.Options every bus shares.
+func (c clusterOptions) options() postgres.Options {
+	return postgres.Options{
+		DSN:       c.dsn,
+		Logger:    c.logger,
+		Retention: c.retention,
+		Persisted: c.persisted,
+	}
 }
 
 func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptions) (storage.Storage, error) {
@@ -751,33 +806,29 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		case postgres.BusPGNotify:
 			// The default, opened exactly as before the bus seam: no bus
 			// settings apply.
-			return postgres.Open(ctx, postgres.Options{DSN: cluster.dsn})
+			return postgres.Open(ctx, cluster.options())
 		case postgres.BusPostgres:
 			mode, err := postgres.ParseNotifyMode(cluster.notifyMode)
 			if err != nil {
 				return nil, fmt.Errorf("invalid --postgres-notify-mode: %w", err)
 			}
-			return postgres.Open(ctx, postgres.Options{
-				DSN:              cluster.dsn,
-				Bus:              postgres.BusPostgres,
-				NotifyMode:       mode,
-				NotifyWindow:     cluster.notifyWindow,
-				NotifyMaxPending: cluster.notifyMaxPending,
-				SweepInterval:    cluster.sweepInterval,
-				Logger:           cluster.logger,
-			})
+			opts := cluster.options()
+			opts.Bus = postgres.BusPostgres
+			opts.NotifyMode = mode
+			opts.NotifyWindow = cluster.notifyWindow
+			opts.NotifyMaxPending = cluster.notifyMaxPending
+			opts.SweepInterval = cluster.sweepInterval
+			return postgres.Open(ctx, opts)
 		case postgres.BusNATS:
 			if cluster.natsURL == "" {
 				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
 			}
-			return postgres.Open(ctx, postgres.Options{
-				DSN:                cluster.dsn,
-				Bus:                postgres.BusNATS,
-				NATSURL:            cluster.natsURL,
-				NATSInlineMaxBytes: cluster.natsInlineMax,
-				SweepInterval:      cluster.sweepInterval,
-				Logger:             cluster.logger,
-			})
+			opts := cluster.options()
+			opts.Bus = postgres.BusNATS
+			opts.NATSURL = cluster.natsURL
+			opts.NATSInlineMaxBytes = cluster.natsInlineMax
+			opts.SweepInterval = cluster.sweepInterval
+			return postgres.Open(ctx, opts)
 		default:
 			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s, %s)", cluster.bus, postgres.BusPGNotify, postgres.BusPostgres, postgres.BusNATS)
 		}

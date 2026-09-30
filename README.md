@@ -132,7 +132,8 @@ docker compose up --build
 ```
 
 The nodes auto-migrate the empty database on boot (under a Postgres
-advisory lock), so there's no manual setup. Each node is reachable on its
+advisory lock), so there's no manual setup. Cluster mode needs
+PostgreSQL 14 or later. Each node is reachable on its
 own host port and all three share the key `app.key:secret`, so a
 client can attach to any of them:
 

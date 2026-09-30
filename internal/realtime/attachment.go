@@ -635,14 +635,25 @@ func (a *attachment) computeResumeReplay(anchor string) ([]*protocol.ChannelMess
 		return reverseAndNormalise(cms[:cut]), a.resumeFrom, true, nil
 	}
 
-	// Client cursor not matched. Two sub-cases:
+	// Client cursor not matched. Three sub-cases:
+	//   - the cursor predates the channel's retention floor → cms
+	//     between it and the oldest retained one may have aged out, so
+	//     continuity cannot be proven: attach at the live head with
+	//     RESUMED clear, an error, and no replay (DESIGN.md §4.3).
 	//   - returned cap+1 cms → cap exceeded
 	//   - returned <= cap cms → exhausted the backwards walk; storage
-	//     has nothing older. Without retention (not yet implemented),
-	//     that means we delivered the full history, RESUMED set.
-	//     The client's cursor is effectively older than everything
-	//     we have — common after a rewind that used the channel's
-	//     initial serial as its attach point.
+	//     has nothing older and nothing it held was dropped, so we
+	//     delivered the full history, RESUMED set. The client's cursor
+	//     is effectively older than everything we have — common after
+	//     a rewind that used the channel's initial serial as its attach
+	//     point.
+	if floor := a.channel.RetainedSince(time.Now()); floor != "" && a.resumeFrom < floor {
+		return nil, anchor, false, &protocol.ErrorInfo{
+			Message:    "unable to recover channel (messages expired): the resume point is older than the channel's retained history",
+			Code:       80016,
+			StatusCode: 404,
+		}
+	}
 	if len(cms) <= a.replayCap {
 		return reverseAndNormalise(cms), a.resumeFrom, true, nil
 	}
@@ -723,11 +734,18 @@ func (a *attachment) computeRewindReplay(anchor string) ([]*protocol.ChannelMess
 		} else if mode == rewindDuration {
 			capExceeded = true
 		}
-	} else {
+	} else if len(cms) > 0 {
 		// Rewind window covers everything we have; no predecessor in
 		// storage. Use the channel's immutable initial serial.
 		attachPoint = a.channel.InitialChannelSerial()
 		windowCms = cms
+	} else {
+		// Nothing retained at all: attach at the live head. The initial
+		// serial would be equivalent for a backend that keeps
+		// everything, but under retention (DESIGN.md §6.3) it is older
+		// than the retention floor, so the client's next resume from it
+		// would be refused as a discontinuity although nothing was lost.
+		attachPoint = anchor
 	}
 
 	var info *protocol.ErrorInfo

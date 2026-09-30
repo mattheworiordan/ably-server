@@ -134,6 +134,16 @@ func (m *Metrics) RegisterBus(src storage.BusStatser) {
 	m.registry.MustRegister(newBusCollector(src))
 }
 
+// Register adds further collectors to the registry, for components that
+// own their own series (the Postgres backend's ably_storage_* retention
+// series). A nil Metrics ignores the call.
+func (m *Metrics) Register(cs ...prometheus.Collector) {
+	if m == nil {
+		return
+	}
+	m.registry.MustRegister(cs...)
+}
+
 // Handler returns the HTTP handler that serves the registry in the
 // Prometheus text exposition format. Registered at /metrics on the debug
 // listener (--debug-listen), alongside pprof — not the main listener

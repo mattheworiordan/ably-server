@@ -293,6 +293,17 @@ func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.
 	return ch.store.History(ctx, q)
 }
 
+// RetainedSince returns the channel's retention floor as of now: the
+// serial prefix at or after which every persisted cm is still held, or ""
+// when the backend keeps everything (storage.RetentionBounded, DESIGN.md
+// §4.3, §6.3).
+func (c *Channel) RetainedSince(now time.Time) string {
+	if rb, ok := c.store.(storage.RetentionBounded); ok {
+		return rb.RetainedSince(now)
+	}
+	return ""
+}
+
 // Members returns the channel's current presence set plus the
 // channelSerial the set is current as-of, delegating to the storage
 // backend. Backs presence sync on attach (DESIGN.md §12.4).

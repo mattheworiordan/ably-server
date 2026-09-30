@@ -443,3 +443,46 @@ func TestRunLifecycleAndConnFlagValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestPersistedNamespaces(t *testing.T) {
+	persisted := persistedNamespaces([]config.Namespace{
+		{ID: "persisted", Persisted: true},
+		{ID: "ephemeral"},
+	})
+	for name, want := range map[string]bool{
+		"persisted:room":       true,
+		"persisted:a:b":        true,
+		"ephemeral:room":       false,
+		"persisted":            false, // no namespace separator: the default namespace
+		"other:room":           false,
+		"persistedx:room":      false,
+		"persisted:presence_x": true,
+	} {
+		if got := persisted(name); got != want {
+			t.Errorf("persisted(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestRunRetentionMalformedIsStartupError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		file string
+	}{
+		{name: "env message", env: map[string]string{messageRetentionEnv: "soon"}},
+		{name: "file persisted", file: `persisted-retention = "a day"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"--keys=app.key:secret"}
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != 1 || !strings.Contains(out.String(), "invalid duration") {
+				t.Errorf("exit = %d, output %q; want 1 and an invalid duration error", code, out.String())
+			}
+		})
+	}
+}

@@ -618,9 +618,15 @@ Continuity instead lives at the attachment level, driven by the client:
   messages are no longer held in storage — see the retention note in §6)
   the server still attaches: it picks the channel's current head as the attach
   point, clears `ATTACHED.flags.RESUMED`, and populates `ATTACHED.error`
-  with an `ErrorInfo` explaining that the requested resume could not be
-  satisfied so the SDK can surface a discontinuity to the application. No
-  replay is delivered in this case.
+  with an `ErrorInfo` (code 80016, "unable to recover channel (messages
+  expired)") explaining that the requested resume could not be satisfied
+  so the SDK can surface a discontinuity to the application. No replay is
+  delivered in this case. "Older than retained history" is decided by
+  time, not by what happens to be left in storage: a cursor whose mint
+  time is before now minus the channel's retention (§6.3) cannot be proven
+  continuous, because cms between it and the oldest retained one may have
+  been dropped. Backends that do not enforce retention (memory, disk)
+  never take this path.
 
 `rewind` is the only honoured channel param. `rewind=N` (positive integer)
 selects an attach point N messages before the live head; `rewind=<duration>`
@@ -943,12 +949,13 @@ read goroutine, calling into `ChannelManager` to get/release a Channel.
 
 ## 6. Storage
 
-> **Open design question — retention.** This section describes a
-> retention *mechanism* (a serial-ordered sweep bounded by a message TTL and
-> a per-channel `max_messages` cap), but the *policy* it enforces is not yet
-> settled: the default TTL value, the cap, and whether operators can
-> override either are still being decided. References elsewhere to "the
-> retention window" or messages "aging out" point back here.
+> **Retention.** The Postgres backend (cluster mode) enforces retention:
+> a channel keeps its log for the continuity window (`--message-retention`,
+> default 2 minutes) unless its namespace is persisted, in which case it
+> keeps it for `--persisted-retention` (default 24 hours). The mechanism is
+> partition drop, described in §6.3. The memory and disk backends do not
+> yet enforce retention. References elsewhere to "the retention window" or
+> messages "aging out" mean the channel's retention class in §6.3.
 
 The storage interface has two facets: a process-wide `Storage` that
 hands out per-channel `ChannelStore`s and owns any shared resources
@@ -1051,7 +1058,7 @@ Layout — channel-scoped buckets via composite keys:
   order, mirroring the Postgres backend's PK range scan.
 - `ids`: keyed `<channel>\0<Message.id>`, value is the channelSerial
   the id landed in. bbolt has no secondary indexes, so this is the
-  manual equivalent of Postgres's partial UNIQUE idempotency index.
+  manual equivalent of Postgres's idempotency index.
   Entries are dropped by the same sweep that trims `channel_messages`
   past TTL — idempotency is bounded by message retention.
 - `versions` and `messages` (mutable messages, §13): the bbolt analogue
@@ -1086,7 +1093,7 @@ live tail is a bounded history range scan.
 
 ### 6.3 Database backend (cluster mode)
 
-Postgres only. With the `pgnotify` or `postgres` bus (§7.2), LISTEN/NOTIFY
+Postgres only, version 14 or later. With the `pgnotify` or `postgres` bus (§7.2), LISTEN/NOTIFY
 gives us pub/sub and the same database serves as the durable store, so
 cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
 a NATS server or cluster for delivery; Postgres stays the store.
@@ -1110,13 +1117,15 @@ CREATE TABLE channel_messages (
   kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14)
   message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
   payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
-  PRIMARY KEY (channel, channel_serial, idx)
-);
+  persisted      BOOLEAN  NOT NULL DEFAULT FALSE,  -- retention class, the level-1 partition key (see Retention)
+  PRIMARY KEY (channel, channel_serial, idx, persisted)
+) PARTITION BY LIST (persisted);  -- each class then PARTITION BY RANGE (channel_serial)
 
--- Idempotency: a non-NULL client-supplied id is unique per channel
--- within the retention window. The partial index skips NULL ids so
--- publishes without an id never collide.
-CREATE UNIQUE INDEX channel_messages_idempotency_idx
+-- Idempotency lookup: a non-NULL client-supplied id is unique per
+-- channel within the channel's retention. A partitioned table cannot
+-- carry a UNIQUE index without the partition key, so this is a plain
+-- index and the channels-row lock is the arbiter (see below).
+CREATE INDEX channel_messages_id_idx
   ON channel_messages (channel, id) WHERE id IS NOT NULL;
 
 -- serial → versions: every version of a message in version order, backing
@@ -1159,6 +1168,12 @@ CREATE TABLE presence (
 );
 ```
 
+The sketch abbreviates partitioning. In the shipped schema (migration
+`0002_partitioned_log`) `channel_messages` and `messages` each carry the
+`persisted` column and are partitioned on two levels, described under
+"Retention" below; `messages` is ranged on `message_serial` and its key
+is `(channel, message_serial, persisted)`.
+
 Reads over the log (`channel_messages`) add `kind = 'message'` (or
 `'presence'`) to the predicates above. Collapsed message history reads the
 materialised `messages` table ordered by `create_serial`; a version scan
@@ -1188,7 +1203,18 @@ and is applied at `postgres.Open` by an auto-migrate sweep:
 The mechanism is forward-only, hand-rolled (no migration library),
 and matches what a load balancer rolling-restart of N nodes against
 the same Postgres needs: every restart is a no-op except the one
-that introduces a new migration file.
+that introduces a new migration file. A migration that loses a
+deadlock or a lock wait against nodes still on the old version is
+retried (up to five attempts).
+
+`0002_partitioned_log` is the exception to a cheap rolling upgrade. It
+locks both tables, attaches the existing log as one leaf (a scan and a
+primary-key build in proportion to its size), and changes what the
+old version writes to: until every node runs the new version, old nodes
+write channels of persisted namespaces into the live class, where those
+rows age out on the continuity window. Rows written before the upgrade
+also land in the live class, so a persisted namespace's history from
+before the upgrade is kept only for the continuity window.
 
 Per-publish writes run inside one transaction that first locks the
 channel's row in `channels` (`advance_channel_serial` mints the next
@@ -1201,24 +1227,88 @@ original cm and rolls the transaction back, so it does not burn a serial. Each n
 serial format itself (the `@seriesId` suffix) disambiguates concurrent
 mints, so generator state is not shared across nodes.
 
-Retention is a periodic background job that deletes the oldest log rows
-on each channel using the channelSerial range — the first 14 characters
-are the zero-padded mint timestamp in ms, so lex comparison matches
-numeric comparison:
+**Retention.** The two tables that grow with every publish,
+`channel_messages` and `messages`, are partitioned so that retention is a
+partition drop, not a row-by-row DELETE:
 
-```sql
-DELETE FROM channel_messages
-WHERE channel = $1
-  AND channel_serial < lpad(((now_ms - ttl_ms))::text, 14, '0');
-```
+- **Level 1, `LIST (persisted)`: the retention class.** `persisted = FALSE`
+  (the `_live` partitions) holds channels outside any persisted namespace;
+  they keep the continuity window, `--message-retention`, default 2
+  minutes, which is the period a client can resume across (§4.3).
+  `persisted = TRUE` (the `_persisted` partitions) holds channels whose
+  namespace is a `[[namespaces]]` entry with `persisted = true` (§9); they
+  keep `--persisted-retention`, default 24 hours. A channel's namespace is
+  the part of its name before the first `:`.
+- **Level 2, `RANGE` on the serial: time.** `channel_messages` is ranged on
+  `channel_serial` and `messages` on `message_serial` (the create's
+  serial). A serial starts with its 14-digit zero-padded mint time in ms
+  (§8), so a serial range is a time range and the bounds are plain digit
+  strings, for example `FROM ('01727700000000') TO ('01727700060000')`.
+  Each leaf covers one width: half the class's retention, clamped to
+  between 1 minute and 1 hour (1 minute for the continuity window, 1 hour
+  for 24 hours). While sweeps succeed, a row lives for at most its
+  retention plus one width plus one sweep interval.
 
-A per-channel cap (counted in ChannelMessages = `DISTINCT
-channel_serial`) is applied in the same sweep.
+Every node runs a maintenance sweep at `Open` (before it serves) and then
+every half leaf width (30 s by default). It reads the time from the
+database's clock, the same clock that mints serials, so a node with a
+skewed clock cannot drop a leaf still being written. Then:
 
-The intended default message TTL is **2 minutes**, matching Ably cloud's
-default. The TTL value, the per-channel message cap, and whether operators
-can override either are still being decided (see the retention note at the
-top of §6).
+1. **Create ahead.** Under a transaction-scoped advisory lock, it creates
+   every missing leaf from the current slot to at least an hour (and at
+   least two widths) ahead, in both classes of both tables, filling any
+   gap. A leaf is created as a standalone table and then attached, which
+   takes only a `SHARE UPDATE EXCLUSIVE` lock on the parent, so creation
+   does not block publishes. A publish whose serial had no leaf would
+   fail, so a failure here fails `Open`; in the loop it is logged and
+   retried, and the hour of lookahead is the margin for sweeps failing.
+2. **Drop expired.** For every leaf whose whole range ends at or before
+   now minus its class's retention, it runs `ALTER TABLE ... DETACH
+   PARTITION ... CONCURRENTLY` and then `DROP TABLE`. The concurrent detach
+   waits for older snapshots instead of locking out new ones, so a drop
+   does not stall publishes; each detach is bounded to 30 seconds, and one
+   cut short is finished with `DETACH ... FINALIZE` on a later sweep. A
+   detached leaf whose `DROP` failed is found again by name and dropped.
+   Only one node drops at a time (a session advisory lock, tried rather
+   than waited for), and the drop lock is separate from the creation
+   lock, so a slow drop never holds up creation. `Open` creates but does
+   not drop.
+
+A resume whose cursor was minted before now minus the channel's retention
+is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
+by its offset from the database clock (measured at every sweep) plus one
+second, so small clock errors err towards refusing. For a persisted
+channel the floor is also at least the bound of the legacy leaf a
+migrated log became (recorded in `retention_state`), because those rows
+sit in the live class.
+
+The idempotency lookup is bounded to serials from the channel's
+retention floor up to the serial being written (every stored cm of the
+channel sorts below it), so it reads only the leaves in that range and a
+channel is idempotent within its own retention. It spans both classes, so
+rows left in the other class by the migration or by a namespace change
+still dedupe. A mutation, annotation or version read
+whose target has aged out finds no row and gets `ErrTargetNotFound` (§13.2):
+the projection row goes with the leaf that holds the message's create
+serial. The `presence` table and the `channels` table are not partitioned:
+presence rows are bounded by live membership (§12.5), and a `channels` row
+is one small row per channel ever used.
+
+Every node must run with the same retention settings, since whichever node
+sweeps applies its own. Changing a channel's class (editing a namespace's
+`persisted` flag) applies to new writes; rows already written age out with
+the class they were written in.
+
+A database created before migration `0002_partitioned_log` keeps its rows:
+a non-empty old table becomes one leaf of the live class covering
+everything up to a minute past the migration, and ages out on the
+continuity window.
+
+Series (§10): `ably_storage_partitions_created_total{table}`,
+`ably_storage_partitions_dropped_total{table}`,
+`ably_storage_retention_errors_total`, and the gauges
+`ably_storage_log_bytes{table}` (heap, indexes and TOAST of every leaf) and
+`ably_storage_log_partitions{table}`, as of the node's last sweep.
 
 ## 7. Pub/Sub
 
@@ -1681,6 +1771,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --ws-read-buffer-size 1024    per-connection WebSocket read buffer, bytes (§5.2)
 --ws-write-buffer-size 4096   pooled WebSocket write buffer, bytes (§5.2)
 --http-idle-timeout 120s      how long an idle HTTP keep-alive connection is kept open (§2.2)
+--message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
+--persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -1697,10 +1789,11 @@ Configuration may also be supplied via an optional TOML config file
 `postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
-`ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout` —
-`shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
-`channel-idle-timeout`, `conn-write-timeout` and `http-idle-timeout` as
-duration strings, e.g. `"10s"`, the sizes as integers). API keys are
+`ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
+`message-retention`, `persisted-retention` — `shutdown-grace`,
+`postgres-notify-window`, `bus-sweep-interval`, `channel-idle-timeout`,
+`conn-write-timeout`, `http-idle-timeout` and the retentions as duration
+strings, e.g. `"10s"`, the sizes as integers). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
@@ -1726,10 +1819,11 @@ the server boots with is visible in one file, structured like the Ably
 that JSON into this config rather than the server parsing it):
 
 - `[[namespaces]]` — a namespace `id` plus the `persisted`,
-  `mutableMessages`, and `pushEnabled` feature flags. These are **parsed
-  and recorded but behaviourally inert**: no behaviour keys off them yet;
-  they exist so a provisioner can round-trip the full app shape. A
-  namespace with no `id` is a startup error.
+  `mutableMessages`, and `pushEnabled` feature flags. `persisted` selects
+  the retention class of the namespace's channels in cluster mode (§6.3).
+  `mutableMessages` and `pushEnabled` are **parsed and recorded but
+  behaviourally inert**; they exist so a provisioner can round-trip the
+  full app shape. A namespace with no `id` is a startup error.
 - `[[channels]]` — a channel `name` plus nested `[[channels.presence]]`
   member entries (`clientId`, `data`, `encoding`). At startup, before the
   listener opens, each member is entered through the normal
@@ -1794,6 +1888,12 @@ name = "persisted:presence_fixtures"
     disconnected for not reading fast enough: `queue_full` (the outbound
     queue stayed at its bound for the write timeout) or `write_timeout` (a
     socket write missed its deadline) (§5.2).
+  - Cluster mode only, from the retention sweep (§6.3):
+    `ably_storage_partitions_created_total{table}`,
+    `ably_storage_partitions_dropped_total{table}`,
+    `ably_storage_retention_errors_total` (counters) and
+    `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
+    (gauges). `table` is `channel_messages` or `messages`.
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres

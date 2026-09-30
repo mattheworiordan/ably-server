@@ -32,6 +32,10 @@
 // chain.go: each cm carries its predecessor serial, the publishing node
 // delivers its own cm straight after commit, and gaps are filled from
 // the log.
+//
+// The log and the latest-version projection are partitioned by
+// retention class and then by serial range; retention.go creates leaf
+// partitions ahead of time and drops expired ones (DESIGN.md §6.3).
 package postgres
 
 import (
@@ -42,11 +46,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/ably/ably-server/internal/logging"
@@ -165,6 +172,15 @@ type Options struct {
 	// the bus's default: DefaultPostgresSweepInterval or
 	// DefaultNATSSweepInterval.
 	SweepInterval time.Duration
+
+	// Retention configures how long the message log keeps each class of
+	// channel (DESIGN.md §6.3). The zero value applies the defaults.
+	Retention Retention
+
+	// Persisted reports whether a channel belongs to a persisted
+	// namespace, and so keeps Retention.Persisted rather than the
+	// continuity window. Nil means no channel is persisted.
+	Persisted func(channel string) bool
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
@@ -175,6 +191,17 @@ type Storage struct {
 	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
 	namespace string // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
 	logger    *logging.Logger
+
+	retention Retention                 // resolved retention settings (§6.3)
+	persisted func(channel string) bool // retention class of a channel
+	metrics   *retentionMetrics
+	// clockOffset is the database clock minus this node's, in ms, as of
+	// the last sweep; RetainedSince applies it (§4.3).
+	clockOffset atomic.Int64
+	// legacyBound is the upper bound of the live-class leaf a migrated
+	// pre-partitioning log became (retention_state), or "" when there was
+	// none. Persisted channels' rows from before it sit in the live class.
+	legacyBound string
 
 	busKind    string // BusPGNotify, BusPostgres or BusNATS
 	notifyMode string // the BusPostgres notify mode, "" for the other buses
@@ -228,6 +255,15 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: ping: %w", err)
 	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&version); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: read server version: %w", err)
+	}
+	if version < minPostgresVersion {
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: PostgreSQL %d is too old: the partitioned message log needs 14 or later", version)
+	}
 	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
@@ -238,6 +274,10 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		logger = logging.Default()
 	}
 
+	persisted := opts.Persisted
+	if persisted == nil {
+		persisted = func(string) bool { return false }
+	}
 	loopCtx, cancel := context.WithCancel(context.Background())
 	s := &Storage{
 		pool:          pool,
@@ -251,6 +291,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		reconnectMax:  listenReconnectMaxDelay,
 		sweepInterval: opts.SweepInterval,
 		timing:        currentChainTiming(),
+		retention:     opts.Retention.resolve(),
+		persisted:     persisted,
+		metrics:       newRetentionMetrics(),
 		channels:      make(map[string]*channelStore),
 		reconcileCh:   make(chan struct{}, 1),
 		loopCtx:       loopCtx,
@@ -261,6 +304,14 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		cancel()
 		pool.Close()
 		return nil, err
+	}
+
+	// Create the leaf partitions publishes will land in before any
+	// publish can run (DESIGN.md §6.3); the retention loop keeps them
+	// ahead and drops expired ones. Open does not drop, so a slow drop
+	// never delays startup.
+	if err := s.preparePartitions(ctx); err != nil {
+		return fail(fmt.Errorf("storage/postgres: prepare log partitions: %w", err))
 	}
 
 	if busKind != BusPGNotify {
@@ -308,9 +359,10 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		s.bus = b
 	}
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.presenceLeaseBumpLoop(loopCtx)
 	go s.presenceReaperLoop(loopCtx)
+	go s.retentionLoop(loopCtx)
 	s.bus.start(loopCtx)
 	return s, nil
 }
@@ -429,6 +481,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 	if appender != nil {
 		cs.ready = make(chan struct{})
 	}
+	s.setRetention(cs)
 	return cs
 }
 
@@ -468,6 +521,13 @@ func (s *Storage) Close() error {
 		s.pool.Close()
 	})
 	return nil
+}
+
+// Collectors returns the backend's Prometheus collectors (the
+// ably_storage_* retention series, DESIGN.md §10), for registration on
+// the process registry.
+func (s *Storage) Collectors() []prometheus.Collector {
+	return s.metrics.collectors()
 }
 
 // Ping reports whether the node can serve cluster traffic: the Postgres
@@ -748,7 +808,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if _, ok := applied[m.version]; ok {
 			continue
 		}
-		if err := applyMigration(ctx, conn, m); err != nil {
+		if err := applyMigrationWithRetry(ctx, conn, m); err != nil {
 			return fmt.Errorf("apply %s: %w", m.version, err)
 		}
 	}
@@ -791,6 +851,36 @@ func listMigrations() ([]migration, error) {
 	return out, nil
 }
 
+// migrationRetryDelay is the pause between attempts of a migration that
+// lost a deadlock or a lock wait.
+var migrationRetryDelay = 250 * time.Millisecond
+
+// applyMigrationWithRetry retries a migration that failed on a deadlock
+// or a lock timeout: a migration that restructures tables in use by
+// nodes still running the old version can lose the deadlock detector's
+// choice, and the whole transaction rolls back, so a retry is safe.
+func applyMigrationWithRetry(ctx context.Context, conn *pgxpool.Conn, m migration) error {
+	const attempts = 5
+	var err error
+	for i := range attempts {
+		if err = applyMigration(ctx, conn, m); err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || (pgErr.Code != "40P01" && pgErr.Code != "55P03") {
+			return err
+		}
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(migrationRetryDelay):
+			}
+		}
+	}
+	return err
+}
+
 // applyMigration runs a single migration's SQL and records the
 // schema_migrations row in the same transaction.
 func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error {
@@ -831,6 +921,17 @@ type channelStore struct {
 	timing   chainTiming
 	stats    *busStats // the owning Storage's bus counters (nil in unit tests)
 	pgChan   string    // the postgres bus's notification channel (pgChannelName)
+
+	// persisted selects the channel's retention class: the value of the
+	// persisted partition key on every row it writes (DESIGN.md §6.3).
+	// retention is that class's retention; clock is the storage's
+	// database clock offset; floorMin raises a persisted channel's
+	// retention floor over rows a migration left in the live class. All
+	// feed RetainedSince and the idempotency window.
+	persisted bool
+	retention time.Duration
+	clock     *atomic.Int64
+	floorMin  string
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the
@@ -980,7 +1081,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	if err != nil {
 		return nil, false, err
 	}
-	if original, err := cs.findIdempotent(ctx, tx, nonEmptyIDs(msgs)); err != nil || original != nil {
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyIDs(msgs), channelSerial); err != nil || original != nil {
 		return original, original != nil, err
 	}
 
@@ -1008,16 +1109,16 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 			idArg = m.ID
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
-			 VALUES ($1, $2, $3, $4, 'message', $5, $6)`,
-			cs.name, channelSerial, i, idArg, payload, m.Serial,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, persisted)
+			 VALUES ($1, $2, $3, $4, 'message', $5, $6, $7)`,
+			cs.name, channelSerial, i, idArg, payload, m.Serial, cs.persisted,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert message %d: %w", i, err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO messages (channel, message_serial, payload, deleted)
-			 VALUES ($1, $2, $3, FALSE)`,
-			cs.name, m.Serial, payload,
+			`INSERT INTO messages (channel, message_serial, payload, deleted, persisted)
+			 VALUES ($1, $2, $3, FALSE, $4)`,
+			cs.name, m.Serial, payload, cs.persisted,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert projection %d: %w", i, err)
 		}
@@ -1064,7 +1165,7 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	if err != nil {
 		return nil, false, err
 	}
-	if original, err := cs.findIdempotent(ctx, tx, mutIDs); err != nil || original != nil {
+	if original, err := cs.findIdempotent(ctx, tx, mutIDs, channelSerial); err != nil || original != nil {
 		return original, original != nil, err
 	}
 
@@ -1100,9 +1201,9 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	// is_append marks appends so the versions read collapses their runs
 	// to the aggregate (DESIGN.md §13.3); the log row itself is retained.
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, is_append)
-		 VALUES ($1, $2, 0, $3, 'message', $4, $5, $6)`,
-		cs.name, channelSerial, idArg, payload, mut.Serial, mut.Action == protocol.MessageAppend,
+		`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, is_append, persisted)
+		 VALUES ($1, $2, 0, $3, 'message', $4, $5, $6, $7)`,
+		cs.name, channelSerial, idArg, payload, mut.Serial, mut.Action == protocol.MessageAppend, cs.persisted,
 	); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: insert version: %w", err)
 	}
@@ -1254,7 +1355,7 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	if err != nil {
 		return nil, false, err
 	}
-	if original, err := cs.findIdempotent(ctx, tx, nonEmptyPresenceIDs(presence)); err != nil || original != nil {
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyPresenceIDs(presence), channelSerial); err != nil || original != nil {
 		return original, original != nil, err
 	}
 
@@ -1275,9 +1376,9 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 			idArg = p.ID
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload)
-			 VALUES ($1, $2, $3, $4, 'presence', $5)`,
-			cs.name, channelSerial, i, idArg, payload,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, persisted)
+			 VALUES ($1, $2, $3, $4, 'presence', $5, $6)`,
+			cs.name, channelSerial, i, idArg, payload, cs.persisted,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert presence %d: %w", i, err)
 		}
@@ -1364,7 +1465,7 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	if err != nil {
 		return nil, false, err
 	}
-	if original, err := cs.findIdempotent(ctx, tx, nonEmptyAnnotationIDs(annotations)); err != nil || original != nil {
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyAnnotationIDs(annotations), channelSerial); err != nil || original != nil {
 		return original, original != nil, err
 	}
 
@@ -1415,9 +1516,9 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		// channel_messages_serial_idx serves the annotations-for-message
 		// scan (DESIGN.md §14.4).
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, summary)
-			 VALUES ($1, $2, $3, $4, 'annotation', $5, $6, $7)`,
-			cs.name, channelSerial, i, idArg, payload, a.MessageSerial, summaryBlob,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, summary, persisted)
+			 VALUES ($1, $2, $3, $4, 'annotation', $5, $6, $7, $8)`,
+			cs.name, channelSerial, i, idArg, payload, a.MessageSerial, summaryBlob, cs.persisted,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert annotation %d: %w", i, err)
 		}
@@ -1894,15 +1995,21 @@ func nonEmptyAnnotationIDs(annotations []*protocol.Annotation) []string {
 // It must run after the caller has locked the channels row (via
 // advanceSerial) in tx: that lock, not an index, is what makes the check
 // race-free, because every writer of this channel queues on it.
-func (cs *channelStore) findIdempotent(ctx context.Context, tx pgx.Tx, ids []string) (*protocol.ChannelMessage, error) {
+// The lookup is bounded to serials from the channel's retention floor up
+// to before (the serial this publish was just given; every stored cm of
+// the channel sorts below it), so it touches only the leaves in that
+// range: a channel is idempotent within its own retention (§6.3). It
+// spans both retention classes, so rows left in the other class by a
+// migration or a namespace change still dedupe.
+func (cs *channelStore) findIdempotent(ctx context.Context, tx pgx.Tx, ids []string, before string) (*protocol.ChannelMessage, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 	var existingCS string
 	err := tx.QueryRow(ctx,
 		`SELECT channel_serial FROM channel_messages
-		 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
-		cs.name, ids).Scan(&existingCS)
+		 WHERE channel = $1 AND id = ANY($2) AND channel_serial >= $3 AND channel_serial < $4 LIMIT 1`,
+		cs.name, ids, cs.idempotencyFloor(), before).Scan(&existingCS)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return nil, nil

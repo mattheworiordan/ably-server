@@ -21,6 +21,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
@@ -112,6 +113,19 @@ type Storage interface {
 	// Close, behaviour of ChannelStores previously handed out is
 	// undefined.
 	Close() error
+}
+
+// RetentionBounded is implemented by a ChannelStore whose backend drops
+// history older than a retention window (the Postgres backend, DESIGN.md
+// §6.3). RetainedSince returns a serial prefix such that, as of now,
+// every cm persisted on the channel with a serial at or after it is still
+// held; anything older may have aged out. Serials compare lexically and
+// start with their mint time, so the prefix is the retention floor's
+// 14-digit ms timestamp. A resume from a cursor older than it cannot be
+// proven continuous (§4.3). Backends that keep everything do not
+// implement it.
+type RetentionBounded interface {
+	RetainedSince(now time.Time) string
 }
 
 // Pinger is implemented by backends with an external dependency worth

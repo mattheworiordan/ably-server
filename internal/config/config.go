@@ -51,6 +51,11 @@ type File struct {
 	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
 	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`
 	BusSweepInterval         string `toml:"bus-sweep-interval"`
+	// MessageRetention and PersistedRetention are duration strings (e.g.
+	// "2m", "24h") for the cluster-mode message log's retention classes
+	// (DESIGN.md §6.3, §9).
+	MessageRetention   string `toml:"message-retention"`
+	PersistedRetention string `toml:"persisted-retention"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual
@@ -70,9 +75,9 @@ type File struct {
 	// (DESIGN.md §2.2, §9).
 	HTTPIdleTimeout string `toml:"http-idle-timeout"`
 	// Namespaces are [[namespaces]] entries mirroring the test-app-setup
-	// post_apps shape (DESIGN.md §9, §12.5). They are parsed and retained
-	// but behaviourally inert: the feature flags are recorded, not acted
-	// on. They exist so the whole startup state lives in one config file.
+	// post_apps shape (DESIGN.md §9, §12.5). persisted selects the
+	// cluster-mode retention class of the namespace's channels (§6.3);
+	// the other flags are recorded but inert.
 	Namespaces []Namespace `toml:"namespaces"`
 	// Channels are [[channels]] entries whose nested presence members are
 	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
@@ -91,8 +96,8 @@ type KeyEntry struct {
 
 // Namespace is one [[namespaces]] entry (DESIGN.md §9, §12.5): a
 // namespace id plus feature flags mirroring test-app-setup's post_apps
-// shape. The flags are recorded but inert — no behaviour keys off them
-// yet.
+// shape. Persisted selects the retention class in cluster mode (§6.3);
+// MutableMessages and PushEnabled are recorded but inert.
 type Namespace struct {
 	ID              string `toml:"id"`
 	Persisted       bool   `toml:"persisted"`

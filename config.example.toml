@@ -69,6 +69,16 @@
 # for nats (env: ABLY_SERVER_BUS_SWEEP_INTERVAL).
 # bus-sweep-interval = "0s"
 
+# Cluster mode: how long a channel outside any persisted namespace keeps
+# its message log, the continuity window a client can resume across
+# (env: ABLY_SERVER_MESSAGE_RETENTION).
+# message-retention = "2m"
+
+# Cluster mode: how long a channel in a persisted namespace (see
+# [[namespaces]] below) keeps its message log
+# (env: ABLY_SERVER_PERSISTED_RETENTION).
+# persisted-retention = "24h"
+
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
 # shutdown-grace = "10s"
@@ -128,8 +138,10 @@
 # capability = '{"chat:*":["subscribe"]}'
 
 # [[namespaces]] entries mirror the Ably test-app-setup post_apps shape:
-# a namespace `id` plus feature flags. These are parsed and recorded but
-# behaviourally inert today — no behaviour keys off them yet.
+# a namespace `id` plus feature flags. In cluster mode `persisted = true`
+# gives the namespace's channels (names starting "<id>:") the
+# persisted-retention above instead of the continuity window. The other
+# flags are parsed and recorded but inert.
 #
 # [[namespaces]]
 # id = "persisted"
