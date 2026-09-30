@@ -98,6 +98,14 @@ SSH_PRIVATE_KEY_PATH="${SSH_PRIVATE_KEY_PATH%.pub}"
 : "${ECR_REGISTRY:=${AWS_ACCOUNT_ID:-}.dkr.ecr.${AWS_REGION:-}.amazonaws.com}"
 export ACTIVE_STATE
 
+# Ably internal: mint credentials from ablyctl when none are set. Skipped in a
+# dry run and when NO_AWS=1 (local image builds).
+if [ -f "$BENCH_AWS_DIR/ably-internal.sh" ]; then
+  # shellcheck source=ably-internal.sh
+  source "$BENCH_AWS_DIR/ably-internal.sh"
+  if ! is_dry && [ "${NO_AWS:-0}" != 1 ]; then ensure_credentials; fi
+fi
+
 # ---------------------------------------------------------------- logging
 
 log() { printf '%s [%s] %s\n' "$(date -u +%H:%M:%S)" "$SCRIPT_NAME" "$(_mask "$*")" >&2; }
@@ -210,6 +218,33 @@ aws_r() {
   printf '%s\n' "$out"
 }
 
+# aws_probe <allowed-regex> <args...>: a harmless call used to learn whether
+# an action is permitted. Prints ALLOWED, DENIED or UNKNOWN. A call that
+# succeeds, or fails with a message matching <allowed-regex> (a dry-run
+# marker or a parameter validation error, which AWS reports only after the
+# authorisation check passed), counts as ALLOWED. In a dry run it prints the
+# call and reports ALLOWED.
+aws_probe() {
+  local ok=$1 out rc=0
+  shift
+  if is_dry; then
+    _ext "" aws "$@" --region "$AWS_REGION"
+    echo ALLOWED
+    return 0
+  fi
+  out=$(aws "$@" --region "$AWS_REGION" 2>&1) || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo ALLOWED
+  elif printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|AuthorizationError|explicit deny|is not permitted'; then
+    echo DENIED
+  elif printf '%s' "$out" | grep -Eq "$ok"; then
+    echo ALLOWED
+  else
+    printf '%s\n' "$out" | head -3 >&2
+    echo UNKNOWN
+  fi
+}
+
 # aws_w_tolerate <stderr-pattern> <fake> args...: a write that may already
 # be in place; an error matching the pattern is logged and ignored.
 aws_w_tolerate() {
@@ -318,6 +353,11 @@ state_put_instance() {
 }
 
 # ---------------------------------------------------------------- misc
+
+# date_ago <days>: a UTC date (YYYY-MM-DD), GNU or BSD date.
+date_ago() {
+  date -u -d "$1 days ago" +%Y-%m-%d 2>/dev/null || date -u -v-"$1"d +%Y-%m-%d
+}
 
 # parse_duration 90m -> 5400. Plain numbers are seconds.
 parse_duration() {

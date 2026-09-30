@@ -87,6 +87,31 @@ cost_checkpoint
 check "accrual adds one hour" 3.0000 "$(state_get '.budget.accrued_usd' | awk '{printf "%.4f", $1}')"
 check "checkpoint sets new rate" 4.2140 "$(state_get '.budget.rate_usd_h' | awk '{printf "%.4f", $1}')"
 
+# ablyctl credential helper (fake ablyctl on PATH; never the real one)
+mkdir "$tmp/fakebin"
+cat >"$tmp/fakebin/ablyctl" <<'FAKE'
+#!/bin/sh
+[ "$FAKE_ABLYCTL_FAIL" = 1 ] && exit 3
+echo "export AWS_ACCESS_KEY_ID=AKIAFAKE_$(echo "$*" | tr " " "_")"
+echo "export AWS_SECRET_ACCESS_KEY=fake"
+echo "export AWS_SESSION_TOKEN=fake"
+FAKE
+chmod +x "$tmp/fakebin/ablyctl"
+minted=$( (
+  unset AWS_ACCESS_KEY_ID AWS_PROFILE
+  PATH="$tmp/fakebin:$PATH" FAKE_ABLYCTL_FAIL=0 ensure_credentials
+  echo "$AWS_ACCESS_KEY_ID"
+) )
+check "ablyctl default account and role" "AKIAFAKE_aws_env_--account_dev_--aws-role_Operator" "$minted"
+minted=$( (
+  unset AWS_ACCESS_KEY_ID AWS_PROFILE
+  PATH="$tmp/fakebin:$PATH" ABLYCTL_ACCOUNT=acct AWS_SSO_ROLE=Other ensure_credentials
+  echo "$AWS_ACCESS_KEY_ID"
+) )
+check "ablyctl account and role overridable" "AKIAFAKE_aws_env_--account_acct_--aws-role_Other" "$minted"
+check "existing credentials are kept" keep "$( (export AWS_ACCESS_KEY_ID=keep; PATH="$tmp/fakebin:$PATH" ensure_credentials; echo "$AWS_ACCESS_KEY_ID") )"
+check "ablyctl failure exits non-zero" bad "$( (unset AWS_ACCESS_KEY_ID AWS_PROFILE; PATH="$tmp/fakebin:$PATH" FAKE_ABLYCTL_FAIL=1 ensure_credentials 2>/dev/null) || echo bad)"
+
 if [ "$fails" -gt 0 ]; then
   echo "$fails check(s) failed" >&2
   exit 1

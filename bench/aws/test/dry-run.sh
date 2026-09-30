@@ -27,12 +27,12 @@ export DRY_RUN=1 DRY_STATE_FILE="$tmp/state.json"
 export AWS_ACCOUNT_ID=111111111111 AWS_REGION=test-region-1 PROJECT_TAG=test-scale
 export ADMIN_CIDR=203.0.113.9/32 SSH_PUBLIC_KEY_PATH="$tmp/bench.pub" ALARM_EMAIL=ops@example.invalid
 export RDS_PASSWORD=Secretpassword0123456789 RUN_TIME_LIMIT=45m
-export NODE_COUNT=2 LOADGEN_COUNT=1 PUBLISHER_COUNT=1 SHARDS=1 BUS=nats SERVER_TAG=abc1234 LOADGEN_TAG=abc1234
+export NODE_COUNT=2 LOADGEN_COUNT=1 PUBLISHER_COUNT=1 SHARDS=1 BUS=nats IMAGE_TAG=testtag ALLOW_DIRTY=1
 export LOG_FILE="$tmp/LOG.md" RESULTS_DIR="$tmp/results"
 export KEEP_WORK_DIR=0 SKIP_BOOT_WAIT=0
 : >"$tmp/bench.pub"
 
-DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 70-collect.sh 80-stop.sh 80-start.sh 90-teardown.sh"
+DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh build-push.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 70-collect.sh 80-stop.sh 80-start.sh 90-teardown.sh"
 read -r -a SEQUENCE <<<"${SEQUENCE:-$DEFAULT_SEQUENCE}"
 out="$tmp/calls.txt"
 : >"$out"
@@ -67,6 +67,7 @@ sed -E \
   -e "s#$tmp#<tmp>#g" \
   -e "s#$REPO#<repo>#g" \
   -e 's#[0-9]{8}T[0-9]{6}Z#<timestamp>#g' \
+  -e 's#Start=[0-9-]{10},End=[0-9-]{10}#Start=<date>,End=<date>#' \
   "$out" >"$tmp/calls.norm"
 
 if grep -q "$RDS_PASSWORD" "$tmp/calls.norm" "$tmp"/stderr.* 2>/dev/null; then

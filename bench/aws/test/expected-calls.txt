@@ -1,5 +1,19 @@
 ### 00-preflight.sh 
 DRYRUN aws sts get-caller-identity --query Account --region test-region-1 --output text
+DRYRUN aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --region test-region-1 --output text
+DRYRUN aws ec2 run-instances --dry-run --image-id ami-dryrun --instance-type c7i.2xlarge --min-count 1 --max-count 1 --region test-region-1
+DRYRUN aws ec2 create-security-group --dry-run --group-name test-scale-probe --description probe --region test-region-1
+DRYRUN aws ec2 create-placement-group --dry-run --group-name test-scale-probe --strategy cluster --region test-region-1
+DRYRUN aws ec2 import-key-pair --dry-run --key-name test-scale-probe --public-key-material ssh-ed25519 --region test-region-1
+DRYRUN aws ec2 terminate-instances --dry-run --instance-ids i-00000000000000000 --region test-region-1
+DRYRUN aws rds create-db-instance --db-instance-identifier test-scale-probe --db-instance-class db.t3.micro --engine preflight-invalid-engine --region test-region-1
+DRYRUN aws ecr create-repository --repository-name 'INVALID NAME' --region test-region-1
+DRYRUN aws cloudwatch put-metric-alarm --alarm-name test-scale-probe --namespace probe --metric-name probe --statistic Maximum --period 1 --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanThreshold --region test-region-1
+DRYRUN aws sns create-topic --name 'invalid name!' --region test-region-1
+DRYRUN aws budgets create-budget --account-id 111111111111 --budget BudgetName=test-scale-probe,BudgetLimit={Amount=-1,Unit=USD},TimeUnit=MONTHLY,BudgetType=COST --region test-region-1
+DRYRUN aws budgets describe-budgets --account-id 111111111111 --max-results 1 --region test-region-1
+DRYRUN aws ce get-cost-and-usage --time-period Start=<date>,End=<date> --granularity DAILY --metrics UnblendedCost --region test-region-1
+DRYRUN aws iam create-role --role-name 'invalid name!' --assume-role-policy-document {} --region test-region-1
 DRYRUN aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query Quota.Value --region test-region-1 --output text
 DRYRUN aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=location,Values=test-region-1a Name=instance-type,Values=c7i.2xlarge --query InstanceTypeOfferings[0].InstanceType --region test-region-1 --output text
 DRYRUN aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=location,Values=test-region-1a Name=instance-type,Values=c7i.8xlarge --query InstanceTypeOfferings[0].InstanceType --region test-region-1 --output text
@@ -28,7 +42,18 @@ DRYRUN aws iam attach-role-policy --role-name test-scale-instance --policy-arn a
 DRYRUN aws iam get-instance-profile --instance-profile-name test-scale-instance --query InstanceProfile.InstanceProfileName --region test-region-1 --output text
 DRYRUN aws iam create-instance-profile --instance-profile-name test-scale-instance --tags Key=Project,Value=test-scale Key=Name,Value=test-scale-instance --region test-region-1
 DRYRUN aws iam add-role-to-instance-profile --instance-profile-name test-scale-instance --role-name test-scale-instance --region test-region-1
-DRYRUN aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --region test-region-1 --output text
+### build-push.sh 
+DRYRUN aws ecr get-login-password --region test-region-1 | docker login --username AWS --password-stdin 111111111111.dkr.ecr.test-region-1.amazonaws.com
+DRYRUN docker buildx build --platform linux/amd64 -f Dockerfile -t ably-server:testtag --load <repo>
+DRYRUN aws ecr describe-repositories --repository-names ably-server --query repositories[0].repositoryName --region test-region-1 --output text
+DRYRUN aws ecr create-repository --repository-name ably-server --tags Key=Project,Value=test-scale Key=Name,Value=ably-server --region test-region-1
+DRYRUN docker tag ably-server:testtag 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-server:testtag
+DRYRUN docker push 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-server:testtag
+DRYRUN docker buildx build --platform linux/amd64 -f bench/aws/Dockerfile.loadgen -t ably-loadgen:testtag --load <repo>
+DRYRUN aws ecr describe-repositories --repository-names ably-loadgen --query repositories[0].repositoryName --region test-region-1 --output text
+DRYRUN aws ecr create-repository --repository-name ably-loadgen --tags Key=Project,Value=test-scale Key=Name,Value=ably-loadgen --region test-region-1
+DRYRUN docker tag ably-loadgen:testtag 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-loadgen:testtag
+DRYRUN docker push 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-loadgen:testtag
 ### 20-postgres.sh 
 DRYRUN aws rds describe-db-subnet-groups --db-subnet-group-name test-scale-db --query DBSubnetGroups[0].DBSubnetGroupName --region test-region-1 --output text
 DRYRUN aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-dryrun --query Subnets[].SubnetId --region test-region-1 --output text
@@ -98,7 +123,7 @@ DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
 DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.25 'nohup timeout 2820 sh -c 'while true; do docker stats --no-stream --format "{{json .}}" >> /var/tmp/docker-stats-run-<timestamp>-smoke-1pct.jsonl; sleep 10; done' >/dev/null 2>&1 </dev/null &'
 DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.76 'nohup timeout 2820 sh -c 'while true; do docker stats --no-stream --format "{{json .}}" >> /var/tmp/docker-stats-run-<timestamp>-smoke-1pct.jsonl; sleep 10; done' >/dev/null 2>&1 </dev/null &'
 DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.14 'nohup timeout 2820 sh -c 'while true; do docker stats --no-stream --format "{{json .}}" >> /var/tmp/docker-stats-run-<timestamp>-smoke-1pct.jsonl; sleep 10; done' >/dev/null 2>&1 </dev/null &'
-DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.13 'nohup bash -c 'timeout -k 30 2700 docker run --rm --name conductor-run --network host -v /opt/bench/run/run-<timestamp>-smoke-1pct:/run-input:ro -v /opt/bench/results/run-<timestamp>-smoke-1pct:/results 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-loadgen:abc1234 ably-conductor --scenario=/run-input/{SCENARIO; echo $? > /opt/bench/results/run-<timestamp>-smoke-1pct/exit-code' >/opt/bench/results/run-<timestamp>-smoke-1pct/conductor.log 2>&1 </dev/null &'
+DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.13 'nohup bash -c 'timeout -k 30 2700 docker run --rm --name conductor-run --network host -v /opt/bench/run/run-<timestamp>-smoke-1pct:/run-input:ro -v /opt/bench/results/run-<timestamp>-smoke-1pct:/results 111111111111.dkr.ecr.test-region-1.amazonaws.com/ably-loadgen:testtag ably-conductor --scenario=/run-input/{SCENARIO; echo $? > /opt/bench/results/run-<timestamp>-smoke-1pct/exit-code' >/opt/bench/results/run-<timestamp>-smoke-1pct/conductor.log 2>&1 </dev/null &'
 DRYRUN ssh -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.13 'cat /opt/bench/results/run-<timestamp>-smoke-1pct/exit-code 2>/dev/null || true'
 DRYRUN scp -r -i <tmp>/bench -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 ec2-user@198.51.100.13:/opt/bench/results/run-<timestamp>-smoke-1pct <tmp>/results/
 ### 70-collect.sh run-TEST

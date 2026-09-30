@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# The ably-loadgen image: the load generator, the conductor and ably-bench
+# (kept for the exact-once slice). Build from the repository root:
+#
+#   docker buildx build --platform linux/amd64 -f bench/aws/Dockerfile.loadgen -t ably-loadgen:local .
+#
+# It builds every one of the commands below that exists under cmd/. On a
+# branch without cmd/ably-loadgen or cmd/ably-conductor it builds what is
+# there and says so (the load generator branch adds those two).
+#
+# There is no ENTRYPOINT: the boxes run "docker run ... <image> <command> <args>".
+
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN set -eu; \
+    mkdir -p /out; \
+    built=""; \
+    for c in ably-loadgen ably-conductor ably-bench; do \
+      if [ -d "cmd/$c" ]; then \
+        CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -o "/out/$c" "./cmd/$c"; \
+        built="$built $c"; \
+      else \
+        echo "note: cmd/$c not present on this branch; not built"; \
+      fi; \
+    done; \
+    [ -n "$built" ] || { echo "no load generator commands found under cmd/" >&2; exit 1; }; \
+    echo "built:$built" > /out/BUILT
+
+FROM alpine:3.20
+# ca-certificates for TLS targets, curl and jq for debugging on the boxes.
+RUN apk add --no-cache ca-certificates curl jq
+COPY --from=build /out/ /usr/local/bin/
+ENV PATH=/usr/local/bin:$PATH
+CMD ["sh", "-c", "cat /usr/local/bin/BUILT; ls /usr/local/bin"]
