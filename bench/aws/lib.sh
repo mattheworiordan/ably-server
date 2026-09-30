@@ -725,7 +725,7 @@ ssh_do() { # <instance-name> <remote command...>
   local name=$1 ip
   shift
   ip=$(inst_field "$name" public_ip)
-  [ -n "$ip" ] || die "no public address for $name in STATE (run refresh via 80-start.sh or 40/50)"
+  [ -n "$ip" ] || die "no public address for $name in STATE (the box may be gone: re-run the script that creates it)"
   local -a opts
   mapfile -t opts < <(_ssh_opts)
   _ext "" ssh "${opts[@]}" "ec2-user@$ip" "$@"
@@ -881,7 +881,7 @@ parse_dsn() {
 # RUN_RC (an exit code, or "unknown" if none arrived in limit + 300 s).
 run_detached() {
   local name=$1 rdir=$2 script=$3 limit=$4 deadline
-  [ -n "$(inst_field "$name" public_ip)" ] || die "no public address for $name in STATE (run 80-start.sh or refresh)"
+  [ -n "$(inst_field "$name" public_ip)" ] || die "no public address for $name in STATE (the box may be gone: re-run the script that creates it)"
   ssh_do "$name" "mkdir -p $rdir"
   scp_to "$name" "$script" "$rdir/cmd.sh"
   ssh_do "$name" "nohup bash -c 'timeout -k 30 $limit bash $rdir/cmd.sh; echo \$? > $rdir/exit-code' >$rdir/run.log 2>&1 </dev/null &"

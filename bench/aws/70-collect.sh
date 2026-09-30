@@ -68,4 +68,4 @@ step "conductor results" scp_from "$cname" "/opt/bench/results/$run_id/." "$out/
 if ! is_dry; then
   jq 'del(.api_key, .grafana_password) | if .postgres.instances then .postgres.instances |= map_values(del(.dsn)) else . end' "$ACTIVE_STATE" >"$out/state-redacted.json"
 fi
-log_line 70-collect "collected $run_id into $out" "write the run up (plan section 13); 80-stop.sh when the day's runs are done"
+log_line 70-collect "collected $run_id into $out" "write the run up (plan section 13); 80-terminate.sh --yes when the day's runs are done"
