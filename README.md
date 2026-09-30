@@ -34,6 +34,7 @@ One Go binary, three storage modes selected by `--mode`:
 | `cluster` | Postgres       | `LISTEN/NOTIFY` on one channel (`--bus=pgnotify`, the default) | N stateless nodes, shared DB   |
 | `cluster` + `--bus=postgres` | Postgres | per-channel `LISTEN`, coalesced wake-ups by default | N stateless nodes, shared DB, no other dependency |
 | `cluster` + `--bus=nats` | Postgres | NATS core pub/sub | N stateless nodes, shared DB, a NATS server or cluster carries cross-node delivery |
+| `cluster` + a `--postgres-dsn` list | Postgres, sharded by channel | any of the three buses | N stateless nodes over several databases, each channel stored in one |
 
 In every cluster mode Postgres is the store and orders each channel;
 `--bus` only chooses how a committed message reaches the other nodes
@@ -108,6 +109,21 @@ ably-server --mode cluster --bus postgres
 
 # Clustered, with NATS as the cross-node bus (Postgres stays the store)
 ably-server --mode cluster --bus nats --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
+```
+
+**Sharding.** When one Postgres primary's write rate is the limit, give
+`--postgres-dsn` a comma-separated list of URL-form DSNs. Each channel is
+stored in one database, chosen by a hash of its name; nothing in the data
+model spans channels, so there is no cross-shard transaction. Every node
+must list the same DSNs in the same order, and the list is fixed for the
+life of the data: there is no resharding, no migration between shards
+and no rebalancing, and a node started with a changed list refuses to
+start ([DESIGN.md §6.4](DESIGN.md#64-channel-sharding)). One DSN behaves
+exactly as before.
+
+```sh
+ably-server --mode cluster --bus nats --nats-url nats://nats1:4222 \
+  --postgres-dsn 'postgres://u:pw@db1:5432/ably,postgres://u:pw@db2:5432/ably'
 ```
 
 `bench/` has a three-node compose stack per bus, each on its own ports

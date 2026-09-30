@@ -231,7 +231,7 @@ func Run(ctx context.Context, opts Opts) int {
 	fs.Var(&keysFlags, "keys", "API key in appId.keyId:keySecret format; repeatable (env: "+keysEnv+", comma-separated)")
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
-	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
+	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable; a comma-separated list of URL-form DSNs shards channels across the databases by channel-name hash, fixed for the life of the data (DESIGN.md §6.4) (env: "+postgresDSNEnv+")")
 	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPGNotify), "cluster-mode cross-node bus: pgnotify (the shipped LISTEN/NOTIFY broker), postgres (per-channel LISTEN, see --postgres-notify-mode) or nats; Postgres stays the store in every case (DESIGN.md §7.2) (env: "+busEnv+")")
 	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted (env: "+natsURLEnv+")")
 	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
@@ -369,7 +369,11 @@ func Run(ctx context.Context, opts Opts) int {
 	m := metrics.New()
 	if bs, ok := store.(storage.BusStatser); ok {
 		st := bs.BusStats()
-		logger.Info("storage ready", "mode", *mode, "bus", st.Bus, "postgresNotifyMode", st.Mode)
+		shards := 1
+		if sh, ok := store.(interface{ Shards() int }); ok {
+			shards = sh.Shards()
+		}
+		logger.Info("storage ready", "mode", *mode, "bus", st.Bus, "postgresNotifyMode", st.Mode, "shards", shards)
 		m.RegisterBus(bs) // ably_bus_* series (DESIGN.md §7.2, §10)
 	} else {
 		logger.Info("storage ready", "mode", *mode)
@@ -843,7 +847,7 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		case postgres.BusPGNotify:
 			// The default, opened exactly as before the bus seam: no bus
 			// settings apply.
-			return postgres.Open(ctx, cluster.options())
+			return openPostgres(ctx, cluster.options())
 		case postgres.BusPostgres:
 			mode, err := postgres.ParseNotifyMode(cluster.notifyMode)
 			if err != nil {
@@ -858,7 +862,7 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 				cluster.logger.Warn(msg)
 			}
 			opts.SweepInterval = cluster.sweepInterval
-			return postgres.Open(ctx, opts)
+			return openPostgres(ctx, opts)
 		case postgres.BusNATS:
 			if cluster.natsURL == "" {
 				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
@@ -868,13 +872,29 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 			opts.NATSURL = cluster.natsURL
 			opts.NATSInlineMaxBytes = cluster.natsInlineMax
 			opts.SweepInterval = cluster.sweepInterval
-			return postgres.Open(ctx, opts)
+			return openPostgres(ctx, opts)
 		default:
 			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s, %s)", cluster.bus, postgres.BusPGNotify, postgres.BusPostgres, postgres.BusNATS)
 		}
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}
+}
+
+// openPostgres opens the cluster-mode store for opts.DSN, the
+// --postgres-dsn value. One DSN opens a plain postgres.Storage, exactly
+// as before sharding; a list of two or more opens one Storage per DSN
+// behind postgres.Sharded, which routes each channel to its shard by
+// hash (DESIGN.md §6.4).
+func openPostgres(ctx context.Context, opts postgres.Options) (storage.Storage, error) {
+	dsns, err := postgres.SplitDSNs(opts.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --postgres-dsn: %w", err)
+	}
+	if len(dsns) == 1 {
+		return postgres.Open(ctx, opts)
+	}
+	return postgres.OpenSharded(ctx, opts, dsns)
 }
 
 // newLogger builds the process logger. level is parsed by

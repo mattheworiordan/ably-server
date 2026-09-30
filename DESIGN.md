@@ -1396,13 +1396,106 @@ nodes it is one commit per batch, and many publishes from one node share a
 lock hold. Per-channel batches are shallow (52,000 writes/s over 700,000
 channels is about one message per channel per batch), so the gain is
 width across channels, not depth per channel. Cluster write throughput is
-still one primary's.
+still one primary's per database; channel sharding (§6.4) spreads
+channels over several.
 
 Series (§10): `ably_publish_batch_size` (histogram),
 `ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
 `ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`).
+
+### 6.4 Channel sharding
+
+One Postgres primary bounds cluster write throughput (§6.3). To go past
+it, `--postgres-dsn` takes a comma-separated list of databases, and each
+channel is stored in exactly one of them.
+
+**Why this is small.** Nothing in the data model spans channels. A
+channel's serials, log, idempotency keys, presence set, message
+projection, versions and annotation summaries are all keyed by the
+channel, and every write and read names one channel. So a hash of the
+channel name to a database is a routing rule with no cross-shard
+invariant: no transaction spans two databases, and no node owns a
+channel. Postgres stays the sequencer (§8): the channel's row lock in its
+shard orders it.
+
+**The list.** Entries are URL-form DSNs (`postgres://` or
+`postgresql://`), separated by commas. A comma separates two entries only
+when a URL starts straight after it, so a single DSN with commas of its
+own (a multi-host URL, or a key=value DSN) stays one DSN; a list of two
+or more therefore needs URL-form DSNs. An empty entry or a repeated DSN
+is refused at startup, as is a value that looks like a list of key=value
+DSNs. The shard count is the list length. One DSN behaves as without
+sharding: the server opens one database as before, with no routing layer
+between the channel and its store; the only additions are one read at
+startup (below) and the `ably_storage_shards` gauge.
+
+**The hash.** Shard = jump consistent hash (Lamping and Veach, 2014) of
+a 64-bit key: FNV-1a over the channel name's bytes, mixed by the
+SplitMix64 finalizer. It depends only on the name and the shard count,
+so every node given the same list routes a channel to the same database.
+Jump hash spreads channels evenly and, if the count grew from n to n+1,
+would move only the channels that land on the new shard (about 1/(n+1)).
+The mixing keeps the shard choice independent of the publish lane choice
+(FNV-1a mod lanes, §6.3), so each shard's channels still spread over a
+node's lanes. `postgres.ShardFor` is the function; a test pins its
+output.
+
+**One full store per shard.** Each shard is a complete Postgres backend
+of its own: its own pool, migrations, partition maintenance and
+retention sweep (§6.3), presence lease and reaper (§12.5), publish lanes
+(§6.3), and cross-node bus connection (§7.2). What a single-database node
+does once, a sharded node does once per shard, against that shard only.
+
+| Operation | Scope | How it is handled |
+|---|---|---|
+| Publish, mutation, annotation, presence write | one channel | routed to the channel's shard; a publish batch never spans shards (lanes are per shard) |
+| History, versions, annotations, members, resume floor | one channel | routed |
+| Serial minting, idempotency lookup | one channel | routed (the `channels` row lock and the id index are in the shard) |
+| Bind, release (idle-channel eviction, §5.1) | one channel | routed |
+| Migrations, partition creation, retention drop | account-wide | per shard, at open and in each shard's sweep |
+| Presence lease bump and crashed-node reaper | account-wide | per shard; a reaped member's LEAVE is published on that shard |
+| Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard |
+| `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
+| `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
+| `/readyz` | account-wide | ready only while every shard (and its bus) is |
+| `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
+| `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
+| `GET /stats` stub | account-wide | touches no storage |
+| Sandbox per-app schemas (§15) | account-wide | created in and dropped from every shard |
+
+**Shard identity.** A list is fixed for the life of its data, and the
+server checks this at startup. Shard 0 opens first. On its first open
+each shard's database records, in a `shard_identity` table, its index,
+the list length, a list id (minted by shard 0 and carried by every other
+shard) and a random id of its own; once every shard has opened, shard 0
+also records the ids of the databases at every position. Every later
+open compares. So a node is refused at startup when it lists the DSNs in
+another order, lists more or fewer, lists one database twice, lists a
+shard of another list, or lists another database (an empty one, say) at
+a position a database has already served; a single-DSN node pointed at
+one shard of a list is refused too. A database that already holds
+channels but has no identity (it served a single-DSN deployment) cannot
+join a list, because the channels that now hash elsewhere would be
+stranded. A single-DSN node creates no table and writes nothing for
+this; it only reads, at startup, whether the table exists in its schema.
+Stop single-DSN nodes before first starting a list on their database: a
+node already running checks nothing after it starts.
+
+What a failed first start records stays: if one shard cannot be reached,
+the shards that opened keep their identity, and a later start must use
+the same list. To start again with another list while no shard holds
+channels yet, drop `shard_identity` in each shard's schema.
+
+**Not supported: resharding, migration, rebalancing.** The count cannot
+change without moving data, and there is no tool that moves it. A hot
+channel stays on one shard and is still bound by one row lock (§6.3);
+sharding raises cluster write throughput to the sum of the shards', not a
+single channel's. All nodes must list the same DSNs in the same order.
+
+Series (§10): `ably_storage_shards` (gauge), the number of shards; 1 for
+a single DSN.
 
 ## 7. Pub/Sub
 
@@ -1901,7 +1994,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --listen :8080                HTTP/WS bind
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
---postgres-dsn  postgres://…  cluster mode only
+--postgres-dsn  postgres://…  cluster mode only; a comma-separated list of URL DSNs shards channels (§6.4)
 --bus {pgnotify|postgres|nats}  cluster mode cross-node bus (§7.2); default: pgnotify
 --nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
@@ -2051,6 +2144,11 @@ name = "persisted:presence_fixtures"
     `ably_storage_retention_errors_total` (counters) and
     `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
     (gauges). `table` is `channel_messages` or `messages`.
+  - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres
+    shards (§6.4); 1 for a single DSN. With two or more shards every
+    `ably_storage_*` and `ably_publish_*` series above carries a `shard`
+    label (the shard's index in the `--postgres-dsn` list), and the
+    `ably_bus_*` series below are summed over shards.
   - Cluster mode only, from publish batching (§6.3):
     `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
@@ -2753,7 +2851,9 @@ and, because the bus hashes the schema into its channel names (§7.2),
 on a shared NATS server too. CI uses this to run an SDK suite end to end
 on the `nats` bus. The flags have `ABLY_LOCAL_SANDBOX_CHILD_POSTGRES_DSN`,
 `ABLY_LOCAL_SANDBOX_CHILD_BUS` and `ABLY_LOCAL_SANDBOX_CHILD_NATS_URL`
-equivalents.
+equivalents. A comma-separated `--child-postgres-dsn` list gives sharded
+children (§6.4): each app's schema is created in and dropped from every
+database, and the child gets the list with the schema set on each DSN.
 
 ## 16. Testing strategy
 

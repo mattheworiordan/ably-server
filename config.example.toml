@@ -28,6 +28,13 @@
 # libpq DSN for cluster mode (env: ABLY_SERVER_POSTGRES_DSN). Required
 # when --mode=cluster and not supplied by a flag or env var.
 # postgres-dsn = "postgres://user:pw@host:5432/db?sslmode=disable"
+#
+# A comma-separated list of URL-form DSNs shards channels across the
+# databases: each channel lives on one of them, chosen by a hash of its
+# name. The list's order and length are fixed for the life of the data
+# (no resharding); every node must list the same DSNs in the same order.
+# See DESIGN.md §6.4.
+# postgres-dsn = "postgres://u:pw@db1:5432/ably,postgres://u:pw@db2:5432/ably"
 
 # Cluster-mode cross-node bus (env: ABLY_SERVER_BUS). Postgres stays the
 # store with every bus; the bus only decides how a committed message
