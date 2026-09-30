@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: scale-proof
+    folder: Scale proof
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

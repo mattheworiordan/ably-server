@@ -1,4 +1,39 @@
-# Load generation for the scale proof
+# bench/aws
+
+Scripts that stand up the scale-proof test fleet on AWS, run a scenario,
+collect the results and tear the fleet down. Start with [RUNBOOK.md](RUNBOOK.md).
+Anonymised results go in [RESULTS.md](RESULTS.md).
+
+| File | What it does |
+|---|---|
+| `env.example` | Every environment variable, with placeholders. Copy it outside the repository. |
+| `lib.sh` | Shared helpers: dry-run wrapper, tags, state file (jq), log, waits, cost estimate. |
+| `00-preflight.sh` | Credentials, account, permission probes, vCPU quota, billing alarm, image registry (ECR repositories only for `IMAGE_REGISTRY_KIND=ecr`). |
+| `10-network.sh` | Default VPC, one zone, security group, instance profile (ecr only; a placement group only on request; no key pair: the SSH key goes in user-data). |
+| `build-push.sh`, `Dockerfile.loadgen` | Build `ably-server` and `ably-loadgen` for linux/amd64, push to `IMAGE_REGISTRY` (ghcr or ECR; none builds only), record tags. `mirror` copies the third party images to the same registry. |
+| `20-postgres.sh` | PostgreSQL 17 in Docker on an r7i.4xlarge with an EBS data volume (io2 or gp3), not RDS (see RUNBOOK section 1); optionally several instances for run 8. |
+| `25-pgdriver.sh`, `65-run-0a.sh`, `pgbench/` | Run 0a: pgbench against Postgres alone. |
+| `30-nats.sh` | Three-server NATS core cluster. |
+| `40-nodes.sh` | The ably-server nodes. |
+| `50-loadgen.sh`, `55-observability.sh`, `observability/` | Generators, publishers, conductor, Prometheus, Grafana, postgres_exporter. |
+| `60-run.sh` | Run one scenario on the conductor under `RUN_TIME_LIMIT` and copy the results back. |
+| `70-collect.sh` | Gather metrics, logs and database statistics for a run. |
+| `80-terminate.sh` | Between runs: terminate every instance and its disks (there is no stop and start) and keep the network. |
+| `90-teardown.sh` | Delete everything tagged for the project and verify. |
+| `cost-estimate.sh` | Hourly rate of what is running, an estimate of the spend so far, and a warning about tagged instances and volumes STATE does not know. |
+| `templates/` | The user-data that boots each kind of box. |
+| `test/` | Tests that need no AWS account: `test/run-all.sh`. |
+
+Every script is safe to run again (create or reuse), tags what it creates with
+`Project=$PROJECT_TAG`, records ids in `$STATE_FILE`, appends a line to
+`$LOG_FILE`, and prints the calls it would make with `DRY_RUN=1`.
+Nothing here names an account or a region: they come from the environment.
+
+Needs bash 4.4 or newer, AWS CLI v2, `jq`, `ssh`, Docker with buildx.
+
+The load generator and conductor that the run scripts drive are described below.
+
+## Load generation for the scale proof
 
 Two binaries drive the cloud runs (plan §6 item 8, §7, §8):
 
@@ -14,13 +49,13 @@ same-process latency).
 
 Nothing here names a customer: workloads are shapes F, M and D.
 
-## Build
+### Build
 
     go build -o bin/ ./cmd/ably-loadgen ./cmd/ably-conductor
 
 Both are static Go binaries with no runtime dependencies.
 
-## Local smoke
+### Local smoke
 
     bench/aws/local-smoke.sh     # shapes M, D, F at 1%, then M with a node killed
 
@@ -30,7 +65,7 @@ avoids Docker Desktop's port proxy), runs each through the conductor and
 writes a report. `SMOKE_IMAGE` and `BUS` point it at another server
 build.
 
-## Quick start (laptop, against a local cluster)
+### Quick start (laptop, against a local cluster)
 
     # three nodes on :8081-8083, debug listeners on :9091-9093
     ably-conductor run --scenario bench/scenarios/shape-d.toml \
@@ -42,7 +77,7 @@ build.
 `--local N` spawns N agents on 127.0.0.1 with every role. In the cloud
 the agents run on their own boxes and the conductor gets an inventory.
 
-## What the generator does
+### What the generator does
 
 - **Protocol.** A raw WebSocket client (gorilla/websocket, msgpack
   frames) that speaks only CONNECTED, ATTACH/ATTACHED, DETACH, MESSAGE,
@@ -97,7 +132,7 @@ the agents run on their own boxes and the conductor gets an inventory.
   re-attaches every channel with the last channelSerial it saw; the
   checker holds a RESUMED re-attach to continuity.
 
-## `ably-loadgen`
+### `ably-loadgen`
 
     ably-loadgen serve [--listen :9200] [--metrics-listen :9101] [--role generator|publisher|all]
                        [--summary-dir DIR] [--addr-file FILE]
@@ -146,7 +181,7 @@ the accepted roles.
 
 Exit status is 1 if the job saw any correctness violation.
 
-### Summary (`Summary`, one per job)
+#### Summary (`Summary`, one per job)
 
 `connections` (target, opened, peak, open at the end of the hold,
 connect failures, reconnects, churn and unplanned drops), `attachments`,
@@ -163,7 +198,7 @@ discontinuities, first violations, per sampled channel records),
 `resources` (the generator's own heap, stacks, RSS and goroutines every
 10 s, and bytes per connection at the end of the ramp) and `errors`.
 
-## `ably-conductor`
+### `ably-conductor`
 
     ably-conductor plan --scenario FILE [--multiplier M] [--scale S] [--json]
     ably-conductor [run] --scenario FILE (--inventory FILE | --endpoints ... --agent ... | --local N) [flags]
@@ -198,7 +233,7 @@ is a run. `run` flags:
 
 Exit status: 0 PASS, 1 FAIL or ABORTED, 2 usage.
 
-### Inventory
+#### Inventory
 
 Two shapes are accepted. The one bench/aws/60-run.sh renders from STATE
 (recognised by its `generators` or `api_key` keys):
@@ -239,7 +274,7 @@ node's `--debug-listen` address; without it memory and goroutine
 flatness is reported as not measured. `vcpu` and `memory_gb` feed the
 footprint.
 
-### Run record (`results/<run-id>/`)
+#### Run record (`results/<run-id>/`)
 
 - `plan.json`: scenario, multiplier, scale, derived totals, inventory
   (key removed), phase times.
@@ -269,7 +304,7 @@ per 10k writes/s) is reported, not gated.
 shards: envelope with pass counts and run-to-run spread, footprint, and
 the node and shard curves.
 
-## Scenario format (`bench/scenarios/*.toml`)
+### Scenario format (`bench/scenarios/*.toml`)
 
 Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
 (0.01, 0.1) multiply them; each class says what absorbs the factor.
@@ -343,7 +378,7 @@ at 1% and 10%, about 5.5k connections and 590 publishes/s at 1%; a test
 keeps their classes equal to the shape files'). The files are TOML, so
 60-run.sh needs the extension: `60-run.sh smoke-1pct.toml`.
 
-## Generator host tuning
+### Generator host tuning
 
 At 200k connections per box: raise the open-file limit (`ulimit -n
 1048576`, or `--ulimit nofile=1048576:1048576` for Docker), widen the

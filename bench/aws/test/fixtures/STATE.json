@@ -1,0 +1,100 @@
+{
+  "resources": [],
+  "images": {
+    "ably-server": {
+      "tag": "abc1234"
+    },
+    "ably-loadgen": {
+      "tag": "abc1234"
+    }
+  },
+  "runs": [],
+  "instances": {
+    "fixture-node-1": {
+      "id": "i-0001",
+      "role": "node",
+      "type": "c7i.2xlarge",
+      "private_ip": "10.0.1.11",
+      "public_ip": "198.51.100.11",
+      "running": true
+    },
+    "fixture-node-2": {
+      "id": "i-0002",
+      "role": "node",
+      "type": "c7i.2xlarge",
+      "private_ip": "10.0.1.12",
+      "public_ip": "198.51.100.12",
+      "running": true
+    },
+    "fixture-nats-1": {
+      "id": "i-0003",
+      "role": "nats",
+      "type": "c7i.2xlarge",
+      "private_ip": "10.0.1.21",
+      "public_ip": "198.51.100.21",
+      "running": true
+    },
+    "fixture-loadgen-1": {
+      "id": "i-0004",
+      "role": "loadgen",
+      "type": "c7i.8xlarge",
+      "private_ip": "10.0.1.31",
+      "public_ip": "198.51.100.31",
+      "running": true
+    },
+    "fixture-publisher-1": {
+      "id": "i-0005",
+      "role": "publisher",
+      "type": "c7i.4xlarge",
+      "private_ip": "10.0.1.41",
+      "public_ip": "198.51.100.41",
+      "running": true
+    },
+    "fixture-conductor-1": {
+      "id": "i-0006",
+      "role": "conductor",
+      "type": "c7i.2xlarge",
+      "private_ip": "10.0.1.51",
+      "public_ip": "198.51.100.51",
+      "running": true
+    },
+    "fixture-pg-io2": {
+      "id": "i-0007",
+      "role": "postgres",
+      "type": "r7i.4xlarge",
+      "private_ip": "10.0.1.61",
+      "public_ip": "198.51.100.61",
+      "running": true
+    }
+  },
+  "postgres": {
+    "active_storage": "io2",
+    "instances": {
+      "fixture-pg-io2": {
+        "id": "fixture-pg-io2",
+        "storage": "io2",
+        "shard": 1,
+        "storage_gb": 1000,
+        "iops": 20000,
+        "endpoint": "10.0.1.61",
+        "dsn": "postgres://ably:fixturepassword@10.0.1.61:5432/ably?sslmode=disable",
+        "running": true,
+        "type": "r7i.4xlarge",
+        "private_ip": "10.0.1.61",
+        "port": 5432,
+        "managed": "ec2-docker"
+      }
+    }
+  },
+  "nats": {
+    "urls": "nats://10.0.1.21:4222"
+  },
+  "api_key": "bench.fixture:fixturesecret",
+  "loadgen": {
+    "image": "example/ably-loadgen:abc"
+  },
+  "deployment": {
+    "bus": "nats",
+    "server_image": "example/ably-server:abc"
+  }
+}
