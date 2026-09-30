@@ -30,6 +30,16 @@ type trialConfig struct {
 	rate     float64       // offered load, messages/sec across all publishers
 	warmup   time.Duration // discarded from latency/throughput stats
 	duration time.Duration // measurement window
+
+	// stagger phase-shifts each publisher's first send across one publish
+	// interval. Without it every publisher's limiter starts at the same
+	// instant, so all of them fire together and the offered load arrives
+	// as a burst of len(publishers) messages every interval rather than a
+	// smooth stream. That matters once the publisher count is large: with
+	// 300 publishers each burst is 300 publishes, and the latency
+	// percentiles then measure how fast the system drains a 300-message
+	// burst, whatever the average rate is.
+	stagger bool
 }
 
 type correctness struct {
@@ -176,11 +186,21 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 	publishStop := time.Unix(0, measureEndNano)
 
 	var wg sync.WaitGroup
-	for _, p := range pubs {
+	for i, p := range pubs {
 		wg.Add(1)
-		go func(p *publisher) {
+		go func(p *publisher, i int) {
 			defer wg.Done()
 			lim := rate.NewLimiter(rate.Limit(perPub), 1)
+			if cfg.stagger && perPub > 0 {
+				// Publisher i first sends i/len(pubs) of a publish interval
+				// late, spreading arrivals evenly across the interval.
+				offset := time.Duration(float64(i) / float64(len(pubs)) / perPub * float64(time.Second))
+				select {
+				case <-time.After(offset):
+				case <-ctx.Done():
+					return
+				}
+			}
 			var seq int64
 			for {
 				if err := lim.WaitN(ctx, 1); err != nil {
@@ -211,7 +231,7 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 					<-inflight
 				}
 			}
-		}(p)
+		}(p, i)
 	}
 	wg.Wait()
 

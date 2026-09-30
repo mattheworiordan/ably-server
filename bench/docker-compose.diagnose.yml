@@ -1,0 +1,19 @@
+# Overlay for the scale stack used only for the diagnosis runs: loads
+# pg_stat_statements so per-statement call counts and mean execution times
+# can be read back. Kept out of the measurement stack because the extension
+# adds a small overhead.
+#
+#   docker compose -f bench/docker-compose.scale.yml -f bench/docker-compose.diagnose.yml \
+#     -p ablyscale up -d --scale node=3
+#
+# Then: docker exec ablyscale-postgres-1 psql -U ably -d ably -c 'CREATE EXTENSION pg_stat_statements'
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - max_connections=1000
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all

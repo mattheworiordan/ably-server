@@ -36,6 +36,7 @@ type options struct {
 	msgSize     int
 	duration    time.Duration
 	warmup      time.Duration
+	stagger     bool
 
 	search    bool
 	rate      float64
@@ -57,6 +58,7 @@ func run(args []string, out *os.File) int {
 	fs.IntVar(&o.msgSize, "msg-size", 128, "approximate message payload size in bytes")
 	fs.DurationVar(&o.duration, "duration", 10*time.Second, "measurement window per trial")
 	fs.DurationVar(&o.warmup, "warmup", 2*time.Second, "warmup period excluded from stats")
+	fs.BoolVar(&o.stagger, "stagger", false, "phase-shift publishers evenly across one publish interval instead of starting them all in lockstep (matters with many publishers: lockstep sends a burst of --publishers messages every interval)")
 
 	fs.BoolVar(&o.search, "search", false, "search for the max throughput within the p50/p99 budget instead of a single fixed-rate run")
 	fs.Float64Var(&o.rate, "rate", 1000, "offered load in messages/sec (fixed-run rate, or the starting rate in --search)")
@@ -94,6 +96,7 @@ func run(args []string, out *os.File) int {
 		msgSize:     o.msgSize,
 		warmup:      o.warmup,
 		duration:    o.duration,
+		stagger:     o.stagger,
 	}
 
 	fmt.Fprintf(out, "ably-bench: %d endpoint(s), %d channels, %d publishers, %d subscribers, %dB messages, %s protocol\n",

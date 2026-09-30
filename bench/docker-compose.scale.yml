@@ -1,0 +1,66 @@
+# Scalable cluster topology for benchmarking cluster-mode scaling.
+#
+# Unlike the repo's docker-compose.yml (three fixed nodes on 8081-8083),
+# this file defines ONE generic `node` service so the node count can be
+# chosen at `up` time:
+#
+#   docker compose -f bench/docker-compose.scale.yml -p ablyscale up -d --scale node=6
+#
+# Each replica publishes container port 8080 on the next free host port in
+# the 8101-8124 range (so up to 24 nodes). Discover the mapped ports with
+# bench/scale-endpoints.sh. All nodes share one key and one Postgres, exactly
+# like the original file; the node image and flags are identical.
+#
+# Differences from ../docker-compose.yml (deliberately minimal):
+#   - postgres max_connections is raised from 100 to 1000. Each node's pgx
+#     pool defaults to max(4, NumCPU) connections (18 in this VM), so twelve
+#     nodes can ask for 216+ connections and would otherwise fail with "too
+#     many clients", which would measure a config limit, not the design.
+#   - postgres publishes on host port 5433, so it never clashes with the
+#     original stack's 5432 if both were ever up.
+#   - each node serves pprof and /metrics on :6060 inside its container
+#     (not published to the host; scrape with `docker exec`).
+#   - restart: "no", so a crashing node is visible instead of looping.
+
+name: ablyscale
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_connections=1000"]
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  node:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ably-server:local
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ABLY_SERVER_KEYS: app.key:secret
+      ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable
+      ABLY_SERVER_DEBUG_LISTEN: ":6060"
+    command:
+      - --mode=cluster
+      - --listen=:8080
+      - --log-level=info
+    ports:
+      - "8101-8124:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
