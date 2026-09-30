@@ -159,3 +159,32 @@ func TestNATSBusReadyzReflectsConnection(t *testing.T) {
 		t.Fatalf("Ping after reconnect: %v", err)
 	}
 }
+
+// TestNATSBusSchemasShareNATSWithoutCrossTalk: two deployments in
+// different schemas share one NATS server (DESIGN.md §7.2). A publish on
+// "room" in one never reaches a node bound to "room" in the other: the
+// subject carries a namespace token per schema.
+func TestNATSBusSchemasShareNATSWithoutCrossTalk(t *testing.T) {
+	c := pgtest.Start(t)
+	n := natstest.Start(t)
+	ctx := context.Background()
+
+	pubNode := openNATSNode(t, c.FreshSchemaDSN(t), n.URL)
+	otherNode := openNATSNode(t, c.FreshSchemaDSN(t), n.URL)
+	mine, theirs := &cmRecorder{}, &cmRecorder{}
+	ch := bindChannel(t, pubNode, "room", mine)
+	bindChannel(t, otherNode, "room", theirs)
+	before := natsBusOf(t, otherNode).nc.Stats().InMsgs
+
+	for i := range 5 {
+		publish(t, ctx, ch, fmt.Sprintf("m-%d", i))
+	}
+	mine.waitFor(t, 5, 5*time.Second)
+	time.Sleep(300 * time.Millisecond)
+	if got := theirs.count(); got != 0 {
+		t.Fatalf("the other schema's node received %d cms, want 0", got)
+	}
+	if got := natsBusOf(t, otherNode).nc.Stats().InMsgs - before; got != 0 {
+		t.Fatalf("the other schema's node received %d NATS messages, want 0", got)
+	}
+}

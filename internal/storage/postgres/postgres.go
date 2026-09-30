@@ -173,7 +173,7 @@ type Storage struct {
 	dsn       string // retained so a LISTEN goroutine can re-dial on drop
 	series    string // per-process seriesId, embedded in every minted channelSerial
 	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
-	namespace string // current_schema(), mixed into every postgres-bus notification channel name
+	namespace string // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
 	logger    *logging.Logger
 
 	busKind    string // BusPGNotify, BusPostgres or BusNATS
@@ -263,6 +263,15 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		return nil, err
 	}
 
+	if busKind != BusPGNotify {
+		// The schema this Storage works in namespaces its bus channels
+		// (LISTEN names, NATS subjects): NOTIFY is per database, not per
+		// schema, and a NATS cluster may be shared by several deployments.
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&s.namespace); err != nil {
+			return fail(fmt.Errorf("storage/postgres: current_schema: %w", err))
+		}
+	}
+
 	switch busKind {
 	case BusNATS:
 		if s.sweepInterval <= 0 {
@@ -276,12 +285,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	case BusPostgres:
 		if s.sweepInterval <= 0 {
 			s.sweepInterval = postgresSweepDefault
-		}
-		// The schema this Storage works in namespaces its notification
-		// channels: NOTIFY is per database, not per schema (see
-		// pgChannelName).
-		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&s.namespace); err != nil {
-			return fail(fmt.Errorf("storage/postgres: current_schema: %w", err))
 		}
 		// Dedicated LISTEN connection. It LISTENs on nothing yet: each
 		// channel is LISTENed when this node first binds it (Channel).
@@ -360,8 +363,15 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
 		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
 	}
-	appender.Initialize(current, initial)
-	cs.seed(current)
+	// Initialize the appender and let deliveries through. pgnotify also
+	// runs here a reconcile a LISTEN reconnect requested during the bind
+	// (pgnotify.go initialize); the chaining buses seed their delivery
+	// point (chain.go seedChain).
+	if s.bus.chains() {
+		cs.seedChain(current, initial)
+	} else if err := cs.initialize(ctx, current, initial); err != nil {
+		s.logger.Warn("storage/postgres: reconcile during bind failed", "channel", name, "err", err)
+	}
 	if cs.isReleased() {
 		// Release ran while this bind was in flight and may have missed
 		// the subscription bind put in place; drop it.
@@ -841,7 +851,12 @@ type channelStore struct {
 	released    bool
 	ready       chan struct{}
 	readyClosed bool
-	preSeed     []*protocol.ChannelMessage // pgnotify: deliveries received before the seed
+	// pgnotify only (pgnotify.go): deliveries received before the bind
+	// seeded, a reconcile a LISTEN reconnect requested meanwhile, and a
+	// log-read stub for unit tests.
+	preSeed        []*protocol.ChannelMessage
+	needsReconcile bool
+	loadAfterFn    func(ctx context.Context, after string) ([]*protocol.ChannelMessage, error)
 
 	// Chained-delivery state, used only by a bus whose chains() is true
 	// (DESIGN.md §7.2). seeded is set once Storage.Channel has read the

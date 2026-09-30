@@ -23,11 +23,15 @@ import (
 const DefaultNATSInlineMaxBytes = 256 << 10
 
 // Subject scheme (DESIGN.md §7.2): one subject per Ably channel,
-// "ably.cm." plus the unpadded URL-safe base64 of the channel name,
-// which never contains a NATS token separator or wildcard. A name
-// whose encoding exceeds natsMaxSubjectToken is hashed instead
-// ("ably.cm.h.<sha256 hex>"); the envelope carries the channel name,
-// so a receiver drops anything not addressed to its channel.
+// "ably.cm.", a namespace token, ".", then the unpadded URL-safe base64
+// of the channel name, which never contains a NATS token separator or
+// wildcard. The namespace token is the hex of the first 6 bytes of
+// SHA-256 of the schema the Storage works in (current_schema()), so two
+// deployments sharing one NATS cluster but not a schema never hear each
+// other's channels (the postgres bus's LISTEN names do the same). A
+// name whose encoding exceeds natsMaxSubjectToken is hashed instead
+// ("ably.cm.<ns>.h.<sha256 hex>"); the envelope carries the channel
+// name, so a receiver drops anything not addressed to its channel.
 const (
 	natsSubjectPrefix   = "ably.cm."
 	natsMaxSubjectToken = 200
@@ -50,14 +54,22 @@ var (
 // interval (DESIGN.md §7.2).
 const DefaultNATSSweepInterval = 5 * time.Second
 
-// natsSubject derives the NATS subject for an Ably channel name.
-func natsSubject(channel string) string {
+// natsNamespacePrefix is the subject prefix for every channel of one
+// schema: "ably.cm.<ns>.".
+func natsNamespacePrefix(namespace string) string {
+	sum := sha256.Sum256([]byte(namespace))
+	return natsSubjectPrefix + hex.EncodeToString(sum[:6]) + "."
+}
+
+// natsSubject derives the NATS subject for an Ably channel name under a
+// namespace prefix (natsNamespacePrefix).
+func natsSubject(prefix, channel string) string {
 	enc := base64.RawURLEncoding.EncodeToString([]byte(channel))
 	if len(enc) <= natsMaxSubjectToken {
-		return natsSubjectPrefix + enc
+		return prefix + enc
 	}
 	sum := sha256.Sum256([]byte(channel))
-	return natsSubjectPrefix + "h." + hex.EncodeToString(sum[:])
+	return prefix + "h." + hex.EncodeToString(sum[:])
 }
 
 // natsEnvelope is the body of a NATS bus message: the channel, the cm's
@@ -147,6 +159,7 @@ type natsBus struct {
 	s         *Storage
 	nc        *nats.Conn
 	inlineMax int
+	prefix    string // natsNamespacePrefix(schema)
 
 	// Tuning snapshotted at dial so goroutines never read the vars.
 	flushTimeout, retryWait time.Duration
@@ -160,6 +173,7 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 	b := &natsBus{
 		s:            s,
 		inlineMax:    opts.NATSInlineMaxBytes,
+		prefix:       natsNamespacePrefix(s.namespace),
 		flushTimeout: natsFlushTimeout,
 		retryWait:    natsReconcileRetryWait,
 	}
@@ -222,7 +236,7 @@ func (b *natsBus) chains() bool { return true }
 // the SUB took effect and is received. Messages that arrive before the
 // channel is seeded are held by the delivery point.
 func (b *natsBus) bind(ctx context.Context, cs *channelStore) error {
-	sub, err := b.nc.Subscribe(natsSubject(cs.name), func(m *nats.Msg) {
+	sub, err := b.nc.Subscribe(natsSubject(b.prefix, cs.name), func(m *nats.Msg) {
 		b.s.stats.received.Add(1)
 		ev, channel, err := decodeNATSEnvelope(m.Data)
 		if err != nil {
@@ -292,7 +306,7 @@ func (b *natsBus) afterCommit(cs *channelStore, cm *protocol.ChannelMessage, pre
 		if pointer {
 			b.s.stats.pointers.Add(1)
 		}
-		if err := b.nc.Publish(natsSubject(cs.name), data); err != nil {
+		if err := b.nc.Publish(natsSubject(b.prefix, cs.name), data); err != nil {
 			b.s.stats.publishErrors.Add(1)
 			b.s.logger.Warn("storage/postgres: NATS bus publish failed; remote nodes recover the cm from the log", "channel", cs.name, "serial", cm.ChannelSerial, "err", err)
 		} else {

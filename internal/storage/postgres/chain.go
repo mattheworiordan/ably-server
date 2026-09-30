@@ -139,13 +139,24 @@ func (cs *channelStore) seed(current string) {
 	cs.seeded = true
 	cs.closeReadyLocked()
 	if cs.released {
-		cs.preSeed = nil
 		return
 	}
-	if cs.preSeed != nil {
-		cs.flushPreSeedLocked() // pgnotify: what arrived during the bind
-	}
 	cs.settleLocked()
+}
+
+// seedChain finishes a chaining bus's bind: Initialize the appender and
+// seed the delivery point, under hwmMu so no append can come first, and
+// not at all for a store released while it was binding.
+func (cs *channelStore) seedChain(current, initial string) {
+	cs.hwmMu.Lock()
+	if cs.released {
+		cs.closeReadyLocked()
+		cs.hwmMu.Unlock()
+		return
+	}
+	cs.appender.Initialize(current, initial)
+	cs.hwmMu.Unlock()
+	cs.seed(current)
 }
 
 // closeReadyLocked closes the ready channel (once), releasing a pgBus

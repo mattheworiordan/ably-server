@@ -10,19 +10,21 @@ package postgres
 // was: the LISTEN connection strips pgxpool DSN settings (so a DSN with
 // pool_max_conns no longer fails it); the reconnect backoff is copied at
 // Open; a released channel (Storage.Release) is not delivered to; and
-// the per-channel de-dup mark is seeded with the watermark at bind
-// (Storage.Channel), and a notification that arrives while the bind is
-// still reading the watermark is kept until then, so a cm the watermark
-// already covers is dropped rather than appended (before this, such a
-// cm could even reach the appender before Initialize), and a reconnect
-// reconcile replays from the watermark rather than from the start of
-// the log. The last is needed for a re-bind after Release to honour the
-// Appender contract.
+// the bind fix WS3 made on scale/channel-lifecycle (582331f): the
+// per-channel de-dup mark is seeded with the watermark at bind, a
+// notification that arrives while the bind is still reading the
+// watermark is held until then (before, it could reach the appender
+// before Initialize), and a reconcile a LISTEN reconnect requests
+// during a bind is run from the watermark and merged with the held
+// notifications before the channel goes live (before, it replayed the
+// whole log or could drop messages). A re-bind after Release needs the
+// last two to honour the Appender contract.
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -192,8 +194,8 @@ func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
 		return false
 	}
 	if !cs.seeded {
-		// The bind has not read its watermark yet: keep the cm until seed
-		// knows which side of the watermark it is on (flushPreSeedLocked).
+		// The bind has not read its watermark yet: keep the cm until
+		// initialize knows which side of the watermark it is on.
 		cs.preSeed = append(cs.preSeed, cm)
 		return false
 	}
@@ -206,14 +208,74 @@ func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
 	return true
 }
 
-// flushPreSeedLocked delivers the cms the pgnotify bus received for the
-// channel while its bind was reading the watermark: those above the
-// watermark, in the order they arrived (NOTIFYs arrive in commit order),
-// once each. Called by seed with hwmMu held.
-func (cs *channelStore) flushPreSeedLocked() {
-	held := cs.preSeed
-	cs.preSeed = nil
-	for _, cm := range held {
+// initialize finishes a pgnotify bind (after WS3's fix on
+// scale/channel-lifecycle): it hands the watermark to the appender,
+// seeds the high-water mark with it, and delivers what arrived while
+// the store was being bound, before deliver may reach the appender
+// directly:
+//
+//   - cms deliver held in preSeed (a NOTIFY between the dispatch-map
+//     insert and the watermark read), and
+//   - if a LISTEN reconnect asked for a reconcile while the store was
+//     unseeded, every cm committed after the watermark, read from the
+//     log (their NOTIFYs may have been lost in the drop).
+//
+// Both sets are merged in serial order and filtered against the mark
+// under hwmMu. Per channel, serial order is commit order, so a log read
+// holds every held cm at or below its newest serial, and nothing is
+// skipped. The store is marked seeded only once no reconcile request is
+// outstanding; until then deliver keeps buffering, so no NOTIFY can
+// advance the mark past a cm the reconcile is about to deliver. A
+// log-read error is returned after the store is seeded anyway (a later
+// reconnect reconciles again). A store released while binding never
+// Initializes its appender.
+func (cs *channelStore) initialize(ctx context.Context, current, initial string) error {
+	cs.hwmMu.Lock()
+	if cs.released {
+		cs.hwmMu.Unlock()
+		return nil
+	}
+	cs.appender.Initialize(current, initial)
+	if current > cs.lastSeen {
+		cs.lastSeen = current
+	}
+	for {
+		if cs.released {
+			cs.preSeed = nil
+			cs.hwmMu.Unlock()
+			return nil
+		}
+		if !cs.needsReconcile {
+			cs.deliverSortedLocked(cs.preSeed)
+			cs.preSeed = nil
+			cs.seeded = true
+			cs.hwmMu.Unlock()
+			return nil
+		}
+		cs.needsReconcile = false
+		after := cs.lastSeen
+		cs.hwmMu.Unlock()
+
+		missed, err := cs.loadAfter(ctx, after)
+
+		cs.hwmMu.Lock()
+		if err != nil {
+			cs.deliverSortedLocked(cs.preSeed)
+			cs.preSeed = nil
+			cs.seeded = true
+			cs.hwmMu.Unlock()
+			return err
+		}
+		cs.deliverSortedLocked(append(missed, cs.preSeed...))
+		cs.preSeed = nil
+	}
+}
+
+// deliverSortedLocked delivers cms in serial order through the mark.
+// Called with hwmMu held on an Initialized store.
+func (cs *channelStore) deliverSortedLocked(cms []*protocol.ChannelMessage) {
+	sort.Slice(cms, func(i, j int) bool { return cms[i].ChannelSerial < cms[j].ChannelSerial })
+	for _, cm := range cms {
 		if cm.ChannelSerial <= cs.lastSeen {
 			cs.st().duplicates.Add(1)
 			continue
@@ -227,19 +289,55 @@ func (cs *channelStore) flushPreSeedLocked() {
 // reconcileFromHistory replays every cm minted after the channel's
 // last-delivered serial — both message and presence kinds, merged in
 // channelSerial order — through deliver (DESIGN.md §7.2). Called after
-// a LISTEN reconnect to recover cms whose NOTIFY was lost in the gap.
+// a LISTEN reconnect to recover cms whose NOTIFY was lost in the gap. A
+// store still binding has no watermark yet: its initialize runs the
+// reconcile once it has one, so this does not replay the whole history.
 func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
 	cs.hwmMu.Lock()
+	if cs.released {
+		cs.hwmMu.Unlock()
+		return nil
+	}
+	if !cs.seeded {
+		cs.needsReconcile = true
+		cs.hwmMu.Unlock()
+		return nil
+	}
 	after := cs.lastSeen
 	cs.hwmMu.Unlock()
 
+	missed, err := cs.loadAfter(ctx, after)
+	if err != nil {
+		return err
+	}
+	for _, cm := range missed {
+		if cs.deliver(cm) {
+			cs.st().filled.Add(1)
+		}
+	}
+	return nil
+}
+
+// loadAfter reads every cm committed after the given serial from the
+// log; loadAfterFn replaces it in unit tests.
+func (cs *channelStore) loadAfter(ctx context.Context, after string) ([]*protocol.ChannelMessage, error) {
+	if cs.loadAfterFn != nil {
+		return cs.loadAfterFn(ctx, after)
+	}
+	return cs.missedAfter(ctx, after)
+}
+
+// missedAfter reads the message and presence cms committed after the
+// given serial, merged in channelSerial order (the pgnotify reconcile
+// does not read annotations, as before the bus seam).
+func (cs *channelStore) missedAfter(ctx context.Context, after string) ([]*protocol.ChannelMessage, error) {
 	messages, err := cs.History(ctx, storage.HistoryQuery{
 		Kind:               storage.KindMessage,
 		Direction:          storage.DirectionForwards,
 		AfterChannelSerial: after,
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile messages: %w", err)
+		return nil, fmt.Errorf("reconcile messages: %w", err)
 	}
 	presence, err := cs.History(ctx, storage.HistoryQuery{
 		Kind:               storage.KindPresence,
@@ -247,15 +345,9 @@ func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
 		AfterChannelSerial: after,
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile presence: %w", err)
+		return nil, fmt.Errorf("reconcile presence: %w", err)
 	}
-
-	for _, cm := range mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages) {
-		if cs.deliver(cm) {
-			cs.st().filled.Add(1)
-		}
-	}
-	return nil
+	return mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages), nil
 }
 
 // mergeByChannelSerial merges two channelSerial-ascending cm slices

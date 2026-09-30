@@ -445,22 +445,31 @@ func TestNATSBusSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
 }
 
 // TestNATSSubjectIsSafe checks the subject scheme: one NATS token per
-// channel whatever characters the name holds, and a hashed token for a
-// name too long to encode.
+// channel whatever characters the name holds, a hashed token for a name
+// too long to encode, and a namespace token that keeps two schemas'
+// channels of the same name apart.
 func TestNATSSubjectIsSafe(t *testing.T) {
+	prefix := natsNamespacePrefix("public")
+	ns, ok := strings.CutPrefix(prefix, natsSubjectPrefix)
+	if !ok || !strings.HasSuffix(ns, ".") || strings.ContainsAny(strings.TrimSuffix(ns, "."), ".*> \t\r\n") {
+		t.Fatalf("natsNamespacePrefix(public) = %q, want %q plus one literal token and a dot", prefix, natsSubjectPrefix)
+	}
 	for _, name := range []string{"room", "a.b.c", "*", ">", "chat:room one", "ünïcødé", strings.Repeat("n", 1000)} {
-		subj := natsSubject(name)
-		rest, ok := strings.CutPrefix(subj, natsSubjectPrefix)
+		subj := natsSubject(prefix, name)
+		rest, ok := strings.CutPrefix(subj, prefix)
 		if !ok {
-			t.Fatalf("natsSubject(%q) = %q, want prefix %q", name, subj, natsSubjectPrefix)
+			t.Fatalf("natsSubject(%q) = %q, want prefix %q", name, subj, prefix)
 		}
 		rest = strings.TrimPrefix(rest, "h.")
 		if rest == "" || strings.ContainsAny(rest, ".*> \t\r\n") {
 			t.Errorf("natsSubject(%q) = %q: token %q is not a single literal NATS token", name, subj, rest)
 		}
 	}
-	if natsSubject("a") == natsSubject("b") {
+	if natsSubject(prefix, "a") == natsSubject(prefix, "b") {
 		t.Error("distinct names share a subject")
+	}
+	if natsSubject(natsNamespacePrefix("s1"), "room") == natsSubject(natsNamespacePrefix("s2"), "room") {
+		t.Error("the same channel in two schemas shares a subject")
 	}
 }
 
