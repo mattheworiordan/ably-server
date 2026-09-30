@@ -122,6 +122,8 @@ type busStats struct {
 	drops, listens, unlistens                          atomic.Uint64
 	wakeupsSent, wakeupsReceived, flushes, flushErrors atomic.Uint64
 	overflow, flushNanos                               atomic.Uint64
+
+	lag [lagPaths]lagHistogram // delivery lag by path (buslag.go)
 }
 
 // discardStats absorbs the counts of a channelStore built without a
@@ -175,6 +177,7 @@ func (s *Storage) BusStats() storage.BusStats {
 		FlushErrors:       c.flushErrors.Load(),
 		Overflow:          c.overflow.Load(),
 		FlushSeconds:      time.Duration(c.flushNanos.Load()).Seconds(),
+		DeliveryLag:       c.lagSnapshot(),
 	}
 	return out
 }

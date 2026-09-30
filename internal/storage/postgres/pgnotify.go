@@ -218,6 +218,7 @@ func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
 	}
 	cs.lastSeen = cm.ChannelSerial
 	cs.appender.Append(cm)
+	cs.st().observeLag(lagFetched, 0, cm)
 	return true
 }
 
@@ -296,6 +297,7 @@ func (cs *channelStore) deliverSortedLocked(cms []*protocol.ChannelMessage) {
 		cs.lastSeen = cm.ChannelSerial
 		cs.st().fetched.Add(1)
 		cs.appender.Append(cm)
+		cs.st().observeLag(lagFetched, 0, cm)
 	}
 }
 

@@ -80,7 +80,8 @@ type busEvent struct {
 	prev    string                   // the channel's serial before this cm ("" if unknown)
 	cm      *protocol.ChannelMessage // nil for a pointer whose body is not yet read
 	src     eventSource
-	fetched bool // cm was read from the log by serial (a pointer), not carried by the bus
+	fetched bool  // cm was read from the log by serial (a pointer), not carried by the bus
+	sentAt  int64 // when the publisher sent the bus message (Unix ns; 0 if the bus does not say)
 }
 
 // resolvePointer reads a pointer event's body from the log, outside
@@ -280,6 +281,13 @@ func (cs *channelStore) appendEventLocked(ev busEvent) bool {
 		cs.st().inline.Add(1)
 	}
 	cs.appender.Append(ev.cm)
+	switch {
+	case ev.src == srcFastPath:
+	case ev.fetched:
+		cs.st().observeLag(lagFetched, ev.sentAt, ev.cm)
+	default:
+		cs.st().observeLag(lagInline, ev.sentAt, ev.cm)
+	}
 	return true
 }
 
@@ -403,6 +411,7 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 		cs.delivered++
 		cs.st().filled.Add(1)
 		cs.appender.Append(cm)
+		cs.st().observeLag(lagFilled, 0, cm)
 	}
 	if upTo != "" && upTo > cs.lastSeen {
 		var stale []busEvent
@@ -419,6 +428,7 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 				cs.delivered++
 				cs.st().filled.Add(1)
 				cs.appender.Append(ev.cm)
+				cs.st().observeLag(lagFilled, ev.sentAt, ev.cm)
 			}
 		}
 		cs.logger.Warn("storage/postgres: bus gap not found in the log; skipped past it", "channel", cs.name, "upTo", upTo)

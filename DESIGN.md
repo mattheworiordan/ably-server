@@ -2046,6 +2046,22 @@ name = "persisted:presence_fixtures"
     `ably_bus_reconciled_channels_total`, `ably_bus_reconcile_seconds_total`,
     `ably_bus_sweeps_total`, `ably_bus_sweep_catch_ups_total`,
     `ably_bus_sweep_seconds_total`.
+  - `ably_bus_delivery_lag_seconds{path}` (histogram, buckets 1 ms to
+    30 s): for each cm a node appends that came from another node, the
+    time from its commit to the append, by delivery path (`inline`,
+    `fetched`, `filled`, the same paths as the delivery counters). The
+    start is the bus message's send time on the nats bus (the envelope
+    carries it, taken straight after the commit); on the other buses, and
+    for any cm read from the log, it is the cm's stored timestamp (a
+    message's version timestamp, which the serial minted under the row
+    lock in the publish transaction fixes, so it is within one commit of
+    the commit itself; millisecond resolution). The publisher fast path
+    is not recorded. The two nodes' clocks are compared, so the
+    histogram is only as good as their sync (chrony in the cloud runs).
+    It separates time on the bus (and in the node's receive path) from
+    time the server spends before the commit and after the append: a
+    delivery latency seen by a client, minus this, is the publish path
+    plus the connection's own queue.
   - Postgres bus: `ably_bus_listens_total`, `ably_bus_unlistens_total`, and
     in coalesced mode `ably_bus_coalesced_wakeups_sent_total`,
     `ably_bus_coalesced_wakeups_received_total`,

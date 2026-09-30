@@ -96,7 +96,9 @@ func natsSubject(prefix, channel string) string {
 // serial and its predecessor's, and the cm itself exactly as the
 // publish stored it. CM is nil for a pointer. Annotation.Summary is
 // msgpack:"-" (the log carries it in its own column), so the summary
-// snapshots ride alongside, index-aligned with CM.Annotations.
+// snapshots ride alongside, index-aligned with CM.Annotations. SentAt is
+// when the publishing node sent it, straight after the commit (Unix
+// nanoseconds), from which a receiver measures the bus delivery lag.
 type natsEnvelope struct {
 	_msgpack  struct{} `msgpack:",as_array"`
 	Channel   string
@@ -104,12 +106,13 @@ type natsEnvelope struct {
 	Prev      string
 	CM        *protocol.ChannelMessage
 	Summaries [][]byte
+	SentAt    int64
 }
 
 // encodeNATSEnvelope encodes cm for the bus, inline when the encoding
 // fits within inlineMax and as a pointer otherwise.
 func encodeNATSEnvelope(channel string, cm *protocol.ChannelMessage, prev string, inlineMax int) (data []byte, pointer bool, err error) {
-	env := natsEnvelope{Channel: channel, Serial: cm.ChannelSerial, Prev: prev, CM: cm}
+	env := natsEnvelope{Channel: channel, Serial: cm.ChannelSerial, Prev: prev, CM: cm, SentAt: time.Now().UnixNano()}
 	if len(cm.Annotations) > 0 {
 		env.Summaries = make([][]byte, len(cm.Annotations))
 		for i, a := range cm.Annotations {
@@ -157,7 +160,7 @@ func decodeNATSEnvelope(data []byte) (busEvent, string, error) {
 			}
 		}
 	}
-	return busEvent{serial: env.Serial, prev: env.Prev, cm: env.CM}, env.Channel, nil
+	return busEvent{serial: env.Serial, prev: env.Prev, cm: env.CM, sentAt: env.SentAt}, env.Channel, nil
 }
 
 // natsBus is the NATS core pub/sub Bus (DESIGN.md §7.2). After a publish

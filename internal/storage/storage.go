@@ -232,6 +232,27 @@ type BusStats struct {
 	// wake-ups dropped by the overflow policy (DESIGN.md §7.2).
 	WakeupsSent, WakeupsReceived, Flushes, FlushErrors, Overflow uint64
 	FlushSeconds                                                 float64
+
+	// DeliveryLag is the time from a cm's commit to its append on this
+	// node, for cms that arrived from another node (not the publisher
+	// fast path), keyed by delivery path: "inline", "fetched", "filled"
+	// (DESIGN.md §10, ably_bus_delivery_lag_seconds). Nil when the bus
+	// records none.
+	DeliveryLag map[string]LagHistogram
+}
+
+// BusLagBuckets are the upper bounds, in seconds, of the bus delivery
+// lag histogram (ably_bus_delivery_lag_seconds).
+var BusLagBuckets = []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+
+// LagHistogram is a snapshot of one delivery-lag histogram: Counts[i]
+// is the cumulative number of observations at or below BusLagBuckets[i],
+// Count all observations (the +Inf bucket) and Sum their total in
+// seconds.
+type LagHistogram struct {
+	Counts []uint64
+	Count  uint64
+	Sum    float64
 }
 
 // ChannelStore is the per-channel persistence facet. All methods are

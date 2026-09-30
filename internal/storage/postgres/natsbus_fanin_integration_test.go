@@ -84,3 +84,43 @@ func TestNATSBusGoroutinesDoNotScaleWithChannels(t *testing.T) {
 		assertSerials(t, fmt.Sprintf("node2 ch-%d", i), recs[i].serials(), want[i])
 	}
 }
+
+// TestNATSBusRecordsDeliveryLag: every cm a node receives over the bus
+// from another node is recorded in the delivery-lag histogram on the
+// inline path (ably_bus_delivery_lag_seconds, DESIGN.md §10); the
+// publisher's own fast-path deliveries are not.
+func TestNATSBusRecordsDeliveryLag(t *testing.T) {
+	c := pgtest.Start(t)
+	n := natstest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	s1 := openNATSNode(t, dsn, n.URL)
+	s2 := openNATSNode(t, dsn, n.URL)
+	a1, a2 := &cmRecorder{}, &cmRecorder{}
+	ch1 := bindChannel(t, s1, "room", a1)
+	bindChannel(t, s2, "room", a2)
+
+	const total = 10
+	for i := range total {
+		if _, _, err := ch1.Store(ctx, []*protocol.Message{{Data: fmt.Sprintf("m-%d", i)}}); err != nil {
+			t.Fatalf("Store %d: %v", i, err)
+		}
+	}
+	a2.waitFor(t, total, 5*time.Second)
+	a1.waitFor(t, total, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // the echoes reach node1 and are dropped
+
+	lag2 := s2.BusStats().DeliveryLag["inline"]
+	if lag2.Count != total {
+		t.Errorf("node2 inline lag observations = %d, want %d", lag2.Count, total)
+	}
+	if lag2.Sum <= 0 || lag2.Sum/float64(lag2.Count) > 1 {
+		t.Errorf("node2 mean lag %.4fs (sum %.4f), want above 0 and well under 1 s on one host", lag2.Sum/float64(max(lag2.Count, 1)), lag2.Sum)
+	}
+	for path, h := range s1.BusStats().DeliveryLag {
+		if h.Count != 0 {
+			t.Errorf("node1 (the publisher) recorded %d %s lag observations, want 0", h.Count, path)
+		}
+	}
+}

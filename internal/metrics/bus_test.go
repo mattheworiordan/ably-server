@@ -27,6 +27,9 @@ func TestRegisterBusExposesBusStats(t *testing.T) {
 	src := &fakeBus{st: storage.BusStats{
 		Bus: "postgres", Mode: "coalesced", Connected: true, BoundChannels: 4, ReceiveQueueDepth: 9,
 		Received: 7, Inline: 3, FastPath: 2, WakeupsSent: 5, Overflow: 1, Drops: 6, ReconcileSeconds: 1.5,
+		DeliveryLag: map[string]storage.LagHistogram{
+			"inline": {Counts: lagCounts(map[float64]uint64{0.001: 1, 0.005: 3, 30: 4}), Count: 5, Sum: 40.012},
+		},
 	}}
 	m.RegisterBus(src)
 	rec := httptest.NewRecorder()
@@ -47,6 +50,14 @@ func TestRegisterBusExposesBusStats(t *testing.T) {
 		"ably_bus_reconcile_seconds_total 1.5",
 		"# TYPE ably_bus_received_total counter",
 		"# TYPE ably_bus_bound_channels gauge",
+		"# TYPE ably_bus_delivery_lag_seconds histogram",
+		`ably_bus_delivery_lag_seconds_bucket{path="inline",le="0.001"} 1`,
+		`ably_bus_delivery_lag_seconds_bucket{path="inline",le="0.0025"} 1`,
+		`ably_bus_delivery_lag_seconds_bucket{path="inline",le="0.005"} 3`,
+		`ably_bus_delivery_lag_seconds_bucket{path="inline",le="30"} 4`,
+		`ably_bus_delivery_lag_seconds_bucket{path="inline",le="+Inf"} 5`,
+		`ably_bus_delivery_lag_seconds_count{path="inline"} 5`,
+		`ably_bus_delivery_lag_seconds_sum{path="inline"} 40.012`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics lacks %q", want)
@@ -55,4 +66,19 @@ func TestRegisterBusExposesBusStats(t *testing.T) {
 	if src.calls != 1 {
 		t.Errorf("BusStats called %d times in one scrape, want 1", src.calls)
 	}
+}
+
+// lagCounts builds cumulative storage.BusLagBuckets counts from the
+// cumulative count at a few bucket bounds (each bound holds until the
+// next one given).
+func lagCounts(at map[float64]uint64) []uint64 {
+	out := make([]uint64, len(storage.BusLagBuckets))
+	var cur uint64
+	for i, le := range storage.BusLagBuckets {
+		if v, ok := at[le]; ok {
+			cur = v
+		}
+		out[i] = cur
+	}
+	return out
 }

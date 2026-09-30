@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"sort"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ably/ably-server/internal/storage"
@@ -24,6 +26,7 @@ type busMetric struct {
 type busCollector struct {
 	src     storage.BusStatser
 	info    *prometheus.Desc
+	lag     *prometheus.Desc
 	metrics []busMetric
 }
 
@@ -36,6 +39,9 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 		info: prometheus.NewDesc("ably_bus_info",
 			"The cluster bus this node runs (label bus) and the postgres bus notify mode (label mode). Always 1.",
 			[]string{"bus", "mode"}, nil),
+		lag: prometheus.NewDesc("ably_bus_delivery_lag_seconds",
+			"Time from a cm's commit to its append on this node, for cms from another node (the publisher fast path is not included), by delivery path (inline, fetched, filled). Measured from the bus message's send time on the nats bus, else the cm's stored timestamp (DESIGN.md §10).",
+			[]string{"path"}, nil),
 	}
 	add := func(name, help string, gauge bool, get func(storage.BusStats) float64) {
 		c.metrics = append(c.metrics, busMetric{desc: prometheus.NewDesc("ably_bus_"+name, help, nil, nil), gauge: gauge, get: get})
@@ -83,6 +89,7 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 // Describe implements prometheus.Collector.
 func (c *busCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.info
+	ch <- c.lag
 	for _, m := range c.metrics {
 		ch <- m.desc
 	}
@@ -98,5 +105,20 @@ func (c *busCollector) Collect(ch chan<- prometheus.Metric) {
 			vt = prometheus.GaugeValue
 		}
 		ch <- prometheus.MustNewConstMetric(m.desc, vt, m.get(st))
+	}
+	paths := make([]string, 0, len(st.DeliveryLag))
+	for path := range st.DeliveryLag {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		h := st.DeliveryLag[path]
+		buckets := make(map[float64]uint64, len(storage.BusLagBuckets))
+		for i, le := range storage.BusLagBuckets {
+			if i < len(h.Counts) {
+				buckets[le] = h.Counts[i]
+			}
+		}
+		ch <- prometheus.MustNewConstHistogram(c.lag, h.Count, h.Sum, buckets, path)
 	}
 }
