@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -527,4 +528,38 @@ func TestBusReconcileAfterDroppedListenPerChannel(t *testing.T) {
 		t.Fatal("B delivered nothing from its reconcile: the in-gap cms were not recovered from the log")
 	}
 	t.Logf("B after reconnect: reconciles=%d filled=%d duplicates=%d", after.Reconciles-before.Reconciles, after.Filled-before.Filled, after.Duplicates-before.Duplicates)
+}
+
+// TestBusListenConnAcceptsPoolDSNSettings opens a Storage whose DSN
+// carries a pgxpool setting (pool_max_conns). The LISTEN connection must
+// strip it like the pool does, instead of sending it to the server as an
+// unknown runtime parameter (which fails the connection), and the bus
+// must still deliver.
+func TestBusListenConnAcceptsPoolDSNSettings(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	q := u.Query()
+	q.Set("pool_max_conns", "7")
+	u.RawQuery = q.Encode()
+	ctx := context.Background()
+
+	a := openNode(t, u.String())
+	rec := &recorder{}
+	if _, err := a.Channel(ctx, "room", rec); err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	b := openNode(t, u.String())
+	pub, err := b.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	want := publish(t, ctx, pub, "hello")
+	waitForCount(t, rec, 1, 10*time.Second)
+	if got := rec.serials(); got[0] != want {
+		t.Fatalf("got %s, want %s", got[0], want)
+	}
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
@@ -275,18 +276,21 @@ func (s *Storage) listen(ctx context.Context, pgChan string) error {
 	}
 }
 
-// dialListenConn opens a raw connection for the LISTEN goroutine. The
-// deadline context-watcher is set explicitly (it is also pgx's default):
-// the loop interrupts WaitForNotification by cancelling its context, and
-// the deadline handler turns that into a read timeout, which pgconn
-// treats as non-fatal, so the connection stays usable. A cancel-request
-// handler would instead race a server-side cancel against the next
-// LISTEN.
+// dialListenConn opens a raw connection for the LISTEN goroutine. The DSN
+// is parsed as a pool DSN so pgxpool's own settings (pool_max_conns and
+// the like) are stripped rather than sent to the server as unknown
+// runtime parameters. The deadline context-watcher is set explicitly (it
+// is also pgx's default): the loop interrupts WaitForNotification by
+// cancelling its context, and the deadline handler turns that into a
+// read timeout, which pgconn treats as non-fatal, so the connection stays
+// usable. A cancel-request handler would instead race a server-side
+// cancel against the next LISTEN.
 func dialListenConn(ctx context.Context, dsn string) (*pgx.Conn, error) {
-	cfg, err := pgx.ParseConfig(dsn)
+	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: parse DSN for LISTEN conn: %w", err)
 	}
+	cfg := poolCfg.ConnConfig
 	cfg.BuildContextWatcherHandler = func(pgConn *pgconn.PgConn) ctxwatch.Handler {
 		return &pgconn.DeadlineContextWatcherHandler{Conn: pgConn.Conn()}
 	}
