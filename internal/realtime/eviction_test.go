@@ -92,12 +92,17 @@ type evictHarness struct {
 
 func newEvictServer(t *testing.T) *evictHarness {
 	t.Helper()
+	return newEvictServerIdle(t, evictIdle)
+}
+
+func newEvictServerIdle(t *testing.T, idle time.Duration) *evictHarness {
+	t.Helper()
 	parsed, err := auth.ParseAPIKey(testKey)
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
 	st := newReleaseGateStorage()
-	manager := core.NewManagerWithOptions(st, core.Options{IdleTimeout: evictIdle, SweepInterval: 5 * time.Millisecond})
+	manager := core.NewManagerWithOptions(st, core.Options{IdleTimeout: idle, SweepInterval: 5 * time.Millisecond})
 	t.Cleanup(manager.Close)
 	rt := NewServer([]auth.APIKey{parsed}, manager, time.Hour, logging.New(slog.DiscardHandler), nil, nil)
 	mux := http.NewServeMux()
@@ -296,7 +301,7 @@ func TestEvictionPublishDuringEviction(t *testing.T) {
 // the delayed LEAVE lands the channel is evicted.
 func TestEvictionHeldOffByPresenceMember(t *testing.T) {
 	h := newEvictServer(t)
-	const grace = 400 * time.Millisecond
+	const grace = 1500 * time.Millisecond
 	h.rt.remainPresentFor = grace
 
 	pub := dialClient(t, h.srv, "alice")
@@ -306,16 +311,17 @@ func TestEvictionHeldOffByPresenceMember(t *testing.T) {
 	_ = pub.Close() // abrupt: the member stays for the grace window
 	dropped := time.Now()
 
-	// Well past the idle timeout but inside the grace window, the
-	// channel must still be bound.
+	// Well past the idle timeout (60ms) and well inside the grace
+	// window, the channel must still be bound.
 	time.Sleep(5 * evictIdle)
-	if time.Since(dropped) < grace-50*time.Millisecond {
-		if got := h.manager.BoundChannels(); got != 1 {
-			t.Fatalf("BoundChannels = %d during the presence grace window, want 1", got)
-		}
-		if _, releases := h.store.counts("room"); releases != 0 {
-			t.Fatalf("channel with a presence member was released %d times", releases)
-		}
+	if elapsed := time.Since(dropped); elapsed >= grace/2 {
+		t.Fatalf("test machine too slow: %v elapsed, cannot check inside the %v grace window", elapsed, grace)
+	}
+	if got := h.manager.BoundChannels(); got != 1 {
+		t.Fatalf("BoundChannels = %d during the presence grace window, want 1", got)
+	}
+	if _, releases := h.store.counts("room"); releases != 0 {
+		t.Fatalf("channel with a presence member was released %d times", releases)
 	}
 	h.waitBound(t, 0, grace+2*time.Second)
 	if time.Since(dropped) < grace {
@@ -328,7 +334,11 @@ func TestEvictionHeldOffByPresenceMember(t *testing.T) {
 // stops the channel is evicted, and its next publish rebinds and is
 // ACKed.
 func TestEvictionRealtimePublisherWithoutSubscriber(t *testing.T) {
-	h := newEvictServer(t)
+	// A longer idle timeout than the other tests, so a slow publish+ACK
+	// round trip under -race cannot let the channel fall idle between
+	// publishes.
+	const idle = 400 * time.Millisecond
+	h := newEvictServerIdle(t, idle)
 	pub := dialClient(t, h.srv, "alice")
 	drainConnected(t, pub)
 
@@ -339,7 +349,7 @@ func TestEvictionRealtimePublisherWithoutSubscriber(t *testing.T) {
 		if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
 			t.Fatalf("frame = %v, want ACK", ack.Action)
 		}
-		time.Sleep(evictIdle / 3)
+		time.Sleep(idle / 8)
 	}
 	if binds, releases := h.store.counts("feed"); binds != 1 || releases != 0 {
 		t.Fatalf("while publishing: binds=%d releases=%d, want 1 and 0", binds, releases)

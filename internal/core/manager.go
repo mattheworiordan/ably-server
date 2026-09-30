@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -176,6 +177,13 @@ func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error)
 				return nil, ctx.Err()
 			}
 			if ch.bindErr != nil {
+				// The bind ran under the first caller's context. If that
+				// caller went away, this caller's own bind attempt may
+				// still succeed: retry rather than inherit its
+				// cancellation (the failed entry is already gone).
+				if isContextErr(ch.bindErr) && ctx.Err() == nil {
+					continue
+				}
 				return nil, ch.bindErr
 			}
 			ch.life.Lock()
@@ -250,6 +258,11 @@ func (m *Manager) sweep() int {
 	evicted := 0
 	var victims []*Channel
 	for i := range m.shards {
+		select {
+		case <-m.stop:
+			return evicted // Close: stop between shards
+		default:
+		}
 		sh := &m.shards[i]
 		sh.mu.Lock()
 		for _, ch := range sh.channels {
@@ -289,4 +302,9 @@ func (m *Manager) release(sh *shard, ch *Channel) {
 	close(ch.released)
 	m.bound.Add(-1)
 	m.metrics.ChannelEvicted()
+}
+
+// isContextErr reports whether err is a context cancellation or deadline.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

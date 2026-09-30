@@ -505,3 +505,51 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// blockingBindStorage blocks Channel until release is closed, then fails
+// with the caller's context error if it ended meanwhile.
+type blockingBindStorage struct {
+	storage.Storage
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *blockingBindStorage) Channel(ctx context.Context, name string, a storage.Appender) (storage.ChannelStore, error) {
+	if s.calls.Add(1) == 1 {
+		close(s.entered)
+		<-s.release
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return s.Storage.Channel(ctx, name, a)
+}
+
+// A GetChannel that waited on another caller's bind does not inherit
+// that caller's cancellation: it binds itself.
+func TestGetChannelWaiterRetriesAfterBinderCancelled(t *testing.T) {
+	st := &blockingBindStorage{Storage: memory.New(memory.Options{}), entered: make(chan struct{}), release: make(chan struct{})}
+	m := NewManager(st)
+	binderCtx, cancelBinder := context.WithCancel(context.Background())
+	binderErr := make(chan error, 1)
+	go func() {
+		_, err := m.GetChannel(binderCtx, "shared")
+		binderErr <- err
+	}()
+	<-st.entered
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := m.GetChannel(context.Background(), "shared")
+		waiter <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // let the waiter park on the bind
+	cancelBinder()
+	close(st.release)
+	if err := <-binderErr; err == nil {
+		t.Fatal("cancelled binder got no error")
+	}
+	if err := <-waiter; err != nil {
+		t.Fatalf("waiter inherited the binder's cancellation: %v", err)
+	}
+}
