@@ -36,7 +36,7 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +49,9 @@ jobs:
       # Default bus (pgnotify) for the SDK suite; the storage package's
       # contract suite runs on every bus mode in this job too.
       - name: go test (integration, race)
-        run: go test -tags=integration -race ./...
+        # The postgres package alone runs past go test's 10m default on a CI
+        # runner since the batching and retention suites landed.
+        run: go test -tags=integration -race -timeout 30m ./...
 
   # One cell per cluster bus (DESIGN.md §7.2): the storage contract suite
   # for that bus, then the SDK integration suite with the servers on it.
