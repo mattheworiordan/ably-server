@@ -58,6 +58,13 @@ type Batching struct {
 	// QueueMax bounds each lane's queue; beyond it a publish fails with
 	// storage.ErrOverloaded. Zero means DefaultPublishQueueMax.
 	QueueMax int
+
+	// LingerMin is a floor on accumulation when nothing is in flight: an
+	// idle lane holds its first publish until it has waited this long (or
+	// BatchMax are queued) before committing, so publishes arriving
+	// meanwhile share the commit. Zero (the default) commits at once, the
+	// leading edge.
+	LingerMin time.Duration
 }
 
 func (b Batching) enabled() bool { return b.Lanes > 0 }
@@ -72,6 +79,7 @@ func (b Batching) resolve() Batching {
 	if b.QueueMax <= 0 {
 		b.QueueMax = DefaultPublishQueueMax
 	}
+	b.LingerMin = max(b.LingerMin, 0)
 	return b
 }
 
@@ -144,6 +152,9 @@ type laneSet struct {
 
 func newLaneSet(b Batching, c committer, m *writeMetrics) *laneSet {
 	ls := &laneSet{metrics: m}
+	m.lanes.Set(float64(b.Lanes))
+	m.lingerMax.Set(b.LingerMax.Seconds())
+	m.lingerMin.Set(b.LingerMin.Seconds())
 	var ctx context.Context
 	ctx, ls.cancel = context.WithCancel(context.Background())
 	for i := range b.Lanes {
@@ -258,13 +269,20 @@ func (l *lane) submit(p *pending) error {
 }
 
 // pumpLocked starts as many batches as the rules allow: one at once when
-// nothing is in flight (the leading edge); a further one only when the
-// newest in-flight batch has been running for LingerMax, and then only
-// with publishes whose channels are not already in flight.
+// nothing is in flight (the leading edge), or, with LingerMin set, once
+// the oldest queued publish has waited LingerMin or BatchMax are queued;
+// a further one only when the newest in-flight batch has been running for
+// LingerMax, and then only with publishes whose channels are not already
+// in flight.
 func (l *lane) pumpLocked() {
 	for len(l.queue) > 0 && !l.closed && l.inflight < maxInflightPerLane {
 		if l.inflight > 0 {
 			if wait := l.opts.LingerMax - time.Since(l.lastDispatch); wait > 0 {
+				l.armTimerLocked(wait)
+				return
+			}
+		} else if l.opts.LingerMin > 0 && len(l.queue) < l.opts.BatchMax {
+			if wait := l.opts.LingerMin - time.Since(l.queue[0].enqueued); wait > 0 {
 				l.armTimerLocked(wait)
 				return
 			}
@@ -283,7 +301,7 @@ func (l *lane) pumpLocked() {
 	}
 }
 
-// armTimerLocked schedules a pump after d, for the linger cap.
+// armTimerLocked schedules a pump after d, for the linger cap or floor.
 func (l *lane) armTimerLocked(d time.Duration) {
 	if l.timer != nil {
 		l.timer.Stop()
@@ -426,6 +444,9 @@ func (l *lane) stop() {
 
 // writeMetrics are the ably_publish_* batching series (DESIGN.md §10).
 type writeMetrics struct {
+	lanes         prometheus.Gauge
+	lingerMax     prometheus.Gauge
+	lingerMin     prometheus.Gauge
 	batchSize     prometheus.Histogram
 	commits       prometheus.Counter
 	commitSeconds prometheus.Histogram
@@ -437,6 +458,18 @@ type writeMetrics struct {
 
 func newWriteMetrics() *writeMetrics {
 	return &writeMetrics{
+		lanes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ably_publish_lanes",
+			Help: "Publish batching lanes (--publish-lanes); 0 when every publish commits in its own transaction.",
+		}),
+		lingerMax: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ably_publish_linger_max_seconds",
+			Help: "In-flight time after which a lane starts a second batch (--publish-linger-max); 0 when batching is off.",
+		}),
+		lingerMin: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ably_publish_linger_min_seconds",
+			Help: "How long an idle lane holds its first publish before committing (--publish-linger-min).",
+		}),
 		batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_publish_batch_size",
 			Help:    "Publishes committed per batch transaction.",
@@ -471,5 +504,5 @@ func newWriteMetrics() *writeMetrics {
 }
 
 func (m *writeMetrics) collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks}
+	return []prometheus.Collector{m.lanes, m.lingerMax, m.lingerMin, m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks}
 }

@@ -1357,7 +1357,16 @@ keep their order. Per lane:
    flight longer than `--publish-linger-max` (default 5 ms), the queued
    publishes of other channels start a second batch, so a stalled commit
    delays only the channels in it (at most two batches per lane).
-4. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
+4. `--publish-linger-min` (default 0, off) puts a floor under step 1:
+   an idle lane holds its first publish until it has waited that long, or
+   `--publish-batch-max` publishes are queued, so publishes arriving
+   meanwhile share its commit. Publishes that have already waited behind
+   an in-flight commit for longer are not held again. It trades up to that
+   much ACK latency for deeper batches when many lanes across many nodes
+   each find little queued (measured: 1.2 to 4 publishes a commit with 4
+   lanes on 10 to 20 nodes, where one primary needs about 30 to reach its
+   rate).
+5. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
    Beyond it a publish is refused at once with Ably error **42910** (HTTP
    429 on REST, a NACK on realtime): nothing is stored and the client
    should back off and retry.
@@ -1438,7 +1447,9 @@ width across channels, not depth per channel. Cluster write throughput is
 still one primary's per database; channel sharding (§6.4) spreads
 channels over several.
 
-Series (§10): `ably_publish_batch_size` (histogram),
+Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
+`ably_publish_linger_min_seconds` (gauges: the configuration in effect),
+`ably_publish_batch_size` (histogram),
 `ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
@@ -2084,6 +2095,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
+--publish-linger-min 0s       cluster mode: how long an idle lane holds its first publish; 0 = leading edge (§6.3)
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
 --publish-bind-on-write false cluster mode: true binds a channel on every REST publish (§5.1, §6.3)
 ```
@@ -2104,11 +2116,11 @@ Configuration may also be supplied via an optional TOML config file
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`, `publish-queue-max`,
-`publish-bind-on-write` —
+`publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
+`publish-queue-max`, `publish-bind-on-write` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
-retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
+retentions, `publish-linger-max` and `publish-linger-min` as duration strings, e.g. `"10s"`,
 the sizes and counts as integers). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
@@ -2219,6 +2231,8 @@ name = "persisted:presence_fixtures"
     label (the shard's index in the `--postgres-dsn` list), and the
     `ably_bus_*` series below are summed over shards.
   - Cluster mode only, from publish batching (§6.3):
+    `ably_publish_lanes`, `ably_publish_linger_max_seconds`,
+    `ably_publish_linger_min_seconds` (gauges, the configuration),
     `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
     `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`

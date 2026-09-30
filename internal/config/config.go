@@ -58,10 +58,12 @@ type File struct {
 	MessageRetention   string `toml:"message-retention"`
 	PersistedRetention string `toml:"persisted-retention"`
 	// Publish batching for the cluster-mode write path (DESIGN.md §6.3,
-	// §9). Zero means absent; publish-linger-max is a duration string.
+	// §9). Zero means absent; publish-linger-max and publish-linger-min
+	// are duration strings.
 	PublishLanes     int    `toml:"publish-lanes"`
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
+	PublishLingerMin string `toml:"publish-linger-min"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
 	// PublishBindOnWrite restores binding a channel on every REST publish
 	// (DESIGN.md §6.3); absent/false keeps the write-only path.

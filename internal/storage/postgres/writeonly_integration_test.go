@@ -27,16 +27,6 @@ func writeOnlyBuses(t *testing.T) map[string]Options {
 	}
 }
 
-func openOptsT(t *testing.T, o Options) *Storage {
-	t.Helper()
-	s, err := Open(context.Background(), o)
-	if err != nil {
-		t.Fatalf("Open (%s): %v", o.Bus, err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
-}
-
 // assertNothingBound checks that s holds no binding of any kind: no
 // channel store, so nothing for the sweep to read or eviction to
 // release, and no bus subscription.
@@ -73,7 +63,7 @@ func TestUnboundPublishCrossNodeEveryBus(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/lanes=%d", name, lanes), func(t *testing.T) {
 				o.DSN = c.FreshSchemaDSN(t)
 				o.Batching = Batching{Lanes: lanes}
-				a, b := openOptsT(t, o), openOptsT(t, o)
+				a, b := openOpts(t, o), openOpts(t, o)
 
 				recB := &cmRecorder{}
 				bindChannel(t, b, "room", recB)
@@ -143,7 +133,7 @@ func TestUnboundPublishRacingBindEveryBus(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			o.DSN = c.FreshSchemaDSN(t)
 			o.Batching = Batching{Lanes: 4}
-			a := openOptsT(t, o)
+			a := openOpts(t, o)
 			for iter := range 10 {
 				channel := fmt.Sprintf("race-%d", iter)
 				var (
@@ -225,7 +215,7 @@ func TestShardedUnboundPublishRoutesByHash(t *testing.T) {
 func TestUnboundPublishBindOnWrite(t *testing.T) {
 	c := pgtest.Start(t)
 	ctx := context.Background()
-	a := openOptsT(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 4}, BindOnWrite: true})
+	a := openOpts(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 4}, BindOnWrite: true})
 	st := a.UnboundChannel("room")
 	publish(t, ctx, st, "x")
 	if _, err := a.Channel(ctx, "room", &recordingAppender{}); err != nil {

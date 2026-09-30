@@ -157,3 +157,25 @@ func metricValue(t *testing.T, debugAddr, name string) float64 {
 	t.Fatalf("%s not found in /metrics", name)
 	return 0
 }
+
+// TestIntegrationPublishBatchingFlagsReachMetrics: --publish-lanes,
+// --publish-linger-max and --publish-linger-min are honoured end to end
+// and reported on /metrics, and a publish is counted in the batch-size
+// histogram (DESIGN.md §6.3, §10), so a scale run can confirm the
+// settings it ran with.
+func TestIntegrationPublishBatchingFlagsReachMetrics(t *testing.T) {
+	pgc := pgtest.Start(t)
+	node, debug := startNode(t, pgc.FreshSchemaDSN(t), "--publish-lanes=1", "--publish-linger-max=10ms", "--publish-linger-min=3ms")
+	restPublish(t, node, "lanes-room", "x")
+	for name, want := range map[string]float64{
+		"ably_publish_lanes":              1,
+		"ably_publish_linger_max_seconds": 0.01,
+		"ably_publish_linger_min_seconds": 0.003,
+		"ably_publish_batch_size_count":   1,
+		"ably_publish_commits_total":      1,
+	} {
+		if got := metricValue(t, debug, name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+}

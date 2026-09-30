@@ -75,6 +75,7 @@ const (
 	publishLanesEnv     = "ABLY_SERVER_PUBLISH_LANES"
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
+	publishLingerMinEnv = "ABLY_SERVER_PUBLISH_LINGER_MIN"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 	publishBindEnv      = "ABLY_SERVER_PUBLISH_BIND_ON_WRITE"
 )
@@ -194,6 +195,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	publishLingerMinDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMinEnv), file.PublishLingerMin, 0)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	publishQueueMaxDefault, err := config.DefaultInt(opts.Getenv(publishQueueMaxEnv), file.PublishQueueMax, postgres.DefaultPublishQueueMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -252,6 +258,7 @@ func Run(ctx context.Context, opts Opts) int {
 	publishLanes := fs.Int("publish-lanes", publishLanesDefault, "cluster mode: publish lanes for leading-edge batching; a channel always uses the same lane; 0 commits every publish in its own transaction (DESIGN.md §6.3) (env: "+publishLanesEnv+")")
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
+	publishLingerMin := fs.Duration("publish-linger-min", publishLingerMinDefault, "cluster mode: how long an idle lane holds its first publish so others can join its commit; 0 commits at once (DESIGN.md §6.3) (env: "+publishLingerMinEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
 	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
@@ -273,6 +280,10 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
+		return 2
+	}
+	if *publishLingerMin < 0 {
+		fmt.Fprintln(opts.Out, "--publish-linger-min must not be negative")
 		return 2
 	}
 	if *channelIdleTimeout < 0 {
@@ -361,6 +372,7 @@ func Run(ctx context.Context, opts Opts) int {
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
 			LingerMax: *publishLingerMax,
+			LingerMin: *publishLingerMin,
 			QueueMax:  *publishQueueMax,
 		},
 	})

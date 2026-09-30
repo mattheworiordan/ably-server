@@ -60,6 +60,23 @@ func TestBatchedChannelStoreContractEveryBus(t *testing.T) {
 	}
 }
 
+// TestOneLaneLingerChannelStoreContractEveryBus runs the storage contract
+// suite with one lane and a linger floor and cap (--publish-lanes=1
+// --publish-linger-min=2ms --publish-linger-max=10ms), the batch-depth
+// settings the scale runs compare (DESIGN.md §6.3), on every bus.
+func TestOneLaneLingerChannelStoreContractEveryBus(t *testing.T) {
+	c := pgtest.Start(t)
+	for name, opts := range batchedBuses(t) {
+		t.Run(name, func(t *testing.T) {
+			storagetest.RunChannelStoreTests(t, func(t *testing.T) storage.Storage {
+				o := opts(c.FreshSchemaDSN(t))
+				o.Batching = Batching{Lanes: 1, LingerMin: 2 * time.Millisecond, LingerMax: 10 * time.Millisecond}
+				return openOpts(t, o)
+			})
+		})
+	}
+}
+
 // orderAppender records every delivered serial and whether any arrived
 // out of order or twice.
 type orderAppender struct {
