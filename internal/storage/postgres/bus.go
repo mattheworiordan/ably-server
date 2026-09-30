@@ -89,6 +89,7 @@ func pgChannelName(namespace, name string) string {
 type busNotification struct {
 	Channel string   `json:"channel"`
 	Serial  string   `json:"serial"`
+	Wake    bool     `json:"wake,omitempty"` // coalesced-mode wake-up: read everything after the mark
 	Prev    string   `json:"prev,omitempty"`
 	Kind    string   `json:"kind,omitempty"`
 	Rows    [][]byte `json:"rows,omitempty"`
@@ -157,6 +158,11 @@ type busCounters struct {
 	filled        atomic.Uint64
 	fetchErrors   atomic.Uint64
 	listens       atomic.Uint64
+	wakeupsSent   atomic.Uint64
+	wakeups       atomic.Uint64
+	pulls         atomic.Uint64
+	polls         atomic.Uint64
+	pollPulls     atomic.Uint64
 }
 
 // BusStats is a point-in-time copy of this node's bus counters
@@ -196,6 +202,17 @@ type BusStats struct {
 	// Listens counts LISTEN statements this node has issued, including
 	// re-LISTENs after a reconnect.
 	Listens uint64
+	// WakeupsSent counts coalesced-mode wake-ups this node's notifier sent
+	// (at most one per channel per window).
+	WakeupsSent uint64
+	// Wakeups counts coalesced-mode wake-ups this node received.
+	Wakeups uint64
+	// Pulls counts range reads run for wake-ups, polls and fast-path gaps
+	// in coalesced mode.
+	Pulls uint64
+	// Polls counts safety-net polls; PollPulls the range reads they queued.
+	Polls     uint64
+	PollPulls uint64
 	// BoundChannels is the number of channels this node LISTENs for.
 	BoundChannels int
 }
@@ -219,6 +236,11 @@ func (s *Storage) BusStats() BusStats {
 		Filled:        c.filled.Load(),
 		FetchErrors:   c.fetchErrors.Load(),
 		Listens:       c.listens.Load(),
+		WakeupsSent:   c.wakeupsSent.Load(),
+		Wakeups:       c.wakeups.Load(),
+		Pulls:         c.pulls.Load(),
+		Polls:         c.polls.Load(),
+		PollPulls:     c.pollPulls.Load(),
 		BoundChannels: bound,
 	}
 }
@@ -536,10 +558,12 @@ func (s *Storage) stopWorkers() {
 }
 
 // busItem is one unit of work on a channel's delivery queue: a raw NOTIFY
-// payload, or a reconcile request.
+// payload, a reconcile request, or (coalesced mode) a pull: a range read
+// of everything after the high-water mark.
 type busItem struct {
 	payload   string
 	reconcile bool
+	pull      bool
 }
 
 // busQueue is a bound channel's ordered delivery queue. slots holds one
@@ -610,8 +634,14 @@ func (cs *channelStore) drain() {
 // or a notification whose cm it decodes inline or reads back by serial.
 func (cs *channelStore) process(ctx context.Context, it busItem) {
 	st := &cs.s.stats
-	if it.reconcile {
+	switch {
+	case it.reconcile:
 		st.reconciles.Add(1)
+		cs.fill(ctx, "")
+		return
+	case it.pull:
+		cs.pullQueued.Store(false)
+		st.pulls.Add(1)
 		cs.fill(ctx, "")
 		return
 	}
@@ -622,6 +652,19 @@ func (cs *channelStore) process(ctx context.Context, it busItem) {
 		return
 	}
 	last := cs.watermark()
+	if n.Wake {
+		// Coalesced-mode wake-up: n.Serial is the latest write the sender
+		// made on this channel in its window. Read everything after the
+		// mark, unless we are already past it.
+		st.wakeups.Add(1)
+		if n.Serial <= last {
+			st.duplicates.Add(1)
+			return
+		}
+		st.pulls.Add(1)
+		cs.fill(ctx, "")
+		return
+	}
 	if n.Serial <= last {
 		st.duplicates.Add(1) // already delivered (fast path, fill): no read needed
 		return
@@ -699,12 +742,24 @@ func (cs *channelStore) fill(ctx context.Context, upTo string) {
 // mark), the fast path steps aside: our cm then arrives through the
 // NOTIFY path behind the earlier one, so the appender still sees every
 // cm once and in serial order.
+//
+// In coalesced mode it also marks the channel for this window's wake-up,
+// and on a gap it queues a range read at once rather than waiting for a
+// wake-up.
 func (cs *channelStore) publishLocal(cm *protocol.ChannelMessage, prev string) {
+	if cs.s.notifier != nil {
+		cs.s.notifier.mark(cs.pgChan, cs.name, cm.ChannelSerial)
+	}
 	if cs.appender == nil || !cs.isReady() {
 		return // not bound here, or the bind is still in progress: NOTIFY delivers
 	}
-	if cs.deliver(cm, prev) == deliverOK {
+	switch cs.deliver(cm, prev) {
+	case deliverOK:
 		cs.s.stats.fastPath.Add(1)
+	case deliverGap:
+		if cs.s.notifier != nil {
+			cs.requestPull(cs.s.loopCtx)
+		}
 	}
 }
 
@@ -839,6 +894,9 @@ func (s *Storage) loadRange(ctx context.Context, channel, after, upTo string, li
 // stored rows inline when they fit. Postgres holds the notification
 // until commit, so listeners see it only if the write commits.
 func (cs *channelStore) notifyTx(ctx context.Context, tx pgx.Tx, serial, prev string, kind storage.Kind, rows, sums [][]byte) error {
+	if cs.s.notifier != nil {
+		return nil // coalesced mode: the notifier wakes receivers after commit
+	}
 	payload, _, err := encodeNotification(cs.name, serial, prev, kind, rows, sums)
 	if err != nil {
 		return err

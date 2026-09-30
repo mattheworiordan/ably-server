@@ -111,6 +111,19 @@ type Options struct {
 	// broker's reconnect/reconcile lifecycle (DESIGN.md §7.2) and the
 	// presence reaper (§12.5). Nil means logging.Default().
 	Logger *logging.Logger
+
+	// NotifyMode selects how a committed write reaches the other nodes
+	// that hold its channel (DESIGN.md §7.2). The zero value is
+	// NotifyPerPublish.
+	NotifyMode NotifyMode
+
+	// NotifyWindow is the coalescing window in NotifyCoalesced mode: a
+	// node sends at most one wake-up per channel per window. Zero means
+	// 50ms. It is the latency a remote subscriber pays in that mode.
+	NotifyWindow time.Duration
+
+	// PollInterval is the NotifyCoalesced safety-net poll. Zero means 2s.
+	PollInterval time.Duration
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
@@ -123,6 +136,8 @@ type Storage struct {
 	logger    *logging.Logger
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
+
+	notifier *wakeNotifier // non-nil only in NotifyCoalesced mode
 
 	mu       sync.RWMutex
 	channels map[string]*channelStore // every store handed out, by Ably channel name
@@ -159,6 +174,10 @@ type Storage struct {
 func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if opts.DSN == "" {
 		return nil, errors.New("storage/postgres: Open requires a DSN")
+	}
+	mode, err := ParseNotifyMode(string(opts.NotifyMode))
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	pool, err := pgxpool.New(ctx, opts.DSN)
 	if err != nil {
@@ -220,6 +239,19 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	go s.listenLoop(loopCtx)
 	go s.presenceLeaseBumpLoop(loopCtx)
 	go s.presenceReaperLoop(loopCtx)
+	if mode == NotifyCoalesced {
+		window, poll := opts.NotifyWindow, opts.PollInterval
+		if window <= 0 {
+			window = defaultNotifyWindow
+		}
+		if poll <= 0 {
+			poll = defaultPollInterval
+		}
+		s.notifier = newWakeNotifier(s, window)
+		s.wg.Add(2)
+		go s.notifier.run(loopCtx)
+		go s.pollLoop(loopCtx, poll)
+	}
 	return s, nil
 }
 
@@ -663,6 +695,8 @@ type channelStore struct {
 
 	// q is the bound channel's ordered delivery queue (bus.go).
 	q busQueue
+	// pullQueued de-duplicates queued coalesced-mode range reads.
+	pullQueued atomic.Bool
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the

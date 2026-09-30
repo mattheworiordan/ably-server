@@ -43,6 +43,8 @@ import (
 const (
 	keysEnv            = "ABLY_SERVER_KEYS"
 	postgresDSNEnv     = "ABLY_SERVER_POSTGRES_DSN"
+	pgNotifyModeEnv    = "ABLY_SERVER_POSTGRES_NOTIFY_MODE"
+	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
 	logFormatEnv       = "ABLY_SERVER_LOG_FORMAT"
 	debugListenEnv     = "ABLY_SERVER_DEBUG_LISTEN"
 	modeEnv            = "ABLY_SERVER_MODE"
@@ -114,6 +116,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	pgNotifyWindowDefault, err := config.DefaultDuration(opts.Getenv(pgNotifyWindowEnv), "", 50*time.Millisecond)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
 	fs.SetOutput(opts.Out)
@@ -124,6 +131,8 @@ func Run(ctx context.Context, opts Opts) int {
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
+	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), "", string(postgres.NotifyPerPublish)), "cluster mode bus: publish (one NOTIFY per write, inside its transaction) or coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) (DESIGN.md §7.2) (env: "+pgNotifyModeEnv+")")
+	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced (env: "+pgNotifyWindowEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -192,7 +201,16 @@ func Run(ctx context.Context, opts Opts) int {
 		logger.Info("tracing enabled")
 	}
 
-	store, err := openStorage(ctx, *mode, *dataDir, *postgresDSN)
+	notifyMode, err := postgres.ParseNotifyMode(*pgNotifyMode)
+	if err != nil {
+		logger.Error("invalid --postgres-notify-mode", "err", err)
+		return 1
+	}
+	store, err := openStorage(ctx, *mode, *dataDir, postgres.Options{
+		DSN:          *postgresDSN,
+		NotifyMode:   notifyMode,
+		NotifyWindow: *pgNotifyWindow,
+	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
 		return 1
@@ -206,7 +224,7 @@ func Run(ctx context.Context, opts Opts) int {
 			logger.Error("close storage", "err", err)
 		}
 	}()
-	logger.Info("storage ready", "mode", *mode)
+	logger.Info("storage ready", "mode", *mode, "postgresNotifyMode", notifyMode)
 
 	m := metrics.New()
 	manager := core.NewManager(store)
@@ -589,7 +607,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storage.Storage, error) {
+func openStorage(ctx context.Context, mode, dataDir string, pg postgres.Options) (storage.Storage, error) {
 	switch mode {
 	case "memory":
 		return memory.New(memory.Options{}), nil
@@ -602,10 +620,10 @@ func openStorage(ctx context.Context, mode, dataDir, postgresDSN string) (storag
 		}
 		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
 	case "cluster":
-		if postgresDSN == "" {
+		if pg.DSN == "" {
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
 		}
-		return postgres.Open(ctx, postgres.Options{DSN: postgresDSN})
+		return postgres.Open(ctx, pg)
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}
