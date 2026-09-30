@@ -61,12 +61,15 @@ if not batches:
     print("no samples in window")
     raise SystemExit(0)
 
-pg, nodes_sum, bench_cpu = [], [], []
+pg, nodes_sum, bench_cpu, nats_cpu = [], [], [], []
 per_node = defaultdict(list)
 for t, d in sorted(batches.items()):
     pg_v = [v for n, v in d.items() if "postgres" in n]
     bench_v = [v for n, v in d.items() if "bench" in n]
-    node_v = {n: v for n, v in d.items() if "postgres" not in n and "bench" not in n}
+    nats_v = [v for n, v in d.items() if "nats" in n and "node" not in n]
+    node_v = {n: v for n, v in d.items() if "postgres" not in n and "bench" not in n and not ("nats" in n and "node" not in n)}
+    if nats_v:
+        nats_cpu.append(sum(nats_v))
     if pg_v:
         pg.append(sum(pg_v))
     if bench_v:
@@ -98,6 +101,8 @@ if nodes_sum:
     print(line("all nodes (sum)", nodes_sum))
 if bench_cpu:
     print(line("bench container", bench_cpu))
+if nats_cpu:
+    print(line("nats server", nats_cpu))
 if a.per_node:
     for n in sorted(per_node):
         print(line(n, per_node[n]))

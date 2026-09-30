@@ -11,6 +11,9 @@
 #                 `docker stats` (empty: no docker sampling)
 #   PG_CONTAINER  name of the postgres container; when set, connection
 #                 counts and pg_stat_database deltas are recorded
+#   METRICS_FILTER regex of node container names whose /metrics (debug
+#                 listener :6060, scale stack only) is scraped before and
+#                 after the run into <label>.metrics-<container>-{before,after}.txt
 #
 # Files written: <label>.log (timestamped bench output),
 # <label>.top.log (host top, every 2s), <label>.dockerstats.csv.
@@ -41,6 +44,15 @@ pg_snapshot() {
     "SELECT 'pg_connections', count(*), count(*) FILTER (WHERE state='active') FROM pg_stat_activity WHERE datname='ably'" 2>/dev/null
 }
 
+scrape_metrics() { # scrape_metrics before|after
+  [ -n "${METRICS_FILTER:-}" ] || return 0
+  local c
+  for c in $(docker ps --format '{{.Names}}' | grep -E "$METRICS_FILTER" | sort); do
+    docker exec "$c" wget -qO- http://localhost:6060/metrics 2>/dev/null \
+      | grep -E '^(ably_|go_goroutines|process_cpu_seconds_total)' > "$LOG_DIR/$label.metrics-$c-$1.txt" || true
+  done
+}
+
 top -l 0 -s 2 -n 8 -o cpu -stats pid,command,cpu,mem > "$LOG_DIR/$label.top.log" 2>&1 &
 top_pid=$!
 stats_pid=""
@@ -50,12 +62,14 @@ if [ -n "${STATS_FILTER:-}" ]; then
 fi
 
 { echo "# pg before:"; pg_snapshot | sed 's/^/#   /'; } >> "$log"
+scrape_metrics before
 start="$(gdate +%s.%N)"
 "$BENCH_BIN" --endpoints "$endpoints" "$@" 2>&1 \
   | while IFS= read -r line; do printf '%s %s\n' "$(gdate +%H:%M:%S.%3N)" "$line"; done \
   | tee -a "$log"
 rc="${PIPESTATUS[0]}"
 end="$(gdate +%s.%N)"
+scrape_metrics after
 { echo "# pg after:"; pg_snapshot | sed 's/^/#   /'; } >> "$log"
 
 kill "$top_pid" >/dev/null 2>&1 || true

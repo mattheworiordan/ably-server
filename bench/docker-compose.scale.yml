@@ -21,12 +21,15 @@
 #   - each node serves pprof and /metrics on :6060 inside its container
 #     (not published to the host; scrape with `docker exec`).
 #   - restart: "no", so a crashing node is visible instead of looping.
+#   - the Postgres image can be overridden with PG_IMAGE (default
+#     postgres:16-alpine, the same as the original file), to separate the
+#     effect of the Postgres version from the effect of the code.
 
 name: ablyscale
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${PG_IMAGE:-postgres:16-alpine}
     command: ["postgres", "-c", "max_connections=1000"]
     environment:
       POSTGRES_USER: ably

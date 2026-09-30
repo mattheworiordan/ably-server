@@ -34,14 +34,18 @@ if [ "$INNET" = 1 ]; then
 fi
 export BENCH_BIN LOG_DIR
 
-SEARCH=(--search --duration 15s --warmup 3s --p50 20ms --p99 100ms --max-rate 100000 --rate 250)
+START_RATE="${START_RATE:-250}"
+SEARCH=(--search --duration 15s --warmup 3s --p50 20ms --p99 100ms --max-rate 100000 --rate "$START_RATE")
 
 profile_flags() {
   case "$1" in
     default)  echo "--channels 4 --publishers 4 --subscribers 4" ;;
     fanout)   echo "--channels 1 --publishers 1 --subscribers 300" ;;
     many)     echo "--channels 300 --publishers 300 --subscribers 300" ;;
-    allnodes) echo "--channels 25 --publishers 25 --subscribers 300" ;;
+    # many with the two harness fixes: publishers phase-shifted (--stagger) and
+    # a 10 s warm-up so the connection/attach transient is not measured.
+    manyfix)  echo "--channels 300 --publishers 300 --subscribers 300 --stagger --warmup 10s" ;;
+    allnodes) echo "--channels 25 --publishers 25 --subscribers 300 --stagger" ;;
     *) echo "unknown profile $1" >&2; return 1 ;;
   esac
 }
@@ -97,6 +101,7 @@ up_scale() {
   ( cd "$repo" && docker compose -f bench/docker-compose.scale.yml -p ablyscale down -v --remove-orphans >/dev/null 2>&1
     docker compose -f bench/docker-compose.scale.yml -p ablyscale up -d --scale node="$n" ) || return 1
   PG=ablyscale-postgres-1
+  METRICS_FILTER='^ablyscale-node'; export METRICS_FILTER
   ENDPOINTS="$("$here/scale-endpoints.sh")"
   STATS_FILTER='^ablyscale-'
   local have; have="$(echo "$ENDPOINTS" | tr ',' '\n' | grep -c .)"

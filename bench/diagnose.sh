@@ -15,11 +15,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 label="${1:?label}"; profile="${2:?profile}"; rate="${3:?rate}"; dur="${4:-30s}"
 PG=ablyscale-postgres-1
 ENDPOINTS="$("$here/scale-endpoints.sh")"
+warm=3s
 case "$profile" in
   default)  flags="--channels 4 --publishers 4 --subscribers 4" ;;
   fanout)   flags="--channels 1 --publishers 1 --subscribers 300" ;;
   many)     flags="--channels 300 --publishers 300 --subscribers 300" ;;
-  allnodes) flags="--channels 25 --publishers 25 --subscribers 300" ;;
+  manyfix)  flags="--channels 300 --publishers 300 --subscribers 300 --stagger"; warm=10s ;;
+  allnodes) flags="--channels 25 --publishers 25 --subscribers 300 --stagger" ;;
   *) echo "unknown profile" >&2; exit 2 ;;
 esac
 nodes="$(docker ps --format '{{.Names}}' | grep '^ablyscale-node-' | sort)"
@@ -54,7 +56,7 @@ stats_pid=$!
 # CPU profile of the first node in the middle of the measurement window
 # (warm-up 3 s + connection setup), and goroutine dump.
 (
-  sleep 14
+  sleep $(( ${warm%s} + 6 ))
   docker exec "$first" wget -qO /tmp/cpu.pprof "http://localhost:6060/debug/pprof/profile?seconds=10" 2>/dev/null
   docker cp "$first:/tmp/cpu.pprof" "$out/cpu-$first.pprof" >/dev/null 2>&1
   docker exec "$first" wget -qO- "http://localhost:6060/debug/pprof/goroutine?debug=1" 2>/dev/null | head -60 > "$out/goroutines-$first.txt"
@@ -62,7 +64,7 @@ stats_pid=$!
 prof_pid=$!
 
 echo "# $label $(date -u +%FT%TZ) profile=$profile rate=$rate duration=$dur endpoints=$ENDPOINTS" | tee "$out/run.log"
-"$BENCH_BIN" --endpoints "$ENDPOINTS" --rate "$rate" --duration "$dur" --warmup 3s $flags 2>&1 | tee -a "$out/run.log"
+"$BENCH_BIN" --endpoints "$ENDPOINTS" --rate "$rate" --duration "$dur" --warmup "$warm" $flags 2>&1 | tee -a "$out/run.log"
 wait "$prof_pid" 2>/dev/null || true
 kill "$poll_pid" "$stats_pid" >/dev/null 2>&1 || true
 wait "$poll_pid" "$stats_pid" 2>/dev/null || true
