@@ -36,11 +36,14 @@ type RunRecord struct {
 	NodeStats NodeStats    `json:"node_stats"`
 	Footprint Footprint    `json:"footprint"`
 	Fault     *FaultRecord `json:"fault,omitempty"`
-	Checks    []Check      `json:"checks"`
-	Pass      bool         `json:"pass"`
-	Verdict   string       `json:"verdict"`
-	Errors    []string     `json:"errors,omitempty"`
-	Jobs      []JobRef     `json:"jobs"`
+	// ServerBoundPerAttachment is BoundRatio: server channels bound over
+	// generator attachments at the end of the hold.
+	ServerBoundPerAttachment float64  `json:"server_channels_bound_per_generator_attachment,omitempty"`
+	Checks                   []Check  `json:"checks"`
+	Pass                     bool     `json:"pass"`
+	Verdict                  string   `json:"verdict"`
+	Errors                   []string `json:"errors,omitempty"`
+	Jobs                     []JobRef `json:"jobs"`
 }
 
 // JobRef names one generator job of the run.
@@ -81,7 +84,12 @@ type NodeStats struct {
 	// ConnectionsOpen is the nodes' summed open connections at the end of
 	// the hold, as the server counts them.
 	ConnectionsOpen float64 `json:"connections_open"`
-	Measured        bool    `json:"measured"`
+	// Server-side counts summed over nodes at the first and last sample
+	// of the hold, to set against the generator's own counts.
+	ConnectionsAtStart   float64 `json:"connections_at_start"`
+	ChannelsBoundAtStart float64 `json:"channels_bound_at_start"`
+	ChannelsBoundAtEnd   float64 `json:"channels_bound_at_end"`
+	Measured             bool    `json:"measured"`
 }
 
 // Footprint is plan §8's footprint: provisioned and used resources per
@@ -140,6 +148,7 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 		c.Target += s.Connections.Target
 		c.Opened += s.Connections.Opened
 		c.Peak += s.Connections.Peak
+		c.OpenAtMeasureStart += s.Connections.OpenAtMeasureStart
 		c.OpenAtMeasureEnd += s.Connections.OpenAtMeasureEnd
 		c.ConnectFailures += s.Connections.ConnectFailures
 		c.Reconnects += s.Connections.Reconnects
@@ -147,6 +156,7 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 		c.UnplannedDrops += s.Connections.UnplannedDrops
 		a := &r.Attachments
 		a.Target += s.Attachments.Target
+		a.AttachedAtMeasureStart += s.Attachments.AttachedAtMeasureStart
 		a.AttachedAtMeasureEnd += s.Attachments.AttachedAtMeasureEnd
 		a.Failures += s.Attachments.Failures
 		a.ChannelOpens += s.Attachments.ChannelOpens
@@ -263,6 +273,9 @@ func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS int64) 
 		}
 		ns.RSSBytes += last.Values["process_resident_memory_bytes"]
 		ns.ConnectionsOpen += last.Values["ably_connections_open"]
+		ns.ConnectionsAtStart += first.Values["ably_connections_open"]
+		ns.ChannelsBoundAtStart += first.Values["ably_channels_bound"]
+		ns.ChannelsBoundAtEnd += last.Values["ably_channels_bound"]
 	}
 	return ns
 }
@@ -297,6 +310,33 @@ func ComputeFootprint(inv *Inventory, res RunResult, ns NodeStats) Footprint {
 	f.UsedPer10kWrites = per(f.CoresUsed, f.WritesPerSec, 1e4)
 	f.RSSGBPer100kConns = per(f.RSSGB, f.Connections, 1e5)
 	return f
+}
+
+func relChange(from, to int64) float64 {
+	if from <= 0 {
+		return 0
+	}
+	return float64(to-from) / float64(from)
+}
+
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// BoundRatio is the server's bound channels over the generator's
+// attachments at the end of the hold (0 when either is unknown). Near
+// the number of nodes a channel's subscribers span (1 when each channel
+// lives on one node) means the server holds what the generator
+// attached; much higher means channels are retained past their use.
+func (rec *RunRecord) BoundRatio() float64 {
+	a := rec.Result.Attachments.AttachedAtMeasureEnd
+	if a <= 0 || rec.NodeStats.ChannelsBoundAtEnd <= 0 {
+		return 0
+	}
+	return rec.NodeStats.ChannelsBoundAtEnd / float64(a)
 }
 
 func msOf(us uint64) string { return fmt.Sprintf("%.1f ms", float64(us)/1000) }
@@ -386,6 +426,17 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		add(Check{Name: "connections open at end of hold", Value: fmt.Sprintf("%d of %d", c.OpenAtMeasureEnd, c.Target),
 			Limit: fmt.Sprintf(">= %.0f", want), Pass: float64(c.OpenAtMeasureEnd) >= want, Gating: true})
 	}
+	// The generator must hold its load steady through the hold, or node
+	// memory growth measures the generator rather than the server.
+	if c, a := res.Connections, res.Attachments; c.OpenAtMeasureStart > 0 {
+		dc := relChange(c.OpenAtMeasureStart, c.OpenAtMeasureEnd)
+		da := relChange(a.AttachedAtMeasureStart, a.AttachedAtMeasureEnd)
+		gate := rec.Fault == nil
+		add(Check{Name: "generator load steady over hold",
+			Value: fmt.Sprintf("connections %d to %d (%+.1f%%), attachments %d to %d (%+.1f%%)", c.OpenAtMeasureStart, c.OpenAtMeasureEnd, dc*100,
+				a.AttachedAtMeasureStart, a.AttachedAtMeasureEnd, da*100),
+			Limit: fmt.Sprintf("within ±%.0f%%", spec.MaxLoadDrift*100), Pass: abs(dc) <= spec.MaxLoadDrift && abs(da) <= spec.MaxLoadDrift, Gating: gate})
+	}
 	ns := rec.NodeStats
 	if ns.Measured {
 		// A killed node moves its connections to the survivors, so growth
@@ -406,6 +457,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		add(Check{Name: "resume discontinuities", Value: fmt.Sprint(res.Attachments.Discontinuities), Limit: "reported",
 			Pass: true, Gating: false, Note: "server declined a resume (outside the continuity window or replay cap)"})
 	}
+	rec.ServerBoundPerAttachment = rec.BoundRatio()
 	rec.Checks = checks
 	rec.Pass = true
 	for _, c := range checks {
@@ -465,6 +517,17 @@ func (rec *RunRecord) Markdown() string {
 	fmt.Fprintf(&b, "| Channel opens/s (churn) | %.0f | %d opens |\n", rec.Plan.ChannelOpensPerSec, r.Attachments.ChannelOpens)
 	if rec.Plan.PresenceMembers > 0 {
 		fmt.Fprintf(&b, "| Presence members | %d | %d entered, %d left, %d nacks |\n", rec.Plan.PresenceMembers, r.Presence.Entered, r.Presence.Left, r.Presence.Nacks)
+	}
+	ns := rec.NodeStats
+	b.WriteString("\n| Over the hold | Start | End |\n|---|---|---|\n")
+	fmt.Fprintf(&b, "| Generator connections | %d | %d |\n", r.Connections.OpenAtMeasureStart, r.Connections.OpenAtMeasureEnd)
+	fmt.Fprintf(&b, "| Generator attachments | %d | %d (plan %d + %d churn slots) |\n", r.Attachments.AttachedAtMeasureStart, r.Attachments.AttachedAtMeasureEnd, rec.Plan.Attachments, rec.Plan.ChurnSlots)
+	if ns.Measured {
+		fmt.Fprintf(&b, "| Server connections (sum of nodes) | %.0f | %.0f |\n", ns.ConnectionsAtStart, ns.ConnectionsOpen)
+		fmt.Fprintf(&b, "| Server channels bound (sum of nodes) | %.0f | %.0f |\n", ns.ChannelsBoundAtStart, ns.ChannelsBoundAtEnd)
+	}
+	if ratio := rec.BoundRatio(); ratio > 0 {
+		fmt.Fprintf(&b, "\nServer channels bound / generator attachments at the end of the hold: %.3f.\n", ratio)
 	}
 	b.WriteString("\n| Latency | n | p50 | p90 | p99 | p99.9 | max |\n|---|---|---|---|---|---|---|\n")
 	names := make([]string, 0, len(r.Latency))

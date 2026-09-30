@@ -141,6 +141,13 @@ func TestEvaluateFailures(t *testing.T) {
 				r.NodeStats = NodeStats{Measured: true, GoroutineGrowth: 0.5}
 			}
 		}, "node goroutine growth"},
+		{"generator attachments drift", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				s[0].Connections.OpenAtMeasureStart = 100
+				s[0].Attachments.AttachedAtMeasureStart = 150
+				s[0].Attachments.AttachedAtMeasureEnd = 180
+			}
+		}, "generator load steady"},
 		{"planned load never delivered", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[0].Deliveries.Rate = 15
@@ -350,5 +357,28 @@ func TestEvaluateFaultRunReportsGrowthWithoutGating(t *testing.T) {
 	})
 	if !rec.Pass {
 		t.Fatalf("fault run failed on growth: %v", failing(rec))
+	}
+}
+
+func TestEvaluateSteadyLoadAndBoundRatio(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s != nil {
+			s[0].Connections.OpenAtMeasureStart = 100
+			s[0].Attachments.AttachedAtMeasureStart = 151
+		} else {
+			r.NodeStats = NodeStats{Measured: true, ChannelsBoundAtStart: 140, ChannelsBoundAtEnd: 165}
+		}
+	})
+	if !rec.Pass {
+		t.Fatalf("steady run failed: %v", failing(rec))
+	}
+	if r := rec.ServerBoundPerAttachment; r < 1.09 || r > 1.11 {
+		t.Fatalf("bound ratio %v, want 165/150", r)
+	}
+	md := rec.Markdown()
+	for _, want := range []string{"| Generator attachments | 151 | 150", "| Server channels bound (sum of nodes) | 140 | 165 |", "generator attachments at the end of the hold: 1.100"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown lacks %q\n%s", want, md)
+		}
 	}
 }

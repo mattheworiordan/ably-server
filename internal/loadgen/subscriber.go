@@ -52,22 +52,31 @@ type subSession struct {
 	reconnect    bool
 	churned      atomic.Bool
 	ended        bool
+	slot         bool // holds a churn slot
 }
 
-func (j *Job) runSubscriber(ctx context.Context) {
+// holdSettle is how long after the hold starts its opening counts are
+// taken: long enough for the last ramp connection to attach.
+func holdSettle(hold time.Duration) time.Duration {
+	return min(2*time.Second, hold/10)
+}
+
+// newSubSessions builds this process's sessions from its slice of the
+// plan. A slot-holding connection starts with one churn channel, attached
+// with the rest during the ramp.
+func (j *Job) newSubSessions() []*subSession {
 	plans := j.Plan.SubscriberSlice(j.Spec.Index, j.Spec.Count)
 	j.targetConns = len(plans)
-	for _, cp := range plans {
-		j.targetAtts += int64(len(cp.Attach))
-	}
 	sessions := make([]*subSession, len(plans))
 	for i, cp := range plans {
+		j.targetAtts += int64(len(cp.Attach))
 		s := &subSession{
 			j:        j,
 			global:   cp.Global,
 			endpoint: cp.Global % len(j.Spec.Endpoints),
-			atts:     make(map[string]*subAtt, len(cp.Attach)),
+			atts:     make(map[string]*subAtt, len(cp.Attach)+1),
 			order:    make([]string, 0, len(cp.Attach)),
+			slot:     cp.ChurnSlot,
 		}
 		for _, ap := range cp.Attach {
 			a := &subAtt{channel: ap.Channel}
@@ -77,9 +86,26 @@ func (j *Job) runSubscriber(ctx context.Context) {
 			s.atts[ap.Channel] = a
 			s.order = append(s.order, ap.Channel)
 		}
+		if cp.ChurnSlot {
+			j.targetAtts++
+			name := j.Plan.Prefix + "-open-c" + strconv.Itoa(cp.Global) + "-0"
+			a := &subAtt{channel: name, churn: true}
+			s.churnAtt = a
+			s.atts[name] = a
+		}
 		sessions[i] = s
 	}
-	plans = nil
+	return sessions
+}
+
+func (j *Job) runSubscriber(ctx context.Context) {
+	sessions := j.newSubSessions()
+	var holders []*subSession
+	for _, s := range sessions {
+		if s.slot {
+			holders = append(holders, s)
+		}
+	}
 
 	if !sleepUntil(ctx, j.start) {
 		return
@@ -108,10 +134,23 @@ func (j *Job) runSubscriber(ctx context.Context) {
 		}
 	}()
 
-	// Churn during the hold.
+	// Churn during the hold. Both kinds replace rather than add: a
+	// dropped connection is re-established at once, and a channel open
+	// detaches the slot's previous churn channel, so connections and
+	// attachments stay flat after the ramp.
 	churnCtx, stopChurn := context.WithDeadline(runCtx, j.measureEnd)
 	var churnWG sync.WaitGroup
 	if sleepUntil(runCtx, j.measureStart) {
+		// The hold-start counts are taken just after the last ramp
+		// connection has had time to attach.
+		churnWG.Add(1)
+		go func() {
+			defer churnWG.Done()
+			if sleepUntil(churnCtx, j.measureStart.Add(holdSettle(j.Plan.Scenario.Timing.Hold.Duration))) {
+				j.c.openAtStart.Store(j.c.open.Load())
+				j.c.attachedAtStart.Store(j.c.attached.Load())
+			}
+		}()
 		share := func(total float64) float64 { return total / float64(j.Spec.Count) }
 		if r := share(j.Plan.Churn.ConnectsPerSec); r > 0 && n > 0 {
 			churnWG.Add(1)
@@ -124,7 +163,7 @@ func (j *Job) runSubscriber(ctx context.Context) {
 				}, nil)
 			}()
 		}
-		if r := share(j.Plan.Churn.ChannelOpensPerSec); r > 0 && n > 0 {
+		if r := share(j.Plan.Churn.ChannelOpensPerSec); r > 0 && len(holders) > 0 {
 			churnWG.Add(1)
 			go func() {
 				defer churnWG.Done()
@@ -132,7 +171,7 @@ func (j *Job) runSubscriber(ctx context.Context) {
 				Pace(churnCtx, func(time.Time) float64 { return r }, time.Second, func(time.Time) {
 					k++
 					name := j.Plan.Prefix + "-open-" + strconv.Itoa(j.Spec.Index) + "-" + strconv.Itoa(k)
-					sessions[rand.IntN(n)].openChurnChannel(name)
+					holders[rand.IntN(len(holders))].openChurnChannel(name)
 				}, nil)
 			}()
 		}
@@ -313,24 +352,36 @@ func (s *subSession) churnConnection(abrupt bool) {
 	}
 }
 
-// openChurnChannel attaches a never-used channel on this connection,
-// detaching the previous churn channel.
-func (s *subSession) openChurnChannel(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn == nil || s.ended {
-		return
-	}
-	if old := s.churnAtt; old != nil {
+// rotateChurn replaces the session's churn channel with name in its
+// attachment set and returns the channel it replaced ("" if none). The
+// caller holds s.mu. It is the bookkeeping half of openChurnChannel.
+func (s *subSession) rotateChurn(name string) (old *subAtt, a *subAtt) {
+	old = s.churnAtt
+	if old != nil {
 		delete(s.atts, old.channel)
 		if old.state == attAttached {
 			s.j.trackAttached(-1)
 		}
-		_ = s.conn.Detach(old.channel)
 	}
-	a := &subAtt{channel: name, churn: true, state: attAttaching, openStart: time.Now()}
+	a = &subAtt{channel: name, churn: true, state: attAttaching, openStart: time.Now()}
 	s.churnAtt = a
 	s.atts[name] = a
+	return old, a
+}
+
+// openChurnChannel replaces this connection's churn channel with a
+// never-used one: DETACH the old, ATTACH the new. Called only on a
+// slot-holding session, so each open is matched by a detach.
+func (s *subSession) openChurnChannel(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil || s.ended || !s.slot {
+		return
+	}
+	old, a := s.rotateChurn(name)
+	if old != nil {
+		_ = s.conn.Detach(old.channel)
+	}
 	if err := s.conn.Attach(name, "", protocol.FlagSubscribe); err != nil {
 		a.state = attPending
 	}

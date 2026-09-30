@@ -65,6 +65,7 @@ var nodeMetricNames = []string{
 	"go_goroutines",
 	"go_memstats_heap_inuse_bytes",
 	"ably_connections_open",
+	"ably_channels_bound",
 	"ably_messages_published_total",
 	"ably_messages_delivered_total",
 }

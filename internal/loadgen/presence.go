@@ -60,6 +60,12 @@ func (j *Job) runPresence(ctx context.Context) {
 	}()
 	if sleepUntil(runCtx, j.measureStart) {
 		churnCtx, stopChurn := context.WithDeadline(runCtx, j.measureEnd)
+		go func() {
+			if sleepUntil(churnCtx, j.measureStart.Add(holdSettle(j.Plan.Scenario.Timing.Hold.Duration))) {
+				j.c.openAtStart.Store(j.c.open.Load())
+				j.c.attachedAtStart.Store(j.c.attached.Load())
+			}
+		}()
 		// One churn is two events (leave, enter).
 		rate := j.Plan.Presence.EventsPerSec / 2 / float64(j.Spec.Count)
 		if rate > 0 {

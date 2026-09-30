@@ -142,8 +142,8 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "shape %s (%s) at %gx, scale %g: ramp %s, hold %s, drain %s\n\n", sc.Shape, sc.Name, p.Multiplier, p.Scale,
 		sc.Timing.Ramp.Duration, sc.Timing.Hold.Duration, sc.Timing.Drain.Duration)
 	fmt.Fprintf(stdout, "| Measure | Value |\n|---|---|\n")
-	fmt.Fprintf(stdout, "| Connections | %d |\n| Attachments | %d |\n| Channels | %d (%d with subscribers, %d sampled) |\n",
-		t.Connections, t.Attachments, t.Channels, t.SubscribedChannels, t.SampledChannels)
+	fmt.Fprintf(stdout, "| Connections | %d |\n| Attachments | %d (+ %d churn slots, replaced at the channel-open rate) |\n| Channels | %d (%d with subscribers, %d sampled) |\n",
+		t.Connections, t.Attachments, t.ChurnSlots, t.Channels, t.SubscribedChannels, t.SampledChannels)
 	fmt.Fprintf(stdout, "| Publishes/s | %.0f (REST %.0f, realtime %.0f) |\n| Deliveries/s | %.0f (fan-out %.2f) |\n",
 		t.PublishesPerSec, t.RESTPublishesPerS, t.RTPublishesPerSec, t.DeliveriesPerSec, t.FanOut)
 	fmt.Fprintf(stdout, "| Inbound bytes/s | %.0f |\n| Streams | %d (fastest %.2f/s) |\n| Connects/s | %.0f |\n| Channel opens/s | %.0f |\n",

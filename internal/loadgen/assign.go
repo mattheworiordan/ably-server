@@ -17,6 +17,9 @@ type ConnPlan struct {
 	// it picks the node (Global mod nodes) so load spreads evenly.
 	Global int
 	Attach []AttachPlan
+	// ChurnSlot: the connection holds one churn channel, replaced at the
+	// channel-open rate during the hold.
+	ChurnSlot bool
 }
 
 // SubscriberSlice returns the connections owned by subscriber process
@@ -32,7 +35,7 @@ func (p *Plan) SubscriberSlice(index, count int) []ConnPlan {
 	}
 	conns := make([]ConnPlan, 0, p.Connections/count+1)
 	for c := index; c < p.Connections; c += count {
-		conns = append(conns, ConnPlan{Global: c})
+		conns = append(conns, ConnPlan{Global: c, ChurnSlot: p.ChurnSlot(c)})
 	}
 	C := int64(p.Connections)
 	for ci := range p.Classes {

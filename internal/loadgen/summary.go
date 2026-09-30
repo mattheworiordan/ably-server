@@ -54,23 +54,28 @@ type Summary struct {
 
 // ConnStats counts connections.
 type ConnStats struct {
-	Target           int   `json:"target"`
-	Opened           int64 `json:"opened"`
-	Peak             int64 `json:"peak"`
-	OpenAtMeasureEnd int64 `json:"open_at_measure_end"`
-	ConnectFailures  int64 `json:"connect_failures"`
-	Reconnects       int64 `json:"reconnects"`
-	ChurnDrops       int64 `json:"churn_drops"`
-	UnplannedDrops   int64 `json:"unplanned_drops"`
+	Target int   `json:"target"`
+	Opened int64 `json:"opened"`
+	Peak   int64 `json:"peak"`
+	// OpenAtMeasureStart is taken just after the hold starts (see
+	// holdSettle); with OpenAtMeasureEnd it shows the generator held its
+	// load steady.
+	OpenAtMeasureStart int64 `json:"open_at_measure_start"`
+	OpenAtMeasureEnd   int64 `json:"open_at_measure_end"`
+	ConnectFailures    int64 `json:"connect_failures"`
+	Reconnects         int64 `json:"reconnects"`
+	ChurnDrops         int64 `json:"churn_drops"`
+	UnplannedDrops     int64 `json:"unplanned_drops"`
 }
 
 // AttachStats counts attachments.
 type AttachStats struct {
-	Target               int64 `json:"target"`
-	AttachedAtMeasureEnd int64 `json:"attached_at_measure_end"`
-	Failures             int64 `json:"failures"`
-	ChannelOpens         int64 `json:"channel_opens"`
-	Discontinuities      int64 `json:"discontinuities"`
+	Target                 int64 `json:"target"`
+	AttachedAtMeasureStart int64 `json:"attached_at_measure_start"`
+	AttachedAtMeasureEnd   int64 `json:"attached_at_measure_end"`
+	Failures               int64 `json:"failures"`
+	ChannelOpens           int64 `json:"channel_opens"`
+	Discontinuities        int64 `json:"discontinuities"`
 }
 
 // PublishStats counts publishes. Offered is what the schedule called

@@ -86,6 +86,13 @@ the agents run on their own boxes and the conductor gets an inventory.
   cross-node. Clocks must be synced (chrony). REST ACK latency is from
   the *scheduled* send time, retries included, so a saturated server
   cannot hide behind a slower schedule.
+- **Churn is steady state.** Both kinds replace, never add, so after
+  the ramp the generator's connections and attachments are flat. A
+  connection drop is followed at once by a reconnect of the same
+  connection. Channel churn uses churn slots: `channel_opens_per_sec` x
+  `channel_lifetime` connections (spread evenly) each hold one churn
+  channel from the ramp on, and each open detaches a slot's channel and
+  attaches a never-used one, so opens/s equals detaches/s.
 - **Resume.** A dropped connection (churn or failure) reconnects and
   re-attaches every channel with the last channelSerial it saw; the
   checker holds a RESUMED re-attach to continuity.
@@ -247,8 +254,14 @@ p50 <= 50 ms and p99 <= 250 ms, cross-node where there is such traffic
 attach p99 <= 500 ms at the target churn; zero violations of every kind
 on the sample; achieved publish rate >= 95% of offered and offered >=
 95% of target (the generator kept up); no rejected publishes;
-connections open at the end of the hold >= 99% of target; node RSS and
-goroutines grow <= 10% across the hold. The footprint (vCPU and memory,
+connections open at the end of the hold >= 99% of target; deliveries/s
+>= 90% of the plan's; the generator's own connections and attachments
+within ±3% from hold start to end (else node growth would measure the
+generator); node RSS and goroutines grow <= 10% across the hold (reported,
+not gated, in a fault run). The record sets the generator's connections
+and attachments at hold start and end beside the nodes'
+`ably_connections_open` and `ably_channels_bound`, and gives server
+channels bound over generator attachments at the end of the hold. The footprint (vCPU and memory,
 provisioned and used, per 100k connections, per 100k deliveries/s and
 per 10k writes/s) is reported, not gated.
 
@@ -280,7 +293,8 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
 
     [churn]
     connects_per_sec = 1000    # drop and re-establish (half abrupt, half CLOSE)
-    channel_opens_per_sec = 2400  # attach never-used channels
+    channel_opens_per_sec = 2400  # replace a churn channel with a never-used one
+    channel_lifetime = "60s"   # mean churn-channel life: opens/s x lifetime churn slots
     resume = true              # re-attach with channelSerial, held to continuity
 
     [[class]]                  # repeat per class of channel
@@ -312,6 +326,8 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_goroutine_growth = 0.10
     max_connection_loss = 0.01
     tail_margin = "1s"
+    min_delivery_ratio = 0.9     # deliveries/s measured over planned
+    max_load_drift = 0.03        # generator connections and attachments, hold start to end
 
 `ably-conductor plan` prints the derived connections, attachments,
 channels, publishes/s, deliveries/s, fan-out, streams, churn and

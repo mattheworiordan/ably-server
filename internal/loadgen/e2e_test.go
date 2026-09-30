@@ -392,6 +392,12 @@ func TestJobsEndToEnd(t *testing.T) {
 			if s.Connections.OpenAtMeasureEnd < int64(s.Connections.Target)-2 {
 				t.Errorf("subscriber %d: %d of %d connections open at the end of the hold", s.Index, s.Connections.OpenAtMeasureEnd, s.Connections.Target)
 			}
+			// Churn replaces, never adds: attachments are flat over the hold
+			// (a connection mid-reconnect at either instant can take its
+			// few attachments out of one count).
+			if d := s.Attachments.AttachedAtMeasureEnd - s.Attachments.AttachedAtMeasureStart; d > 3 || d < -6 {
+				t.Errorf("subscriber %d: attachments %d at hold start, %d at end", s.Index, s.Attachments.AttachedAtMeasureStart, s.Attachments.AttachedAtMeasureEnd)
+			}
 			if s.Latency[loadgen.LatDelivery].Count() == 0 || s.Latency[loadgen.LatConnectAttach].Count() == 0 {
 				t.Errorf("subscriber %d recorded no latency", s.Index)
 			}

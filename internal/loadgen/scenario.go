@@ -78,9 +78,15 @@ type Churn struct {
 	// channels.
 	ConnectsPerSec float64 `toml:"connects_per_sec"      json:"connects_per_sec"`
 	// ChannelOpensPerSec: attaches to never-used channel names per
-	// second, each on an existing connection that detaches its previous
-	// churn channel.
+	// second. Churn replaces, never adds: a fixed set of churn slots
+	// (ChannelOpensPerSec x ChannelLifetime of them, spread over the
+	// connections and attached during the ramp) each hold one churn
+	// channel, and an open detaches a slot's channel and attaches a new
+	// one, so attachments stay flat after the ramp.
 	ChannelOpensPerSec float64 `toml:"channel_opens_per_sec" json:"channel_opens_per_sec"`
+	// ChannelLifetime is the mean life of a churn channel (default 60s),
+	// which sets the number of churn slots.
+	ChannelLifetime Duration `toml:"channel_lifetime" json:"channel_lifetime"`
 	// Resume: a re-established connection re-attaches with the last
 	// channelSerial it saw and the checker holds it to continuity
 	// (DESIGN.md §4.3).
@@ -161,6 +167,11 @@ type PassSpec struct {
 	// MinDeliveryRatio: deliveries/s measured over the plan's (default
 	// 0.9). Catches load that was planned but never generated.
 	MinDeliveryRatio float64 `toml:"min_delivery_ratio" json:"min_delivery_ratio"`
+	// MaxLoadDrift: allowed change of the generator's own connections
+	// and attachments from the start to the end of the hold (default
+	// 0.03). Beyond it the run is invalid: node growth would measure the
+	// generator, not the server.
+	MaxLoadDrift float64 `toml:"max_load_drift" json:"max_load_drift"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -177,6 +188,7 @@ func DefaultPass() PassSpec {
 		MaxConnectionLoss:  0.01,
 		TailMargin:         Duration{time.Second},
 		MinDeliveryRatio:   0.9,
+		MaxLoadDrift:       0.03,
 	}
 }
 
@@ -215,6 +227,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinDeliveryRatio == 0 {
 		p.MinDeliveryRatio = d.MinDeliveryRatio
+	}
+	if p.MaxLoadDrift == 0 {
+		p.MaxLoadDrift = d.MaxLoadDrift
 	}
 	return p
 }
@@ -366,7 +381,10 @@ type Plan struct {
 	Presence    Presence
 	Pass        PassSpec
 	Attachments int64
-	sampleCut   uint64
+	// ChurnSlots is the number of churn channels held at any time (one
+	// per slot-holding connection), on top of Attachments.
+	ChurnSlots int
+	sampleCut  uint64
 }
 
 // Resolve scales the scenario. multiplier and scale of 0 take the
@@ -404,6 +422,7 @@ func (s *Scenario) Resolve(multiplier, scale float64, runTag string) (*Plan, err
 		Churn: Churn{
 			ConnectsPerSec:     s.Churn.ConnectsPerSec * f,
 			ChannelOpensPerSec: s.Churn.ChannelOpensPerSec * f,
+			ChannelLifetime:    s.Churn.ChannelLifetime,
 			Resume:             s.Churn.Resume,
 		},
 		Presence: s.Presence,
@@ -460,7 +479,27 @@ func (s *Scenario) Resolve(multiplier, scale float64, runTag string) (*Plan, err
 		p.Classes = append(p.Classes, rc)
 	}
 	p.Attachments = next
+	if p.Churn.ChannelLifetime.Duration <= 0 {
+		p.Churn.ChannelLifetime = Duration{DefaultChannelLifetime}
+	}
+	if p.Churn.ChannelOpensPerSec > 0 && p.Connections > 0 {
+		p.ChurnSlots = min(p.Connections, max(1, int(math.Round(p.Churn.ChannelOpensPerSec*p.Churn.ChannelLifetime.Seconds()))))
+	}
 	return p, nil
+}
+
+// DefaultChannelLifetime is the mean life of a churn channel when the
+// scenario does not set churn.channel_lifetime.
+const DefaultChannelLifetime = 60 * time.Second
+
+// ChurnSlot reports whether global connection c holds a churn slot. The
+// ChurnSlots holders are spread evenly over the connections.
+func (p *Plan) ChurnSlot(c int) bool {
+	if p.ChurnSlots <= 0 || c < 0 || c >= p.Connections {
+		return false
+	}
+	C, S := int64(p.Connections), int64(p.ChurnSlots)
+	return (int64(c)+1)*S/C > int64(c)*S/C
 }
 
 func scaleCount(n int, f float64) int {
@@ -525,8 +564,11 @@ func (p *Plan) PubID(stream int) string {
 
 // Totals are the plan's derived load figures.
 type Totals struct {
-	Connections        int     `json:"connections"`
-	Attachments        int64   `json:"attachments"`
+	Connections int   `json:"connections"`
+	Attachments int64 `json:"attachments"`
+	// ChurnSlots are held on top of Attachments: the generator should
+	// hold Attachments + ChurnSlots attachments through the hold.
+	ChurnSlots         int     `json:"churn_slots"`
 	Channels           int     `json:"channels"`
 	SubscribedChannels int     `json:"subscribed_channels"`
 	SampledChannels    int     `json:"sampled_channels"`
@@ -564,6 +606,7 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 	t := Totals{
 		Connections:        p.Connections,
 		Attachments:        p.Attachments,
+		ChurnSlots:         p.ChurnSlots,
 		ConnectsPerSec:     p.Churn.ConnectsPerSec,
 		ChannelOpensPerSec: p.Churn.ChannelOpensPerSec,
 	}

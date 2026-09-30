@@ -86,7 +86,7 @@ type counters struct {
 	offeredInWindow, ackedInWindow                                              atomic.Int64
 	received, inWindow, negLatency, foreign                                     atomic.Int64
 	presEntered, presLeft, presNacks, presReceived                              atomic.Int64
-	openAtEnd, attachedAtEnd                                                    atomic.Int64
+	openAtEnd, attachedAtEnd, openAtStart, attachedAtStart                      atomic.Int64
 }
 
 // Job runs one role for one run.
@@ -401,11 +401,12 @@ func (j *Job) buildSummary() *Summary {
 		MeasureEndUS: j.measureEnd.UnixMicro(), EndUS: time.Now().UnixMicro(),
 		Connections: ConnStats{
 			Target: j.targetConns, Opened: j.c.opened.Load(), Peak: j.c.peak.Load(),
-			OpenAtMeasureEnd: j.c.openAtEnd.Load(), ConnectFailures: j.c.connectFailures.Load(),
+			OpenAtMeasureStart: j.c.openAtStart.Load(),
+			OpenAtMeasureEnd:   j.c.openAtEnd.Load(), ConnectFailures: j.c.connectFailures.Load(),
 			Reconnects: j.c.reconnects.Load(), ChurnDrops: j.c.churnDrops.Load(), UnplannedDrops: j.c.unplannedDrops.Load(),
 		},
 		Attachments: AttachStats{
-			Target: j.targetAtts, AttachedAtMeasureEnd: j.c.attachedAtEnd.Load(), Failures: j.c.attachFailures.Load(),
+			Target: j.targetAtts, AttachedAtMeasureStart: j.c.attachedAtStart.Load(), AttachedAtMeasureEnd: j.c.attachedAtEnd.Load(), Failures: j.c.attachFailures.Load(),
 			ChannelOpens: j.c.channelOpens.Load(), Discontinuities: j.c.discontinuities.Load(),
 		},
 		Publishes: PublishStats{
