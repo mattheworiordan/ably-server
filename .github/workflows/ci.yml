@@ -134,6 +134,9 @@ jobs:
           repository: ably/ably-go
           ref: main
           path: ably-go
+          # ablytest reads the app spec and the msgpack fixtures from the
+          # ably-common submodule; without it every sandbox test panics.
+          submodules: true
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -156,16 +159,18 @@ jobs:
           cat sandbox.log; exit 1
 
       - name: Run the ably-go suite
-        run: compat/runners/ably-go/run.sh --sdk-dir ably-go --url http://localhost:9010 --out compat-results-ably-go.json
+        run: compat/runners/ably-go/run.sh --sdk-dir ably-go --url http://localhost:9010 --out "$GITHUB_WORKSPACE/compat-results-ably-go.json"
 
       - name: Gate against the known failures
-        run: go run ./cmd/compat-gate --results compat-results-ably-go.json --ignore compat/known-failures/ably-go.toml
+        run: go run ./cmd/compat-gate --results "$GITHUB_WORKSPACE/compat-results-ably-go.json" --ignore compat/known-failures/ably-go.toml
 
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: compat-ably-go-nats
+          # The runner writes the report from inside the SDK checkout, so
+          # every step names it by absolute path.
           path: |
-            compat-results-ably-go.json
-            sandbox.log
+            ${{ github.workspace }}/compat-results-ably-go.json
+            ${{ github.workspace }}/sandbox.log
