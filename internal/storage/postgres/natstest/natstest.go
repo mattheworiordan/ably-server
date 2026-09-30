@@ -114,6 +114,14 @@ func (p *Proxy) Cut() {
 	clear(p.conns)
 }
 
+// Retarget points new connections at another upstream (host:port).
+// Connections already open are left alone.
+func (p *Proxy) Retarget(target string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.target = target
+}
+
 // Restore lets connections through again.
 func (p *Proxy) Restore() {
 	p.mu.Lock()
