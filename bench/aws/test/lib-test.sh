@@ -42,9 +42,13 @@ check "mask in _fmt flag value" 'aws rds create-db-instance --master-user-passwo
 check "mask in free text" 'dsn=postgres://u:***@h/db' "$(_mask "dsn=postgres://u:$RDS_PASSWORD@h/db")"
 check "space args are quoted" "aws x 'a b'" "$(_fmt aws x 'a b')"
 
+# host-network port clashes
+check "port clash is fatal" bad "$( (bash -c 'LOADGEN_AGENT_PORT=9100 source "$0"' "$HERE/../lib.sh" 2>/dev/null) || echo bad)"
+
 # password rules
 check "password ok" ok "$(check_password && echo ok)"
 check "password too short" bad "$( (RDS_PASSWORD=short check_password 2>/dev/null) || echo bad)"
+check "password placeholder rejected" bad "$( (RDS_PASSWORD=change-me-16-chars-min check_password 2>/dev/null) || echo bad)"
 check "password bad char" bad "$( (RDS_PASSWORD='abcdefghijklmnop/qrstuvwxyz' check_password 2>/dev/null) || echo bad)"
 
 # templates
@@ -74,10 +78,11 @@ cat >"$DRY_STATE_FILE" <<'JSON'
 {"resources":[],"images":{},"runs":[],
  "instances":{"node-1":{"type":"c7i.2xlarge","running":true},"node-2":{"type":"c7i.2xlarge","running":true},
               "gen-1":{"type":"c7i.8xlarge","running":true},"pub-1":{"type":"c7i.4xlarge","running":false}},
- "postgres":{"instances":{"pg":{"class":"db.r7g.4xlarge","storage":"gp3","storage_gb":1000,"iops":0,"running":true}}}}
+ "postgres":{"instances":{"pg":{"class":"db.r7g.4xlarge","storage":"gp3","storage_gb":1000,"iops":0,"running":true},
+                          "pg2":{"class":"db.r7g.4xlarge","storage":"io2","storage_gb":1000,"iops":20000,"running":false}}}}
 JSON
-# 2 x 0.36 + 1.43 = 2.15 ; rds 1.90 + 1000*0.12/730 = 2.064 (rounded to 3 places)
-check "fleet rate" 4.2140 "$(awk -v r="$(fleet_hourly_rate)" 'BEGIN{printf "%.4f", r}')"
+# 2 x 0.36 + 1.43 = 2.15 ; running rds 1.90 + 1000*0.12/730 = 2.064 ; stopped io2 rds still bills (1000*0.125 + 20000*0.10)/730 = 2.911
+check "fleet rate (stopped database still bills storage)" 7.1250 "$(awk -v r="$(fleet_hourly_rate)" 'BEGIN{printf "%.4f", r}')"
 check "io2 rds rate" 4.811 "$(IO2_USD_PER_IOPS_MONTH=0.10 IO2_USD_PER_GB_MONTH=0.125 rds_hourly db.r7g.4xlarge io2 1000 20000)"
 check "price override" 9 "$(PRICE_c7i_2xlarge=9 price_of c7i.2xlarge)"
 check "vcpus" 32 "$(vcpus_of c7i.8xlarge)"
@@ -85,7 +90,7 @@ check "vcpus" 32 "$(vcpus_of c7i.8xlarge)"
 _state_update '.budget = {since_epoch: ($n - 3600), rate_usd_h: 2, accrued_usd: 1}' --argjson n "$(date +%s)"
 cost_checkpoint
 check "accrual adds one hour" 3.0000 "$(state_get '.budget.accrued_usd' | awk '{printf "%.4f", $1}')"
-check "checkpoint sets new rate" 4.2140 "$(state_get '.budget.rate_usd_h' | awk '{printf "%.4f", $1}')"
+check "checkpoint sets new rate" 7.1250 "$(state_get '.budget.rate_usd_h' | awk '{printf "%.4f", $1}')"
 
 # ablyctl credential helper (fake ablyctl on PATH; never the real one)
 mkdir "$tmp/fakebin"

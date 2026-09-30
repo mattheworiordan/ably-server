@@ -6,7 +6,7 @@
 #   bench/aws/00-preflight.sh
 #
 # Needs: AWS_ACCOUNT_ID, AWS_REGION, ALARM_EMAIL (when the alarm must be created).
-# Optional: BUDGET_ALARM_USD (750), BUDGET_CAP_USD (1500), BUDGET_SCOPE (tag|account),
+# Optional: BUDGET_ALARM_USD (750), BUDGET_CAP_USD (1500), BUDGET_SCOPE (account|tag),
 #           FLEET_PROFILE (2x|1x, sizes the vCPU check), FORCE_NO_ALARM=1 (see RUNBOOK).
 SCRIPT_NAME=00-preflight
 # shellcheck source=lib.sh
@@ -16,7 +16,7 @@ need_cmd jq openssl
 is_dry || need_cmd aws
 require_env AWS_ACCOUNT_ID AWS_REGION
 : "${FLEET_PROFILE:=2x}"
-: "${BUDGET_SCOPE:=tag}"
+: "${BUDGET_SCOPE:=account}"
 : "${BUDGET_NAME:=${PROJECT_TAG}-cap}"
 state_init
 
@@ -55,13 +55,17 @@ ami=$(resolve_ami)
 check_perm ec2:RunInstances 'DryRunOperation' ec2 run-instances --dry-run --image-id "$ami" --instance-type "$NODE_INSTANCE_TYPE" --min-count 1 --max-count 1
 check_perm ec2:CreateSecurityGroup 'DryRunOperation|InvalidVpc|InvalidGroup' ec2 create-security-group --dry-run --group-name "${PROJECT_TAG}-probe" --description probe
 check_perm ec2:CreatePlacementGroup 'DryRunOperation' ec2 create-placement-group --dry-run --group-name "${PROJECT_TAG}-probe" --strategy cluster
-check_perm ec2:ImportKeyPair 'DryRunOperation|InvalidKey|InvalidParameter' ec2 import-key-pair --dry-run --key-name "${PROJECT_TAG}-probe" --public-key-material "ssh-ed25519"
+if is_dry || [ -r "$SSH_PUBLIC_KEY_PATH" ]; then
+  check_perm ec2:ImportKeyPair 'DryRunOperation' ec2 import-key-pair --dry-run --key-name "${PROJECT_TAG}-probe" --public-key-material "fileb://$SSH_PUBLIC_KEY_PATH"
+else
+  log "permission not probed: ec2:ImportKeyPair (cannot read SSH_PUBLIC_KEY_PATH; 10-network.sh needs it)"
+fi
 check_perm ec2:TerminateInstances 'DryRunOperation|InvalidInstanceID' ec2 terminate-instances --dry-run --instance-ids i-00000000000000000
 check_perm rds:CreateDBInstance 'InvalidParameter|Invalid|Validation' rds create-db-instance --db-instance-identifier "${PROJECT_TAG}-probe" --db-instance-class db.t3.micro --engine preflight-invalid-engine
 check_perm ecr:CreateRepository 'InvalidParameter|Invalid' ecr create-repository --repository-name "INVALID NAME"
-check_perm cloudwatch:PutMetricAlarm 'InvalidParameter|Validation' cloudwatch put-metric-alarm --alarm-name "${PROJECT_TAG}-probe" --namespace probe --metric-name probe --statistic Maximum --period 1 --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanThreshold
+check_perm cloudwatch:PutMetricAlarm 'InvalidParameter|Validation' cloudwatch put-metric-alarm --alarm-name "${PROJECT_TAG}-probe" --namespace probe --metric-name probe --statistic Maximum --period 7 --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanThreshold --region "$BILLING_REGION"
 perm_cw=$PERM_LAST
-check_perm sns:CreateTopic 'InvalidParameter|Invalid|Validation' sns create-topic --name "invalid name!"
+check_perm sns:CreateTopic 'InvalidParameter|Invalid|Validation' sns create-topic --name "invalid name!" --region "$BILLING_REGION"
 perm_sns=$PERM_LAST
 check_perm budgets:CreateBudget 'InvalidParameter|Invalid|Validation' budgets create-budget --account-id "$AWS_ACCOUNT_ID" \
   --budget "BudgetName=${PROJECT_TAG}-probe,BudgetLimit={Amount=-1,Unit=USD},TimeUnit=MONTHLY,BudgetType=COST"
@@ -106,12 +110,16 @@ need_vcpus=$((nodes * $(vcpus_of "$NODE_INSTANCE_TYPE") +
   $(vcpus_of "$CONDUCTOR_INSTANCE_TYPE") +
   $(vcpus_of "$PGDRIVER_INSTANCE_TYPE")))
 quota=$(aws_r "$need_vcpus" service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query Quota.Value) || quota=""
+# vCPUs already in use by other standard-family instances in this account and region.
+in_use=$(aws_r "" ec2 describe-instances --filters Name=instance-state-name,Values=pending,running \
+  --query 'Reservations[].Instances[].[InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore]') || in_use=""
+in_use=$(awk '$1 !~ /^(inf|trn|hpc|dl|vt|g|p|f|x|u|mac)/ && NF >= 3 { n += $2 * $3 } END { print n + 0 }' <<<"$in_use")
 if [ -z "$quota" ]; then
   log "WARNING: could not read the on-demand vCPU quota (L-1216C47A); check it by hand. The $FLEET_PROFILE fleet needs $need_vcpus vCPUs."
-elif awk -v q="$quota" -v n="$need_vcpus" 'BEGIN{exit !(q+0 >= n)}'; then
-  log "vCPU quota $quota covers the $FLEET_PROFILE fleet ($need_vcpus vCPUs)"
+elif awk -v q="$quota" -v u="$in_use" -v n="$need_vcpus" 'BEGIN{exit !(q - u >= n)}'; then
+  log "vCPU quota $quota, $in_use in use: room for the $FLEET_PROFILE fleet ($need_vcpus vCPUs)"
 else
-  die "on-demand vCPU quota is $quota; the $FLEET_PROFILE fleet needs $need_vcpus. Request an increase for quota L-1216C47A."
+  die "on-demand vCPU quota is $quota with $in_use in use; the $FLEET_PROFILE fleet needs $need_vcpus. Request an increase for quota L-1216C47A, or use FLEET_PROFILE=1x."
 fi
 state_set_json '.preflight.need_vcpus' "$need_vcpus"
 
@@ -145,7 +153,7 @@ budget_exists() {
 }
 cw_alarm_exists() { # <alarm name>
   local a
-  a=$(AWS_R_QUIET=1 aws_r "" cloudwatch describe-alarms --alarm-names "$1" --query 'MetricAlarms[0].AlarmName' --region us-east-1) || return 1
+  a=$(AWS_R_QUIET=1 aws_r "" cloudwatch describe-alarms --alarm-names "$1" --query 'MetricAlarms[0].AlarmName' --region "$BILLING_REGION") || return 1
   [ -n "$a" ]
 }
 create_budget() {
@@ -164,20 +172,29 @@ create_budget() {
     [n("ACTUAL";$p), n("ACTUAL";100), n("FORECASTED";100)]' >"$wd/budget-notifications.json"
   aws_w "" budgets create-budget --account-id "$AWS_ACCOUNT_ID" \
     --budget "file://$wd/budget.json" --notifications-with-subscribers "file://$wd/budget-notifications.json"
+  log "Budgets data lags by hours and forecasts need history: treat the budget as a backstop and rely on cost-estimate.sh and the spend gate day to day"
+  if [ "$BUDGET_SCOPE" = tag ]; then log "scope tag: the Project cost allocation tag must be activated in Billing (up to 24 h) or this budget sees no spend"; fi
   log "created budget $BUDGET_NAME: warn at \$$BUDGET_ALARM_USD (${alarm_pct}%), cap \$$BUDGET_CAP_USD, scope $BUDGET_SCOPE"
 }
 create_cw_alarms() { # billing metrics live in one region only
   local topic a usd
-  topic=$(aws_w "arn:aws:sns:us-east-1:$AWS_ACCOUNT_ID:${PROJECT_TAG}-billing" sns create-topic --name "${PROJECT_TAG}-billing" \
-    --tags "Key=Project,Value=$PROJECT_TAG" --query TopicArn --output text --region us-east-1)
-  aws_w "" sns subscribe --topic-arn "$topic" --protocol email --notification-endpoint "$ALARM_EMAIL" --region us-east-1 >/dev/null
+  topic=$(aws_w "arn:aws:sns:$BILLING_REGION:$AWS_ACCOUNT_ID:${PROJECT_TAG}-billing" sns create-topic --name "${PROJECT_TAG}-billing" \
+    --tags "Key=Project,Value=$PROJECT_TAG" --query TopicArn --output text --region "$BILLING_REGION")
+  aws_w "" sns subscribe --topic-arn "$topic" --protocol email --notification-endpoint "$ALARM_EMAIL" --region "$BILLING_REGION" >/dev/null
   for usd in "$BUDGET_ALARM_USD" "$BUDGET_CAP_USD"; do
     a="${PROJECT_TAG}-billing-${usd}usd"
     aws_w "" cloudwatch put-metric-alarm --alarm-name "$a" --namespace AWS/Billing --metric-name EstimatedCharges \
       --dimensions "Name=Currency,Value=USD" "Name=LinkedAccount,Value=$AWS_ACCOUNT_ID" \
       --statistic Maximum --period 21600 --evaluation-periods 1 --threshold "$usd" \
-      --comparison-operator GreaterThanThreshold --alarm-actions "$topic" --region us-east-1
+      --comparison-operator GreaterThanThreshold --alarm-actions "$topic" --region "$BILLING_REGION"
   done
+  local pending
+  pending=$(AWS_R_QUIET=1 aws_r "" sns list-subscriptions-by-topic --topic-arn "$topic" --region "$BILLING_REGION" \
+    --query "Subscriptions[?SubscriptionArn=='PendingConfirmation'] | length(@)") || pending=""
+  if [ -n "$pending" ] && [ "$pending" != 0 ]; then
+    log "WARNING: the SNS subscription for $ALARM_EMAIL is pending: open the confirmation e-mail, or the alarm will not reach you"
+  fi
+  log "billing metrics need 'Receive Billing Alerts' enabled on the account; until the first data point the alarms show INSUFFICIENT_DATA"
   log "created CloudWatch billing alarms at \$$BUDGET_ALARM_USD and \$$BUDGET_CAP_USD (whole account, not just this project) -> $topic. Confirm the email subscription."
 }
 alarm_ok=0
@@ -215,6 +232,7 @@ state_set_json '.budget.alarm_usd' "$BUDGET_ALARM_USD"
 state_set_json '.budget.cap_usd' "$BUDGET_CAP_USD"
 state_set '.budget.name' "$BUDGET_NAME"
 ensure_api_key >/dev/null
+state_set '.preflight.ok_at' "$(date -u +%FT%TZ)"
 
 log_line 00-preflight "account ok; vcpu quota ok for $FLEET_PROFILE ($need_vcpus); ECR and billing alarm in place" "10-network.sh"
 log "preflight complete"

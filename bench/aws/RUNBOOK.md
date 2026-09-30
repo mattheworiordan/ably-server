@@ -56,7 +56,14 @@ bill.
 - `60-run.sh` and `65-run-0a.sh` refuse to start without `RUN_TIME_LIMIT`, and
   refuse when the estimated spend plus the run would pass the cap
   (`OVERRIDE_BUDGET_GUARD=1` exists; use it only after a decision by whoever owns the budget).
-- Every run is detached on its box under `timeout(1)`, so a hung run ends.
+- Every run is detached on its box under `timeout(1)`, so a hung run ends. That
+  ends the conductor (or pgbench), not the fleet: the generators and publishers
+  keep running and billing until you stop them (`AUTO_STOP_AFTER_RUN=1` does it).
+- `10` to `50`, `60` and `65` refuse to run until `00-preflight.sh` has passed,
+  and `20` to `50` refuse once the spend estimate has reached the cap.
+- Dead-man switch: every box is launched to stop (not terminate) itself
+  `FLEET_MAX_UPTIME_H` hours (default 10) after it boots; `80-start.sh` arms it
+  again. It stops compute only: the database needs `80-stop.sh`.
 - `80-stop.sh` between runs, `90-teardown.sh --yes` at the end of every working day.
 
 ## 2. Prerequisites
@@ -109,9 +116,13 @@ Optional, with defaults:
 | `LOG_FILE` | `.../LOG.md` next to the state file | One line per completed step. |
 | `RESULTS_DIR` | `.../results` next to the state file | Raw results per run. |
 | `BUDGET_ALARM_USD`, `BUDGET_CAP_USD` | 750, 1500 | Warning and cap. |
-| `BUDGET_SCOPE` | `tag` | `tag` counts only spend tagged `Project=$PROJECT_TAG` (activate the `Project` cost allocation tag in Billing first; it can take a day). `account` counts everything in the account. |
+| `BUDGET_SCOPE` | `account` | `account` counts everything in the account (other spend there can trip the alarm). `tag` counts only spend tagged `Project=$PROJECT_TAG`, but sees nothing until the `Project` cost allocation tag is activated in Billing (up to a day). Either way Budgets data lags by hours: the local spend estimate is the day-to-day guard. |
 | `BUDGET_METHOD` | `auto` | `auto` uses Budgets when the role may create one, else CloudWatch billing alarms with SNS. `cloudwatch` forces the second. |
-| `FLEET_PROFILE` | `2x` | Sizes the vCPU quota check (`2x` or `1x`). |
+| `FLEET_PROFILE` | `2x` | Sizes the vCPU quota check (`2x` or `1x`); vCPUs already in use in the account are subtracted. |
+| `FLEET_MAX_UPTIME_H` | 10 | Dead-man switch: each box stops itself this many hours after it boots. `SKIP_REARM=1` makes `80-start.sh` skip re-arming it. |
+| `USE_PLACEMENT_GROUP` | 1 | `0` launches without the cluster placement group (for capacity errors). |
+| `BILLING_REGION` | `us-east-1` | The one region that holds billing metrics; CloudWatch billing alarms and their SNS topic live there. |
+| `ECR_REPO_SERVER`, `ECR_REPO_LOADGEN` | `$PROJECT_TAG/ably-server`, `$PROJECT_TAG/ably-loadgen` | ECR repository names. Teardown with `TEARDOWN_ALL=1` deletes only repositories tagged for the project. |
 | `INSTANCE_PROFILE_NAME` | (created) | An existing instance profile with ECR read access. |
 | `VPC_ID`, `SUBNET_ID` | (default VPC) | Use these instead of the default VPC. |
 | `NODE_COUNT`, `NATS_COUNT`, `LOADGEN_COUNT`, `PUBLISHER_COUNT` | 10, 3, 3, 2 | Fleet sizes. |
@@ -336,9 +347,13 @@ The defaults are provisional until the load generator branch fixes its flags:
 
 | Variable | Default |
 |---|---|
-| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9100 --metrics-listen=:9101` |
-| `PUBLISHER_CMD` | `ably-loadgen serve --role=publisher --listen=:9100 --metrics-listen=:9101` |
+| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101` |
+| `PUBLISHER_CMD` | `ably-loadgen serve --role=publisher --listen=:9200 --metrics-listen=:9101` |
 | `CONDUCTOR_CMD` | `ably-conductor --scenario=/run-input/{SCENARIO} --inventory=/run-input/inventory.json --results=/results --run-id={RUN_ID}` |
+
+Port 9100 is taken by node-exporter on every box (all containers use host
+networking), so the agent listens on `LOADGEN_AGENT_PORT` (default 9200).
+`lib.sh` stops with an error if two ports on one kind of box are the same.
 
 `60-run.sh` writes `inventory.json` (nodes with their HTTP, WebSocket and
 metrics addresses, NATS URLs, generator and publisher agent addresses, the
@@ -367,4 +382,7 @@ instance types, versions and flags of every run are recorded in STATE
 - **A box came up but the container is not running.** `ssh` in and read `/var/log/bench-userdata.log` and `docker logs`. `RECONFIGURE=1` re-applies the role part.
 - **ECR pull denied.** The instance profile is missing or not yet propagated; wait a minute, then `RECONFIGURE=1 bench/aws/40-nodes.sh`.
 - **`00-preflight.sh` reports a denied action.** Sign in with a role that has it, or ask for it. Nothing was created.
+- **`10-network.sh` or `30-nats.sh` fails on an address.** NATS servers take fixed private addresses from `NATS_IP_OFFSET` in the subnet; if another instance already holds one, pick another offset.
+- **The database password and the API key are in EC2 user-data.** Anyone who can describe instance attributes in the account can read them, and they appear in `docker inspect` on the box. The bench database is throwaway and only reachable inside the security group; do not reuse the password anywhere.
+- **Teardown says a read failed.** Teardown refuses to treat a failed read as "nothing there". Fix the sign-in or permission and run it again; STATE is kept until it verifies clean.
 - **STATE.json was lost.** `90-teardown.sh --yes` still works. To continue instead, re-run `10-network.sh`, `20-postgres.sh` (with `RDS_PASSWORD`), `30-nats.sh`, `40-nodes.sh` and `50-loadgen.sh`: they find existing resources by tag and name and refill STATE.

@@ -20,6 +20,7 @@ need_cmd jq
 is_dry || need_cmd aws
 require_env AWS_REGION
 state_init
+require_preflight
 require_network_state
 
 case "$RDS_STORAGE" in io2 | gp3) ;; *) die "RDS_STORAGE must be io2 or gp3" ;; esac
@@ -32,7 +33,7 @@ family="postgres${RDS_ENGINE_VERSION%%.*}"
 sslmode=disable
 if [ "$RDS_FORCE_SSL" = 1 ]; then sslmode=require; fi
 
-cost_checkpoint
+spend_gate
 
 # ---- DB subnet group (RDS needs two zones; the instance itself is pinned to one)
 sng="${PROJECT_TAG}-db"
@@ -95,7 +96,7 @@ for shard in $(seq 1 "$SHARDS"); do
     --vpc-security-group-ids "$(state_get '.network.sg_id')" --db-subnet-group-name "$sng"
     --availability-zone "$AZ" --no-multi-az --no-publicly-accessible
     --db-parameter-group-name "$pgroup"
-    --backup-retention-period 0 --no-auto-minor-version-upgrade --no-deletion-protection
+    --backup-retention-period 0 --no-auto-minor-version-upgrade --no-deletion-protection --copy-tags-to-snapshot
     --enable-performance-insights --performance-insights-retention-period 7
     --tags "${RDS_TAGS[@]}")
   if [ -n "$RDS_IOPS" ]; then args+=(--iops "$RDS_IOPS"); fi

@@ -3,7 +3,13 @@
 # lib.sh render_userdata; the role part follows it.
 # shellcheck disable=SC2050,SC2157  # template markers are replaced before the script runs
 set -euxo pipefail
+install -m 600 /dev/null /var/log/bench-userdata.log
 exec > >(tee -a /var/log/bench-userdata.log) 2>&1
+
+# Dead-man switch: the box stops itself (it is launched with stop-on-shutdown)
+# after this many minutes, so a forgotten fleet stops billing for compute.
+# 80-start.sh re-arms it after a restart.
+shutdown -h +@@MAX_UPTIME_MIN@@
 
 dnf install -y docker chrony jq
 

@@ -14,6 +14,7 @@ need_cmd jq
 is_dry || need_cmd aws
 require_env AWS_REGION
 state_init
+require_preflight
 require_network_state
 : "${NATS_IP_OFFSET:=10}"
 
@@ -23,7 +24,7 @@ for i in $(seq 1 "$NATS_COUNT"); do
   ips+=("$(cidr_host_ip "$cidr" $((NATS_IP_OFFSET + i - 1)))")
 done
 
-cost_checkpoint
+spend_gate
 init_work_dir
 ids=()
 names=()

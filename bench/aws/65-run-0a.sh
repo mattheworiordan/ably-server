@@ -20,6 +20,7 @@ need_cmd jq
 is_dry || need_cmd aws
 storage=${1:?usage: 65-run-0a.sh <io2|gp3>}
 state_init
+require_preflight
 load_postgres_password
 require_run_limit
 limit_s=$RUN_LIMIT_S

@@ -19,6 +19,7 @@ need_cmd jq
 is_dry || need_cmd aws
 require_env AWS_REGION
 state_init
+require_preflight
 require_network_state
 : "${BUS:=nats}"
 : "${NODE_GOMEMLIMIT:=13GiB}"
@@ -44,7 +45,7 @@ flags="${flags}${ABLY_SERVER_EXTRA_FLAGS:+ $ABLY_SERVER_EXTRA_FLAGS}"
 env_args="-e GOMEMLIMIT=$NODE_GOMEMLIMIT"
 if [ -n "${NODE_GOMAXPROCS:-}" ]; then env_args+=" -e GOMAXPROCS=$NODE_GOMAXPROCS"; fi
 
-cost_checkpoint
+spend_gate
 init_work_dir
 role_args=("IMAGE=$image" "ENV_ARGS=$env_args" "API_KEY=$api_key" "DSN=$dsns" "PORT=$SERVER_PORT"
   "DEBUG_PORT=$SERVER_DEBUG_PORT" "FLAGS=$flags")

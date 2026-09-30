@@ -19,6 +19,7 @@ need_cmd jq
 is_dry || need_cmd aws
 require_env AWS_REGION
 state_init
+require_preflight
 require_network_state
 : "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT}}"
 : "${PUBLISHER_CMD:=ably-loadgen serve --role=publisher --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT}}"
@@ -27,7 +28,7 @@ tag=$(image_tag ably-loadgen "${LOADGEN_TAG:-}")
 image="${ECR_REGISTRY}/${ECR_REPO_LOADGEN}:${tag}"
 dsns=$(postgres_dsns)
 
-cost_checkpoint
+spend_gate
 init_work_dir
 ids=()
 names=()

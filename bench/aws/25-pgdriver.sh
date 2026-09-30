@@ -11,9 +11,10 @@ need_cmd jq
 is_dry || need_cmd aws
 require_env AWS_REGION
 state_init
+require_preflight
 require_network_state
 
-cost_checkpoint
+spend_gate
 init_work_dir
 ud="$BENCH_WORK_DIR/userdata-pgdriver.sh"
 ECR_LOGIN_REGISTRY='' render_userdata "$ud" pgdriver "PGBENCH_IMAGE=$PGBENCH_IMAGE"

@@ -19,6 +19,7 @@ case "$ADMIN_CIDR" in
 esac
 is_dry || [ -r "$SSH_PUBLIC_KEY_PATH" ] || die "cannot read SSH_PUBLIC_KEY_PATH=$SSH_PUBLIC_KEY_PATH"
 state_init
+require_preflight
 
 # VPC and subnet: the default VPC, the default subnet in $AZ.
 vpc=${VPC_ID:-$(state_get '.network.vpc_id')}

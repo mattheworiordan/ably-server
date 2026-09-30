@@ -32,6 +32,13 @@ if [ -n "$ids" ]; then
   aws_w "" ec2 wait instance-running --instance-ids $ids
   _state_update '.instances |= map_values(.running = true)'
   refresh_instances
+  if [ "${SKIP_REARM:-0}" != 1 ]; then
+    # The boot-time dead-man switch does not survive a stop: arm it again.
+    for name in $(state_instance_names); do
+      wait_ssh "$name"
+      ssh_do "$name" "sudo shutdown -c 2>/dev/null; sudo shutdown -h +$((FLEET_MAX_UPTIME_H * 60))"
+    done
+  fi
   log "started $(wc -w <<<"$ids" | tr -d ' ') instances"
 fi
 cost_checkpoint

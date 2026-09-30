@@ -24,6 +24,7 @@ need_cmd jq
 is_dry || need_cmd aws
 scenario_arg=${1:?usage: 60-run.sh <scenario-file-or-name>}
 state_init
+require_preflight
 load_postgres_password
 
 require_run_limit
@@ -93,8 +94,12 @@ cmd=${CONDUCTOR_CMD//\{RUN_ID\}/$run_id}
 cmd=${cmd//\{SCENARIO\}/$scenario_file}
 image=$(state_get '.loadgen.image')
 [ -n "$image" ] || die "STATE has no loadgen image; run 50-loadgen.sh"
-printf '#!/usr/bin/env bash\nexec docker run --rm --name conductor-run --network host -v %s:/run-input:ro -v %s:/results %s %s\n' \
-  "$idir" "$rdir" "$image" "$cmd" >"$BENCH_WORK_DIR/conductor-cmd.sh"
+cat >"$BENCH_WORK_DIR/conductor-cmd.sh" <<CMD
+#!/usr/bin/env bash
+# timeout(1) sends TERM, then KILL: remove the container on the way out so the run really stops.
+trap 'docker rm -f conductor-run >/dev/null 2>&1 || true' EXIT TERM INT
+docker run --rm --name conductor-run --network host -v $idir:/run-input:ro -v $rdir:/results $image $cmd
+CMD
 run_detached "$cname" "$rdir" "$BENCH_WORK_DIR/conductor-cmd.sh" "$limit_s"
 rc=$RUN_RC
 

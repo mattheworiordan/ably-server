@@ -36,8 +36,11 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${STATE_FILE:=$_default_workshop/STATE.json}"
 : "${DRY_STATE_FILE:=${TMPDIR:-/tmp}/${PROJECT_TAG}-dryrun-STATE.json}"
 
-: "${ECR_REPO_SERVER:=ably-server}"
-: "${ECR_REPO_LOADGEN:=ably-loadgen}"
+: "${ECR_REPO_SERVER:=${PROJECT_TAG}/ably-server}"
+: "${ECR_REPO_LOADGEN:=${PROJECT_TAG}/ably-loadgen}"
+: "${BILLING_REGION:=us-east-1}" # the only region that has billing metrics
+: "${FLEET_MAX_UPTIME_H:=10}"    # dead-man switch: every box stops itself after this long
+: "${USE_PLACEMENT_GROUP:=1}"
 : "${DB_NAME:=ably}"
 : "${DB_USER:=ably}"
 : "${SERVER_PORT:=8080}"
@@ -47,7 +50,7 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${NATS_ROUTE_PORT:=6222}"
 : "${NATS_MONITOR_PORT:=8222}"
 : "${NATS_EXPORTER_PORT:=7777}"
-: "${LOADGEN_AGENT_PORT:=9100}"
+: "${LOADGEN_AGENT_PORT:=9200}"
 : "${LOADGEN_METRICS_PORT:=9101}"
 
 : "${NODE_INSTANCE_TYPE:=c7i.2xlarge}"
@@ -78,6 +81,16 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 
 is_dry() { [ "$DRY_RUN" = 1 ]; }
 
+# Containers use host networking, so the ports of one box must differ.
+_check_ports() { # <box> <port>...
+  local box=$1 seen=" " p
+  shift
+  for p in "$@"; do
+    case "$seen" in *" $p "*) echo "port clash on $box boxes: $p is used twice (check the *_PORT variables)" >&2; exit 1 ;; esac
+    seen+="$p "
+  done
+}
+
 if is_dry; then
   ACTIVE_STATE="$DRY_STATE_FILE"
   : "${AWS_ACCOUNT_ID:=000000000000}"
@@ -97,6 +110,9 @@ SSH_PRIVATE_KEY_PATH="${SSH_PRIVATE_KEY_PATH%.pub}"
 : "${BUDGET_CAP_USD:=1500}"
 : "${ECR_REGISTRY:=${AWS_ACCOUNT_ID:-}.dkr.ecr.${AWS_REGION:-}.amazonaws.com}"
 export ACTIVE_STATE
+_check_ports node "$SERVER_PORT" "$SERVER_DEBUG_PORT" "$NODE_EXPORTER_PORT"
+_check_ports nats "$NATS_CLIENT_PORT" "$NATS_ROUTE_PORT" "$NATS_MONITOR_PORT" "$NATS_EXPORTER_PORT" "$NODE_EXPORTER_PORT"
+_check_ports loadgen "$LOADGEN_AGENT_PORT" "$LOADGEN_METRICS_PORT" "$NODE_EXPORTER_PORT"
 
 # Ably internal: mint credentials from ablyctl when none are set. Skipped in a
 # dry run and when NO_AWS=1 (local image builds).
@@ -151,6 +167,7 @@ require_env() {
 check_password() {
   case "${RDS_PASSWORD:-}" in
     '') die "RDS_PASSWORD is not set" ;;
+    change-me*) die "RDS_PASSWORD is still the placeholder from env.example" ;;
     *[!A-Za-z0-9_-]*) die "RDS_PASSWORD may contain only letters, digits, _ and -" ;;
   esac
   [ "${#RDS_PASSWORD}" -ge 16 ] || die "RDS_PASSWORD must be at least 16 characters"
@@ -526,6 +543,7 @@ launch_instance() {
   ami=$(state_get '.network.ami_id')
   profile=$(state_get '.network.instance_profile')
   local -a args=(ec2 run-instances
+    --instance-initiated-shutdown-behavior stop
     --image-id "$ami" --instance-type "$type" --key-name "$key"
     --security-group-ids "$sg" --subnet-id "$subnet"
     --user-data "file://$ud"
@@ -534,13 +552,20 @@ launch_instance() {
     --tag-specifications "$(tag_spec instance "$name" "$role")" "$(tag_spec volume "$name" "$role")"
     --query 'Instances[0].InstanceId' --output text)
   if [ -n "$profile" ]; then args+=(--iam-instance-profile "Name=$profile"); fi
-  if [ "$place" = 1 ]; then
+  if [ "$place" = 1 ] && [ "$USE_PLACEMENT_GROUP" = 1 ]; then
     args+=(--placement "GroupName=$(state_get '.network.placement_group'),AvailabilityZone=$AZ")
   else
     args+=(--placement "AvailabilityZone=$AZ")
   fi
   if [ -n "$pip" ]; then args+=(--private-ip-address "$pip"); fi
-  id=$(aws_w "i-dry-$name" "${args[@]}")
+  # A new instance profile can take a minute to become usable: retry a few times.
+  local try=0
+  until id=$(aws_w "i-dry-$name" "${args[@]}"); do
+    try=$((try + 1))
+    [ "$try" -lt 4 ] || die "run-instances failed for $name after $try tries"
+    log "run-instances failed for $name; retrying in 15s (an instance profile or capacity may still be settling)"
+    sleep 15
+  done
   if is_dry; then
     state_put_instance "$name" "$id" "$role" "$type" "${pip:-$(fake_ip "$name")}" "198.51.100.$(($(printf '%s' "$name" | cksum | cut -d' ' -f1) % 200 + 10))"
   else
@@ -608,11 +633,32 @@ scp_from() { # <instance-name> <remote path> <local path> (recursive)
   _ext "" scp -r "${opts[@]}" "ec2-user@$ip:$2" "$3"
 }
 
-wait_boot() { # <instance-name>... wait for cloud-init to finish
+# wait_ssh <instance-name>: retry until sshd accepts a connection (EC2 reports
+# "running" a few tens of seconds before it does).
+wait_ssh() {
+  local name=$1 ip tries=0
+  if is_dry; then
+    ssh_do "$name" true
+    return 0
+  fi
+  ip=$(inst_field "$name" public_ip)
+  [ -n "$ip" ] || die "no public address for $name in STATE"
+  until ssh_do "$name" true >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 36 ] || die "$name ($ip) does not accept SSH after 6 minutes; check ADMIN_CIDR and the security group"
+    sleep 10
+  done
+}
+
+# wait_boot <instance-name>...: wait for SSH, then for cloud-init, then check
+# the role script finished (it touches /var/lib/bench-ready only on success).
+wait_boot() {
   local n
-  [ "${SKIP_BOOT_WAIT:-0}" = 1 ] && return 0
+  if [ "${SKIP_BOOT_WAIT:-0}" = 1 ]; then return 0; fi
   for n in "$@"; do
-    ssh_do "$n" 'sudo cloud-init status --wait'
+    wait_ssh "$n"
+    ssh_do "$n" 'sudo cloud-init status --wait >/dev/null; test -f /var/lib/bench-ready' ||
+      die "$n did not finish booting: ssh in and read /var/log/bench-userdata.log (and 'docker logs')"
   done
 }
 
@@ -625,7 +671,8 @@ render_userdata() {
     render_template "$BENCH_AWS_DIR/templates/common.sh" \
       "REGION=$AWS_REGION" "ECR_REGISTRY=${ECR_LOGIN_REGISTRY-$ECR_REGISTRY}" \
       "NODE_EXPORTER_IMAGE=$NODE_EXPORTER_IMAGE" "NODE_EXPORTER_PORT=$NODE_EXPORTER_PORT" \
-      "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}"
+      "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}" \
+      "MAX_UPTIME_MIN=$((FLEET_MAX_UPTIME_H * 60))"
     printf '\n'
     render_template "$BENCH_AWS_DIR/templates/$role.sh" "$@"
     printf '\n'
@@ -641,7 +688,7 @@ render_userdata() {
 # remove their own container first.
 apply_role_script() {
   scp_to "$1" "$2" /tmp/role.sh
-  ssh_do "$1" 'sudo bash -euxo pipefail /tmp/role.sh'
+  ssh_do "$1" 'chmod 600 /tmp/role.sh; sudo bash -euo pipefail /tmp/role.sh; rm -f /tmp/role.sh'
 }
 
 # iname <role> <index>: the Name tag of an instance.
@@ -702,6 +749,7 @@ parse_dsn() {
 # RUN_RC (an exit code, or "unknown" if none arrived in limit + 300 s).
 run_detached() {
   local name=$1 rdir=$2 script=$3 limit=$4 deadline
+  [ -n "$(inst_field "$name" public_ip)" ] || die "no public address for $name in STATE (run 80-start.sh or refresh)"
   ssh_do "$name" "mkdir -p $rdir"
   scp_to "$name" "$script" "$rdir/cmd.sh"
   ssh_do "$name" "nohup bash -c 'timeout -k 30 $limit bash $rdir/cmd.sh; echo \$? > $rdir/exit-code' >$rdir/run.log 2>&1 </dev/null &"
@@ -779,6 +827,12 @@ rds_hourly() { # <class> <storage> <gb> <iops>
 }
 
 # fleet_hourly_rate: USD per hour of everything STATE says is running.
+rds_storage_hourly() { # <storage> <gb> <iops>: what a stopped instance still bills
+  awk -v st="$1" -v gb="$2" -v iops="${3:-0}" \
+    -v i_iops="$IO2_USD_PER_IOPS_MONTH" -v i_gb="$IO2_USD_PER_GB_MONTH" -v g_gb="$GP3_USD_PER_GB_MONTH" \
+    'BEGIN { if (st == "io2") s = (gb*i_gb + iops*i_iops)/730; else s = gb*g_gb/730; printf "%.3f\n", s }'
+}
+
 fleet_hourly_rate() {
   local total=0 type cls st gb iops row
   while IFS= read -r type; do
@@ -793,6 +847,11 @@ fleet_hourly_rate() {
     iops=$(jq -r '.iops // 0' <<<"$row")
     total=$(awk -v t="$total" -v p="$(rds_hourly "$cls" "$st" "$gb" "$iops")" 'BEGIN{printf "%.4f", t+p}')
   done < <(state_get '.postgres.instances // {} | to_entries[] | select(.value.running == true) | .value' | jq -c . 2>/dev/null || true)
+  # Stopped Postgres instances still bill storage and provisioned IOPS.
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    total=$(awk -v t="$total" -v p="$(rds_storage_hourly "$(jq -r .storage <<<"$row")" "$(jq -r '.storage_gb // 0' <<<"$row")" "$(jq -r '.iops // 0' <<<"$row")")" 'BEGIN{printf "%.4f", t+p}')
+  done < <(state_get '.postgres.instances // {} | to_entries[] | select(.value.running != true) | .value' | jq -c . 2>/dev/null || true)
   printf '%s' "$total"
 }
 
@@ -840,4 +899,27 @@ require_run_limit() {
   [ -n "${RUN_TIME_LIMIT:-}" ] || die "RUN_TIME_LIMIT is not set. Every run needs a hard time limit (for example RUN_TIME_LIMIT=45m)."
   RUN_LIMIT_S=$(parse_duration "$RUN_TIME_LIMIT") || die "RUN_TIME_LIMIT=$RUN_TIME_LIMIT is not a duration (use 300, 45m or 2h)"
   [ "$RUN_LIMIT_S" -gt 0 ] || die "RUN_TIME_LIMIT must be positive"
+}
+
+# require_preflight: the billing alarm is checked by 00-preflight.sh only, so
+# every script that creates or starts anything insists it has run.
+require_preflight() {
+  if is_dry; then return 0; fi
+  [ -n "$(state_get '.preflight.ok_at')" ] || die "run 00-preflight.sh first (it checks permissions and the billing alarm)"
+  if [ "$(state_get '.preflight.alarm_method')" = none ] && [ "${FORCE_NO_ALARM:-0}" != 1 ]; then
+    die "00-preflight.sh found no way to create a billing alarm; refusing to create resources"
+  fi
+}
+
+# spend_gate: refuse to add to the fleet once the estimate has reached the cap.
+spend_gate() {
+  local accrued
+  cost_checkpoint
+  accrued=$(state_get '.budget.accrued_usd')
+  : "${accrued:=0}"
+  if awk -v a="$accrued" -v cap="$BUDGET_CAP_USD" 'BEGIN{exit !(a+0 >= cap+0)}'; then
+    [ "${OVERRIDE_BUDGET_GUARD:-0}" = 1 ] || die "the spend estimate (\$$accrued) has reached the cap (\$$BUDGET_CAP_USD). Decide with the budget owner; OVERRIDE_BUDGET_GUARD=1 continues."
+  elif awk -v a="$accrued" -v al="$BUDGET_ALARM_USD" 'BEGIN{exit !(a+0 >= al+0)}'; then
+    log "WARNING: the spend estimate (\$$accrued) is past the alarm level (\$$BUDGET_ALARM_USD)"
+  fi
 }
