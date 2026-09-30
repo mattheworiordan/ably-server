@@ -230,7 +230,11 @@ func (sc *scheduler) complete(r *pubReq, err error) {
 		sc.ackHist.Record(lat)
 	}
 	j.M.AckLatency.WithLabelValues(sc.transport).Observe(lat.Seconds())
-	if r.s.plan.Sampled {
+	// The tail-loss record is fenced at the end of the hold: subscribers
+	// keep reading for the drain after it, so every message acknowledged
+	// by then has the drain to arrive. Publishes that finish during the
+	// publisher's grace period are not held to that.
+	if r.s.plan.Sampled && !now.After(j.measureEnd) {
 		j.recordStream(r.s.plan.Channel, r.s.plan.PubID, r.seq, now.UnixMicro())
 	}
 	s := r.s

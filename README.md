@@ -160,6 +160,20 @@ check — any loss, duplication, or per-channel reordering fails the run.
 searches for the highest sustained rate that still meets it. Run
 `go run ./cmd/ably-bench --help` for the full flag list.
 
+Three things matter for throughput runs. Each publisher connection runs
+its publishes one at a time, so `--publishers` (default 4) caps the rate
+at that many over the publish latency; raise it. With many publishers,
+pass `--stagger` so their first sends are spread across one publish
+interval instead of arriving as one burst per interval. The warm-up
+(`--warmup`) starts only once every client is connected and attached
+(publishers attach explicitly), so the setup transient never lands in the
+measured window.
+
+For cluster-scale load (hundreds of thousands of connections, REST
+publishers, serial-continuity checking on a channel sample, one-way
+latency across nodes), see `cmd/ably-loadgen` and `cmd/ably-conductor` in
+[bench/aws/README.md](bench/aws/README.md).
+
 ## Sandbox provisioner
 
 `cmd/ably-local-sandbox` is a test-app provisioner for the Ably SDK test suites

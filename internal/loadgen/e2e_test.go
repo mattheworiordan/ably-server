@@ -24,18 +24,27 @@ const testKey = "app.key:secret"
 // startServer runs an in-process ably-server in memory mode and returns
 // its host:port.
 func startServer(t *testing.T) string {
+	addr, _ := startServerWithMetrics(t)
+	return addr
+}
+
+// startServerWithMetrics also enables the debug listener and returns its
+// /metrics URL.
+func startServerWithMetrics(t *testing.T) (string, string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan net.Addr, 1)
+	debugReady := make(chan net.Addr, 1)
 	done := make(chan int, 1)
 	var out bytes.Buffer
 	var outMu sync.Mutex
 	go func() {
 		done <- server.Run(ctx, server.Opts{
-			Args:   []string{"--mode=memory", "--listen=127.0.0.1:0", "--log-level=error"},
-			Getenv: func(k string) string { return map[string]string{"ABLY_SERVER_KEYS": testKey}[k] },
-			Out:    lockedWriter{&out, &outMu},
-			Ready:  ready,
+			Args:       []string{"--mode=memory", "--listen=127.0.0.1:0", "--debug-listen=127.0.0.1:0", "--log-level=error"},
+			Getenv:     func(k string) string { return map[string]string{"ABLY_SERVER_KEYS": testKey}[k] },
+			Out:        lockedWriter{&out, &outMu},
+			Ready:      ready,
+			DebugReady: debugReady,
 		})
 	}()
 	t.Cleanup(func() {
@@ -46,9 +55,10 @@ func startServer(t *testing.T) string {
 			t.Error("server did not stop")
 		}
 	})
+	var addr string
 	select {
-	case addr := <-ready:
-		return addr.String()
+	case a := <-ready:
+		addr = a.String()
 	case code := <-done:
 		outMu.Lock()
 		defer outMu.Unlock()
@@ -56,7 +66,13 @@ func startServer(t *testing.T) string {
 	case <-time.After(10 * time.Second):
 		t.Fatal("server not ready")
 	}
-	return ""
+	select {
+	case d := <-debugReady:
+		return addr, "http://" + d.String() + "/metrics"
+	case <-time.After(10 * time.Second):
+		t.Fatal("debug listener not ready")
+	}
+	return "", ""
 }
 
 type lockedWriter struct {

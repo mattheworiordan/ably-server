@@ -28,6 +28,10 @@ func Pace(ctx context.Context, rate func(time.Time) float64, maxCatchUp time.Dur
 		case now := <-t.C:
 			r := rate(now)
 			if r < 0 {
+				// Events owed when the schedule ends were never fired.
+				if dropped != nil && owed >= 1 {
+					dropped(int64(owed))
+				}
 				return
 			}
 			dt := now.Sub(last)

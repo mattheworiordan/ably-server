@@ -1,0 +1,511 @@
+package loadgen
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+// RunRecordVersion is bumped when RunRecord changes incompatibly.
+const RunRecordVersion = 1
+
+// RunRecord is the conductor's result for one run: results/<run-id>/
+// summary.json. It carries shape names only, never anything that
+// identifies a customer, so it can be committed to the fork.
+type RunRecord struct {
+	Version     int               `json:"version"`
+	RunID       string            `json:"run_id"`
+	RunTag      string            `json:"run_tag"`
+	Scenario    string            `json:"scenario"`
+	Shape       string            `json:"shape"`
+	Multiplier  float64           `json:"multiplier"`
+	Scale       float64           `json:"scale"`
+	Bus         string            `json:"bus,omitempty"`
+	Nodes       int               `json:"nodes"`
+	Shards      int               `json:"shards,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
+
+	StartUS        int64 `json:"start_us"`
+	MeasureStartUS int64 `json:"measure_start_us"`
+	MeasureEndUS   int64 `json:"measure_end_us"`
+	EndUS          int64 `json:"end_us"`
+
+	Plan      Totals       `json:"plan"`
+	Result    RunResult    `json:"result"`
+	NodeStats NodeStats    `json:"node_stats"`
+	Footprint Footprint    `json:"footprint"`
+	Fault     *FaultRecord `json:"fault,omitempty"`
+	Checks    []Check      `json:"checks"`
+	Pass      bool         `json:"pass"`
+	Verdict   string       `json:"verdict"`
+	Errors    []string     `json:"errors,omitempty"`
+	Jobs      []JobRef     `json:"jobs"`
+}
+
+// JobRef names one generator job of the run.
+type JobRef struct {
+	ID    string `json:"id"`
+	Role  string `json:"role"`
+	Agent string `json:"agent"`
+	Host  string `json:"host,omitempty"`
+}
+
+// RunResult is the merge of every job's summary.
+type RunResult struct {
+	Connections      ConnStats             `json:"connections"`
+	Attachments      AttachStats           `json:"attachments"`
+	Publishes        PublishStats          `json:"publishes"`
+	Deliveries       DeliveryStats         `json:"deliveries"`
+	Presence         PresenceStats         `json:"presence"`
+	Violations       map[string]int64      `json:"violations"`
+	CheckedMessages  int64                 `json:"checked_messages"`
+	Tail             TailResult            `json:"tail"`
+	FirstViolations  []Violation           `json:"first_violations,omitempty"`
+	Latency          map[string]*Histogram `json:"latency"`
+	GeneratorBytesPC float64               `json:"generator_bytes_per_connection,omitempty"`
+}
+
+// NodeStats summarises the server nodes' metrics over the hold.
+type NodeStats struct {
+	Samples []NodeSample `json:"samples,omitempty"`
+	// MemoryGrowth is the largest fractional RSS growth of any node from
+	// the first to the last sample of the hold.
+	MemoryGrowth float64 `json:"memory_growth"`
+	// GoroutineGrowth is the same for goroutines.
+	GoroutineGrowth float64 `json:"goroutine_growth"`
+	// CoresUsed is the nodes' summed CPU use over the hold.
+	CoresUsed float64 `json:"cores_used"`
+	// RSSBytes is the nodes' summed RSS at the end of the hold.
+	RSSBytes float64 `json:"rss_bytes"`
+	// ConnectionsOpen is the nodes' summed open connections at the end of
+	// the hold, as the server counts them.
+	ConnectionsOpen float64 `json:"connections_open"`
+	Measured        bool    `json:"measured"`
+}
+
+// Footprint is plan §8's footprint: provisioned and used resources per
+// 100k connections, per 100k deliveries/s and per 10k writes/s.
+type Footprint struct {
+	VCPU                  float64 `json:"vcpu"`
+	MemoryGB              float64 `json:"memory_gb"`
+	CoresUsed             float64 `json:"cores_used"`
+	RSSGB                 float64 `json:"rss_gb"`
+	Connections           float64 `json:"connections"`
+	DeliveriesPerSec      float64 `json:"deliveries_per_sec"`
+	WritesPerSec          float64 `json:"writes_per_sec"`
+	VCPUPer100kConns      float64 `json:"vcpu_per_100k_connections"`
+	MemGBPer100kConns     float64 `json:"memory_gb_per_100k_connections"`
+	VCPUPer100kDeliveries float64 `json:"vcpu_per_100k_deliveries_per_sec"`
+	VCPUPer10kWrites      float64 `json:"vcpu_per_10k_writes_per_sec"`
+	UsedPer100kConns      float64 `json:"used_cores_per_100k_connections"`
+	UsedPer100kDeliveries float64 `json:"used_cores_per_100k_deliveries_per_sec"`
+	UsedPer10kWrites      float64 `json:"used_cores_per_10k_writes_per_sec"`
+	RSSGBPer100kConns     float64 `json:"rss_gb_per_100k_connections"`
+}
+
+// FaultRecord is the failure injection step, if any.
+type FaultRecord struct {
+	Command  string `json:"command"`
+	AtUS     int64  `json:"at_us"`
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output,omitempty"`
+}
+
+// Check is one pass criterion.
+type Check struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Limit  string `json:"limit"`
+	Pass   bool   `json:"pass"`
+	Gating bool   `json:"gating"`
+	Note   string `json:"note,omitempty"`
+}
+
+// MergeSummaries combines job summaries: counters add, histograms merge
+// bucket by bucket, and publisher stream records are checked against
+// subscriber records for tail loss.
+func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
+	r := RunResult{Violations: make(map[string]int64), Latency: make(map[string]*Histogram)}
+	published := map[string]map[string]StreamRecord{}
+	var seen []map[string]*ChannelSeen
+	var pubTarget float64
+	var bpcSum float64
+	var bpcN int
+	for _, s := range sums {
+		if s == nil {
+			continue
+		}
+		c := &r.Connections
+		c.Target += s.Connections.Target
+		c.Opened += s.Connections.Opened
+		c.Peak += s.Connections.Peak
+		c.OpenAtMeasureEnd += s.Connections.OpenAtMeasureEnd
+		c.ConnectFailures += s.Connections.ConnectFailures
+		c.Reconnects += s.Connections.Reconnects
+		c.ChurnDrops += s.Connections.ChurnDrops
+		c.UnplannedDrops += s.Connections.UnplannedDrops
+		a := &r.Attachments
+		a.Target += s.Attachments.Target
+		a.AttachedAtMeasureEnd += s.Attachments.AttachedAtMeasureEnd
+		a.Failures += s.Attachments.Failures
+		a.ChannelOpens += s.Attachments.ChannelOpens
+		a.Discontinuities += s.Attachments.Discontinuities
+		p := &r.Publishes
+		p.Streams += s.Publishes.Streams
+		pubTarget += s.Publishes.TargetRate
+		p.Offered += s.Publishes.Offered
+		p.Dropped += s.Publishes.Dropped
+		p.Sent += s.Publishes.Sent
+		p.Acked += s.Publishes.Acked
+		p.Retries += s.Publishes.Retries
+		p.Rejected += s.Publishes.Rejected
+		p.Unresolved += s.Publishes.Unresolved
+		p.OfferedInWindow += s.Publishes.OfferedInWindow
+		p.AckedInWindow += s.Publishes.AckedInWindow
+		p.OfferedRate += s.Publishes.OfferedRate
+		p.AchievedRate += s.Publishes.AchievedRate
+		d := &r.Deliveries
+		d.Received += s.Deliveries.Received
+		d.InWindow += s.Deliveries.InWindow
+		d.Rate += s.Deliveries.Rate
+		d.NegativeLatency += s.Deliveries.NegativeLatency
+		d.Foreign += s.Deliveries.Foreign
+		pr := &r.Presence
+		pr.Members += s.Presence.Members
+		pr.Entered += s.Presence.Entered
+		pr.Left += s.Presence.Left
+		pr.Nacks += s.Presence.Nacks
+		pr.Received += s.Presence.Received
+		for k, v := range s.Correctness.Violations {
+			r.Violations[k] += v
+		}
+		r.CheckedMessages += s.Correctness.CheckedMessages
+		for _, v := range s.Correctness.FirstViolations {
+			if len(r.FirstViolations) < MaxLoggedViolations {
+				r.FirstViolations = append(r.FirstViolations, v)
+			}
+		}
+		for name, h := range s.Latency {
+			if h == nil {
+				continue
+			}
+			m := r.Latency[name]
+			if m == nil {
+				m = NewHistogram()
+				r.Latency[name] = m
+			}
+			m.Merge(h)
+		}
+		for ch, streams := range s.Streams {
+			if published[ch] == nil {
+				published[ch] = map[string]StreamRecord{}
+			}
+			for pub, rec := range streams {
+				if old, ok := published[ch][pub]; !ok || rec.LastAckedSeq > old.LastAckedSeq {
+					published[ch][pub] = rec
+				}
+			}
+		}
+		if s.Role == RoleSubscriber {
+			seen = append(seen, s.Correctness.Channels)
+			if s.Resources.BytesPerConnection > 0 {
+				bpcSum += s.Resources.BytesPerConnection
+				bpcN++
+			}
+		}
+	}
+	r.Publishes.TargetRate = pubTarget
+	r.Tail = TailCheck(published, seen, tailMargin)
+	r.Violations[TailLoss.String()] += r.Tail.Lost
+	for _, v := range r.Tail.Examples {
+		if len(r.FirstViolations) < MaxLoggedViolations {
+			r.FirstViolations = append(r.FirstViolations, v)
+		}
+	}
+	if bpcN > 0 {
+		r.GeneratorBytesPC = bpcSum / float64(bpcN)
+	}
+	return r
+}
+
+// ComputeNodeStats derives growth and use over the hold from node samples.
+func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS int64) NodeStats {
+	ns := NodeStats{Samples: samples}
+	byNode := map[string][]NodeSample{}
+	for _, s := range samples {
+		if s.Error != "" || s.Values == nil {
+			continue
+		}
+		if s.AtUS < measureStartUS || s.AtUS > measureEndUS {
+			continue
+		}
+		byNode[s.Node] = append(byNode[s.Node], s)
+	}
+	for _, ss := range byNode {
+		if len(ss) < 2 {
+			continue
+		}
+		sort.Slice(ss, func(i, j int) bool { return ss[i].AtUS < ss[j].AtUS })
+		first, last := ss[0], ss[len(ss)-1]
+		ns.Measured = true
+		growth := func(name string) float64 {
+			a, b := first.Values[name], last.Values[name]
+			if a <= 0 {
+				return 0
+			}
+			return (b - a) / a
+		}
+		ns.MemoryGrowth = max(ns.MemoryGrowth, growth("process_resident_memory_bytes"))
+		ns.GoroutineGrowth = max(ns.GoroutineGrowth, growth("go_goroutines"))
+		if dt := float64(last.AtUS-first.AtUS) / 1e6; dt > 0 {
+			ns.CoresUsed += (last.Values["process_cpu_seconds_total"] - first.Values["process_cpu_seconds_total"]) / dt
+		}
+		ns.RSSBytes += last.Values["process_resident_memory_bytes"]
+		ns.ConnectionsOpen += last.Values["ably_connections_open"]
+	}
+	return ns
+}
+
+// ComputeFootprint derives plan §8's footprint figures.
+func ComputeFootprint(inv *Inventory, res RunResult, ns NodeStats) Footprint {
+	f := Footprint{
+		CoresUsed:        ns.CoresUsed,
+		RSSGB:            ns.RSSBytes / (1 << 30),
+		Connections:      float64(res.Connections.OpenAtMeasureEnd),
+		DeliveriesPerSec: res.Deliveries.Rate,
+		WritesPerSec:     res.Publishes.AchievedRate,
+	}
+	if inv != nil {
+		for _, n := range inv.Nodes {
+			f.VCPU += n.VCPU
+			f.MemoryGB += n.MemoryGB
+		}
+	}
+	per := func(total, load, unit float64) float64 {
+		if load <= 0 || total <= 0 {
+			return 0
+		}
+		return total / (load / unit)
+	}
+	f.VCPUPer100kConns = per(f.VCPU, f.Connections, 1e5)
+	f.MemGBPer100kConns = per(f.MemoryGB, f.Connections, 1e5)
+	f.VCPUPer100kDeliveries = per(f.VCPU, f.DeliveriesPerSec, 1e5)
+	f.VCPUPer10kWrites = per(f.VCPU, f.WritesPerSec, 1e4)
+	f.UsedPer100kConns = per(f.CoresUsed, f.Connections, 1e5)
+	f.UsedPer100kDeliveries = per(f.CoresUsed, f.DeliveriesPerSec, 1e5)
+	f.UsedPer10kWrites = per(f.CoresUsed, f.WritesPerSec, 1e4)
+	f.RSSGBPer100kConns = per(f.RSSGB, f.Connections, 1e5)
+	return f
+}
+
+func msOf(us uint64) string { return fmt.Sprintf("%.1f ms", float64(us)/1000) }
+
+// Evaluate applies the pass criteria (plan §8) to a run record, filling
+// Checks, Pass and Verdict. A criterion whose input was not measured
+// (no REST publishes, no node metrics) is reported but does not gate.
+func Evaluate(rec *RunRecord, spec PassSpec) {
+	spec = spec.withDefaults()
+	res := &rec.Result
+	var checks []Check
+	add := func(c Check) { checks = append(checks, c) }
+
+	// Delivery latency: publisher to a subscriber on another node, when
+	// there is such traffic; otherwise every delivery.
+	del := res.Latency[LatDeliveryCrossNode]
+	delName := "cross-node"
+	if del == nil || del.Count() == 0 {
+		del = res.Latency[LatDelivery]
+		delName = "all"
+	}
+	if del != nil && del.Count() > 0 {
+		p50, p99 := del.Quantile(0.50), del.Quantile(0.99)
+		add(Check{Name: "delivery p50 (" + delName + ")", Value: msOf(p50), Limit: "<= " + spec.DeliveryP50.String(),
+			Pass: time.Duration(p50)*time.Microsecond <= spec.DeliveryP50.Duration, Gating: true})
+		add(Check{Name: "delivery p99 (" + delName + ")", Value: msOf(p99), Limit: "<= " + spec.DeliveryP99.String(),
+			Pass: time.Duration(p99)*time.Microsecond <= spec.DeliveryP99.Duration, Gating: true})
+		add(Check{Name: "delivery p99 stretch", Value: msOf(p99), Limit: "< " + spec.DeliveryP99Str.String(),
+			Pass: time.Duration(p99)*time.Microsecond < spec.DeliveryP99Str.Duration, Gating: false})
+	} else if rec.Plan.DeliveriesPerSec > 0 {
+		add(Check{Name: "delivery latency", Value: "no deliveries in window", Limit: "deliveries expected", Pass: false, Gating: true})
+	}
+	if h := res.Latency[LatRESTAck]; h != nil && h.Count() > 0 {
+		p99 := h.Quantile(0.99)
+		add(Check{Name: "REST publish ACK p99", Value: msOf(p99), Limit: "<= " + spec.RestAckP99.String(),
+			Pass: time.Duration(p99)*time.Microsecond <= spec.RestAckP99.Duration, Gating: true,
+			Note: "from the scheduled send time, retries included"})
+	}
+	if h := res.Latency[LatRealtimeAck]; h != nil && h.Count() > 0 {
+		p99 := h.Quantile(0.99)
+		add(Check{Name: "realtime publish ACK p99", Value: msOf(p99), Limit: "<= " + spec.RestAckP99.String(),
+			Pass: time.Duration(p99)*time.Microsecond <= spec.RestAckP99.Duration, Gating: false})
+	}
+	if h := res.Latency[LatConnectAttach]; h != nil && h.Count() > 0 {
+		p99 := h.Quantile(0.99)
+		add(Check{Name: "connect+attach p99", Value: msOf(p99), Limit: "<= " + spec.ConnectAttachP99.String(),
+			Pass: time.Duration(p99)*time.Microsecond <= spec.ConnectAttachP99.Duration, Gating: true,
+			Note: fmt.Sprintf("%d samples, churn included", h.Count())})
+	}
+	var bad int64
+	var parts []string
+	for _, k := range ViolationKinds() {
+		n := res.Violations[k.String()]
+		bad += n
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, n))
+		}
+	}
+	value := fmt.Sprintf("0 of %d checked", res.CheckedMessages)
+	if bad > 0 {
+		value = strings.Join(parts, " ")
+	}
+	add(Check{Name: "loss, duplicate, reorder on the sample", Value: value, Limit: "0", Pass: bad == 0, Gating: true,
+		Note: fmt.Sprintf("tail check covered %d streams", res.Tail.Checked)})
+	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
+		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
+	}
+	if p := res.Publishes; p.TargetRate > 0 {
+		ratio := 0.0
+		if p.OfferedRate > 0 {
+			ratio = p.AchievedRate / p.OfferedRate
+		}
+		add(Check{Name: "publish rate achieved", Value: fmt.Sprintf("%.0f of %.0f/s offered (%.0f%%)", p.AchievedRate, p.OfferedRate, ratio*100),
+			Limit: fmt.Sprintf(">= %.0f%%", spec.MinAchievedRatio*100), Pass: ratio >= spec.MinAchievedRatio, Gating: true})
+		add(Check{Name: "offered rate vs target", Value: fmt.Sprintf("%.0f of %.0f/s", p.OfferedRate, p.TargetRate),
+			Limit: fmt.Sprintf(">= %.0f%% (generator kept up)", spec.MinAchievedRatio*100), Pass: p.OfferedRate >= spec.MinAchievedRatio*p.TargetRate, Gating: true,
+			Note: fmt.Sprintf("generator dropped %d scheduled publishes", p.Dropped)})
+		add(Check{Name: "rejected publishes", Value: fmt.Sprint(p.Rejected), Limit: "0", Pass: p.Rejected == 0, Gating: true})
+	}
+	if c := res.Connections; c.Target > 0 {
+		want := float64(c.Target) * (1 - spec.MaxConnectionLoss)
+		add(Check{Name: "connections open at end of hold", Value: fmt.Sprintf("%d of %d", c.OpenAtMeasureEnd, c.Target),
+			Limit: fmt.Sprintf(">= %.0f", want), Pass: float64(c.OpenAtMeasureEnd) >= want, Gating: true})
+	}
+	ns := rec.NodeStats
+	if ns.Measured {
+		add(Check{Name: "node memory growth over hold", Value: fmt.Sprintf("%.1f%%", ns.MemoryGrowth*100),
+			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxMemoryGrowth*100), Pass: ns.MemoryGrowth <= spec.MaxMemoryGrowth, Gating: true})
+		add(Check{Name: "node goroutine growth over hold", Value: fmt.Sprintf("%.1f%%", ns.GoroutineGrowth*100),
+			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxGoroutineGrowth*100), Pass: ns.GoroutineGrowth <= spec.MaxGoroutineGrowth, Gating: true})
+	} else {
+		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
+			Note: "no node metrics URLs in the inventory"})
+	}
+	if res.Attachments.Discontinuities > 0 {
+		add(Check{Name: "resume discontinuities", Value: fmt.Sprint(res.Attachments.Discontinuities), Limit: "reported",
+			Pass: true, Gating: false, Note: "server declined a resume (outside the continuity window or replay cap)"})
+	}
+	rec.Checks = checks
+	rec.Pass = true
+	for _, c := range checks {
+		if c.Gating && !c.Pass {
+			rec.Pass = false
+		}
+	}
+	rec.Verdict = "PASS"
+	if !rec.Pass {
+		rec.Verdict = "FAIL"
+	}
+}
+
+// Markdown renders the run record as the tables a run leaves behind.
+func (rec *RunRecord) Markdown() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Run %s: shape %s at %gx, scale %g: %s\n\n", rec.RunID, rec.Shape, rec.Multiplier, rec.Scale, rec.Verdict)
+	fmt.Fprintf(&b, "Scenario `%s`, bus `%s`, %d nodes", rec.Scenario, rec.Bus, rec.Nodes)
+	if rec.Shards > 1 {
+		fmt.Fprintf(&b, ", %d shards", rec.Shards)
+	}
+	start := time.UnixMicro(rec.StartUS).UTC()
+	fmt.Fprintf(&b, ". Ramp from %s, hold %s.\n\n", start.Format(time.RFC3339), time.Duration(rec.MeasureEndUS-rec.MeasureStartUS)*time.Microsecond)
+	if len(rec.Environment) > 0 {
+		keys := make([]string, 0, len(rec.Environment))
+		for k := range rec.Environment {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&b, "- %s: %s\n", k, rec.Environment[k])
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("| Check | Value | Limit | Result |\n|---|---|---|---|\n")
+	for _, c := range rec.Checks {
+		res := "pass"
+		if !c.Pass {
+			res = "FAIL"
+		}
+		if !c.Gating {
+			res += " (reported)"
+		}
+		note := ""
+		if c.Note != "" {
+			note = " (" + c.Note + ")"
+		}
+		fmt.Fprintf(&b, "| %s | %s%s | %s | %s |\n", c.Name, c.Value, note, c.Limit, res)
+	}
+	r := rec.Result
+	b.WriteString("\n| Measure | Planned | Measured |\n|---|---|---|\n")
+	fmt.Fprintf(&b, "| Connections | %d | %d open at end of hold (peak %d) |\n", rec.Plan.Connections, r.Connections.OpenAtMeasureEnd, r.Connections.Peak)
+	fmt.Fprintf(&b, "| Attachments | %d | %d attached at end of hold |\n", rec.Plan.Attachments, r.Attachments.AttachedAtMeasureEnd)
+	fmt.Fprintf(&b, "| Publishes/s | %.0f | %.0f achieved (%.0f offered) |\n", rec.Plan.PublishesPerSec, r.Publishes.AchievedRate, r.Publishes.OfferedRate)
+	fmt.Fprintf(&b, "| Deliveries/s | %.0f | %.0f |\n", rec.Plan.DeliveriesPerSec, r.Deliveries.Rate)
+	fmt.Fprintf(&b, "| Connects/s (churn) | %.0f | %d reconnects (%d churn, %d unplanned) |\n", rec.Plan.ConnectsPerSec, r.Connections.Reconnects, r.Connections.ChurnDrops, r.Connections.UnplannedDrops)
+	fmt.Fprintf(&b, "| Channel opens/s (churn) | %.0f | %d opens |\n", rec.Plan.ChannelOpensPerSec, r.Attachments.ChannelOpens)
+	if rec.Plan.PresenceMembers > 0 {
+		fmt.Fprintf(&b, "| Presence members | %d | %d entered, %d left, %d nacks |\n", rec.Plan.PresenceMembers, r.Presence.Entered, r.Presence.Left, r.Presence.Nacks)
+	}
+	b.WriteString("\n| Latency | n | p50 | p90 | p99 | p99.9 | max |\n|---|---|---|---|---|---|---|\n")
+	names := make([]string, 0, len(r.Latency))
+	for n, h := range r.Latency {
+		if h.Count() > 0 {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		s := r.Latency[n].Snapshot()
+		fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %s | %s |\n", n, s.Count, msOf(s.P50US), msOf(s.P90US), msOf(s.P99US), msOf(s.P999US), msOf(s.MaxUS))
+	}
+	f := rec.Footprint
+	if f.VCPU > 0 || f.CoresUsed > 0 {
+		b.WriteString("\n| Footprint | Provisioned vCPU | Used cores |\n|---|---|---|\n")
+		fmt.Fprintf(&b, "| per 100k connections | %.2f | %.2f |\n", f.VCPUPer100kConns, f.UsedPer100kConns)
+		fmt.Fprintf(&b, "| per 100k deliveries/s | %.2f | %.2f |\n", f.VCPUPer100kDeliveries, f.UsedPer100kDeliveries)
+		fmt.Fprintf(&b, "| per 10k writes/s | %.2f | %.2f |\n", f.VCPUPer10kWrites, f.UsedPer10kWrites)
+		fmt.Fprintf(&b, "\nNode memory: %.1f GB provisioned, %.2f GB RSS at end of hold (%.2f GB per 100k connections).\n", f.MemoryGB, f.RSSGB, f.RSSGBPer100kConns)
+	}
+	if rec.Fault != nil {
+		fmt.Fprintf(&b, "\nFault injected at %s: `%s` (exit %d).\n", time.UnixMicro(rec.Fault.AtUS).UTC().Format(time.RFC3339), rec.Fault.Command, rec.Fault.ExitCode)
+	}
+	if len(r.FirstViolations) > 0 {
+		b.WriteString("\nFirst violations:\n\n")
+		for _, v := range r.FirstViolations {
+			fmt.Fprintf(&b, "- %s\n", v.String())
+		}
+	}
+	if len(rec.Errors) > 0 {
+		fmt.Fprintf(&b, "\n%d generator errors logged; first: %s\n", len(rec.Errors), rec.Errors[0])
+	}
+	return b.String()
+}
+
+// LogLine is the one-line summary for LOG.md.
+func (rec *RunRecord) LogLine() string {
+	del := rec.Result.Latency[LatDeliveryCrossNode]
+	if del == nil || del.Count() == 0 {
+		del = rec.Result.Latency[LatDelivery]
+	}
+	var p50, p99 uint64
+	if del != nil {
+		p50, p99 = del.Quantile(0.5), del.Quantile(0.99)
+	}
+	var bad int64
+	for _, v := range rec.Result.Violations {
+		bad += v
+	}
+	return fmt.Sprintf("%s UTC | run %s shape %s %gx scale %g bus %s nodes %d | %s: conns %d/%d, pub %.0f/s, del %.0f/s, p50 %s p99 %s, violations %d | see results/%s/summary.md",
+		time.Now().UTC().Format("2006-01-02 15:04"), rec.RunID, rec.Shape, rec.Multiplier, rec.Scale, rec.Bus, rec.Nodes, rec.Verdict,
+		rec.Result.Connections.OpenAtMeasureEnd, rec.Result.Connections.Target, rec.Result.Publishes.AchievedRate, rec.Result.Deliveries.Rate,
+		msOf(p50), msOf(p99), bad, rec.RunID)
+}
