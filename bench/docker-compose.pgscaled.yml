@@ -6,7 +6,9 @@
 #   docker compose -f bench/docker-compose.pgscaled.yml down -v
 #
 # Host ports: nodes 8281, 8282, 8283; Postgres 5434 (user/password/db
-# "ably"). All nodes share the key app.key:secret.
+# "ably"). All nodes share the key app.key:secret. Each node's debug
+# listener (pprof and Prometheus /metrics, including the ably_pgbus_*
+# bus counters) is on 8291, 8292, 8293.
 #
 # Bus mode is chosen per run with environment variables (compose
 # recreates the nodes when they change):
@@ -40,6 +42,7 @@ x-ably-node: &ably-node
   command:
     - --mode=cluster
     - --listen=:8080
+    - --debug-listen=:6060
     - --log-level=info
   healthcheck:
     test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
@@ -67,13 +70,16 @@ services:
     <<: *ably-node
     ports:
       - "8281:8080"
+      - "8291:6060"
 
   node2:
     <<: *ably-node
     ports:
       - "8282:8080"
+      - "8292:6060"
 
   node3:
     <<: *ably-node
     ports:
       - "8283:8080"
+      - "8293:6060"

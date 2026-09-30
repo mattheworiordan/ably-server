@@ -227,6 +227,9 @@ func Run(ctx context.Context, opts Opts) int {
 	logger.Info("storage ready", "mode", *mode, "postgresNotifyMode", notifyMode)
 
 	m := metrics.New()
+	if bs, ok := store.(busStatser); ok {
+		m.Register(busCollectors(bs)...) // cluster bus counters (DESIGN.md §7.2)
+	}
 	manager := core.NewManager(store)
 
 	// Pre-seed presence fixtures declared in the config file before

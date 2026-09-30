@@ -88,6 +88,15 @@ func New() *Metrics {
 	return m
 }
 
+// Register adds collectors owned by other packages to the registry, such
+// as the cluster bus counters (DESIGN.md §7.2). No-op on a nil Metrics.
+func (m *Metrics) Register(cs ...prometheus.Collector) {
+	if m == nil {
+		return
+	}
+	m.registry.MustRegister(cs...)
+}
+
 // Handler returns the HTTP handler that serves the registry in the
 // Prometheus text exposition format. Registered at /metrics on the debug
 // listener (--debug-listen), alongside pprof — not the main listener
