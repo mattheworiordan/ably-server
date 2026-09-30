@@ -1025,9 +1025,15 @@ wait_instances_running() {
 }
 
 # ssh helpers. The host is the instance's public address from STATE.
+# ControlMaster is off for the scripts' own connections: an operator's
+# ~/.ssh/config that multiplexes (ControlMaster auto, ControlPersist) would
+# turn the first boot probe into a long-lived master, and every later call
+# would reuse that login session, which predates cloud-init's group changes
+# (seen: ec2-user's docker group missing until the master was closed).
 _ssh_opts() {
   printf '%s\n' -i "$SSH_PRIVATE_KEY_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30
+    -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=30 \
+    -o ControlMaster=no -o ControlPath=none
 }
 
 ssh_do() { # <instance-name> <remote command...>
