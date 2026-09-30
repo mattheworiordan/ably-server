@@ -28,6 +28,7 @@ export BENCH_AWS_DIR REPO_ROOT
 SCRIPT_NAME="${SCRIPT_NAME:-$(basename "${0:-lib}" .sh)}"
 
 : "${PROJECT_TAG:=ably-server-scale}"
+export PROJECT_TAG
 : "${DRY_RUN:=0}"
 _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${LOG_FILE:=$_default_workshop/LOG.md}"
@@ -560,7 +561,7 @@ render_userdata() {
   shift 2
   {
     render_template "$BENCH_AWS_DIR/templates/common.sh" \
-      "REGION=$AWS_REGION" "ECR_REGISTRY=${ECR_LOGIN_REGISTRY:-$ECR_REGISTRY}" \
+      "REGION=$AWS_REGION" "ECR_REGISTRY=${ECR_LOGIN_REGISTRY-$ECR_REGISTRY}" \
       "NODE_EXPORTER_IMAGE=$NODE_EXPORTER_IMAGE" "NODE_EXPORTER_PORT=$NODE_EXPORTER_PORT" \
       "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}"
     printf '\n'
@@ -573,6 +574,26 @@ render_userdata() {
   [ "$size" -lt 16000 ] || die "user-data for $role is $size bytes; the EC2 limit is 16384"
 }
 
+# apply_role_script <instance-name> <role-script-file>: re-run a role part of
+# the user-data on a live box (new image tag, new flags). The role scripts
+# remove their own container first.
+apply_role_script() {
+  scp_to "$1" "$2" /tmp/role.sh
+  ssh_do "$1" 'sudo bash -euxo pipefail /tmp/role.sh'
+}
+
+# iname <role> <index>: the Name tag of an instance.
+iname() { printf '%s-%s-%s' "$PROJECT_TAG" "$1" "$2"; }
+
+# image_tag <ECR repo key in STATE.images> <override>: a tag from the
+# environment, else the one build-push.sh recorded.
+image_tag() {
+  local key=$1 override=${2:-} t
+  t=${override:-$(state_get ".images[\"$key\"].tag")}
+  [ -n "$t" ] || die "no image tag for $key: set it in the environment or run build-push.sh"
+  printf '%s' "$t"
+}
+
 # ------------------------------------------------------------- postgres
 
 # postgres_dsns: comma separated DSNs of the active storage type, shard order.
@@ -581,6 +602,20 @@ postgres_dsns() {
   active=$(state_get '.postgres.active_storage')
   [ -n "$active" ] || die "STATE has no postgres.active_storage; run 20-postgres.sh first"
   state_get "[.postgres.instances[] | select(.storage == \"$active\")] | sort_by(.shard) | map(.dsn) | join(\",\")"
+}
+
+# load_postgres_password: when RDS_PASSWORD is not in the environment, take it
+# from the first DSN in STATE so that masking still hides it in logs and
+# dry-run output. Call in the main shell (not inside $( )).
+load_postgres_password() {
+  local dsn
+  if [ -n "${RDS_PASSWORD:-}" ]; then return 0; fi
+  dsn=$(state_get '.postgres.instances // {} | to_entries | map(.value.dsn) | first')
+  if [ -n "$dsn" ]; then
+    RDS_PASSWORD=$(printf '%s' "$dsn" | sed -E 's#^[a-z]+://[^:]*:([^@]*)@.*#\1#')
+    export RDS_PASSWORD
+  fi
+  return 0
 }
 
 # ------------------------------------------------------------------ cost

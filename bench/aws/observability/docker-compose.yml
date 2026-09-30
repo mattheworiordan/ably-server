@@ -1,0 +1,56 @@
+# Prometheus, Grafana and postgres_exporter for the conductor box.
+# Ports bind to loopback only; reach them with an SSH tunnel.
+#
+# 55-observability.sh writes the real .env next to this file.
+#   docker compose up -d
+name: bench-observability
+
+services:
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v2.55.1}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=14d
+      - --web.enable-lifecycle
+      - --web.enable-admin-api
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.3.0}
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+  # Started only with COMPOSE_PROFILES=postgres (55-observability.sh sets it).
+  # POSTGRES_EXPORTER_DSN may list several DSNs, comma separated (sharded runs).
+  postgres-exporter:
+    image: ${POSTGRES_EXPORTER_IMAGE:-quay.io/prometheuscommunity/postgres-exporter:v0.15.0}
+    restart: unless-stopped
+    profiles: ["postgres"]
+    environment:
+      DATA_SOURCE_NAME: ${POSTGRES_EXPORTER_DSN:-}
+    command:
+      - --collector.stat_statements
+    expose:
+      - "9187"
+
+volumes:
+  prometheus-data:
+  grafana-data:

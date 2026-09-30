@@ -8,6 +8,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AWS_DIR="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$AWS_DIR/../.." && pwd)"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin"
@@ -26,7 +27,7 @@ export DRY_RUN=1 DRY_STATE_FILE="$tmp/state.json"
 export AWS_ACCOUNT_ID=111111111111 AWS_REGION=test-region-1 PROJECT_TAG=test-scale
 export ADMIN_CIDR=203.0.113.9/32 SSH_PUBLIC_KEY_PATH="$tmp/bench.pub" ALARM_EMAIL=ops@example.invalid
 export RDS_PASSWORD=Secretpassword0123456789 RUN_TIME_LIMIT=45m
-export NODE_COUNT=2 LOADGEN_COUNT=1 PUBLISHER_COUNT=1 SHARDS=1 BUS=nats
+export NODE_COUNT=2 LOADGEN_COUNT=1 PUBLISHER_COUNT=1 SHARDS=1 BUS=nats SERVER_TAG=abc1234 LOADGEN_TAG=abc1234
 export LOG_FILE="$tmp/LOG.md" RESULTS_DIR="$tmp/results"
 export KEEP_WORK_DIR=0 SKIP_BOOT_WAIT=0
 : >"$tmp/bench.pub"
@@ -62,8 +63,9 @@ done
 
 # Normalise volatile text.
 sed -E \
-  -e "s#file://[^ ]*/bench-aws\.[A-Za-z0-9]+/#file://<work>/#g" \
+  -e "s#[^ ]*/bench-aws\.[A-Za-z0-9]+/#<work>/#g" \
   -e "s#$tmp#<tmp>#g" \
+  -e "s#$REPO#<repo>#g" \
   -e 's#[0-9]{8}T[0-9]{6}Z#<timestamp>#g' \
   "$out" >"$tmp/calls.norm"
 
