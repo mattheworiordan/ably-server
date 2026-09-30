@@ -236,7 +236,7 @@ func Run(ctx context.Context, opts Opts) int {
 	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted (env: "+natsURLEnv+")")
 	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
 	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), file.PostgresNotifyMode, string(postgres.NotifyCoalesced)), "--bus=postgres notify mode: coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) or transactional (one NOTIFY per write, inside its transaction) (env: "+pgNotifyModeEnv+")")
-	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced (env: "+pgNotifyWindowEnv+")")
+	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced; under 20ms logs a warning (DESIGN.md §7.2) (env: "+pgNotifyWindowEnv+")")
 	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
 	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks every bound channel against its committed serial and catches up one that fell behind; 0 means the bus default (postgres 2s, nats 5s) (env: "+busSweepEnv+")")
 	messageRetention := fs.Duration("message-retention", messageRetentionDefault, "cluster mode: how long a channel outside any persisted namespace keeps its message log, the continuity window (DESIGN.md §6.3) (env: "+messageRetentionEnv+")")
@@ -854,6 +854,9 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 			opts.NotifyMode = mode
 			opts.NotifyWindow = cluster.notifyWindow
 			opts.NotifyMaxPending = cluster.notifyMaxPending
+			if msg := postgres.NotifyWindowWarning(cluster.notifyWindow); msg != "" && mode == postgres.NotifyCoalesced && cluster.logger != nil {
+				cluster.logger.Warn(msg)
+			}
 			opts.SweepInterval = cluster.sweepInterval
 			return postgres.Open(ctx, opts)
 		case postgres.BusNATS:

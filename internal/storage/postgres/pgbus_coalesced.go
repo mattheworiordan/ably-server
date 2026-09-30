@@ -65,6 +65,13 @@ func ParseNotifyMode(s string) (NotifyMode, error) {
 const (
 	// DefaultNotifyWindow is the default coalescing window.
 	DefaultNotifyWindow = 50 * time.Millisecond
+	// NotifyWindowWarnBelow is the shortest coalescing window the server
+	// accepts without a startup warning (DESIGN.md §7.2). A shorter
+	// window sends a wake-up per written channel more often, and every
+	// wake-up makes Postgres wake each listening backend and each
+	// receiver run a range read: at 5 ms, Postgres went CPU-bound at
+	// about 8,000 publishes/s on a laptop, against about 16,000 at 50 ms.
+	NotifyWindowWarnBelow = 20 * time.Millisecond
 	// DefaultNotifyMaxPending is the default cap on channels pending a
 	// wake-up on one node.
 	DefaultNotifyMaxPending = 65536
@@ -72,6 +79,20 @@ const (
 	// wakeFlushChunk caps the wake-ups sent in one statement.
 	wakeFlushChunk = 1000
 )
+
+// NotifyWindowWarning returns the startup warning for a coalescing
+// window shorter than NotifyWindowWarnBelow, or "" for a safe one (zero
+// means the default). The window is not raised: a short window is a
+// valid choice for a lightly loaded deployment that wants lower remote
+// latency, so the operator is told the trade-off instead.
+func NotifyWindowWarning(window time.Duration) string {
+	if window <= 0 || window >= NotifyWindowWarnBelow {
+		return ""
+	}
+	return fmt.Sprintf("--postgres-notify-window=%s is below %s: each window sends one wake-up per written channel, "+
+		"and every wake-up costs Postgres a notification to each listening backend and each receiver a range read; "+
+		"under load a short window can make Postgres CPU-bound (DESIGN.md §7.2)", window, NotifyWindowWarnBelow)
+}
 
 // wakeNotifier is the per-node coalescing notifier. mark records that a
 // channel committed a write; the first mark in a quiet period starts a

@@ -55,7 +55,9 @@
 
 # Coalescing window for postgres-notify-mode = "coalesced", as a duration
 # string: the extra delivery latency a remote subscriber pays in that
-# mode (env: ABLY_SERVER_POSTGRES_NOTIFY_WINDOW).
+# mode (env: ABLY_SERVER_POSTGRES_NOTIFY_WINDOW). A shorter window sends
+# more wake-ups and loads Postgres more; under 20ms the server logs a
+# warning at startup (DESIGN.md §7.2).
 # postgres-notify-window = "50ms"
 
 # Cap on channels pending a coalesced wake-up on one node. A write to a

@@ -1,9 +1,27 @@
 package postgres
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestNotifyWindowWarning: a coalescing window under 20 ms draws a
+// startup warning that names the trade-off; the default (zero), 20 ms
+// and longer do not (DESIGN.md §7.2).
+func TestNotifyWindowWarning(t *testing.T) {
+	for _, w := range []time.Duration{0, NotifyWindowWarnBelow, DefaultNotifyWindow, time.Second} {
+		if msg := NotifyWindowWarning(w); msg != "" {
+			t.Errorf("window %s warned: %q", w, msg)
+		}
+	}
+	for _, w := range []time.Duration{time.Millisecond, 5 * time.Millisecond, 19 * time.Millisecond} {
+		msg := NotifyWindowWarning(w)
+		if !strings.Contains(msg, w.String()) || !strings.Contains(msg, "CPU-bound") {
+			t.Errorf("window %s: warning %q, want the window and the trade-off", w, msg)
+		}
+	}
+}
 
 // TestWakeNotifierOverflowPolicy checks the coalesced notifier's pending
 // set (DESIGN.md §7.2): one entry per channel however often it is

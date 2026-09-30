@@ -1563,6 +1563,22 @@ A receiver answers a wake-up with one range read after its mark, or no
 read if it is already past that serial. Remote subscribers pay up to one
 window of extra latency; the publisher's fast path is unchanged.
 
+**Choosing the window.** The window trades three things. A shorter window
+lowers remote delivery latency (up to one window, about half a window on
+average). It also raises notify load: each window sends one wake-up per
+channel written in it, and each wake-up makes Postgres signal every
+listening backend and every receiving node run a range read. So for
+channels written more often than once per window, the wake-up rate is
+the number of such channels over the window, whatever the publish rate.
+In the laptop runs a 5 ms window made Postgres CPU-bound at about 8,000
+publishes/s (a storage benchmark reached 2,758/s at 5 ms against 16,078/s
+at 50 ms), while at 50 ms Postgres was not the limit. The server accepts
+any window, but logs a warning at startup for one under 20 ms
+(`postgres.NotifyWindowWarnBelow`): below that the notify load grows
+faster than the latency falls, and a deployment that needs lower remote
+latency under load needs the `nats` bus, whose delivery does not go
+through Postgres at all.
+
 The LISTEN goroutine only receives and dispatches. Each payload goes to
 the bound channel's queue; a channel with queued work has one worker,
 started on demand and gone when the queue drains, so channels are
