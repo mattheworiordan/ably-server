@@ -68,7 +68,9 @@ const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
 // exponential backoff the LISTEN goroutine applies between re-dial
 // attempts after its connection drops (DESIGN.md §7.2). They are
 // package vars, not consts, so integration tests can shrink them; in
-// production they are effectively constant.
+// production they are effectively constant. Open copies them into the
+// Storage, so a test that restores them never races a reconnect still
+// in flight.
 var (
 	listenReconnectBaseDelay = 200 * time.Millisecond
 	listenReconnectMaxDelay  = 5 * time.Second
@@ -119,6 +121,8 @@ type Storage struct {
 	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
 	namespace string // current_schema(), mixed into every Postgres notification channel name
 	logger    *logging.Logger
+
+	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 
 	mu       sync.RWMutex
 	channels map[string]*channelStore // every store handed out, by Ably channel name
@@ -203,6 +207,8 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		node:              serial.NewSeriesID(),
 		namespace:         namespace,
 		logger:            logger,
+		reconnectBase:     listenReconnectBaseDelay,
+		reconnectMax:      listenReconnectMaxDelay,
 		channels:          make(map[string]*channelStore),
 		bound:             make(map[string]*channelStore),
 		initialListenConn: listenConn,
@@ -660,82 +666,13 @@ type channelStore struct {
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the
-	// per-channel de-dup high-water mark that makes post-reconnect
-	// history replay (reconcileFromHistory) idempotent against the normal
-	// NOTIFY dispatch (DESIGN.md §7.2). deliver holds it across
-	// appender.Append, so appends on one channel are serialised in serial
-	// order whichever goroutine delivers.
+	// per-channel de-dup high-water mark that makes the publisher's fast
+	// path, gap fills and post-reconnect reconcile idempotent against the
+	// normal NOTIFY dispatch (DESIGN.md §7.2). deliver (bus.go) holds it
+	// across appender.Append, so appends on one channel are serialised in
+	// serial order whichever goroutine delivers.
 	hwmMu    sync.Mutex
 	lastSeen string
-}
-
-// deliver hands cm to the appender exactly once and in order, advancing
-// the per-channel high-water mark, and reports whether it did. A cm whose
-// serial is not strictly greater than the last delivered serial is
-// dropped: the case where a reconnect's history replay and a
-// subsequently-buffered NOTIFY both carry it. All appends funnel through
-// here.
-func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
-	cs.hwmMu.Lock()
-	defer cs.hwmMu.Unlock()
-	if cm.ChannelSerial <= cs.lastSeen {
-		return false
-	}
-	cs.lastSeen = cm.ChannelSerial
-	cs.appender.Append(cm)
-	return true
-}
-
-// reconcileFromHistory replays every cm minted after the channel's
-// last-delivered serial — both message and presence kinds, merged in
-// channelSerial order — through deliver (DESIGN.md §7.2). Called after
-// a LISTEN reconnect to recover cms whose NOTIFY was lost in the gap.
-func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
-	cs.hwmMu.Lock()
-	after := cs.lastSeen
-	cs.hwmMu.Unlock()
-
-	messages, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindMessage,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return fmt.Errorf("reconcile messages: %w", err)
-	}
-	presence, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindPresence,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return fmt.Errorf("reconcile presence: %w", err)
-	}
-
-	for _, cm := range mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages) {
-		cs.deliver(cm)
-	}
-	return nil
-}
-
-// mergeByChannelSerial merges two channelSerial-ascending cm slices
-// (the message and presence streams share one channelSerial namespace
-// but never collide on a serial) into a single ascending slice.
-func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMessage {
-	out := make([]*protocol.ChannelMessage, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i].ChannelSerial <= b[j].ChannelSerial {
-			out = append(out, a[i])
-			i++
-		} else {
-			out = append(out, b[j])
-			j++
-		}
-	}
-	out = append(out, a[i:]...)
-	out = append(out, b[j:]...)
-	return out
 }
 
 // Store persists one publish atomically: look up any contained
@@ -798,13 +735,12 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 
 	// Fresh publish: advance the channels-row serial (cluster-wide
-	// monotonic via the row lock), stamp Message.Serials, persist.
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`,
-		cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	// monotonic via the row lock), stamp Message.Serials, persist. prev,
+	// the serial this one follows, rides the NOTIFY for the receivers'
+	// gap check and gates the fast path below.
+	prev, channelSerial, err := advanceSerial(ctx, tx, cs.name, cs.series)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
@@ -850,13 +786,14 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	// lands. The LISTEN goroutine on every node that holds the channel
 	// (including this one) routes the cm to the channel's appender
 	// (DESIGN.md §7.2).
-	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindMessage, rows, nil); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, prev, storage.KindMessage, rows, nil); err != nil {
 		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.publishLocal(cm, prev)
 	return cm, false, nil
 }
 
@@ -921,11 +858,9 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: decode target version: %w", err)
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	prev, channelSerial, err := advanceSerial(ctx, tx, cs.name, cs.series)
+	if err != nil {
+		return nil, false, err
 	}
 	version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
 	if err != nil {
@@ -957,12 +892,13 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindMessage, [][]byte{payload}, nil); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, prev, storage.KindMessage, [][]byte{payload}, nil); err != nil {
 		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.publishLocal(cm, prev)
 	return cm, false, nil
 }
 
@@ -1120,11 +1056,9 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	prev, channelSerial, err := advanceSerial(ctx, tx, cs.name, cs.series)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, p := range presence {
 		storage.StampPresenceMember(p, channelSerial, i)
@@ -1199,13 +1133,14 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindPresence, rows, nil); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, prev, storage.KindPresence, rows, nil); err != nil {
 		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.publishLocal(cm, prev)
 	return cm, false, nil
 }
 
@@ -1271,11 +1206,9 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	prev, channelSerial, err := advanceSerial(ctx, tx, cs.name, cs.series)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, a := range annotations {
 		a.Serial = serial.MessageSerial(channelSerial, i)
@@ -1316,13 +1249,14 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindAnnotation, rows, sums); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, prev, storage.KindAnnotation, rows, sums); err != nil {
 		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.publishLocal(cm, prev)
 	return cm, false, nil
 }
 

@@ -10,6 +10,11 @@ package postgres
 // notification goes to its channel's bounded, ordered delivery queue, and
 // a worker per busy channel does the parsing, reads and appends, so a
 // slow read or a slow appender on one channel never stalls another.
+//
+// Every notification also carries the channel's previous serial. That
+// predecessor check makes the publisher's fast path safe (the publishing
+// node appends its own cm straight after commit, and the NOTIFY that
+// follows is a no-op) and lets a receiver repair any gap from the log.
 
 import (
 	"context"
@@ -52,6 +57,10 @@ const (
 	// a queue is full the LISTEN goroutine blocks on it, so backpressure
 	// is explicit instead of an unbounded buffer.
 	channelQueueDepth = 1024
+
+	// fillPageSize caps the cms one gap-fill or reconcile read returns;
+	// the fill loops until it has caught up.
+	fillPageSize = 500
 )
 
 // errStorageClosed is returned by Channel when the storage is closed
@@ -70,13 +79,17 @@ func pgChannelName(namespace, name string) string {
 }
 
 // busNotification is the JSON NOTIFY payload. Channel and Serial are the
-// pointer form. Kind, Rows and Sums, when present, carry the cm inline
-// exactly as stored: one msgpack payload per channel_messages row in idx
-// order, plus that row's annotation summary column (nil for other
-// kinds). encoding/json base64-encodes the []byte fields.
+// pointer form. Prev is the channel's serial immediately before Serial,
+// the receiver's gap check (empty only for the first publish on a
+// channel whose row did not exist yet). Kind, Rows and Sums, when
+// present, carry the cm inline exactly as stored: one msgpack payload per
+// channel_messages row in idx order, plus that row's annotation summary
+// column (nil for other kinds). encoding/json base64-encodes the []byte
+// fields.
 type busNotification struct {
 	Channel string   `json:"channel"`
 	Serial  string   `json:"serial"`
+	Prev    string   `json:"prev,omitempty"`
 	Kind    string   `json:"kind,omitempty"`
 	Rows    [][]byte `json:"rows,omitempty"`
 	Sums    [][]byte `json:"sums,omitempty"`
@@ -85,8 +98,8 @@ type busNotification struct {
 // encodeNotification builds the NOTIFY payload for a freshly written cm:
 // inline when it fits under inlinePayloadLimit, otherwise the pointer
 // form. sums is optional (only annotation rows carry a summary).
-func encodeNotification(channel, serial string, kind storage.Kind, rows, sums [][]byte) (payload string, inline bool, err error) {
-	n := busNotification{Channel: channel, Serial: serial, Kind: string(kind), Rows: rows}
+func encodeNotification(channel, serial, prev string, kind storage.Kind, rows, sums [][]byte) (payload string, inline bool, err error) {
+	n := busNotification{Channel: channel, Serial: serial, Prev: prev, Kind: string(kind), Rows: rows}
 	for _, s := range sums {
 		if s != nil {
 			n.Sums = sums
@@ -137,7 +150,11 @@ type busCounters struct {
 	malformed     atomic.Uint64
 	inline        atomic.Uint64
 	fetched       atomic.Uint64
+	fastPath      atomic.Uint64
 	duplicates    atomic.Uint64
+	gapFills      atomic.Uint64
+	reconciles    atomic.Uint64
+	filled        atomic.Uint64
 	fetchErrors   atomic.Uint64
 	listens       atomic.Uint64
 }
@@ -156,14 +173,25 @@ type BusStats struct {
 	// Malformed counts NOTIFY payloads that did not parse.
 	Malformed uint64
 	// Inline counts cms delivered from an inline payload, with no SELECT.
+	// Inline and Fetched count deliveries, not payloads received.
 	Inline uint64
 	// Fetched counts cms delivered after a SELECT by (channel, serial):
 	// the pointer path for cms too big to inline.
 	Fetched uint64
+	// FastPath counts cms the publishing node delivered to its own
+	// appender straight after commit.
+	FastPath uint64
 	// Duplicates counts NOTIFYs dropped because the cm was already
-	// delivered.
+	// delivered (by the fast path, a gap fill or a reconcile).
 	Duplicates uint64
-	// FetchErrors counts failed reads on the delivery path.
+	// GapFills counts range reads triggered by a predecessor mismatch.
+	GapFills uint64
+	// Reconciles counts per-channel range reads after a LISTEN reconnect.
+	Reconciles uint64
+	// Filled counts cms delivered by gap fills and reconciles.
+	Filled uint64
+	// FetchErrors counts failed reads on the delivery path; the next
+	// notification on the channel repairs the gap from the log.
 	FetchErrors uint64
 	// Listens counts LISTEN statements this node has issued, including
 	// re-LISTENs after a reconnect.
@@ -184,7 +212,11 @@ func (s *Storage) BusStats() BusStats {
 		Malformed:     c.malformed.Load(),
 		Inline:        c.inline.Load(),
 		Fetched:       c.fetched.Load(),
+		FastPath:      c.fastPath.Load(),
 		Duplicates:    c.duplicates.Load(),
+		GapFills:      c.gapFills.Load(),
+		Reconciles:    c.reconciles.Load(),
+		Filled:        c.filled.Load(),
 		FetchErrors:   c.fetchErrors.Load(),
 		Listens:       c.listens.Load(),
 		BoundChannels: bound,
@@ -435,7 +467,7 @@ func (s *Storage) dispatch(ctx context.Context, n *pgconn.Notification) {
 // backoff, retrying until it succeeds or ctx is cancelled (Close). A nil
 // return means ctx was cancelled.
 func (s *Storage) redial(ctx context.Context) *pgx.Conn {
-	delay := listenReconnectBaseDelay
+	delay := s.reconnectBase
 	for {
 		select {
 		case <-ctx.Done():
@@ -451,8 +483,8 @@ func (s *Storage) redial(ctx context.Context) *pgx.Conn {
 			return nil
 		}
 		s.logger.Warn("storage/postgres: LISTEN re-dial failed; backing off", "err", err, "delay", delay)
-		if delay *= 2; delay > listenReconnectMaxDelay {
-			delay = listenReconnectMaxDelay
+		if delay *= 2; delay > s.reconnectMax {
+			delay = s.reconnectMax
 		}
 	}
 }
@@ -579,9 +611,8 @@ func (cs *channelStore) drain() {
 func (cs *channelStore) process(ctx context.Context, it busItem) {
 	st := &cs.s.stats
 	if it.reconcile {
-		if err := cs.reconcileFromHistory(ctx); err != nil && ctx.Err() == nil {
-			cs.s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
-		}
+		st.reconciles.Add(1)
+		cs.fill(ctx, "")
 		return
 	}
 
@@ -590,8 +621,17 @@ func (cs *channelStore) process(ctx context.Context, it busItem) {
 		st.malformed.Add(1)
 		return
 	}
-	if n.Serial <= cs.watermark() {
-		st.duplicates.Add(1) // already delivered: no read needed
+	last := cs.watermark()
+	if n.Serial <= last {
+		st.duplicates.Add(1) // already delivered (fast path, fill): no read needed
+		return
+	}
+	if n.Prev != "" && n.Prev > last {
+		// A cm between our last delivery and this one has not been
+		// delivered here (a lost NOTIFY, or a read that failed): repair the
+		// gap, and this cm with it, from the log.
+		st.gapFills.Add(1)
+		cs.fill(ctx, n.Serial)
 		return
 	}
 
@@ -599,17 +639,72 @@ func (cs *channelStore) process(ctx context.Context, it busItem) {
 	if err != nil {
 		cs.s.logger.Warn("storage/postgres: bad inline payload; reading the cm instead", "channel", cs.name, "serial", n.Serial, "err", err)
 	}
-	if cm != nil {
-		st.inline.Add(1)
-	} else {
+	inline := cm != nil
+	if !inline {
 		if cm, err = cs.s.loadChannelMessage(ctx, cs.name, n.Serial); err != nil {
+			// The next notification's predecessor check sees the gap and
+			// fills it from the log.
 			st.fetchErrors.Add(1)
-			return // best-effort; nothing we can do without the cm
+			return
 		}
-		st.fetched.Add(1)
 	}
-	if !cs.deliver(cm) {
+	switch cs.deliver(cm, n.Prev) {
+	case deliverOK:
+		if inline {
+			st.inline.Add(1)
+		} else {
+			st.fetched.Add(1)
+		}
+	case deliverDuplicate: // the fast path delivered it while we decoded or read
 		st.duplicates.Add(1)
+	case deliverGap: // cannot happen after the check above; stay safe
+		st.gapFills.Add(1)
+		cs.fill(ctx, n.Serial)
+	}
+}
+
+// fill delivers, in order, every cm after the high-water mark up to and
+// including upTo (no upper bound when upTo is empty), reading the log in
+// pages. Messages, presence and annotations share the read, which decodes
+// rows exactly as the pointer path does. A fill reads a contiguous range
+// that starts at the mark, so only the duplicate check applies.
+func (cs *channelStore) fill(ctx context.Context, upTo string) {
+	st := &cs.s.stats
+	for {
+		after := cs.watermark()
+		cms, err := cs.s.loadRange(ctx, cs.name, after, upTo, fillPageSize)
+		if err != nil {
+			st.fetchErrors.Add(1)
+			if ctx.Err() == nil {
+				cs.s.logger.Warn("storage/postgres: gap fill failed", "channel", cs.name, "after", after, "err", err)
+			}
+			return
+		}
+		for _, cm := range cms {
+			if cs.deliver(cm, "") == deliverOK {
+				st.filled.Add(1)
+			}
+		}
+		if len(cms) < fillPageSize {
+			return
+		}
+	}
+}
+
+// publishLocal is the publisher's fast path (DESIGN.md §7.2): straight
+// after its own transaction commits, the publishing node delivers the cm
+// to its own appender, and the NOTIFY that follows is dropped by the
+// high-water mark. If another node's publish on this channel committed
+// just before ours and has not reached this node yet (prev is above the
+// mark), the fast path steps aside: our cm then arrives through the
+// NOTIFY path behind the earlier one, so the appender still sees every
+// cm once and in serial order.
+func (cs *channelStore) publishLocal(cm *protocol.ChannelMessage, prev string) {
+	if cs.appender == nil || !cs.isReady() {
+		return // not bound here, or the bind is still in progress: NOTIFY delivers
+	}
+	if cs.deliver(cm, prev) == deliverOK {
+		cs.s.stats.fastPath.Add(1)
 	}
 }
 
@@ -638,12 +733,113 @@ func (cs *channelStore) watermark() string {
 	return cs.lastSeen
 }
 
+// deliverResult is the outcome of deliver.
+type deliverResult int
+
+const (
+	deliverOK        deliverResult = iota // appended
+	deliverDuplicate                      // serial at or below the high-water mark
+	deliverGap                            // an earlier cm is not delivered yet
+)
+
+// deliver appends cm if it is the next cm on the channel: its serial is
+// above the high-water mark, and prev (the channel's serial just before
+// it) is not above the mark. An empty prev skips the gap check (range
+// reads, and the first publish on a brand-new channel row). Appends are
+// serialised per channel by hwmMu, held across appender.Append, so the
+// appender sees cms strictly in serial order even with the publisher's
+// fast path and the channel's worker both delivering.
+func (cs *channelStore) deliver(cm *protocol.ChannelMessage, prev string) deliverResult {
+	cs.hwmMu.Lock()
+	defer cs.hwmMu.Unlock()
+	if cm.ChannelSerial <= cs.lastSeen {
+		return deliverDuplicate
+	}
+	if prev != "" && prev > cs.lastSeen {
+		return deliverGap
+	}
+	cs.lastSeen = cm.ChannelSerial
+	cs.appender.Append(cm)
+	return deliverOK
+}
+
+// advanceSerial mints the next channelSerial for channel inside tx and
+// also returns the serial it follows (prev), in one round trip: the
+// batch first locks the channels row (SELECT ... FOR UPDATE waits for any
+// concurrent publisher, then reads the latest value) and then calls
+// advance_channel_serial, which advances from that same locked value.
+// prev is empty only for the first publish on a channel whose row did
+// not exist yet.
+func advanceSerial(ctx context.Context, tx pgx.Tx, channel, series string) (prev, next string, err error) {
+	b := &pgx.Batch{}
+	b.Queue(`SELECT channel_serial FROM channels WHERE name = $1 FOR UPDATE`, channel)
+	b.Queue(`SELECT advance_channel_serial($1, $2)`, channel, series)
+	br := tx.SendBatch(ctx, b)
+	if err := br.QueryRow().Scan(&prev); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		_ = br.Close()
+		return "", "", fmt.Errorf("storage/postgres: lock channel row: %w", err)
+	}
+	if err := br.QueryRow().Scan(&next); err != nil {
+		_ = br.Close()
+		return "", "", fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	if err := br.Close(); err != nil {
+		return "", "", fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	return prev, next, nil
+}
+
+const sqlLoadRange = `
+SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
+WHERE channel = $1 AND channel_serial IN (
+	SELECT DISTINCT channel_serial FROM channel_messages
+	WHERE channel = $1 AND channel_serial > $2 AND ($3 = '' OR channel_serial <= $3)
+	ORDER BY channel_serial
+	LIMIT $4)
+ORDER BY channel_serial, idx
+`
+
+// loadRange reads up to limit cms on channel with a serial above after
+// and at most upTo (no upper bound when upTo is empty), in serial order,
+// every kind together, decoded as the pointer path decodes them.
+func (s *Storage) loadRange(ctx context.Context, channel, after, upTo string, limit int) ([]*protocol.ChannelMessage, error) {
+	rows, err := s.pool.Query(ctx, sqlLoadRange, channel, after, upTo, limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: load range %s after %s: %w", channel, after, err)
+	}
+	defer rows.Close()
+
+	var out []*protocol.ChannelMessage
+	for rows.Next() {
+		var (
+			cs      string
+			idx     int
+			kind    string
+			payload []byte
+			summary []byte
+		)
+		if err := rows.Scan(&cs, &idx, &kind, &payload, &summary); err != nil {
+			return nil, fmt.Errorf("storage/postgres: scan range %s: %w", channel, err)
+		}
+		if n := len(out); n == 0 || out[n-1].ChannelSerial != cs {
+			out = append(out, &protocol.ChannelMessage{ChannelSerial: cs})
+		}
+		if err := decodeRow(out[len(out)-1], kind, payload, summary); err != nil {
+			return nil, fmt.Errorf("storage/postgres: range %s:%s idx=%d: %w", channel, cs, idx, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: range rows %s: %w", channel, err)
+	}
+	return out, nil
+}
+
 // notifyTx emits the bus NOTIFY for a freshly written cm inside tx, on
 // the channel's own Postgres notification channel, carrying the cm's
 // stored rows inline when they fit. Postgres holds the notification
 // until commit, so listeners see it only if the write commits.
-func (cs *channelStore) notifyTx(ctx context.Context, tx pgx.Tx, serial string, kind storage.Kind, rows, sums [][]byte) error {
-	payload, _, err := encodeNotification(cs.name, serial, kind, rows, sums)
+func (cs *channelStore) notifyTx(ctx context.Context, tx pgx.Tx, serial, prev string, kind storage.Kind, rows, sums [][]byte) error {
+	payload, _, err := encodeNotification(cs.name, serial, prev, kind, rows, sums)
 	if err != nil {
 		return err
 	}

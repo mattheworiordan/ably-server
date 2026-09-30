@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
@@ -330,4 +331,200 @@ func TestBusSlowChannelDoesNotDelayOthers(t *testing.T) {
 		}
 	}
 	t.Logf("fast channel delivered in %s while the slow channel had delivered %d of %d", latency, slowDone, backlog)
+}
+
+// TestBusPublisherReceivesOwnPublishOnce is test (d): the publishing
+// node's own appender receives each cm exactly once even though it is
+// delivered twice over: by the fast path straight after commit, and by
+// the NOTIFY that follows, which the high-water mark must drop.
+func TestBusPublisherReceivesOwnPublishOnce(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	a := openNode(t, dsn)
+	rec := &recorder{}
+	ch, err := a.Channel(ctx, "room", rec)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+
+	const n = 20
+	var want []string
+	for i := range n {
+		want = append(want, publish(t, ctx, ch, fmt.Sprintf("m-%d", i)))
+		// The fast path appends before Store returns.
+		if got := rec.count(); got != i+1 {
+			t.Fatalf("after publish %d the appender has %d cms, want %d (fast path did not deliver)", i, got, i+1)
+		}
+	}
+
+	// Every NOTIFY comes back and must be dropped as a duplicate.
+	waitFor(t, 10*time.Second, "the node's own NOTIFYs to arrive and be dropped", func() bool {
+		st := a.BusStats()
+		return st.Notifications == n && st.Duplicates == n
+	})
+	time.Sleep(200 * time.Millisecond)
+	got := rec.serials()
+	if len(got) != n {
+		t.Fatalf("appender saw %d cms, want exactly %d", len(got), n)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("cm[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+	if st := a.BusStats(); st.FastPath != n || st.Inline != 0 || st.Fetched != 0 {
+		t.Fatalf("delivery paths fastPath=%d inline=%d fetched=%d, want %d, 0, 0", st.FastPath, st.Inline, st.Fetched, n)
+	}
+}
+
+// TestBusConcurrentPublishersKeepOrderOnEveryNode publishes on one
+// channel from two nodes at once. Each node's fast path must step aside
+// whenever the other node's earlier cm has not reached it yet, so both
+// appenders still see every cm exactly once in the canonical (storage)
+// order.
+func TestBusConcurrentPublishersKeepOrderOnEveryNode(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	a := openNode(t, dsn)
+	b := openNode(t, dsn)
+	recA, recB := &recorder{}, &recorder{}
+	chA, err := a.Channel(ctx, "room", recA)
+	if err != nil {
+		t.Fatalf("A binds room: %v", err)
+	}
+	chB, err := b.Channel(ctx, "room", recB)
+	if err != nil {
+		t.Fatalf("B binds room: %v", err)
+	}
+
+	const perNode = 150
+	var wg sync.WaitGroup
+	for _, ch := range []storage.ChannelStore{chA, chB} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perNode {
+				if _, _, err := ch.Store(ctx, []*protocol.Message{{Data: fmt.Sprintf("m-%d", i)}}); err != nil {
+					t.Errorf("Store: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	page, err := chA.History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards, Limit: 10 * perNode})
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	var canonical []string
+	for _, cm := range page.ChannelMessages {
+		canonical = append(canonical, cm.ChannelSerial)
+	}
+	if len(canonical) != 2*perNode {
+		t.Fatalf("history has %d cms, want %d", len(canonical), 2*perNode)
+	}
+
+	waitForCount(t, recA, 2*perNode, 15*time.Second)
+	waitForCount(t, recB, 2*perNode, 15*time.Second)
+	time.Sleep(300 * time.Millisecond) // room for a (wrong) duplicate
+	for name, rec := range map[string]*recorder{"A": recA, "B": recB} {
+		got := rec.serials()
+		if len(got) != len(canonical) {
+			t.Fatalf("node %s appender saw %d cms, want exactly %d", name, len(got), len(canonical))
+		}
+		for i := range got {
+			if got[i] != canonical[i] {
+				t.Fatalf("node %s cm[%d] = %s, want %s: order or de-dup broken", name, i, got[i], canonical[i])
+			}
+		}
+	}
+	sa, sb := a.BusStats(), b.BusStats()
+	t.Logf("node A: fastPath=%d inline=%d fetched=%d gapFills=%d dup=%d; node B: fastPath=%d inline=%d fetched=%d gapFills=%d dup=%d",
+		sa.FastPath, sa.Inline, sa.Fetched, sa.GapFills, sa.Duplicates, sb.FastPath, sb.Inline, sb.Fetched, sb.GapFills, sb.Duplicates)
+}
+
+// TestBusReconcileAfterDroppedListenPerChannel is test (e): node B holds
+// two channels and its LISTEN connection is killed. Node A publishes on
+// both while B is disconnected (those NOTIFYs are lost) and after it is
+// back. Each of B's channels must still receive every cm exactly once, in
+// order, the in-gap ones through its own reconcile.
+func TestBusReconcileAfterDroppedListenPerChannel(t *testing.T) {
+	// A long first backoff keeps B disconnected while the gap publishes run.
+	defer swapReconnectDelays(750*time.Millisecond, time.Second)()
+
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	appName := fmt.Sprintf("bus_reconcile_%d", time.Now().UnixNano())
+	ctx := context.Background()
+
+	a, err := Open(ctx, Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open A: %v", err)
+	}
+	defer func() { _ = a.Close() }()
+	b, err := Open(ctx, Options{DSN: withApplicationName(t, dsn, appName)})
+	if err != nil {
+		t.Fatalf("Open B: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	names := []string{"one", "two"}
+	recs := map[string]*recorder{}
+	pubs := map[string]storage.ChannelStore{}
+	want := map[string][]string{}
+	for _, name := range names {
+		recs[name] = &recorder{}
+		if _, err := b.Channel(ctx, name, recs[name]); err != nil {
+			t.Fatalf("B binds %s: %v", name, err)
+		}
+		if pubs[name], err = a.Channel(ctx, name, nil); err != nil {
+			t.Fatalf("A opens %s: %v", name, err)
+		}
+	}
+	publishAll := func(phase string, n int) {
+		for i := range n {
+			for _, name := range names {
+				want[name] = append(want[name], publish(t, ctx, pubs[name], fmt.Sprintf("%s-%s-%d", name, phase, i)))
+			}
+		}
+	}
+
+	publishAll("pre", 3)
+	for _, name := range names {
+		waitForCount(t, recs[name], len(want[name]), 10*time.Second)
+	}
+	before := b.BusStats()
+
+	terminateListenBackend(t, c.BaseDSN(), appName)
+	publishAll("gap", 5) // B is not listening: these NOTIFYs are lost
+	publishAll("post", 3)
+
+	for _, name := range names {
+		waitForCount(t, recs[name], len(want[name]), 15*time.Second)
+	}
+	time.Sleep(300 * time.Millisecond) // room for a (wrong) duplicate
+	for _, name := range names {
+		got := recs[name].serials()
+		if len(got) != len(want[name]) {
+			t.Fatalf("channel %s: appender saw %d cms, want exactly %d", name, len(got), len(want[name]))
+		}
+		for i := range got {
+			if got[i] != want[name][i] {
+				t.Fatalf("channel %s cm[%d] = %s, want %s: order or de-dup broken\n got=%v\nwant=%v", name, i, got[i], want[name][i], got, want[name])
+			}
+		}
+	}
+	after := b.BusStats()
+	if after.Reconciles-before.Reconciles < uint64(len(names)) {
+		t.Fatalf("B ran %d reconciles, want at least one per bound channel (%d)", after.Reconciles-before.Reconciles, len(names))
+	}
+	if after.Filled-before.Filled == 0 {
+		t.Fatal("B delivered nothing from its reconcile: the in-gap cms were not recovered from the log")
+	}
+	t.Logf("B after reconnect: reconciles=%d filled=%d duplicates=%d", after.Reconciles-before.Reconciles, after.Filled-before.Filled, after.Duplicates-before.Duplicates)
 }

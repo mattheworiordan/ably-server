@@ -28,7 +28,7 @@ func TestEncodeNotificationInlineThreshold(t *testing.T) {
 	// Find the largest data size that still inlines, then step over it.
 	size := 0
 	for n := 0; n < inlinePayloadLimit; n++ {
-		if _, inline, _ := encodeNotification("room", "00000000000001-000@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", n))}, nil); !inline {
+		if _, inline, _ := encodeNotification("room", "00000000000001-000@s", "00000000000000-999@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", n))}, nil); !inline {
 			size = n
 			break
 		}
@@ -37,7 +37,7 @@ func TestEncodeNotificationInlineThreshold(t *testing.T) {
 		t.Fatal("no data size fell back to a pointer")
 	}
 
-	under, inline, err := encodeNotification("room", "00000000000001-000@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", size-1))}, nil)
+	under, inline, err := encodeNotification("room", "00000000000001-000@s", "00000000000000-999@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", size-1))}, nil)
 	if err != nil || !inline || len(under) >= inlinePayloadLimit {
 		t.Fatalf("just under the limit: inline=%v len=%d err=%v, want inline under %d", inline, len(under), err, inlinePayloadLimit)
 	}
@@ -50,7 +50,7 @@ func TestEncodeNotificationInlineThreshold(t *testing.T) {
 		t.Fatalf("inline decode = %+v, %v; want the stored message back", cm, err)
 	}
 
-	over, inline, err := encodeNotification("room", "00000000000001-000@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", size))}, nil)
+	over, inline, err := encodeNotification("room", "00000000000001-000@s", "00000000000000-999@s", storage.KindMessage, [][]byte{row(strings.Repeat("y", size))}, nil)
 	if err != nil || inline || len(over) > 200 {
 		t.Fatalf("just over the limit: inline=%v len=%d err=%v, want a short pointer", inline, len(over), err)
 	}
@@ -58,8 +58,8 @@ func TestEncodeNotificationInlineThreshold(t *testing.T) {
 	if err := json.Unmarshal([]byte(over), &n); err != nil {
 		t.Fatal(err)
 	}
-	if cm, err := n.inlineCM(); cm != nil || err != nil || n.Serial != "00000000000001-000@s" || n.Channel != "room" {
-		t.Fatalf("pointer decode = %+v (%v), want the (channel, serial) pointer only", n, err)
+	if cm, err := n.inlineCM(); cm != nil || err != nil || n.Serial != "00000000000001-000@s" || n.Channel != "room" || n.Prev != "00000000000000-999@s" {
+		t.Fatalf("pointer decode = %+v (%v), want the (channel, serial, prev) pointer only", n, err)
 	}
 }
 
@@ -76,7 +76,7 @@ func TestEncodeNotificationCarriesAnnotationSummaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enc, inline, err := encodeNotification("room", "00000000000001-000@s", storage.KindAnnotation, [][]byte{payload}, [][]byte{blob})
+	enc, inline, err := encodeNotification("room", "00000000000001-000@s", "", storage.KindAnnotation, [][]byte{payload}, [][]byte{blob})
 	if err != nil || !inline {
 		t.Fatalf("encode: inline=%v err=%v", inline, err)
 	}
