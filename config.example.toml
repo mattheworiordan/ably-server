@@ -79,6 +79,19 @@
 # (env: ABLY_SERVER_PERSISTED_RETENTION).
 # persisted-retention = "24h"
 
+# Cluster mode: leading-edge publish batching (DESIGN.md §6.3). A channel
+# always uses the same lane; an idle lane commits a publish at once, and
+# publishes arriving during a commit are committed together as the next
+# batch. With 0 lanes every publish commits in its own transaction; a 0
+# here reads as unset, so turn batching off with --publish-lanes=0 or
+# ABLY_SERVER_PUBLISH_LANES=0.
+# (env: ABLY_SERVER_PUBLISH_LANES, ABLY_SERVER_PUBLISH_BATCH_MAX,
+# ABLY_SERVER_PUBLISH_LINGER_MAX, ABLY_SERVER_PUBLISH_QUEUE_MAX)
+# publish-lanes = 4
+# publish-batch-max = 200
+# publish-linger-max = "5ms"
+# publish-queue-max = 10000
+
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
 # shutdown-grace = "10s"

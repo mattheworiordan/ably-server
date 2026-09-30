@@ -17,6 +17,7 @@ import (
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // connection is one live WebSocket connection. It owns two goroutines:
@@ -749,7 +750,7 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		cm, _, err := ch.Publish(pubCtx, messages)
 		if err != nil {
 			c.logger.Warn("publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
-			c.nack(ctx, msgSerial, nil)
+			c.nack(ctx, msgSerial, publishErrorInfo(err))
 			return
 		}
 		c.metrics.MessagePublished(time.Since(accepted).Seconds())
@@ -767,6 +768,20 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 			Res:       []*protocol.PublishResult{{Serials: messageSerials(cm.Messages)}},
 		})
 	})
+}
+
+// publishErrorInfo maps a storage publish failure to the ErrorInfo its
+// NACK carries: the retriable batching failures (DESIGN.md §6.3) get
+// their Ably codes so a client can back off and retry; anything else
+// NACKs without one, as before.
+func publishErrorInfo(err error) *protocol.ErrorInfo {
+	switch {
+	case errors.Is(err, storage.ErrOverloaded):
+		return &protocol.ErrorInfo{Message: "publish rejected: server busy, retry later", Code: 42910, StatusCode: 429}
+	case errors.Is(err, storage.ErrUnavailable):
+		return &protocol.ErrorInfo{Message: "publish could not be committed, retry", Code: 50003, StatusCode: 503}
+	}
+	return nil
 }
 
 // messageSerials returns the server-assigned Serial of each message in

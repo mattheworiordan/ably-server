@@ -108,6 +108,11 @@ var (
 var (
 	channelBindHook atomic.Pointer[func(phase string)]
 	loadCMHook      atomic.Pointer[func(channel, serial string) error]
+	// commitBatchHook runs at the start of each batch commit attempt;
+	// commitBatchAfterHook runs after a batch's COMMIT succeeded, as if
+	// its reply were lost. Either can fail the attempt.
+	commitBatchHook      atomic.Pointer[func() error]
+	commitBatchAfterHook atomic.Pointer[func() error]
 )
 
 // fixtureNodeID is the sentinel owner recorded on static fixture presence
@@ -192,6 +197,11 @@ type Options struct {
 	// namespace, and so keeps Retention.Persisted rather than the
 	// continuity window. Nil means no channel is persisted.
 	Persisted func(channel string) bool
+
+	// Batching configures leading-edge publish batching (DESIGN.md
+	// §6.3). The zero value (Lanes 0) commits every publish in its own
+	// transaction; the server enables 4 lanes by default.
+	Batching Batching
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
@@ -206,6 +216,8 @@ type Storage struct {
 	retention Retention                 // resolved retention settings (§6.3)
 	persisted func(channel string) bool // retention class of a channel
 	metrics   *retentionMetrics
+	lanes     *laneSet // publish batching; nil when off (§6.3)
+	wmetrics  *writeMetrics
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
 	clockOffset atomic.Int64
@@ -258,7 +270,21 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if busKind == BusNATS && opts.NATSURL == "" {
 		return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
 	}
-	pool, err := pgxpool.New(ctx, opts.DSN)
+	poolCfg, err := pgxpool.ParseConfig(opts.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: parse DSN: %w", err)
+	}
+	batching := opts.Batching
+	if batching.enabled() {
+		batching = batching.resolve()
+		// Each lane can hold maxInflightPerLane connections for its
+		// batches; leave room for reads, presence and the sweep unless
+		// the DSN sets pool_max_conns itself.
+		if !strings.Contains(opts.DSN, "pool_max_conns") {
+			poolCfg.MaxConns = max(poolCfg.MaxConns, int32(batching.Lanes*maxInflightPerLane+8))
+		}
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: connect: %w", err)
 	}
@@ -305,6 +331,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		retention:     opts.Retention.resolve(),
 		persisted:     persisted,
 		metrics:       newRetentionMetrics(),
+		wmetrics:      newWriteMetrics(),
 		channels:      make(map[string]*channelStore),
 		reconcileCh:   make(chan struct{}, 1),
 		loopCtx:       loopCtx,
@@ -370,6 +397,10 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		s.bus = b
 	}
 
+	if batching.enabled() {
+		s.lanes = newLaneSet(batching, s, s.wmetrics)
+	}
+
 	s.wg.Add(3)
 	go s.presenceLeaseBumpLoop(loopCtx)
 	go s.presenceReaperLoop(loopCtx)
@@ -429,6 +460,7 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
 		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
 	}
+	cs.rowEnsured.Store(true)
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("ensured")
 	}
@@ -532,6 +564,9 @@ func (s *Storage) boundStores() []*channelStore {
 // waits.
 func (s *Storage) Close() error {
 	s.closeOnce.Do(func() {
+		if s.lanes != nil {
+			s.lanes.close() // finish in-flight batches before the bus stops
+		}
 		s.cancel()
 		s.wg.Wait()
 		s.bus.close()
@@ -544,7 +579,7 @@ func (s *Storage) Close() error {
 // ably_storage_* retention series, DESIGN.md §10), for registration on
 // the process registry.
 func (s *Storage) Collectors() []prometheus.Collector {
-	return s.metrics.collectors()
+	return append(s.metrics.collectors(), s.wmetrics.collectors()...)
 }
 
 // Ping reports whether the node can serve cluster traffic: the Postgres
@@ -951,9 +986,14 @@ type channelStore struct {
 	// retention floor over rows a migration left in the live class. All
 	// feed RetainedSince and the idempotency window.
 	persisted bool
-	retention time.Duration
-	clock     *atomic.Int64
-	floorMin  string
+	// lanes is the storage's publish batcher, nil when batching is off
+	// (DESIGN.md §6.3); rowEnsured records that this channel's channels
+	// row is known to exist, so a batch never has to create it.
+	lanes      *laneSet
+	rowEnsured atomic.Bool
+	retention  time.Duration
+	clock      *atomic.Int64
+	floorMin   string
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the
@@ -1077,6 +1117,10 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
+	}
+
+	if cs.lanes != nil {
+		return cs.storeBatched(ctx, cs.lanes, msgs)
 	}
 
 	// Resolve the batch id and stamp each Message.ID = "<batchID>:<idx>"

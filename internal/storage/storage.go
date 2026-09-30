@@ -41,6 +41,20 @@ var ErrTargetNotFound = errors.New("storage: target message not found")
 // map it to a 400 (REST) or a NACK (WS).
 var ErrIncompatibleAppend = errors.New("storage: append data type is incompatible with the target's current data")
 
+// ErrOverloaded is returned by Store when the backend's bounded publish
+// queue is full (the Postgres backend's per-lane queue, DESIGN.md §6.3).
+// Nothing was stored; the publish may be retried after a back-off.
+// Callers map it to Ably 42910 with HTTP 429 (REST) or a NACK (WS).
+var ErrOverloaded = errors.New("storage: publish queue full; retry later")
+
+// ErrUnavailable is returned by Store when the backend could not confirm
+// a commit of the publish (the Postgres backend retries a failed batch
+// once first, checking every publish's id on the retry, DESIGN.md §6.3),
+// or is shutting down. The publish was most likely not stored; a retry
+// with the same id is deduplicated if it was. Callers map it to Ably
+// 50003 with HTTP 503 (REST) or a NACK (WS).
+var ErrUnavailable = errors.New("storage: publish could not be committed; retry")
+
 // ErrInvalidMessageID is returned by StampMessageIDs (and therefore by
 // Store) when a client supplies message ids that do not conform to the
 // required "<batchID>:<idx>" batch shape (DESIGN.md §8). Callers map it

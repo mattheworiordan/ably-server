@@ -128,3 +128,61 @@ func TestRewindWithNothingRetainedAttachesAtHead(t *testing.T) {
 		t.Errorf("resume from the rewind attach point: Flags = %v Error = %+v, want RESUMED and no error", resumed.Flags, resumed.Error)
 	}
 }
+
+// failingStorage wraps a Storage so every Store fails with err, standing
+// in for the Postgres backend's batching failures (DESIGN.md §6.3).
+type failingStorage struct {
+	storage.Storage
+	err error
+}
+
+func (f failingStorage) Channel(ctx context.Context, name string, a storage.Appender) (storage.ChannelStore, error) {
+	cs, err := f.Storage.Channel(ctx, name, a)
+	if err != nil {
+		return nil, err
+	}
+	return failingStore{ChannelStore: cs, err: f.err}, nil
+}
+
+type failingStore struct {
+	storage.ChannelStore
+	err error
+}
+
+func (f failingStore) Store(context.Context, []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	return nil, false, f.err
+}
+
+// TestPublishBatchingFailuresNACKWithRetriableCodes: a publish refused
+// by the backend's batching layer NACKs with the Ably code a client can
+// act on (DESIGN.md §6.3), not a bare NACK.
+func TestPublishBatchingFailuresNACKWithRetriableCodes(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code int
+	}{{storage.ErrOverloaded, 42910}, {storage.ErrUnavailable, 50003}} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			parsed, err := auth.ParseAPIKey(testKey)
+			if err != nil {
+				t.Fatalf("parse api key: %v", err)
+			}
+			manager := core.NewManager(failingStorage{Storage: memory.New(memory.Options{}), err: tc.err})
+			rt := NewServer([]auth.APIKey{parsed}, manager, time.Hour, logging.New(slog.DiscardHandler), nil, nil)
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /", rt.HandleWebSocket)
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			ws := dial(t, srv, "")
+			drainConnected(t, ws)
+			sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+				Action: protocol.ActionMessage, Channel: new("room"), MsgSerial: msgSerialPtr(0),
+				Messages: []*protocol.Message{{Data: "x"}},
+			})
+			acks := collectAcks(t, ws, 1)
+			if acks[0].Action != protocol.ActionNack || acks[0].Error == nil || acks[0].Error.Code != tc.code {
+				t.Errorf("reply = %+v, want a NACK with code %d", acks[0], tc.code)
+			}
+		})
+	}
+}

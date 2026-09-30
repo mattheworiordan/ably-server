@@ -486,3 +486,26 @@ func TestRunRetentionMalformedIsStartupError(t *testing.T) {
 		})
 	}
 }
+
+func TestRunPublishBatchingMalformedIsStartupError(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		env        map[string]string
+		file       string
+	}{
+		{name: "env lanes", env: map[string]string{publishLanesEnv: "four"}, want: "invalid integer"},
+		{name: "file linger", file: `publish-linger-max = "soon"`, want: "invalid duration"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"--keys=app.key:secret"}
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != 1 || !strings.Contains(out.String(), tc.want) {
+				t.Errorf("exit = %d, output %q; want 1 and %q", code, out.String(), tc.want)
+			}
+		})
+	}
+}

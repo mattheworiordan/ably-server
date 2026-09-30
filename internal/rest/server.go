@@ -196,6 +196,18 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorInfo(w, r, http.StatusBadRequest, 40031, err.Error())
 		return
 	}
+	if errors.Is(err, storage.ErrOverloaded) {
+		// The backend's bounded publish queue is full (DESIGN.md §6.3):
+		// nothing was stored; the client should back off and retry.
+		s.writeErrorInfo(w, r, http.StatusTooManyRequests, 42910, "publish rejected: server busy, retry later")
+		return
+	}
+	if errors.Is(err, storage.ErrUnavailable) {
+		// The batch could not be committed (DESIGN.md §6.3); a retry with
+		// the same id is deduplicated.
+		s.writeErrorInfo(w, r, http.StatusServiceUnavailable, 50003, "publish could not be committed, retry")
+		return
+	}
 	if err != nil {
 		s.logger.Warn("publish failed", "channel", name, "err", err)
 		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "publish failed")

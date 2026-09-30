@@ -31,3 +31,47 @@ func SetDetachTimeout(d time.Duration) func() {
 	detachTimeout = d
 	return func() { detachTimeout = orig }
 }
+
+// SetCommitBatchHook installs a hook run at the start of every batch
+// commit attempt (nil removes it).
+func SetCommitBatchHook(h func() error) {
+	if h == nil {
+		commitBatchHook.Store(nil)
+		return
+	}
+	commitBatchHook.Store(&h)
+}
+
+// SetCommitBatchAfterHook installs a hook run after a batch's COMMIT
+// succeeded; an error makes the attempt fail as if the reply were lost
+// (nil removes it).
+func SetCommitBatchAfterHook(h func() error) {
+	if h == nil {
+		commitBatchAfterHook.Store(nil)
+		return
+	}
+	commitBatchAfterHook.Store(&h)
+}
+
+// BatchCounters returns this node's batch commits, retries and
+// deferrals.
+func (s *Storage) BatchCounters() (commits, retries, deferred float64) {
+	read := func(c interface{ Write(*dto.Metric) error }) float64 {
+		var m dto.Metric
+		if err := c.Write(&m); err != nil {
+			return -1
+		}
+		return m.GetCounter().GetValue()
+	}
+	return read(s.wmetrics.commits), read(s.wmetrics.retries), read(s.wmetrics.deferred)
+}
+
+// BatchSizeSum returns the number of batches observed and the publishes
+// they committed.
+func (s *Storage) BatchSizeSum() (count uint64, sum float64) {
+	var m dto.Metric
+	if err := s.wmetrics.batchSize.Write(&m); err != nil {
+		return 0, 0
+	}
+	return m.GetHistogram().GetSampleCount(), m.GetHistogram().GetSampleSum()
+}

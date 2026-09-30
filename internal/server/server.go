@@ -70,6 +70,11 @@ const (
 
 	messageRetentionEnv   = "ABLY_SERVER_MESSAGE_RETENTION"
 	persistedRetentionEnv = "ABLY_SERVER_PERSISTED_RETENTION"
+
+	publishLanesEnv     = "ABLY_SERVER_PUBLISH_LANES"
+	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
+	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
+	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -172,6 +177,26 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	publishLanesDefault, err := config.DefaultInt(opts.Getenv(publishLanesEnv), file.PublishLanes, postgres.DefaultPublishLanes)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	publishBatchMaxDefault, err := config.DefaultInt(opts.Getenv(publishBatchMaxEnv), file.PublishBatchMax, postgres.DefaultPublishBatchMax)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	publishLingerMaxDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMaxEnv), file.PublishLingerMax, postgres.DefaultPublishLingerMax)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	publishQueueMaxDefault, err := config.DefaultInt(opts.Getenv(publishQueueMaxEnv), file.PublishQueueMax, postgres.DefaultPublishQueueMax)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -216,6 +241,10 @@ func Run(ctx context.Context, opts Opts) int {
 	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks every bound channel against its committed serial and catches up one that fell behind; 0 means the bus default (postgres 2s, nats 5s) (env: "+busSweepEnv+")")
 	messageRetention := fs.Duration("message-retention", messageRetentionDefault, "cluster mode: how long a channel outside any persisted namespace keeps its message log, the continuity window (DESIGN.md §6.3) (env: "+messageRetentionEnv+")")
 	persistedRetention := fs.Duration("persisted-retention", persistedRetentionDefault, "cluster mode: how long a channel in a persisted namespace keeps its message log (DESIGN.md §6.3) (env: "+persistedRetentionEnv+")")
+	publishLanes := fs.Int("publish-lanes", publishLanesDefault, "cluster mode: publish lanes for leading-edge batching; a channel always uses the same lane; 0 commits every publish in its own transaction (DESIGN.md §6.3) (env: "+publishLanesEnv+")")
+	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
+	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
+	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -317,6 +346,12 @@ func Run(ctx context.Context, opts Opts) int {
 			Persisted: *persistedRetention,
 		},
 		persisted: persistedNamespaces(file.Namespaces),
+		batching: postgres.Batching{
+			Lanes:     *publishLanes,
+			BatchMax:  *publishBatchMax,
+			LingerMax: *publishLingerMax,
+			QueueMax:  *publishQueueMax,
+		},
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -773,6 +808,7 @@ type clusterOptions struct {
 	sweepInterval    time.Duration
 	logger           *logging.Logger
 	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
+	batching         postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted        func(channel string) bool // persisted-namespace resolver
 }
 
@@ -783,6 +819,7 @@ func (c clusterOptions) options() postgres.Options {
 		Logger:    c.logger,
 		Retention: c.retention,
 		Persisted: c.persisted,
+		Batching:  c.batching,
 	}
 }
 

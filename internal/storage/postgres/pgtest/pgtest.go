@@ -60,7 +60,7 @@ var (
 // Start brings up postgres:17-alpine via testcontainers-go (lazily,
 // once per test binary) and returns a Container handle. Test
 // failures during container startup are reported via t.Fatalf.
-func Start(t *testing.T) *Container {
+func Start(t testing.TB) *Container {
 	t.Helper()
 	containerOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -94,7 +94,7 @@ func Start(t *testing.T) *Container {
 // default database and returns a DSN whose connections default to
 // that schema (via the search_path connection option). The schema
 // is dropped on t.Cleanup.
-func (c *Container) FreshSchemaDSN(t *testing.T) string {
+func (c *Container) FreshSchemaDSN(t testing.TB) string {
 	t.Helper()
 
 	schema := fmt.Sprintf("test_%d", schemaCounter.Add(1))
@@ -130,7 +130,7 @@ func (c *Container) FreshSchemaDSN(t *testing.T) string {
 // appendSearchPath rewrites a libpq-style DSN to set search_path to
 // the given schema. Works for both URL-form ("postgres://...") and
 // key=value DSNs.
-func appendSearchPath(t *testing.T, dsn, schema string) string {
+func appendSearchPath(t testing.TB, dsn, schema string) string {
 	t.Helper()
 	opt := "-c search_path=" + schema
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {

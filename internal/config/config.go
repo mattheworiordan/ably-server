@@ -56,6 +56,12 @@ type File struct {
 	// (DESIGN.md §6.3, §9).
 	MessageRetention   string `toml:"message-retention"`
 	PersistedRetention string `toml:"persisted-retention"`
+	// Publish batching for the cluster-mode write path (DESIGN.md §6.3,
+	// §9). Zero means absent; publish-linger-max is a duration string.
+	PublishLanes     int    `toml:"publish-lanes"`
+	PublishBatchMax  int    `toml:"publish-batch-max"`
+	PublishLingerMax string `toml:"publish-linger-max"`
+	PublishQueueMax  int    `toml:"publish-queue-max"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual

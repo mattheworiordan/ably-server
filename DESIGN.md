@@ -1310,6 +1310,91 @@ Series (§10): `ably_storage_partitions_created_total{table}`,
 `ably_storage_log_bytes{table}` (heap, indexes and TOAST of every leaf) and
 `ably_storage_log_partitions{table}`, as of the node's last sweep.
 
+**Publish batching.** A message publish (`Store`, from REST or realtime
+alike) can be committed together with other publishes of the same node in
+one transaction. This is how one Postgres primary carries tens of
+thousands of writes a second: the cost of a commit is shared by every
+publish in it. It is on by default (`--publish-lanes=4`) with every bus
+(§7.2); `--publish-lanes=0` commits every publish in its own transaction.
+Presence, mutations and annotations are not batched.
+
+The policy is leading edge, not a fixed window. A node has
+`--publish-lanes` lanes (default 4); a channel's name hashes
+to one lane, so all of a node's publishes to one channel share a lane and
+keep their order. Per lane:
+
+1. If nothing is in flight, the first publish commits at once. At low
+   load a publish costs exactly one commit.
+2. While a commit is in flight, arriving publishes queue. When it
+   returns, everything queued (up to `--publish-batch-max`, default 200)
+   commits as the next batch. At high load the batch grows to match the
+   commit latency, so the node tunes itself: 10 nodes at 52,000 writes/s
+   with a 3 ms commit is about 16 publishes a batch, and at 104,000/s
+   about 31; Postgres sees about 3,000 commits/s either way.
+3. A channel is in at most one in-flight batch. If a batch has been in
+   flight longer than `--publish-linger-max` (default 5 ms), the queued
+   publishes of other channels start a second batch, so a stalled commit
+   delays only the channels in it (at most two batches per lane).
+4. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
+   Beyond it a publish is refused at once with Ably error **42910** (HTTP
+   429 on REST, a NACK on realtime): nothing is stored and the client
+   should back off and retry.
+
+Inside a batch, in two round trips (migration `0003_publish_batch`):
+
+- **Round trip 1**, `BEGIN` plus `publish_batch_lock`: the channels rows
+  of the batch are locked in sorted name order. A row already locked by
+  another transaction (a hot channel being written from another node) is
+  skipped (`FOR UPDATE SKIP LOCKED`) and that channel's publishes are
+  deferred to the head of the next batch, so cold channels' ACKs are not
+  delayed by it. A publish deferred twice waits for the lock in its next
+  batch, so a hot channel cannot be starved. Waited-for rows are locked
+  first, in one sorted statement, and everything after it only skips,
+  so batches do not deadlock on channel rows. Client ids
+  are then checked under the locks in one set-based lookup, and one
+  channelSerial is minted per publish in queue order.
+- **Round trip 2**: one multi-row `INSERT` into each of `channel_messages`
+  and `messages`, the bus's in-transaction hook for every cm (queued into
+  the same round trip: one `pg_notify` per cm for `pgnotify` and
+  transactional `postgres`, nothing for coalesced `postgres` and `nats`),
+  and `COMMIT`. Statements are prepared (pgx caches them). After the
+  commit the bus's post-commit hook runs for each cm in batch order (the
+  publisher fast path, the NATS publish, the coalesced wake-up mark), and
+  each cm names the serial before it on its channel, counting earlier cms
+  of the same batch, so the chaining buses (§7.2) see exactly the
+  predecessor chain a single publish would give them.
+- Everything that can reject a single publish (the id format, an id or
+  channel name that is not valid UTF-8 or contains NUL, which Postgres
+  cannot store) is checked before it is queued, and a channel's row is
+  created before its first publish is queued, so one bad publish cannot
+  fail a batch. A publish that repeats a client id of an earlier publish
+  of the same channel in the batch takes that publish's result,
+  idempotently. Server-generated ids are unique by construction and skip
+  the lookup on a first attempt.
+- A batch that fails is retried once. The first attempt's `COMMIT` may
+  have reached the database with only its reply lost, so the retry looks
+  up every publish's id, server-generated ones included, and returns the
+  original of any already stored. If the retry fails too, every publish
+  in the batch is refused with Ably error **50003** (HTTP 503, or a NACK)
+  and may be retried by the client with the same id. Publishes caught by
+  shutdown get the same error.
+- ACKs are per publish, sent when its batch commits.
+
+What it costs: a publish's latency floor is still one commit before its
+ACK (plus the wait for the in-flight batch, at most about one commit
+under load). One hot channel is still serialised by its row lock: across
+nodes it is one commit per batch, and many publishes from one node share a
+lock hold. Per-channel batches are shallow (52,000 writes/s over 700,000
+channels is about one message per channel per batch), so the gain is
+width across channels, not depth per channel. Cluster write throughput is
+still one primary's.
+
+Series (§10): `ably_publish_batch_size` (histogram),
+`ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
+`ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
+`ably_publish_batch_retries_total` and
+`ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`).
+
 ## 7. Pub/Sub
 
 Pub/sub turns a *publish* (originating from any node, via WS or REST)
@@ -1372,7 +1457,9 @@ runs a hook inside the transaction (`pgnotify` and transactional
 `postgres` NOTIFY here, so listeners see the cm only if it commits), the
 transaction commits, and the bus runs a hook after commit (the NATS
 publish, the coalesced wake-up mark, the publisher fast path). The ACK is
-sent after the commit in every mode.
+sent after the commit in every mode. With publish batching (§6.3) the same two hooks
+run for every cm of a batch, the first queued into the batch's last round
+trip before `COMMIT`.
 
 #### pgnotify
 
@@ -1677,6 +1764,16 @@ check fails on any gap or duplicate.
   which lets the disk backend (bbolt) and cluster backend (Postgres)
   use channelSerial directly as the primary key without a separate
   ordering column.
+
+  In cluster mode the order is decided once, at commit, by the channel's
+  row in `channels`: the serial is minted under that row lock, so it is
+  a total order per channel across nodes. With publish batching (§6.3)
+  a node's publishes to one channel go through one lane, in arrival
+  order, and a channel is in at most one in-flight batch, so they are
+  minted in that order: per-publisher order within a channel is kept.
+  Publishes of different nodes to one channel are ordered by which batch
+  takes the row lock first; a batch that finds the row locked defers the
+  channel rather than waiting (§6.3).
 - **Message.serial**: the server-assigned **identity** of an individual
   message, of the form
 
@@ -1773,6 +1870,10 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --http-idle-timeout 120s      how long an idle HTTP keep-alive connection is kept open (§2.2)
 --message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
 --persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
+--publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
+--publish-batch-max 200       cluster mode: most publishes in one batch transaction
+--publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
+--publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -1790,10 +1891,12 @@ Configuration may also be supplied via an optional TOML config file
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
-`message-retention`, `persisted-retention` — `shutdown-grace`,
-`postgres-notify-window`, `bus-sweep-interval`, `channel-idle-timeout`,
-`conn-write-timeout`, `http-idle-timeout` and the retentions as duration
-strings, e.g. `"10s"`, the sizes as integers). API keys are
+`message-retention`, `persisted-retention`, `publish-lanes`,
+`publish-batch-max`, `publish-linger-max`, `publish-queue-max` —
+`shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
+`channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
+retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
+the sizes and counts as integers). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
@@ -1894,6 +1997,11 @@ name = "persisted:presence_fixtures"
     `ably_storage_retention_errors_total` (counters) and
     `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
     (gauges). `table` is `channel_messages` or `messages`.
+  - Cluster mode only, from publish batching (§6.3):
+    `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
+    `ably_publish_commits_total`, `ably_publish_deferred_total`,
+    `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`
+    (counters) and `ably_publish_lane_queue_depth{lane}` (gauge).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres

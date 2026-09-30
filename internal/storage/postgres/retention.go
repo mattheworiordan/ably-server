@@ -133,12 +133,13 @@ func (r Retention) resolve() Retention {
 	return r
 }
 
-// setRetention gives a new channelStore its retention class (DESIGN.md
-// §6.3).
+// setRetention gives a new channelStore its retention class and the
+// storage's publish lanes (DESIGN.md §6.3).
 func (s *Storage) setRetention(cs *channelStore) {
 	cs.persisted = s.persisted(cs.name)
 	cs.retention = s.retentionOf(cs.persisted)
 	cs.clock = &s.clockOffset
+	cs.lanes = s.lanes
 	if cs.persisted {
 		cs.floorMin = s.legacyBound
 	}
