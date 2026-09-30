@@ -387,7 +387,9 @@ func TestJobsEndToEnd(t *testing.T) {
 		}
 		if s.Role == loadgen.RoleSubscriber {
 			seen = append(seen, s.Correctness.Channels)
-			if s.Connections.OpenAtMeasureEnd != int64(s.Connections.Target) {
+			// Churn runs to the end of the hold, so a connection can be
+			// mid-reconnect at that instant.
+			if s.Connections.OpenAtMeasureEnd < int64(s.Connections.Target)-2 {
 				t.Errorf("subscriber %d: %d of %d connections open at the end of the hold", s.Index, s.Connections.OpenAtMeasureEnd, s.Connections.Target)
 			}
 			if s.Latency[loadgen.LatDelivery].Count() == 0 || s.Latency[loadgen.LatConnectAttach].Count() == 0 {

@@ -141,6 +141,11 @@ func TestEvaluateFailures(t *testing.T) {
 				r.NodeStats = NodeStats{Measured: true, GoroutineGrowth: 0.5}
 			}
 		}, "node goroutine growth"},
+		{"planned load never delivered", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				s[0].Deliveries.Rate = 15
+			}
+		}, "deliveries vs plan"},
 		{"nothing checked", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[0].Correctness.CheckedMessages = 0
@@ -333,5 +338,17 @@ func TestReportGroupsRepeatsAndCurves(t *testing.T) {
 	}
 	if strings.Contains(md, "## Shard curve") {
 		t.Error("shard curve without shard variation")
+	}
+}
+
+func TestEvaluateFaultRunReportsGrowthWithoutGating(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.NodeStats = NodeStats{Measured: true, MemoryGrowth: 1.4, GoroutineGrowth: 1.1}
+			r.Fault = &FaultRecord{Command: "kill node2"}
+		}
+	})
+	if !rec.Pass {
+		t.Fatalf("fault run failed on growth: %v", failing(rec))
 	}
 }

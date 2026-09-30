@@ -191,7 +191,7 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 		cfg.Poll = 10 * time.Second
 	}
 	if cfg.HTTP == nil {
-		cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
+		cfg.HTTP = &http.Client{Timeout: 20 * time.Second}
 	}
 	plan, err := cfg.Scenario.Resolve(cfg.Multiplier, cfg.Scale, cfg.RunTag)
 	if err != nil {
@@ -243,7 +243,22 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 		}
 	}
 	for _, j := range jobs {
-		if _, err := agentCall(runCtx, cfg.HTTP, http.MethodPost, strings.TrimRight(j.agent.URL, "/")+"/v1/jobs", j.spec, nil); err != nil {
+		// Retry: a lost response to a start that succeeded comes back as
+		// 409 "already running" for the same job id, which is success.
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			var code int
+			code, err = agentCall(runCtx, cfg.HTTP, http.MethodPost, strings.TrimRight(j.agent.URL, "/")+"/v1/jobs", j.spec, nil)
+			if err == nil || (code == http.StatusConflict && strings.Contains(err.Error(), "already running")) {
+				err = nil
+				break
+			}
+			if code >= 400 && code < 500 {
+				break // refused, not lost
+			}
+			cfg.logf("start job %s on %s: %v (retrying)", j.spec.ID, j.agent.Name, err)
+		}
+		if err != nil {
 			stopAll()
 			return nil, fmt.Errorf("start job %s on %s: %w", j.spec.ID, j.agent.Name, err)
 		}

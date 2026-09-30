@@ -158,6 +158,9 @@ type PassSpec struct {
 	MaxConnectionLoss float64 `toml:"max_connection_loss" json:"max_connection_loss"`
 	// TailMargin: clock margin for the tail-loss check (default 1s).
 	TailMargin Duration `toml:"tail_margin" json:"tail_margin"`
+	// MinDeliveryRatio: deliveries/s measured over the plan's (default
+	// 0.9). Catches load that was planned but never generated.
+	MinDeliveryRatio float64 `toml:"min_delivery_ratio" json:"min_delivery_ratio"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -173,6 +176,7 @@ func DefaultPass() PassSpec {
 		MaxGoroutineGrowth: 0.10,
 		MaxConnectionLoss:  0.01,
 		TailMargin:         Duration{time.Second},
+		MinDeliveryRatio:   0.9,
 	}
 }
 
@@ -208,6 +212,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.TailMargin.Duration == 0 {
 		p.TailMargin = d.TailMargin
+	}
+	if p.MinDeliveryRatio == 0 {
+		p.MinDeliveryRatio = d.MinDeliveryRatio
 	}
 	return p
 }

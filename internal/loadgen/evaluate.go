@@ -376,6 +376,11 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Note: fmt.Sprintf("generator dropped %d scheduled publishes", p.Dropped)})
 		add(Check{Name: "rejected publishes", Value: fmt.Sprint(p.Rejected), Limit: "0", Pass: p.Rejected == 0, Gating: true})
 	}
+	if want := rec.Plan.DeliveriesPerSec; want > 0 {
+		ratio := res.Deliveries.Rate / want
+		add(Check{Name: "deliveries vs plan", Value: fmt.Sprintf("%.0f of %.0f/s (%.0f%%)", res.Deliveries.Rate, want, ratio*100),
+			Limit: fmt.Sprintf(">= %.0f%%", spec.MinDeliveryRatio*100), Pass: ratio >= spec.MinDeliveryRatio, Gating: true})
+	}
 	if c := res.Connections; c.Target > 0 {
 		want := float64(c.Target) * (1 - spec.MaxConnectionLoss)
 		add(Check{Name: "connections open at end of hold", Value: fmt.Sprintf("%d of %d", c.OpenAtMeasureEnd, c.Target),
@@ -383,10 +388,16 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	}
 	ns := rec.NodeStats
 	if ns.Measured {
+		// A killed node moves its connections to the survivors, so growth
+		// across the hold is expected in a fault run: reported, not gated.
+		gate, note := rec.Fault == nil, ""
+		if !gate {
+			note = "fault run: surviving nodes take the killed node's load"
+		}
 		add(Check{Name: "node memory growth over hold", Value: fmt.Sprintf("%.1f%%", ns.MemoryGrowth*100),
-			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxMemoryGrowth*100), Pass: ns.MemoryGrowth <= spec.MaxMemoryGrowth, Gating: true})
+			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxMemoryGrowth*100), Pass: ns.MemoryGrowth <= spec.MaxMemoryGrowth, Gating: gate, Note: note})
 		add(Check{Name: "node goroutine growth over hold", Value: fmt.Sprintf("%.1f%%", ns.GoroutineGrowth*100),
-			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxGoroutineGrowth*100), Pass: ns.GoroutineGrowth <= spec.MaxGoroutineGrowth, Gating: true})
+			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxGoroutineGrowth*100), Pass: ns.GoroutineGrowth <= spec.MaxGoroutineGrowth, Gating: gate, Note: note})
 	} else {
 		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
 			Note: "no node metrics URLs in the inventory"})

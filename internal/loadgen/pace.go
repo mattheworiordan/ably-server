@@ -37,7 +37,9 @@ func Pace(ctx context.Context, rate func(time.Time) float64, maxCatchUp time.Dur
 			dt := now.Sub(last)
 			last = now
 			owed += r * dt.Seconds()
-			if limit := r * maxCatchUp.Seconds(); owed > limit && limit > 0 {
+			// The cap is at least one event, or a rate below
+			// 1/maxCatchUp could never accumulate a whole event.
+			if limit := max(r*maxCatchUp.Seconds(), 1); owed > limit {
 				if dropped != nil {
 					dropped(int64(owed - limit))
 				}
