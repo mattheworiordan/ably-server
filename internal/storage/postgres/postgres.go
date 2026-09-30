@@ -32,6 +32,11 @@
 // pg_advisory_xact_lock inside Store's transaction, so the row
 // stream remains ordered by channelSerial without cross-channel
 // contention.
+//
+// Cross-node delivery sits behind a Bus (bus.go). The LISTEN/NOTIFY
+// broker described above is the default Bus; Options.Bus = BusNATS
+// swaps in NATS core pub/sub on per-channel subjects (natsbus.go,
+// DESIGN.md §7.3) while Postgres stays the store.
 package postgres
 
 import (
@@ -47,6 +52,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/ably/ably-server/internal/logging"
@@ -122,6 +128,22 @@ type Options struct {
 	// broker's reconnect/reconcile lifecycle (DESIGN.md §7.2) and the
 	// presence reaper (§12.5). Nil means logging.Default().
 	Logger *logging.Logger
+
+	// Bus selects the cross-node delivery mechanism: BusPostgres (the
+	// default; LISTEN/NOTIFY on this database, DESIGN.md §7.2) or
+	// BusNATS (NATS core pub/sub, DESIGN.md §7.3). Empty means
+	// BusPostgres. Postgres is the store either way.
+	Bus string
+
+	// NATSURL is the NATS server URL (a comma-separated list is
+	// accepted) for BusNATS. Required when Bus is BusNATS.
+	NATSURL string
+
+	// NATSInlineMaxBytes caps the encoded size of a cm carried inline on
+	// the NATS bus; a larger cm travels as a (channel, serial) pointer
+	// that receivers fetch from the log. Zero means
+	// DefaultNATSInlineMaxBytes.
+	NATSInlineMaxBytes int
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
@@ -135,8 +157,11 @@ type Storage struct {
 	mu       sync.Mutex
 	channels map[string]*channelStore
 
-	initialListenConn *pgx.Conn // first LISTEN conn, dialed by Open; owned by listenLoop thereafter
+	bus               Bus         // cross-node delivery (bus.go); set by Open
+	timing            chainTiming // gap-fill tuning for a chaining bus, snapshotted by Open
+	initialListenConn *pgx.Conn   // first LISTEN conn, dialed by Open for the Postgres bus; owned by listenLoop thereafter
 	cancel            context.CancelFunc
+	done              <-chan struct{} // closed when Close cancels the background goroutines
 	wg                sync.WaitGroup
 	closeOnce         sync.Once
 }
@@ -152,6 +177,15 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if opts.DSN == "" {
 		return nil, errors.New("storage/postgres: Open requires a DSN")
 	}
+	switch opts.Bus {
+	case "", BusPostgres:
+	case BusNATS:
+		if opts.NATSURL == "" {
+			return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
+		}
+	default:
+		return nil, fmt.Errorf("storage/postgres: unknown bus %q (valid: %s, %s)", opts.Bus, BusPostgres, BusNATS)
+	}
 	pool, err := pgxpool.New(ctx, opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: connect: %w", err)
@@ -165,38 +199,50 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
 
-	// Dedicated LISTEN connection. pgxpool doesn't expose the long-
-	// lived single-conn semantics LISTEN needs, so we acquire a
-	// separate raw conn for the broker goroutine. Dialing it here lets
-	// Open fail fast on a bad DSN; the goroutine re-dials fresh conns
-	// itself when this one drops.
-	listenConn, err := dialAndListen(ctx, opts.DSN)
-	if err != nil {
-		pool.Close()
-		return nil, err
-	}
-
 	logger := opts.Logger
 	if logger == nil {
 		logger = logging.Default()
 	}
 
 	s := &Storage{
-		pool:              pool,
-		dsn:               opts.DSN,
-		series:            serial.NewSeriesID(),
-		node:              serial.NewSeriesID(),
-		logger:            logger,
-		channels:          make(map[string]*channelStore),
-		initialListenConn: listenConn,
+		pool:     pool,
+		dsn:      opts.DSN,
+		series:   serial.NewSeriesID(),
+		node:     serial.NewSeriesID(),
+		logger:   logger,
+		channels: make(map[string]*channelStore),
+		timing:   currentChainTiming(),
+	}
+
+	if opts.Bus == BusNATS {
+		b, err := dialNATSBus(s, opts)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		s.bus = b
+	} else {
+		// Dedicated LISTEN connection. pgxpool doesn't expose the long-
+		// lived single-conn semantics LISTEN needs, so we acquire a
+		// separate raw conn for the broker goroutine. Dialing it here lets
+		// Open fail fast on a bad DSN; the goroutine re-dials fresh conns
+		// itself when this one drops.
+		listenConn, err := dialAndListen(ctx, opts.DSN)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		s.initialListenConn = listenConn
+		s.bus = &pgNotifyBus{s: s}
 	}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.wg.Add(3)
-	go s.listenLoop(loopCtx)
+	s.done = loopCtx.Done()
+	s.wg.Add(2)
 	go s.presenceLeaseBumpLoop(loopCtx)
 	go s.presenceReaperLoop(loopCtx)
+	s.bus.start(loopCtx)
 	return s, nil
 }
 
@@ -230,12 +276,22 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 		s.mu.Unlock()
 		return cs, nil
 	}
-	cs := &channelStore{pool: s.pool, series: s.series, node: s.node, name: name, appender: appender}
+	cs := s.newChannelStore(name, appender)
 	s.channels[name] = cs
 	s.mu.Unlock()
 
 	if appender == nil {
 		return cs, nil
+	}
+	// A bus that routes per channel subscribes before the watermark is
+	// read, so every cm committed after the read is received (DESIGN.md
+	// §7.3). The Postgres bus's single LISTEN already covers every
+	// channel, so its bind is a no-op.
+	if err := s.bus.bind(ctx, cs); err != nil {
+		s.mu.Lock()
+		delete(s.channels, name)
+		s.mu.Unlock()
+		return nil, err
 	}
 	var current, initial string
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
@@ -244,10 +300,107 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 		s.mu.Lock()
 		delete(s.channels, name)
 		s.mu.Unlock()
+		s.bus.unbind(cs)
 		return nil, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
 	}
 	appender.Initialize(current, initial)
+	if s.bus.chains() {
+		cs.seed(current)
+	}
 	return cs, nil
+}
+
+// newChannelStore constructs a channelStore bound to appender (nil for a
+// storage-only or transient store).
+func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
+	return &channelStore{
+		pool:     s.pool,
+		series:   s.series,
+		node:     s.node,
+		name:     name,
+		appender: appender,
+		bus:      s.bus,
+		logger:   s.logger,
+		done:     s.done,
+		timing:   s.timing,
+	}
+}
+
+// boundStore returns the channelStore bound to name with a live
+// appender, or nil if this node holds no such channel.
+func (s *Storage) boundStore(name string) *channelStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cs, ok := s.channels[name]; ok && cs.appender != nil {
+		return cs
+	}
+	return nil
+}
+
+// boundStores snapshots every channelStore bound with a live appender.
+func (s *Storage) boundStores() []*channelStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stores := make([]*channelStore, 0, len(s.channels))
+	for _, cs := range s.channels {
+		if cs.appender != nil {
+			stores = append(stores, cs)
+		}
+	}
+	return stores
+}
+
+// sweepWatermarks is the chained bus's safety net (DESIGN.md §7.3). It
+// reads the current serial of every bound channel in one query and
+// catches up each channel whose delivery mark is still behind the
+// watermark this node read on the previous sweep: a cm that old whose
+// bus message has not arrived is treated as lost, not late.
+func (s *Storage) sweepWatermarks(ctx context.Context) error {
+	stores := s.boundStores()
+	if len(stores) == 0 {
+		return nil
+	}
+	byName := make(map[string]*channelStore, len(stores))
+	names := make([]string, 0, len(stores))
+	for _, cs := range stores {
+		byName[cs.name] = cs
+		names = append(names, cs.name)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT name, channel_serial FROM channels WHERE name = ANY($1)`, names)
+	if err != nil {
+		return fmt.Errorf("storage/postgres: read watermarks: %w", err)
+	}
+	current := make(map[string]string, len(names))
+	for rows.Next() {
+		var name, watermark string
+		if err := rows.Scan(&name, &watermark); err != nil {
+			rows.Close()
+			return fmt.Errorf("storage/postgres: scan watermark: %w", err)
+		}
+		current[name] = watermark
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("storage/postgres: watermark rows: %w", err)
+	}
+
+	for name, watermark := range current {
+		cs := byName[name]
+		cs.hwmMu.Lock()
+		behind := cs.seeded && cs.sweptWatermark > cs.lastSeen
+		cs.sweptWatermark = watermark
+		cs.hwmMu.Unlock()
+		if !behind {
+			continue
+		}
+		if err := cs.catchUp(ctx); err != nil {
+			return fmt.Errorf("storage/postgres: sweep catch-up %q: %w", name, err)
+		}
+		cs.hwmMu.Lock()
+		cs.sweepCatchUps++
+		cs.hwmMu.Unlock()
+	}
+	return nil
 }
 
 // Close stops the background goroutines (LISTEN broker and, in cluster
@@ -260,6 +413,7 @@ func (s *Storage) Close() error {
 			s.cancel()
 			s.wg.Wait()
 		}
+		s.bus.close()
 		s.pool.Close()
 	})
 	return nil
@@ -472,7 +626,7 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 		// shape (§12.5): action + connectionId + clientId, no id (a
 		// fresh publish, must not collide with the ENTER's idempotency
 		// key).
-		cs := &channelStore{pool: s.pool, series: s.series, node: s.node, name: o.channel}
+		cs := s.newChannelStore(o.channel, nil)
 		leave := &protocol.PresenceMessage{
 			Action:       protocol.PresenceLeave,
 			ClientID:     o.clientID,
@@ -490,8 +644,58 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 // (channel, channelSerial) via the pool. Used by the LISTEN loop
 // after each NOTIFY.
 func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial string) (*protocol.ChannelMessage, error) {
-	rows, err := s.pool.Query(ctx, sqlLoadCM, channel, channelSerial)
+	return loadChannelMessagePool(ctx, s.pool, channel, channelSerial)
+}
+
+// loadChannelMessagePool is loadChannelMessage against an explicit
+// pool: the fetch-by-serial path a NATS bus pointer resolves through.
+func loadChannelMessagePool(ctx context.Context, pool *pgxpool.Pool, channel, channelSerial string) (*protocol.ChannelMessage, error) {
+	rows, err := pool.Query(ctx, sqlLoadCM, channel, channelSerial)
 	return decodeChannelMessageRows(rows, err, channel, channelSerial)
+}
+
+const sqlLoadRange = `
+SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
+WHERE channel = $1 AND channel_serial > $2 AND ($3 = '' OR channel_serial <= $3)
+ORDER BY channel_serial, idx
+`
+
+// loadChannelMessagesAfter reads every cm on channel with a serial in
+// (after, upTo] (upTo "" means unbounded), of every kind, ascending,
+// with annotation summary snapshots. The chained bus's gap fill and
+// reconcile read the log through it (DESIGN.md §7.3); unlike the
+// History-based reconcile of the LISTEN broker it includes annotation
+// cms, which a chain must see to stay unbroken.
+func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo string) ([]*protocol.ChannelMessage, error) {
+	rows, err := pool.Query(ctx, sqlLoadRange, channel, after, upTo)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: load range %s (%s, %s]: %w", channel, after, upTo, err)
+	}
+	defer rows.Close()
+
+	var out []*protocol.ChannelMessage
+	for rows.Next() {
+		var (
+			channelSerial string
+			idx           int
+			kind          string
+			payload       []byte
+			summary       []byte
+		)
+		if err := rows.Scan(&channelSerial, &idx, &kind, &payload, &summary); err != nil {
+			return nil, fmt.Errorf("storage/postgres: scan range %s: %w", channel, err)
+		}
+		if n := len(out); n == 0 || out[n-1].ChannelSerial != channelSerial {
+			out = append(out, &protocol.ChannelMessage{ChannelSerial: channelSerial})
+		}
+		if err := decodeRowInto(out[len(out)-1], channel, idx, kind, payload, summary); err != nil {
+			return nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: range rows %s: %w", channel, err)
+	}
+	return out, nil
 }
 
 const sqlLoadCM = `
@@ -523,32 +727,9 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 		if err := rows.Scan(&idx, &kind, &payload, &summary); err != nil {
 			return nil, fmt.Errorf("storage/postgres: scan %s:%s: %w", channel, channelSerial, err)
 		}
-		if kind == string(storage.KindPresence) {
-			var p protocol.PresenceMessage
-			if err := msgpack.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("storage/postgres: decode presence payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-			}
-			cm.Presence = append(cm.Presence, &p)
-			continue
+		if err := decodeRowInto(cm, channel, idx, kind, payload, summary); err != nil {
+			return nil, err
 		}
-		if kind == string(storage.KindAnnotation) {
-			var a protocol.Annotation
-			if err := msgpack.Unmarshal(payload, &a); err != nil {
-				return nil, fmt.Errorf("storage/postgres: decode annotation payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-			}
-			if len(summary) > 0 {
-				if err := msgpack.Unmarshal(summary, &a.Summary); err != nil {
-					return nil, fmt.Errorf("storage/postgres: decode annotation summary %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-				}
-			}
-			cm.Annotations = append(cm.Annotations, &a)
-			continue
-		}
-		var m protocol.Message
-		if err := msgpack.Unmarshal(payload, &m); err != nil {
-			return nil, fmt.Errorf("storage/postgres: decode payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-		}
-		cm.Messages = append(cm.Messages, &m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage/postgres: rows %s:%s: %w", channel, channelSerial, err)
@@ -557,6 +738,41 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 		return nil, fmt.Errorf("storage/postgres: ChannelMessage not found: %s:%s", channel, channelSerial)
 	}
 	return cm, nil
+}
+
+// decodeRowInto decodes one channel_messages row of (idx, kind,
+// payload, summary) and appends the item to cm: a presence row into
+// Presence, an annotation row into Annotations with its post-fold
+// summary snapshot reconstructed from the summary column (DESIGN.md
+// §14.2), a message row into Messages.
+func decodeRowInto(cm *protocol.ChannelMessage, channel string, idx int, kind string, payload, summary []byte) error {
+	channelSerial := cm.ChannelSerial
+	switch kind {
+	case string(storage.KindPresence):
+		var p protocol.PresenceMessage
+		if err := msgpack.Unmarshal(payload, &p); err != nil {
+			return fmt.Errorf("storage/postgres: decode presence payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+		}
+		cm.Presence = append(cm.Presence, &p)
+	case string(storage.KindAnnotation):
+		var a protocol.Annotation
+		if err := msgpack.Unmarshal(payload, &a); err != nil {
+			return fmt.Errorf("storage/postgres: decode annotation payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+		}
+		if len(summary) > 0 {
+			if err := msgpack.Unmarshal(summary, &a.Summary); err != nil {
+				return fmt.Errorf("storage/postgres: decode annotation summary %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+			}
+		}
+		cm.Annotations = append(cm.Annotations, &a)
+	default:
+		var m protocol.Message
+		if err := msgpack.Unmarshal(payload, &m); err != nil {
+			return fmt.Errorf("storage/postgres: decode payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+		}
+		cm.Messages = append(cm.Messages, &m)
+	}
+	return nil
 }
 
 // migrate applies any pending embedded migrations under a session-
@@ -700,14 +916,35 @@ type channelStore struct {
 	node     string
 	name     string
 	appender storage.Appender
+	bus      Bus
+	logger   *logging.Logger
+	done     <-chan struct{} // the owning Storage's shutdown signal
+	timing   chainTiming
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender. It is the per-channel de-dup high-water mark that makes
 	// post-reconnect history replay (reconcileFromHistory) idempotent
-	// against the normal NOTIFY dispatch (DESIGN.md §7.2). Only the
-	// LISTEN goroutine writes it, via deliver.
+	// against the normal NOTIFY dispatch (DESIGN.md §7.2). On the
+	// Postgres bus only the LISTEN goroutine writes it, via deliver; on
+	// the NATS bus every writer goes through deliverChained (chain.go),
+	// which also guards the fields below.
 	hwmMu    sync.Mutex
 	lastSeen string
+
+	// Chained-delivery state, used only by a bus whose chains() is true
+	// (DESIGN.md §7.3). seeded is set once Storage.Channel has read the
+	// channel's watermark into lastSeen; pending holds cms that arrived
+	// ahead of their predecessor, keyed by predecessor serial; gapTimer
+	// fires the log read that fills a gap the bus did not.
+	seeded         bool
+	pending        map[string]busEvent
+	gapTimer       *time.Timer
+	gapBackoff     time.Duration
+	sweptWatermark string // the channel's watermark at the previous sweep
+	sub            *nats.Subscription
+
+	// Delivery counters for tests (guarded by hwmMu).
+	delivered, duplicates, held, gapFills, sweepCatchUps int
 }
 
 // deliver hands cm to the appender exactly once and in order, advancing
@@ -779,6 +1016,41 @@ func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMe
 	return out
 }
 
+// advanceSerial mints the publish's channelSerial inside tx via
+// advance_channel_serial, whose channels-row lock serialises writers to
+// the channel cluster-wide. For a bus that chains deliveries it also
+// returns the serial it replaced: the row is locked and read first, in
+// the same round trip, so prev is exactly the cm before this one ("" if
+// the channel had no row yet).
+func (cs *channelStore) advanceSerial(ctx context.Context, tx pgx.Tx) (channelSerial, prev string, err error) {
+	if !cs.bus.chains() {
+		if err := tx.QueryRow(ctx,
+			`SELECT advance_channel_serial($1, $2)`,
+			cs.name, cs.series,
+		).Scan(&channelSerial); err != nil {
+			return "", "", fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+		}
+		return channelSerial, "", nil
+	}
+
+	batch := &pgx.Batch{}
+	batch.Queue(`SELECT channel_serial FROM channels WHERE name = $1 FOR UPDATE`, cs.name)
+	batch.Queue(`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series)
+	br := tx.SendBatch(ctx, batch)
+	if err := br.QueryRow().Scan(&prev); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		_ = br.Close()
+		return "", "", fmt.Errorf("storage/postgres: lock channel row: %w", err)
+	}
+	if err := br.QueryRow().Scan(&channelSerial); err != nil {
+		_ = br.Close()
+		return "", "", fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	if err := br.Close(); err != nil {
+		return "", "", fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	return channelSerial, prev, nil
+}
+
 // Store persists one publish atomically: look up any contained
 // Message.IDs for prior matches (idempotent return on hit), otherwise
 // advance the channel's serial via advance_channel_serial (which
@@ -840,12 +1112,9 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 
 	// Fresh publish: advance the channels-row serial (cluster-wide
 	// monotonic via the row lock), stamp Message.Serials, persist.
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`,
-		cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
@@ -883,24 +1152,18 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		}
 	}
 
-	// NOTIFY inside the tx: PG buffers the payload until commit, so
-	// listeners only see it if the publish actually lands. The
-	// LISTEN goroutine on every node (including this one) routes
-	// the cm to the channel's appender (DESIGN.md §7.2).
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_notify($1, $2)`,
-		notifyChannelName, string(body),
-	); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	// Bus hook inside the tx: the Postgres bus NOTIFYs here (PG buffers
+	// the payload until commit, so listeners only see it if the publish
+	// actually lands; the LISTEN goroutine on every node, including this
+	// one, routes the cm to the channel's appender, DESIGN.md §7.2).
+	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -965,11 +1228,9 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: decode target version: %w", err)
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
 	}
 	version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
 	if err != nil {
@@ -1001,16 +1262,13 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -1168,11 +1426,9 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, p := range presence {
 		storage.StampPresenceMember(p, channelSerial, i)
@@ -1245,17 +1501,14 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -1321,11 +1574,9 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	var channelSerial string
-	if err := tx.QueryRow(ctx,
-		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
-	).Scan(&channelSerial); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
 	}
 	for i, a := range annotations {
 		a.Serial = serial.MessageSerial(channelSerial, i)
@@ -1362,17 +1613,14 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
-	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+		return nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
+	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 

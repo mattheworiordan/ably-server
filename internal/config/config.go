@@ -38,6 +38,12 @@ type File struct {
 	LogLevel      string     `toml:"log-level"`
 	LogFormat     string     `toml:"log-format"`
 	DebugListen   string     `toml:"debug-listen"`
+	// Bus selects cluster mode's cross-node bus, "postgres" or "nats"
+	// (DESIGN.md §7.2, §7.3); NATSURL and NATSInlineMaxBytes configure
+	// the NATS bus. A zero NATSInlineMaxBytes means absent.
+	Bus                string `toml:"bus"`
+	NATSURL            string `toml:"nats-url"`
+	NATSInlineMaxBytes int    `toml:"nats-inline-max-bytes"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual
@@ -156,6 +162,25 @@ func DefaultDuration(env, file string, fallback time.Duration) (time.Duration, e
 		return 0, fmt.Errorf("config: invalid duration %q: %w", v, err)
 	}
 	return d, nil
+}
+
+// DefaultInt is Default for an int-valued flag: env, if set, is parsed
+// with strconv.Atoi (a malformed value is reported as an error, like
+// DefaultDuration); otherwise a non-zero file value wins; otherwise
+// fallback. file is a plain int under the File struct's "zero value
+// means absent" convention.
+func DefaultInt(env string, file int, fallback int) (int, error) {
+	if env != "" {
+		n, err := strconv.Atoi(env)
+		if err != nil {
+			return 0, fmt.Errorf("config: invalid integer %q: %w", env, err)
+		}
+		return n, nil
+	}
+	if file != 0 {
+		return file, nil
+	}
+	return fallback, nil
 }
 
 // DefaultBool is Default for a bool-valued flag: env, if set, is parsed

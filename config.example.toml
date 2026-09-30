@@ -29,6 +29,20 @@
 # when --mode=cluster and not supplied by a flag or env var.
 # postgres-dsn = "postgres://user:pw@host:5432/db?sslmode=disable"
 
+# Cluster-mode cross-node bus: postgres (LISTEN/NOTIFY on the store) or
+# nats (NATS core pub/sub; Postgres stays the store) (env:
+# ABLY_SERVER_BUS). See DESIGN.md §7.2 and §7.3.
+# bus = "postgres"
+
+# NATS server URL for bus = "nats"; a comma-separated list is accepted
+# (env: ABLY_SERVER_NATS_URL). Required when bus = "nats".
+# nats-url = "nats://127.0.0.1:4222"
+
+# Largest encoded message the NATS bus carries inline, in bytes; larger
+# ones travel as a pointer that receivers read from Postgres (env:
+# ABLY_SERVER_NATS_INLINE_MAX_BYTES).
+# nats-inline-max-bytes = 262144
+
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
 # shutdown-grace = "10s"
