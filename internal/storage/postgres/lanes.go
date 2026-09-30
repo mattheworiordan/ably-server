@@ -242,6 +242,11 @@ func (l *lane) submit(p *pending) error {
 		return errLanesClosed
 	}
 	if len(l.queue) >= l.opts.QueueMax {
+		// Publishes whose callers gave up still hold queue slots until
+		// they are taken; reclaim them before refusing a live one.
+		l.reapLocked()
+	}
+	if len(l.queue) >= l.opts.QueueMax {
 		l.metrics.nacks.WithLabelValues("queue_full").Inc()
 		return storage.ErrOverloaded
 	}
@@ -292,15 +297,15 @@ func (l *lane) armTimerLocked(d time.Duration) {
 
 // takeLocked removes and returns up to BatchMax queued publishes whose
 // channels are not in flight, in queue order. Publishes whose caller has
-// already given up are dropped.
+// already given up are dropped, whether or not their channel is busy.
 func (l *lane) takeLocked() []*pending {
 	var batch, rest []*pending
 	for _, p := range l.queue {
 		switch {
-		case len(batch) >= l.opts.BatchMax, l.busy[p.channel] > 0:
-			rest = append(rest, p)
 		case p.ctx.Err() != nil:
 			p.finish(pendingResult{err: p.ctx.Err()})
+		case len(batch) >= l.opts.BatchMax, l.busy[p.channel] > 0:
+			rest = append(rest, p)
 		default:
 			batch = append(batch, p)
 		}
@@ -308,6 +313,21 @@ func (l *lane) takeLocked() []*pending {
 	l.queue = rest
 	l.depth.Set(float64(len(l.queue)))
 	return batch
+}
+
+// reapLocked drops queued publishes whose caller has given up.
+func (l *lane) reapLocked() {
+	kept := l.queue[:0]
+	for _, p := range l.queue {
+		if p.ctx.Err() != nil {
+			p.finish(pendingResult{err: p.ctx.Err()})
+			continue
+		}
+		kept = append(kept, p)
+	}
+	clear(l.queue[len(kept):])
+	l.queue = kept
+	l.depth.Set(float64(len(l.queue)))
 }
 
 // run commits one batch, retrying once on failure, then hands deferred

@@ -253,6 +253,43 @@ func TestLaneQueueBoundRejectsWithOverloaded(t *testing.T) {
 	}
 }
 
+// TestLaneQueueBoundReclaimsAbandonedPublishes: publishes whose callers
+// gave up while their channel's batch was stalled do not keep holding
+// queue slots: a live publish on another channel is queued, not refused
+// with ErrOverloaded, and commits once the stall ends.
+func TestLaneQueueBoundReclaimsAbandonedPublishes(t *testing.T) {
+	f := newFakeCommitter()
+	f.gate = make(chan struct{})
+	ls := testLanes(t, Batching{Lanes: 1, QueueMax: 3, LingerMax: time.Hour}, f)
+	first := publishAsync(ls, newPending(context.Background(), "a"))
+	waitStarted(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	var gaveUp []<-chan error
+	for range 3 {
+		gaveUp = append(gaveUp, publishAsync(ls, newPending(ctx, "a")))
+	}
+	waitQueued(t, ls.lanes[0], 3)
+	cancel()
+	for _, g := range gaveUp {
+		if err := <-g; !errors.Is(err, context.Canceled) {
+			t.Fatalf("abandoned publish: err = %v, want context.Canceled", err)
+		}
+	}
+	live := publishAsync(ls, newPending(context.Background(), "b"))
+	select {
+	case err := <-live:
+		close(f.gate) // let the stalled commit finish so the lane can close
+		<-first
+		t.Fatalf("live publish returned %v while the stalled batch held the lane; want it queued", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(f.gate)
+	<-first
+	if err := <-live; err != nil {
+		t.Fatalf("live publish after the stall: %v", err)
+	}
+}
+
 func TestLaneHotChannelDeferralKeepsOrder(t *testing.T) {
 	f := newFakeCommitter()
 	f.gate = make(chan struct{})
