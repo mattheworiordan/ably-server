@@ -30,6 +30,51 @@ type trialConfig struct {
 	rate     float64       // offered load, messages/sec across all publishers
 	warmup   time.Duration // discarded from latency/throughput stats
 	duration time.Duration // measurement window
+
+	// stagger phase-shifts each publisher's first send across one publish
+	// interval. Without it every publisher's limiter starts at the same
+	// instant, so all of them fire together and the offered load arrives
+	// as a burst of len(publishers) messages every interval rather than a
+	// smooth stream. That matters once the publisher count is large: with
+	// 300 publishers each burst is 300 publishes, and the latency
+	// percentiles then measure how fast the system drains a 300-message
+	// burst, whatever the average rate is.
+	stagger bool
+}
+
+// setupTimeout bounds connecting and attaching every client, which
+// happens before the warm-up and measurement window start.
+const setupTimeout = 2 * time.Minute
+
+// staggerOffset is how long publisher i of n waits before its first
+// send so that n publishers at perPub messages/sec each are spread
+// evenly across one publish interval.
+func staggerOffset(i, n int, perPub float64) time.Duration {
+	if n <= 0 || perPub <= 0 {
+		return 0
+	}
+	return time.Duration(float64(i) / float64(n) / perPub * float64(time.Second))
+}
+
+// window is the measurement window in unix nanoseconds. It is fixed only
+// once every client is connected and attached, so the setup transient
+// (connects, attaches, a publisher's first publish) never lands inside
+// it; subscriber callbacks read it atomically.
+type window struct {
+	start, end atomic.Int64
+}
+
+func (w *window) set(setupDone time.Time, warmup, duration time.Duration) {
+	start := setupDone.Add(warmup).UnixNano()
+	w.end.Store(start + duration.Nanoseconds())
+	w.start.Store(start)
+}
+
+// contains reports whether t (unix ns) is inside the window. Before set
+// the window is empty.
+func (w *window) contains(t int64) bool {
+	s := w.start.Load()
+	return s != 0 && t >= s && t <= w.end.Load()
 }
 
 type correctness struct {
@@ -82,7 +127,7 @@ type publisher struct {
 // runTrial drives one fixed-rate trial end to end and returns its
 // latency distribution and a correctness verdict.
 func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
-	budget := cfg.warmup + cfg.duration + 10*time.Second
+	budget := setupTimeout + cfg.warmup + cfg.duration + 10*time.Second
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
@@ -91,9 +136,7 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 	subClients := make([]*ably.Realtime, cfg.subscribers)
 	subsPerChannel := make([]int, cfg.channels)
 
-	startNano := time.Now().UnixNano()
-	measureStartNano := startNano + cfg.warmup.Nanoseconds()
-	measureEndNano := measureStartNano + cfg.duration.Nanoseconds()
+	var win window
 
 	var totalRecv int64
 	for i := range subs {
@@ -136,7 +179,7 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 			}
 			st.observe(seq)
 
-			if tNano >= measureStartNano && tNano <= measureEndNano {
+			if win.contains(tNano) {
 				s.hist.record(time.Duration(time.Now().UnixNano() - tNano))
 			}
 		}); err != nil {
@@ -155,13 +198,24 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 		if err := connect(ctx, client); err != nil {
 			return trialResult{}, fmt.Errorf("publisher %d connect: %w", i, err)
 		}
+		ch := client.Channels.Get(chName)
+		// Attach explicitly so a publisher's first publish is not also its
+		// implicit attach inside the measured window.
+		if err := ch.Attach(ctx); err != nil {
+			return trialResult{}, fmt.Errorf("publisher %d attach %s: %w", i, chName, err)
+		}
 		pubs[i] = &publisher{
 			client:  client,
-			ch:      client.Channels.Get(chName),
+			ch:      ch,
 			id:      i,
 			channel: chName,
 		}
 	}
+
+	// Every client is connected and attached: open the warm-up now.
+	win.set(time.Now(), cfg.warmup, cfg.duration)
+	measureStartNano := win.start.Load()
+	measureEndNano := win.end.Load()
 
 	// --- Offer load. Each publisher is paced to its share of the total
 	// rate; a bounded in-flight semaphore caps memory and turns a server
@@ -176,11 +230,20 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 	publishStop := time.Unix(0, measureEndNano)
 
 	var wg sync.WaitGroup
-	for _, p := range pubs {
+	for i, p := range pubs {
 		wg.Add(1)
-		go func(p *publisher) {
+		go func(p *publisher, i int) {
 			defer wg.Done()
 			lim := rate.NewLimiter(rate.Limit(perPub), 1)
+			if cfg.stagger {
+				// Publisher i first sends i/len(pubs) of a publish interval
+				// late, spreading arrivals evenly across the interval.
+				select {
+				case <-time.After(staggerOffset(i, len(pubs), perPub)):
+				case <-ctx.Done():
+					return
+				}
+			}
 			var seq int64
 			for {
 				if err := lim.WaitN(ctx, 1); err != nil {
@@ -211,7 +274,7 @@ func runTrial(ctx context.Context, cfg trialConfig) (trialResult, error) {
 					<-inflight
 				}
 			}
-		}(p)
+		}(p, i)
 	}
 	wg.Wait()
 
