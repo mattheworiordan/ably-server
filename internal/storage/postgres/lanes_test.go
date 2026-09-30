@@ -610,7 +610,7 @@ func TestLaneLingerMinFullBatchCommitsAtOnce(t *testing.T) {
 // in-flight commit for longer than the floor commit as soon as it
 // returns; the floor never adds to a wait they have already served.
 func TestLaneLingerMinAfterInFlightCommit(t *testing.T) {
-	const floor = 50 * time.Millisecond
+	const floor = 400 * time.Millisecond
 	f := newFakeCommitter()
 	f.gate = make(chan struct{})
 	ls := testLanes(t, Batching{Lanes: 1, LingerMin: floor, LingerMax: time.Hour}, f)

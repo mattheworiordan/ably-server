@@ -462,8 +462,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 //
 // Binding with a non-nil appender first puts the bus subscription in
 // place (Bus.bind: a no-op for pgnotify, whose one LISTEN covers every
-// channel; a LISTEN or a NATS subscription otherwise), then upserts the
-// channels row via ensure_channel (creating it with a fresh seed serial
+// channel; a LISTEN or a NATS subscription otherwise), then reads the
+// channels row (channelRow: a plain read of a row this node knows
+// exists, else ensure_channel, which creates it with a fresh seed serial
 // if absent) and hands the resulting channelSerial — the watermark — to
 // appender.Initialize before this call returns. Because the
 // subscription is in effect before the read, a cm committed after it

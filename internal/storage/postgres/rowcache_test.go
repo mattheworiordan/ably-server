@@ -8,11 +8,7 @@ import (
 // TestRowCacheBounded: the known-row cache remembers names up to its
 // bound and then forgets the oldest first, never growing past it.
 func TestRowCacheBounded(t *testing.T) {
-	orig := rowCacheSize
-	rowCacheSize = 3
-	t.Cleanup(func() { rowCacheSize = orig })
-
-	c := newRowCache(rowCacheSize)
+	c := newRowCache(3)
 	for i := range 3 {
 		c.add(fmt.Sprintf("c%d", i))
 	}

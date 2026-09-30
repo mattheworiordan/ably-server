@@ -405,14 +405,32 @@ func TestBatchedBadIDFailsOnlyItsPublish(t *testing.T) {
 
 // TestBatchedNewChannelsFromTwoNodesDoNotDeadlock: two nodes publish at
 // once to the same set of channels that have no rows yet, in opposite
-// orders. The rows are created before publishes are queued, and a batch
-// never waits while holding a channel row it skipped others for, so no
-// batch deadlocks or fails.
+// orders, with the rows made both ways (DESIGN.md §6.3, channel rows):
+// inside publish_batch_lock (the default), and before publishes are
+// queued (BindOnWrite). A batch inserts new rows in sorted order and
+// waits for nothing after them, and never waits while holding a channel
+// row it skipped others for, so no batch deadlocks or fails.
 func TestBatchedNewChannelsFromTwoNodesDoNotDeadlock(t *testing.T) {
+	for _, bindOnWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bindOnWrite=%v", bindOnWrite), func(t *testing.T) {
+			testNewChannelsFromTwoNodes(t, bindOnWrite)
+		})
+	}
+}
+
+func testNewChannelsFromTwoNodes(t *testing.T, bindOnWrite bool) {
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
-	nodes := []*postgres.Storage{openBatched(t, dsn, postgres.Batching{Lanes: 1}), openBatched(t, dsn, postgres.Batching{Lanes: 1})}
+	open := func() *postgres.Storage {
+		s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Batching: postgres.Batching{Lanes: 1}, BindOnWrite: bindOnWrite})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	nodes := []*postgres.Storage{open(), open()}
 	var names []string
 	for i := range 12 {
 		names = append(names, fmt.Sprintf("fresh-%02d", i))

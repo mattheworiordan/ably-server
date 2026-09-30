@@ -386,10 +386,11 @@ func TestBatchedLostCommitReplyStillDelivers(t *testing.T) {
 	t.Fatal("remote node did not receive the recovered publish within 2s (the sweep is an hour away)")
 }
 
-// TestPublishBatchLockCreatesMissingRow drives the function's fallback
-// for a channel with no row (which the Go path never reaches, since it
-// creates the row before queueing): the row is created, locked and
-// advanced, and the cm's prev is the new row's seed serial.
+// TestPublishBatchLockCreatesMissingRow drives the function's path for a
+// channel with no row (the default Go path's first publish on a cold
+// channel; under BindOnWrite the row is made before queueing instead):
+// the row is created, locked and advanced, and the cm's prev is the new
+// row's seed serial.
 func TestPublishBatchLockCreatesMissingRow(t *testing.T) {
 	c := pgtest.Start(t)
 	ctx := context.Background()
