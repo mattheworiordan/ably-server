@@ -853,9 +853,10 @@ single delivery path for committed cms: the backend invokes
 `appender.Append(cm)` on every fresh publish (skipped on idempotent
 returns, where the original was delivered when first persisted).
 Memory and bbolt fire it synchronously after commit. Postgres fires
-it asynchronously from the LISTEN goroutine after the NOTIFY emitted
-inside the commit tx round-trips — including for the publisher's own
-publish, so there is no separate path for self-publishes (§7).
+it on the publishing node straight after commit (the fast path) and on
+every other node that holds the channel from that channel's bus worker
+when the notification arrives; the high-water mark drops the
+publisher's own notification (§7.2).
 
 Serial minting and idempotency live behind this interface so persistent
 backends (bbolt, Postgres) can restore monotonic generator state across
@@ -1085,70 +1086,106 @@ Local subscribers parked on the previous tail's `notify` wake up and
 observe the new entry. ACK/201 fires once `Publish` returns; the
 linked-list update has already happened by then.
 
-### 7.2 Cluster mode (Postgres broker)
+### 7.2 Cluster mode (Postgres bus)
 
-Same `channel.Publish` API; the Appender fires from a dedicated
-LISTEN goroutine running inside `postgres.Storage`. A publish is:
+Same `channel.Publish` API. Postgres is both the store and the bus; the
+bus lives in `internal/storage/postgres/bus.go`.
 
-1. The publishing node's `store.Store(ctx, msgs)` mints the serial,
-   `INSERT`s the rows, and emits
-   `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`
-   inside the same transaction. PG buffers the NOTIFY until commit,
-   so listeners only see it if the publish committed.
-2. **Every** node's LISTEN goroutine — including the publisher's
-   — receives the NOTIFY, parses the JSON payload, looks up the
-   local `ChannelStore` for that channel name, fetches the canonical
-   cm by `(channel, channel_serial)`, and calls
-   `appender.Append(cm)`. The publisher's local subscribers see the
-   publish via this same round-trip — there is no fast-path direct
-   Append; no self-vs-foreign dedup.
+**Notification channels.** Each Ably channel has its own Postgres
+notification channel: `ably_c_` plus the hex of the first 16 bytes of
+SHA-256(schema, NUL, channel name), which is always a short lower-case
+identifier. The schema (`current_schema()`) is in the hash because NOTIFY
+is scoped per database, not per schema. A node LISTENs on a channel when
+it first binds it (`Storage.Channel` with an appender), and the LISTEN is
+active before the bind reads the channel's watermark, so no commit can
+slip between the two; the watermark seeds the channel's high-water mark.
+A node therefore receives notifications only for the channels it holds.
+Publishing to a channel does not need a bind. core.Manager has no release
+hook, so a bound channel stays LISTENed for the life of the process.
 
-This means the publisher's local-visibility latency is one NOTIFY
-round-trip (typically ~1–5ms against a same-region Postgres). The
-trade-off is a single, symmetric delivery path: any cm reaches its
-Channel via exactly one mechanism (the Appender callback), regardless
-of which node minted it.
+**Publish (`--postgres-notify-mode=publish`, the default).** The write
+transaction mints the channelSerial and, in the same pipelined round trip
+and under the same channels-row lock, reads the serial it follows
+(`prev`). It inserts the rows and calls `pg_notify` on the channel's
+notification channel; Postgres releases the NOTIFY only if the
+transaction commits. The JSON payload is `{channel, serial, prev}` and,
+when the whole payload is under 7,900 bytes, the cm's rows exactly as
+stored (one msgpack payload per row plus the annotation summary column),
+so receivers skip the read-back. `pg_notify` rejects payloads of 8,000
+bytes or more with the default block size, so bigger cms send the
+pointer only and receivers read the cm back by `(channel, serial)`.
 
-Notifications for channels that have never been opened on this node
-(no `Channel(name, appender)` call yet) are silently dropped. The
-canonical cm remains in storage and is picked up by the eventual
-`ATTACH` via the history-replay path (§4.3).
+**Receive.** The LISTEN goroutine only receives and dispatches: it hands
+each payload to the bound channel's queue (at most 1,024 items; a full
+queue blocks the LISTEN goroutine, so backpressure is explicit). A
+channel with queued work has exactly one worker goroutine, started on
+demand and gone when the queue drains, so channels are consumed in
+parallel and each stays in order. The worker drops a cm at or below the
+high-water mark without any I/O. If `prev` is above the mark (a lost
+NOTIFY, or a failed read), it fills the gap with one range read of the
+log. Otherwise it decodes the inline cm or reads the pointer and appends.
+Every append on a channel goes through one delivery point that holds the
+mark's lock across `Appender.Append`, so the Channel sees each cm once and
+in serial order.
 
-The serial's format is itself the global ordering: the `<seriesId>`
-suffix disambiguates serials minted in the same millisecond by
-different processes, so storage's `ORDER BY channel_serial` reflects
-a single global publish order without a central sequence. Local
-linked-list arrival order on a given node approximates this but may
-have small inversions under cross-node interleavings — canonical
-order is the storage scan.
+**Publisher fast path.** After its transaction commits, the publishing
+node appends its own cm to its own Channel at once if `prev` equals its
+mark; the NOTIFY that follows is then dropped as a duplicate. If `prev`
+is above the mark, another node's earlier cm has not reached this node
+yet, so the fast path steps aside and the cm arrives through the NOTIFY
+path behind the earlier one. Local subscribers therefore see a local
+publish without a Postgres round trip.
 
-NOTIFY's 8KB payload limit is why we send pointers `(channel,
-serial)` rather than full payloads. PG delivers notifications
-at-most-once: a NOTIFY emitted while the LISTEN conn is down is not
-redelivered when it reconnects. The broker therefore survives dropped
-LISTEN connections rather than treating a `WaitForNotification` error
-as fatal. When the conn drops, the LISTEN goroutine re-dials a fresh
-`pgx.Conn` with capped exponential backoff, re-`LISTEN`s, and — before
-resuming the notification loop — **reconciles** each registered
-channel: it reads `History(AfterChannelSerial: lastSeen)` (both the
-message and presence streams, merged in serial order) and delivers each
-missed cm. Re-`LISTEN` precedes the reconcile scan, so any cm committed
-during reconciliation is also buffered as a NOTIFY and observed once the
-loop resumes — never lost in a gap between the snapshot and resubscribe.
-It retries until the storage is `Close()`d.
+**Coalesced notify (`--postgres-notify-mode=coalesced`).** Postgres
+serialises every transaction that issued NOTIFY on one cluster-wide lock,
+taken at commit and held through the commit's WAL flush, so NOTIFYing
+writes cannot group-commit, and per-publish NOTIFY caps the primary's
+commit rate whatever the node count. In coalesced mode writes commit
+without NOTIFY. A per-node notifier sends at most one wake-up per channel
+per window (`--postgres-notify-window`, default 50 ms), in one statement
+outside any transaction, naming the latest serial it wrote there. A
+receiver answers a wake-up with one range read of everything after its
+mark, or no read if it is already past that serial. A 2-second poll of the
+`channels` table is the safety net, so a lost wake-up only adds latency.
+The cost is up to one window of extra latency for remote subscribers;
+the publisher's fast path is unchanged. Receivers handle both payload
+types, whatever their own mode.
 
-Delivery is idempotent across the two paths. Every append — steady-state
-NOTIFY dispatch and reconcile replay alike — funnels through a single
-per-channel delivery point that tracks the highest `channel_serial`
-handed to the appender and drops any cm whose serial is not strictly
-greater. So a cm that arrives via both the reconnect history replay and
-a subsequently-buffered NOTIFY reaches the Channel exactly once, in
-order.
+**Reconnect.** Postgres delivers notifications at most once: a NOTIFY
+sent while the LISTEN connection is down is lost. The LISTEN goroutine
+therefore re-dials with capped exponential backoff, re-LISTENs every
+bound channel (batched), and queues a reconcile on each channel's worker
+ahead of any new notification: one paged range read of every kind
+(messages, presence, annotations) after the channel's mark. The mark
+drops any overlap with notifications that arrive afterwards, so each cm
+reaches the Channel exactly once, in order. It retries until the storage
+is `Close()`d.
 
-LISTEN/NOTIFY's well-known throughput ceiling is not a concern here:
-ably-server targets developer-loop, CI, and modest single-region
-self-host deployments. Operators who need cloud-scale throughput
-should use Ably or fork.
+**Ordering.** The serial's format is itself the global ordering: the
+channels-row lock gives each channel a strictly increasing serial across
+nodes, and the `<seriesId>` suffix disambiguates serials minted in the
+same millisecond by different processes, so storage's
+`ORDER BY channel_serial` is the canonical order. The predecessor check
+makes every node's live list follow that order exactly.
+
+**Limits that remain.** Postgres wakes every listening backend in the
+database on each notifying commit, and each backend filters the
+notification against its own LISTEN list; per-channel LISTEN moves that
+filtering from the nodes into Postgres. In `publish` mode the
+notify-lock ceiling above still applies; `coalesced` mode removes it at
+the price of the window. One Postgres primary is still one primary:
+channel-sharding across several Postgres instances is the next step and
+is not built.
+
+**History.** Until 2026-09 the bus used one global LISTEN channel,
+`ably_channel`. Every node received every notification in the cluster,
+parsed its `{channel, serial}` pointer, dropped it if the channel was not
+open locally, and otherwise ran a SELECT by `(channel, channel_serial)`
+before taking the next notification. The publisher saw its own publish
+only through the same NOTIFY round trip, and reconnect replayed messages
+and presence from History. That made per-node ingress proportional to
+the cluster-wide publish rate and limited a node to one delivered cm per
+Postgres round trip.
 
 ## 8. Identifiers & ordering
 
