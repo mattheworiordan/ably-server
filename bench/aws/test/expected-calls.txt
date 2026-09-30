@@ -1,0 +1,54 @@
+### 00-preflight.sh 
+DRYRUN aws sts get-caller-identity --query Account --region test-region-1 --output text
+DRYRUN aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query Quota.Value --region test-region-1 --output text
+DRYRUN aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=location,Values=test-region-1a Name=instance-type,Values=c7i.2xlarge --query InstanceTypeOfferings[0].InstanceType --region test-region-1 --output text
+DRYRUN aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=location,Values=test-region-1a Name=instance-type,Values=c7i.8xlarge --query InstanceTypeOfferings[0].InstanceType --region test-region-1 --output text
+DRYRUN aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=location,Values=test-region-1a Name=instance-type,Values=c7i.4xlarge --query InstanceTypeOfferings[0].InstanceType --region test-region-1 --output text
+DRYRUN aws ecr describe-repositories --repository-names ably-server --query repositories[0].repositoryName --region test-region-1 --output text
+DRYRUN aws ecr create-repository --repository-name ably-server --tags Key=Project,Value=test-scale Key=Name,Value=ably-server --region test-region-1
+DRYRUN aws ecr describe-repositories --repository-names ably-loadgen --query repositories[0].repositoryName --region test-region-1 --output text
+DRYRUN aws ecr create-repository --repository-name ably-loadgen --tags Key=Project,Value=test-scale Key=Name,Value=ably-loadgen --region test-region-1
+DRYRUN aws budgets describe-budget --account-id 111111111111 --budget-name test-scale-cap --query Budget.BudgetName --region test-region-1 --output text
+DRYRUN aws budgets create-budget --account-id 111111111111 --budget file://<work>/budget.json --notifications-with-subscribers file://<work>/budget-notifications.json --region test-region-1
+### 10-network.sh 
+DRYRUN aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query Vpcs[0].VpcId --region test-region-1 --output text
+DRYRUN aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-dryrun Name=availability-zone,Values=test-region-1a Name=default-for-az,Values=true --query Subnets[0].[SubnetId,CidrBlock] --region test-region-1 --output text
+DRYRUN aws ec2 describe-security-groups --filters Name=group-name,Values=test-scale-sg Name=vpc-id,Values=vpc-dryrun --query SecurityGroups[0].GroupId --region test-region-1 --output text
+DRYRUN aws ec2 create-security-group --group-name test-scale-sg --description 'ably-server scale proof (test-scale)' --vpc-id vpc-dryrun --tag-specifications ResourceType=security-group,Tags=[{Key=Project,Value=test-scale},{Key=Name,Value=test-scale-sg},{Key=Role,Value=network}] --query GroupId --output text --region test-region-1
+DRYRUN aws ec2 authorize-security-group-ingress --group-id sg-dryrun --ip-permissions IpProtocol=-1,UserIdGroupPairs=[{GroupId=sg-dryrun}] --region test-region-1
+DRYRUN aws ec2 authorize-security-group-ingress --group-id sg-dryrun --protocol tcp --port 22 --cidr 203.0.113.9/32 --region test-region-1
+DRYRUN aws ec2 describe-placement-groups --filters Name=group-name,Values=test-scale-cluster --query PlacementGroups[0].GroupName --region test-region-1 --output text
+DRYRUN aws ec2 create-placement-group --group-name test-scale-cluster --strategy cluster --tag-specifications ResourceType=placement-group,Tags=[{Key=Project,Value=test-scale},{Key=Name,Value=test-scale-cluster},{Key=Role,Value=network}] --region test-region-1
+DRYRUN aws ec2 describe-key-pairs --filters Name=key-name,Values=test-scale-key --query KeyPairs[0].KeyName --region test-region-1 --output text
+DRYRUN aws ec2 import-key-pair --key-name test-scale-key --public-key-material fileb://<tmp>/bench.pub --tag-specifications ResourceType=key-pair,Tags=[{Key=Project,Value=test-scale},{Key=Name,Value=test-scale-key},{Key=Role,Value=network}] --region test-region-1
+DRYRUN aws iam get-role --role-name test-scale-instance --query Role.RoleName --region test-region-1 --output text
+DRYRUN aws iam create-role --role-name test-scale-instance --assume-role-policy-document file://<work>/trust.json --tags Key=Project,Value=test-scale Key=Name,Value=test-scale-instance --region test-region-1
+DRYRUN aws iam attach-role-policy --role-name test-scale-instance --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly --region test-region-1
+DRYRUN aws iam attach-role-policy --role-name test-scale-instance --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore --region test-region-1
+DRYRUN aws iam get-instance-profile --instance-profile-name test-scale-instance --query InstanceProfile.InstanceProfileName --region test-region-1 --output text
+DRYRUN aws iam create-instance-profile --instance-profile-name test-scale-instance --tags Key=Project,Value=test-scale Key=Name,Value=test-scale-instance --region test-region-1
+DRYRUN aws iam add-role-to-instance-profile --instance-profile-name test-scale-instance --role-name test-scale-instance --region test-region-1
+DRYRUN aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --region test-region-1 --output text
+### 90-teardown.sh --yes
+DRYRUN aws ec2 describe-instances --filters Name=tag:Project,Values=test-scale Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down --query Reservations[].Instances[].InstanceId --region test-region-1 --output text
+DRYRUN aws rds describe-db-instances --query 'DBInstances[?starts_with(DBInstanceIdentifier, `test-scale-`)].DBInstanceIdentifier' --region test-region-1 --output text
+DRYRUN aws rds describe-db-parameter-groups --query 'DBParameterGroups[?starts_with(DBParameterGroupName, `test-scale-`)].DBParameterGroupName' --region test-region-1 --output text
+DRYRUN aws rds describe-db-subnet-groups --query 'DBSubnetGroups[?starts_with(DBSubnetGroupName, `test-scale-`)].DBSubnetGroupName' --region test-region-1 --output text
+DRYRUN aws ec2 describe-network-interfaces --filters Name=tag:Project,Values=test-scale --query NetworkInterfaces[].NetworkInterfaceId --region test-region-1 --output text
+DRYRUN aws ec2 describe-volumes --filters Name=tag:Project,Values=test-scale Name=status,Values=available --query Volumes[].VolumeId --region test-region-1 --output text
+DRYRUN aws ec2 delete-security-group --group-id sg-dryrun --region test-region-1
+DRYRUN aws ec2 delete-placement-group --group-name test-scale-cluster --region test-region-1
+DRYRUN aws ec2 delete-key-pair --key-name test-scale-key --region test-region-1
+DRYRUN aws iam remove-role-from-instance-profile --instance-profile-name test-scale-instance --role-name test-scale-instance --region test-region-1
+DRYRUN aws iam delete-instance-profile --instance-profile-name test-scale-instance --region test-region-1
+DRYRUN aws iam detach-role-policy --role-name test-scale-instance --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly --region test-region-1
+DRYRUN aws iam detach-role-policy --role-name test-scale-instance --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore --region test-region-1
+DRYRUN aws iam delete-role --role-name test-scale-instance --region test-region-1
+DRYRUN aws ec2 describe-instances --filters Name=tag:Project,Values=test-scale Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down --query Reservations[].Instances[].InstanceId --region test-region-1 --output text
+DRYRUN aws rds describe-db-instances --query 'DBInstances[?starts_with(DBInstanceIdentifier, `test-scale-`)].DBInstanceIdentifier' --region test-region-1 --output text
+DRYRUN aws ec2 describe-volumes --filters Name=tag:Project,Values=test-scale --query Volumes[].VolumeId --region test-region-1 --output text
+DRYRUN aws ec2 describe-network-interfaces --filters Name=tag:Project,Values=test-scale --query NetworkInterfaces[].NetworkInterfaceId --region test-region-1 --output text
+DRYRUN aws ec2 describe-security-groups --filters Name=tag:Project,Values=test-scale --query SecurityGroups[].GroupId --region test-region-1 --output text
+DRYRUN aws ec2 describe-placement-groups --filters Name=tag:Project,Values=test-scale --query PlacementGroups[].GroupName --region test-region-1 --output text
+DRYRUN aws ec2 describe-key-pairs --filters Name=tag:Project,Values=test-scale --query KeyPairs[].KeyName --region test-region-1 --output text
+DRYRUN aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=test-scale --query ResourceTagMappingList[].ResourceARN --region test-region-1 --output text
