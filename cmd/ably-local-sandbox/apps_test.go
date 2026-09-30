@@ -202,3 +202,33 @@ func TestTranslateValidationErrors(t *testing.T) {
 		}
 	})
 }
+
+// TestClusterChildArgs checks the cluster-mode child flags: a schema per
+// app that needs no quoting, the search_path in the child DSN, and the
+// bus flags.
+func TestClusterChildArgs(t *testing.T) {
+	a, b := schemaFor("App-ID.x:y"), schemaFor("App-ID.x:y")
+	if a == b {
+		t.Fatalf("two provisions of one app id share schema %q", a)
+	}
+	for _, r := range a {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			t.Fatalf("schema %q has a character that needs quoting", a)
+		}
+	}
+	c := &clusterChildren{dsn: "postgres://u:p@h:5432/db?sslmode=disable", bus: "nats", natsURL: "nats://n1:4222,nats://n2:4222"}
+	args, err := c.args("sandbox_x_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--mode cluster", "--bus nats", "--nats-url nats://n1:4222,nats://n2:4222", "search_path%3Dsandbox_x_1", "sslmode=disable"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("child args %q lack %q", joined, want)
+		}
+	}
+	kv, err := withSearchPath("host=h dbname=db", "s1")
+	if err != nil || kv != "host=h dbname=db options='-c search_path=s1'" {
+		t.Errorf("key=value DSN = %q, %v", kv, err)
+	}
+}

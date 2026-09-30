@@ -41,6 +41,7 @@ type child struct {
 	cmd     *exec.Cmd
 	logFile *os.File
 	tmpDir  string
+	schema  string // cluster-mode children: the app's schema, dropped on terminate
 	// done is closed once cmd.Wait returns; waitErr holds its result.
 	done    chan struct{}
 	waitErr error
@@ -50,6 +51,7 @@ type child struct {
 // (DESIGN.md §15).
 type provisioner struct {
 	serverCmd serverCommand
+	cluster   *clusterChildren // nil: memory-mode children
 	logDir    string
 	idleTTL   time.Duration
 	logger    *logging.Logger
@@ -114,10 +116,26 @@ func (p *provisioner) startChild(appID, tomlConfig string) (*child, error) {
 		return nil, fmt.Errorf("create log file: %w", err)
 	}
 
+	modeArgs := []string{"--mode", "memory"}
+	var schema string
+	if p.cluster != nil {
+		schema = schemaFor(appID)
+		if modeArgs, err = p.cluster.args(schema); err != nil {
+			_ = logFile.Close()
+			cleanup()
+			return nil, err
+		}
+		if err := p.cluster.createSchema(schema); err != nil {
+			_ = logFile.Close()
+			cleanup()
+			return nil, err
+		}
+	}
+
 	args := append([]string{}, p.serverCmd.prefixArgs...)
+	args = append(args, "--config", cfgPath)
+	args = append(args, modeArgs...)
 	args = append(args,
-		"--config", cfgPath,
-		"--mode", "memory",
 		"--listen", "127.0.0.1:0",
 		"--addr-file", addrPath,
 		// SDK compat suites POST stats before reading them back;
@@ -140,6 +158,9 @@ func (p *provisioner) startChild(appID, tomlConfig string) (*child, error) {
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
 		cleanup()
+		if schema != "" {
+			_ = p.cluster.dropSchema(schema)
+		}
 		return nil, fmt.Errorf("start ably-server: %w", err)
 	}
 
@@ -148,6 +169,7 @@ func (p *provisioner) startChild(appID, tomlConfig string) (*child, error) {
 		cmd:     cmd,
 		logFile: logFile,
 		tmpDir:  tmpDir,
+		schema:  schema,
 		done:    make(chan struct{}),
 	}
 	go func() {
@@ -214,6 +236,11 @@ func (p *provisioner) terminate(c *child) {
 		_ = c.logFile.Close()
 	}
 	_ = os.RemoveAll(c.tmpDir)
+	if c.schema != "" && p.cluster != nil {
+		if err := p.cluster.dropSchema(c.schema); err != nil {
+			p.logger.Warn("drop app schema", "appId", c.appID, "err", err)
+		}
+	}
 }
 
 // reapLoop periodically kills children not touched within idleTTL,

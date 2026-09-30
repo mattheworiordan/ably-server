@@ -28,6 +28,9 @@ const (
 	idleTTLEnv   = "ABLY_LOCAL_SANDBOX_IDLE_TTL"
 	logDirEnv    = "ABLY_LOCAL_SANDBOX_LOG_DIR"
 	logLevelEnv  = "ABLY_LOCAL_SANDBOX_LOG_LEVEL"
+	childDSNEnv  = "ABLY_LOCAL_SANDBOX_CHILD_POSTGRES_DSN"
+	childBusEnv  = "ABLY_LOCAL_SANDBOX_CHILD_BUS"
+	childNATSEnv = "ABLY_LOCAL_SANDBOX_CHILD_NATS_URL"
 )
 
 func main() {
@@ -60,6 +63,9 @@ func run(ctx context.Context, opts runOpts) int {
 	idleTTL := fs.Duration("idle-ttl", defDuration(opts.Getenv(idleTTLEnv), 30*time.Minute), "kill child servers not provisioned or deleted within this window (env: "+idleTTLEnv+")")
 	logDir := fs.String("log-dir", opts.Getenv(logDirEnv), "directory for per-app child configs and logs; a temp dir is created if empty (env: "+logDirEnv+")")
 	logLevel := fs.String("log-level", def(opts.Getenv(logLevelEnv), "info"), "log level: "+logging.LevelNames+" (env: "+logLevelEnv+")")
+	childDSN := fs.String("child-postgres-dsn", opts.Getenv(childDSNEnv), "run children in cluster mode against this Postgres database, one schema per app; empty runs memory-mode children (env: "+childDSNEnv+")")
+	childBus := fs.String("child-bus", def(opts.Getenv(childBusEnv), "pgnotify"), "cluster bus for cluster-mode children: pgnotify, postgres or nats (env: "+childBusEnv+")")
+	childNATS := fs.String("child-nats-url", opts.Getenv(childNATSEnv), "NATS URL for cluster-mode children with --child-bus=nats (env: "+childNATSEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -90,6 +96,21 @@ func run(ctx context.Context, opts runOpts) int {
 	}
 
 	p := newProvisioner(serverCmd, dir, *idleTTL, logger)
+	if *childDSN != "" {
+		switch *childBus {
+		case "pgnotify", "postgres":
+		case "nats":
+			if *childNATS == "" {
+				logger.Error("--child-bus=nats requires --child-nats-url")
+				return 1
+			}
+		default:
+			logger.Error("unknown --child-bus", "bus", *childBus)
+			return 1
+		}
+		p.cluster = &clusterChildren{dsn: *childDSN, bus: *childBus, natsURL: *childNATS}
+		logger.Info("children run in cluster mode", "bus", *childBus)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /apps", p.handleCreateApp)

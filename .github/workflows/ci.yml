@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'scale/**']
   pull_request:
 
 jobs:
@@ -17,6 +17,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
       - name: go build
         run: go build ./...
@@ -33,7 +36,7 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,5 +46,126 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Default bus (pgnotify) for the SDK suite; the storage package's
+      # contract suite runs on every bus mode in this job too.
       - name: go test (integration, race)
         run: go test -tags=integration -race ./...
+
+  # One cell per cluster bus (DESIGN.md §7.2): the storage contract suite
+  # for that bus, then the SDK integration suite with the servers on it.
+  bus:
+    name: Cluster bus ${{ matrix.bus }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bus: pgnotify
+            contract: TestPostgresChannelStoreContract
+          - bus: postgres
+            contract: TestCoalescedChannelStoreContract
+          - bus: postgres-transactional
+            contract: TestPGBusTransactionalChannelStoreContract
+          - bus: nats
+            contract: TestNATSBusChannelStoreContract
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Storage contract suite
+        run: go test -tags=integration -race -count=1 -run '^${{ matrix.contract }}$' -v ./internal/storage/postgres/
+
+      - name: SDK integration suite
+        env:
+          ABLY_INTEGRATION_BUS: ${{ matrix.bus }}
+        run: go test -tags=integration -race -count=1 ./internal/server/integrationtest/
+
+  compose:
+    name: Compose stack ${{ matrix.bus }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        bus: [pgnotify, postgres, nats]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Three nodes up; publish on node 1, read on node 3
+        run: bench/compose-smoke.sh ${{ matrix.bus }}
+
+  # The ably-go compatibility suite as a smoke of the nats bus end to end:
+  # every provisioned app gets a cluster-mode child on its own Postgres
+  # schema, delivering over a NATS server. Gated against the same
+  # known-failures list as memory mode, so a cluster-only failure shows
+  # as a regression.
+  compat-nats:
+    name: Compat ably-go (nats bus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ably
+          POSTGRES_PASSWORD: ably
+          POSTGRES_DB: ably
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ably -d ably"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      nats:
+        image: nats:2.11-alpine
+        ports: ['4222:4222']
+    steps:
+      - name: Checkout ably-server
+        uses: actions/checkout@v4
+
+      - name: Checkout ably-go
+        uses: actions/checkout@v4
+        with:
+          repository: ably/ably-go
+          ref: main
+          path: ably-go
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build ably-server and the sandbox
+        run: |
+          mkdir -p bin
+          go build -o bin/ably-server ./cmd/ably-server
+          go build -o bin/ably-local-sandbox ./cmd/ably-local-sandbox
+
+      - name: Start the sandbox (cluster-mode children on the nats bus)
+        run: |
+          bin/ably-local-sandbox --listen :9010 \
+            --child-postgres-dsn 'postgres://ably:ably@localhost:5432/ably?sslmode=disable' \
+            --child-bus nats --child-nats-url nats://localhost:4222 \
+            > sandbox.log 2>&1 &
+          for i in $(seq 1 50); do curl -fsS -X POST localhost:9010/stats >/dev/null 2>&1 && exit 0; sleep 0.2; done
+          cat sandbox.log; exit 1
+
+      - name: Run the ably-go suite
+        run: compat/runners/ably-go/run.sh --sdk-dir ably-go --url http://localhost:9010 --out compat-results-ably-go.json
+
+      - name: Gate against the known failures
+        run: go run ./cmd/compat-gate --results compat-results-ably-go.json --ignore compat/known-failures/ably-go.toml
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-ably-go-nats
+          path: |
+            compat-results-ably-go.json
+            sandbox.log

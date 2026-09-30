@@ -1138,9 +1138,15 @@ re-`LISTEN`s, and then reconciles each bound channel from
 `History(AfterChannelSerial: lastSeen)` (messages and presence, merged in
 serial order) before it resumes. A per-channel high-water mark drops any
 cm at or below the last one delivered, so the reconcile and a buffered
-notification never deliver a cm twice. The mark is seeded with the
-channel's watermark at bind, so a notification for a cm already covered
-by the watermark is dropped too.
+notification never deliver a cm twice. The store joins the dispatch map
+before the bind reads the channel's watermark, so no notification
+committed after the read is missed; one that arrives before
+`Initialize` is held and replayed after it, filtered against the
+watermark, which also seeds the mark. A reconnect that asks for a
+reconcile while a channel is still binding defers it: the bind runs it
+from the watermark and merges it with the held notifications before the
+channel goes live, so a held notification cannot move the mark past a
+cm whose notification was lost in the drop.
 
 Two ceilings limit this bus. Postgres serialises every transaction that
 issued a NOTIFY on one lock, shared by every database in the Postgres
@@ -1249,8 +1255,10 @@ channels.
 #### nats
 
 After commit the publishing node publishes one message to the channel's
-subject, `ably.cm.` plus the unpadded URL-safe base64 of the channel name
-(`ably.cm.h.<sha256 hex>` for a name too long to encode). The body is a
+subject: `ably.cm.`, a namespace token (the hex of the first 6 bytes of
+SHA-256 of the schema, so deployments sharing a NATS cluster but not a
+schema never hear each other), `.`, then the unpadded URL-safe base64 of
+the channel name (`h.<sha256 hex>` for a name too long to encode). The body is a
 msgpack envelope of channel, serial, predecessor and the cm as stored,
 with annotation summary snapshots. A cm whose encoding exceeds
 `--nats-inline-max-bytes` (default 256 KiB) goes as a pointer, and
@@ -2273,6 +2281,18 @@ that, it falls back to `go run ./cmd/ably-server` (which assumes the
 working directory is the module root, the case when the provisioner itself
 runs under `go run`).
 
+**Cluster-mode children.** With `--child-postgres-dsn` the provisioner
+runs every child in cluster mode instead (`--mode cluster
+--postgres-dsn <dsn with search_path=<schema>> --bus <--child-bus>`, plus
+`--nats-url <--child-nats-url>` for `--child-bus=nats`). Each app gets a
+fresh schema in that database, created on `POST /apps` and dropped when
+the child is terminated. A schema per app keeps apps apart in Postgres
+and, because the bus hashes the schema into its channel names (§7.2),
+on a shared NATS server too. CI uses this to run an SDK suite end to end
+on the `nats` bus. The flags have `ABLY_LOCAL_SANDBOX_CHILD_POSTGRES_DSN`,
+`ABLY_LOCAL_SANDBOX_CHILD_BUS` and `ABLY_LOCAL_SANDBOX_CHILD_NATS_URL`
+equivalents.
+
 ## 16. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
@@ -2283,6 +2303,13 @@ runs under `go run`).
 - **Cluster**: Postgres + 2 server processes in Docker Compose; tests cover
   cross-node publish and `channelSerial`-based replay on reconnect to a
   different node.
+- **Per bus** (§7.2): the storage contract suite runs on every cluster bus
+  (`pgnotify`, `postgres` coalesced and transactional, `nats`); the SDK
+  integration suite runs on any of them via `ABLY_INTEGRATION_BUS`; each
+  bus has a three-node compose stack under `bench/` with
+  `bench/compose-smoke.sh`; and CI runs all of these as a matrix, plus the
+  ably-go suite against cluster-mode sandbox children on the `nats` bus
+  (§15). NATS-cluster failover is tested against three NATS servers.
 
 There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
