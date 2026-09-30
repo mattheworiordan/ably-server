@@ -98,6 +98,7 @@ func (cs *channelStore) offerLocked(ev busEvent) {
 	case ev.prev > cs.lastSeen:
 		// The predecessor has not been delivered yet: hold, and read the
 		// gap from the log if it does not turn up.
+		cs.held++
 		cs.holdLocked(ev)
 		cs.armGapFillLocked(cs.timing.gapDelay)
 		return

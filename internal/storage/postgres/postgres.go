@@ -944,7 +944,7 @@ type channelStore struct {
 	sub            *nats.Subscription
 
 	// Delivery counters for tests (guarded by hwmMu).
-	delivered, duplicates, gapFills, sweepCatchUps int
+	delivered, duplicates, held, gapFills, sweepCatchUps int
 }
 
 // deliver hands cm to the appender exactly once and in order, advancing
