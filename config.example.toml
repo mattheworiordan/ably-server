@@ -94,6 +94,26 @@
 # ABLY_SERVER_CHANNEL_IDLE_TIMEOUT).
 # channel-idle-timeout = "60s"
 
+# Connection layer (DESIGN.md §5.2). Bytes of encoded frames queued for
+# one connection before pushes to it wait
+# (env: ABLY_SERVER_CONN_OUTBOUND_MAX_BYTES).
+# conn-outbound-max-bytes = 1048576
+
+# Deadline for one frame write, and the longest wait for room in a full
+# outbound queue, before the client is disconnected as a slow consumer
+# (env: ABLY_SERVER_CONN_WRITE_TIMEOUT).
+# conn-write-timeout = "10s"
+
+# Per-connection WebSocket read buffer, and the pooled write buffer, in
+# bytes (env: ABLY_SERVER_WS_READ_BUFFER_SIZE,
+# ABLY_SERVER_WS_WRITE_BUFFER_SIZE).
+# ws-read-buffer-size = 1024
+# ws-write-buffer-size = 4096
+
+# How long an idle HTTP keep-alive connection is kept open waiting for
+# the next request (DESIGN.md §2.2) (env: ABLY_SERVER_HTTP_IDLE_TIMEOUT).
+# http-idle-timeout = "120s"
+
 # [[keys]] entries are the only file-tier source of API keys, and the
 # only one that can carry a narrowing capability. Each entry is an
 # Ably-format key spec plus an optional `capability` — an

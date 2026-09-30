@@ -343,6 +343,11 @@ func qualifierMatches(x, y string) bool {
 //   - "*" alone matches every channel, as does the sandbox all-access
 //     key's "[*]*".
 func matchResource(pattern, channel string) bool {
+	// "*" matches every channel; answered without splitting either name
+	// (the full capability every flag/env key grants, DESIGN.md §2.2).
+	if pattern == "*" {
+		return true
+	}
 	qual, pSegs := parseResource(pattern)
 	if !qualifierMatches(qual, "") {
 		return false

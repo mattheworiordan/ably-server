@@ -408,7 +408,7 @@ key = "app.key:secret"
 	}
 }
 
-func TestRunChannelIdleTimeoutValidation(t *testing.T) {
+func TestRunLifecycleAndConnFlagValidation(t *testing.T) {
 	cases := []struct {
 		name     string
 		args     []string
@@ -420,6 +420,11 @@ func TestRunChannelIdleTimeoutValidation(t *testing.T) {
 		{"negative flag", []string{"--keys=app.key:secret", "--channel-idle-timeout=-1s"}, nil, "", 2, "must not be negative"},
 		{"malformed env", []string{"--keys=app.key:secret"}, map[string]string{channelIdleEnv: "soon"}, "", 1, "invalid duration"},
 		{"malformed file", []string{"--keys=app.key:secret"}, nil, `channel-idle-timeout = "soon"`, 1, "invalid duration"},
+		{"zero outbound bytes", []string{"--keys=app.key:secret", "--conn-outbound-max-bytes=0"}, nil, "", 2, "must be positive"},
+		{"negative write timeout", []string{"--keys=app.key:secret", "--conn-write-timeout=-1s"}, nil, "", 2, "must be positive"},
+		{"malformed read buffer env", []string{"--keys=app.key:secret"}, map[string]string{wsReadBufEnv: "big"}, "", 1, "invalid integer"},
+		{"zero http idle timeout", []string{"--keys=app.key:secret", "--http-idle-timeout=0s"}, nil, "", 2, "must be positive"},
+		{"malformed write timeout file", []string{"--keys=app.key:secret"}, nil, `conn-write-timeout = "soon"`, 1, "invalid duration"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

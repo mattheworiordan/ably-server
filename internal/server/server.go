@@ -61,7 +61,18 @@ const (
 	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
 	busSweepEnv        = "ABLY_SERVER_BUS_SWEEP_INTERVAL"
 	channelIdleEnv     = "ABLY_SERVER_CHANNEL_IDLE_TIMEOUT"
+	connOutboundEnv    = "ABLY_SERVER_CONN_OUTBOUND_MAX_BYTES"
+	connWriteTOEnv     = "ABLY_SERVER_CONN_WRITE_TIMEOUT"
+	wsReadBufEnv       = "ABLY_SERVER_WS_READ_BUFFER_SIZE"
+	wsWriteBufEnv      = "ABLY_SERVER_WS_WRITE_BUFFER_SIZE"
+	httpIdleEnv        = "ABLY_SERVER_HTTP_IDLE_TIMEOUT"
 )
+
+// DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
+// keep-alive connection open waiting for the next request (DESIGN.md
+// §2.2). Without it an idle keep-alive connection is held until the
+// client closes it.
+const DefaultHTTPIdleTimeout = 120 * time.Second
 
 // Opts bundles Run's inputs so the production main() and tests
 // share one entry point. Args/Getenv/Out are required; Ready is an
@@ -122,6 +133,31 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	connWriteTimeoutDefault, err := config.DefaultDuration(opts.Getenv(connWriteTOEnv), file.ConnWriteTimeout, realtime.DefaultConnWriteTimeout)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	connOutboundDefault, err := config.DefaultInt64(opts.Getenv(connOutboundEnv), file.ConnOutboundMaxBytes, realtime.DefaultConnOutboundMaxBytes)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	wsReadBufDefault, err := config.DefaultInt64(opts.Getenv(wsReadBufEnv), file.WSReadBufferSize, realtime.DefaultWSReadBufferSize)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	wsWriteBufDefault, err := config.DefaultInt64(opts.Getenv(wsWriteBufEnv), file.WSWriteBufferSize, realtime.DefaultWSWriteBufferSize)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	httpIdleDefault, err := config.DefaultDuration(opts.Getenv(httpIdleEnv), file.HTTPIdleTimeout, DefaultHTTPIdleTimeout)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -173,11 +209,24 @@ func Run(ctx context.Context, opts Opts) int {
 	addrFile := fs.String("addr-file", opts.Getenv(addrFileEnv), "path to write the bound listener address to once listening; used by a parent process to discover an ephemeral (--listen :0) port (env: "+addrFileEnv+")")
 	enableStatsStub := fs.Bool("enable-stats-stub", enableStatsStubDefault, "register the GET/POST /stats compatibility stub used by SDK test flows; unregistered (404) by default (env: "+enableStatsStubEnv+")")
 	channelIdleTimeout := fs.Duration("channel-idle-timeout", channelIdleDefault, "evict a channel with no attachments, no operation in flight and no presence members after this long idle, releasing its storage binding; 0 disables eviction (DESIGN.md §5.1) (env: "+channelIdleEnv+")")
+	connOutboundMaxBytes := fs.Int64("conn-outbound-max-bytes", connOutboundDefault, "bytes of encoded frames queued for one connection before publishers to it wait; a queue that stays full for --conn-write-timeout disconnects the client as a slow consumer (DESIGN.md §5.2) (env: "+connOutboundEnv+")")
+	connWriteTimeout := fs.Duration("conn-write-timeout", connWriteTimeoutDefault, "deadline for one frame write, and the longest wait for room in a full outbound queue, before the connection is closed as a slow consumer (DESIGN.md §5.2) (env: "+connWriteTOEnv+")")
+	wsReadBufferSize := fs.Int64("ws-read-buffer-size", wsReadBufDefault, "per-connection WebSocket read buffer in bytes (DESIGN.md §5.2) (env: "+wsReadBufEnv+")")
+	wsWriteBufferSize := fs.Int64("ws-write-buffer-size", wsWriteBufDefault, "WebSocket write buffer in bytes, pooled and held only during a write (DESIGN.md §5.2) (env: "+wsWriteBufEnv+")")
+	httpIdleTimeout := fs.Duration("http-idle-timeout", httpIdleDefault, "how long an idle HTTP keep-alive connection is kept open for the next request (DESIGN.md §2.2) (env: "+httpIdleEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
+		return 2
+	}
+	if *httpIdleTimeout <= 0 {
+		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
 		return 2
 	}
 	if *channelIdleTimeout < 0 {
 		fmt.Fprintln(opts.Out, "--channel-idle-timeout must not be negative")
+		return 2
+	}
+	if *connOutboundMaxBytes <= 0 || *connWriteTimeout <= 0 || *wsReadBufferSize <= 0 || *wsWriteBufferSize <= 0 {
+		fmt.Fprintln(opts.Out, "--conn-outbound-max-bytes, --conn-write-timeout, --ws-read-buffer-size and --ws-write-buffer-size must be positive")
 		return 2
 	}
 
@@ -296,6 +345,12 @@ func Run(ctx context.Context, opts Opts) int {
 
 	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
 	rt.SetRemainPresentFor(*remainPresentFor)
+	rt.SetConnLimits(realtime.ConnLimits{
+		OutboundMaxBytes: *connOutboundMaxBytes,
+		WriteTimeout:     *connWriteTimeout,
+		ReadBufferSize:   int(*wsReadBufferSize),
+		WriteBufferSize:  int(*wsWriteBufferSize),
+	})
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally.
@@ -318,6 +373,9 @@ func Run(ctx context.Context, opts Opts) int {
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Keep-alive (DESIGN.md §2.2): REST publishers reuse connections;
+		// an idle one is closed after this long.
+		IdleTimeout: *httpIdleTimeout,
 	}
 
 	listener, err := net.Listen("tcp", *listen)

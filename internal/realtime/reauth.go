@@ -150,8 +150,10 @@ func (c *connection) handleAuth(ctx context.Context, msg *protocol.ProtocolMessa
 	c.setAuth(p.Capabilities(), p.ExpiresAt)
 	c.reconcileAttachmentCapabilities(ctx)
 
-	// Signal the authLoop to reschedule against the new expiry. The
-	// channel is buffered (cap 1) so this never blocks the read loop.
+	// Signal the authLoop to reschedule against the new expiry, starting
+	// it if this connection had none (a Basic connection's first token).
+	// The channel is buffered (cap 1) so this never blocks the read loop.
+	c.startAuthLoop()
 	select {
 	case c.reauth <- p.ExpiresAt:
 	case <-ctx.Done():

@@ -31,6 +31,51 @@ const DefaultHeartbeatInterval = 15 * time.Second
 // server's connection.defaultRemainPresentFor (15s).
 const DefaultRemainPresentFor = 15 * time.Second
 
+// Connection-layer defaults (DESIGN.md §5.2, §9).
+const (
+	// DefaultConnOutboundMaxBytes bounds the encoded frames queued for one
+	// connection.
+	DefaultConnOutboundMaxBytes = 1 << 20
+	// DefaultConnWriteTimeout bounds one frame write, and how long a push
+	// waits for room in a full outbound queue before the connection is
+	// disconnected as a slow consumer.
+	DefaultConnWriteTimeout = 10 * time.Second
+	// DefaultWSReadBufferSize is the per-connection WebSocket read buffer.
+	// Inbound traffic on a subscriber connection is small (ATTACH,
+	// HEARTBEAT, ACKable publishes), and a larger frame is read in several
+	// fills, so 1 KiB keeps the resident cost of 100k+ connections low.
+	DefaultWSReadBufferSize = 1024
+	// DefaultWSWriteBufferSize is the WebSocket write buffer. Write
+	// buffers come from a shared pool and are held only during a write,
+	// so this costs memory per concurrent write, not per connection.
+	DefaultWSWriteBufferSize = 4096
+)
+
+// ConnLimits configures the per-connection outbound path (DESIGN.md
+// §5.2). Zero fields take the Default* values.
+type ConnLimits struct {
+	OutboundMaxBytes int64
+	WriteTimeout     time.Duration
+	ReadBufferSize   int
+	WriteBufferSize  int
+}
+
+func (l ConnLimits) withDefaults() ConnLimits {
+	if l.OutboundMaxBytes <= 0 {
+		l.OutboundMaxBytes = DefaultConnOutboundMaxBytes
+	}
+	if l.WriteTimeout <= 0 {
+		l.WriteTimeout = DefaultConnWriteTimeout
+	}
+	if l.ReadBufferSize <= 0 {
+		l.ReadBufferSize = DefaultWSReadBufferSize
+	}
+	if l.WriteBufferSize <= 0 {
+		l.WriteBufferSize = DefaultWSWriteBufferSize
+	}
+	return l
+}
+
 // Server holds the realtime endpoint's state. Its HTTP handlers are
 // exported methods; callers register them on their own ServeMux.
 type Server struct {
@@ -41,6 +86,7 @@ type Server struct {
 	metrics           *metrics.Metrics
 	tracer            trace.Tracer
 	upgrader          websocket.Upgrader
+	limits            ConnLimits
 
 	// connKeySecret authenticates connectionKeys (id.NewConnectionKey /
 	// VerifyConnectionKey, DESIGN.md §8): random per process, never
@@ -58,6 +104,13 @@ type Server struct {
 	mu    sync.Mutex
 	conns map[*connection]struct{}
 	byKey map[string]*connection
+	// connWG tracks the connection goroutines HandleWebSocket starts, so
+	// Shutdown can wait for their teardown (presence LEAVEs included)
+	// before the storage is closed.
+	connWG sync.WaitGroup
+	// closing is set under mu when Shutdown begins; register refuses new
+	// connections from then on.
+	closing bool
 
 	// remainPresentFor is the presence grace window for an abrupt
 	// disconnect (DESIGN.md §12.5); see DefaultRemainPresentFor. Tests
@@ -81,6 +134,15 @@ func (s *Server) SetRemainPresentFor(d time.Duration) {
 	s.remainPresentFor = d
 }
 
+// SetConnLimits overrides the connection-layer limits (DESIGN.md §5.2).
+// Intended to be called once, right after NewServer and before the
+// server handles connections.
+func (s *Server) SetConnLimits(l ConnLimits) {
+	s.limits = l.withDefaults()
+	s.upgrader.ReadBufferSize = s.limits.ReadBufferSize
+	s.upgrader.WriteBufferSize = s.limits.WriteBufferSize
+}
+
 // NewServer constructs a Server. The Manager pairs each Channel with
 // its storage facet — publishes go through Channel.Publish, which
 // delegates to the storage backend.
@@ -90,7 +152,9 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 		// crypto/rand on supported platforms never returns an error.
 		panic(err)
 	}
+	limits := ConnLimits{}.withDefaults()
 	return &Server{
+		limits:            limits,
 		authn:             auth.NewAuthenticator(keys...),
 		manager:           manager,
 		heartbeatInterval: heartbeatInterval,
@@ -108,6 +172,11 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 			// reverse proxy, so cross-origin is the norm. Auth is the
 			// real boundary, not Origin.
 			CheckOrigin: func(*http.Request) bool { return true },
+			// Per-connection read buffer; write buffers are pooled and
+			// held only while a frame is being written (DESIGN.md §5.2).
+			ReadBufferSize:  limits.ReadBufferSize,
+			WriteBufferSize: limits.WriteBufferSize,
+			WriteBufferPool: &sync.Pool{},
 		},
 	}
 }
@@ -196,7 +265,8 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		manager:           s.manager,
 		metrics:           s.metrics,
 		tracer:            s.tracer,
-		outbound:          make(chan *protocol.ProtocolMessage, 16),
+		out:               newOutQueue(s.limits.OutboundMaxBytes, s.limits.WriteTimeout),
+		writeTimeout:      s.limits.WriteTimeout,
 		attachments:       make(map[string]*attachment),
 		entered:           make(map[string]map[string]struct{}),
 		publishQ:          make(chan func(), 16),
@@ -208,24 +278,48 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// The upgrade succeeded: count the connection and time its lifetime,
 	// bracketing conn.run so the gauge and lifetime histogram stay
 	// balanced whichever way the loop exits (DESIGN.md §10).
+	if !s.register(conn) {
+		// Shutdown has begun: this connection would not be drained.
+		_ = ws.Close()
+		return
+	}
 	opened := time.Now()
 	s.metrics.ConnectionOpened()
-	defer func() { s.metrics.ConnectionClosed(time.Since(opened).Seconds()) }()
-
-	s.register(conn)
-	defer s.deregister(conn)
 	conn.logger.Info("connection opened", "clientId", clientID)
-	defer conn.logger.Info("connection closed")
-	conn.run(r.Context())
+
+	// Run the connection on its own goroutine and return from the HTTP
+	// handler. The socket is hijacked, so net/http no longer serves it,
+	// but while the handler runs net/http keeps its per-connection
+	// state alive, including a 4 KiB read buffer and a 4 KiB write
+	// buffer the WebSocket never uses: about 8 KiB per connection, 800
+	// MiB at 100k connections (DESIGN.md §5.2). The request context is
+	// cancelled when the handler returns, so the connection runs under
+	// a context that keeps its values (the tracing span) but not its
+	// cancellation.
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		defer s.connWG.Done()
+		defer func() { s.metrics.ConnectionClosed(time.Since(opened).Seconds()) }()
+		defer s.deregister(conn)
+		defer conn.logger.Info("connection closed")
+		conn.run(ctx)
+	}()
 }
 
 // register adds a live connection to the registry, indexing it by its
-// connectionKey (== connectionId) for publish-on-behalf resolution.
-func (s *Server) register(c *connection) {
+// connectionKey (== connectionId) for publish-on-behalf resolution, and
+// counts it in connWG. It refuses (false) once Shutdown has begun, so
+// every connWG.Add happens before Shutdown's Wait.
+func (s *Server) register(c *connection) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
 	s.conns[c] = struct{}{}
 	s.byKey[c.id] = c
-	s.mu.Unlock()
+	s.connWG.Add(1)
+	return true
 }
 
 // deregister removes a connection from the registry once its run loop has
@@ -394,6 +488,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 	s.stopReaper()
 
 	s.mu.Lock()
+	s.closing = true
 	conns := make([]*connection, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
@@ -407,7 +502,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 	for i, c := range conns {
 		c.disconnect()
 		if i == len(conns)-1 {
-			return
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -416,9 +511,25 @@ func (s *Server) Shutdown(ctx context.Context) {
 			for _, straggler := range conns[i+1:] {
 				straggler.forceClose()
 			}
+			s.waitConns(ctx)
 			return
 		case <-time.After(interval):
 		}
+	}
+	s.waitConns(ctx)
+}
+
+// waitConns waits for every connection goroutine to finish its teardown,
+// or for ctx to end.
+func (s *Server) waitConns(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		s.connWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }
 

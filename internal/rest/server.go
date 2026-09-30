@@ -112,7 +112,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil {
 		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
 		return
@@ -211,7 +211,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	// shape (e.g. "TojWzTkLiH:0"). serials carries the stable identity Serial
 	// of each published message in batch order, which the client then uses to
 	// address the message via PATCH/GET .../messages/{serial} (§8, §13).
-	respBody, err := marshalValue(publishResponse{
+	respBody, err := encodePublishResponse(publishResponse{
 		Channel:   name,
 		MessageID: publishMessageID(cm),
 		Serials:   publishSerials(cm),
@@ -254,6 +254,85 @@ func publishSerials(cm *protocol.ChannelMessage) []string {
 		serials[i] = m.Serial
 	}
 	return serials
+}
+
+// maxBodyPrealloc caps the buffer readBody allocates up front from a
+// declared Content-Length, so a false length cannot force a large
+// allocation.
+const maxBodyPrealloc = 1 << 20
+
+// readBody reads the request body. With a declared Content-Length (every
+// SDK sends one) it reads into one exactly-sized buffer instead of
+// io.ReadAll's growing ones (DESIGN.md §2.2).
+func readBody(r *http.Request) ([]byte, error) {
+	n := r.ContentLength
+	if n <= 0 || n > maxBodyPrealloc {
+		return io.ReadAll(r.Body)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r.Body, buf); err != nil {
+		return nil, err
+	}
+	// Anything past the declared length is an error in net/http's own
+	// framing; a stub reader in tests may still carry more.
+	var one [1]byte
+	if m, _ := r.Body.Read(one[:]); m > 0 {
+		rest, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return append(append(buf, one[0]), rest...), nil
+	}
+	return buf, nil
+}
+
+// encodePublishResponse encodes the publish response. For JSON whose
+// strings need no escaping — the normal case: channel names, message ids
+// and serials — it writes the bytes directly, identical to encoding/json's
+// output, without reflection; anything else goes through marshalValue.
+func encodePublishResponse(v publishResponse, format protocol.Format) ([]byte, error) {
+	if format != protocol.FormatJSON || !jsonPlain(v.Channel) || !jsonPlain(v.MessageID) {
+		return marshalValue(v, format)
+	}
+	size := len(`{"channel":"","messageId":""}`) + len(v.Channel) + len(v.MessageID)
+	for _, sr := range v.Serials {
+		if !jsonPlain(sr) {
+			return marshalValue(v, format)
+		}
+		size += len(sr) + 3
+	}
+	b := make([]byte, 0, size+len(`,"serials":[]`))
+	b = append(b, `{"channel":"`...)
+	b = append(b, v.Channel...)
+	b = append(b, `","messageId":"`...)
+	b = append(b, v.MessageID...)
+	b = append(b, '"')
+	if len(v.Serials) > 0 {
+		b = append(b, `,"serials":[`...)
+		for i, sr := range v.Serials {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = append(b, '"')
+			b = append(b, sr...)
+			b = append(b, '"')
+		}
+		b = append(b, ']')
+	}
+	return append(b, '}'), nil
+}
+
+// jsonPlain reports whether encoding/json writes s verbatim between
+// quotes: printable ASCII other than the quote, backslash and the HTML
+// characters it escapes.
+func jsonPlain(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
 }
 
 // updateDeleteResponse is the REST PATCH /messages/{serial} response
@@ -1410,8 +1489,10 @@ func (s *Server) resolveRequestClientID(w http.ResponseWriter, r *http.Request, 
 // (RSL1m1). Query wins over header when both are present, as in the
 // reference.
 func requestClientIDParam(r *http.Request) (string, error) {
-	if v := r.URL.Query().Get("clientId"); v != "" {
-		return v, nil
+	if r.URL.RawQuery != "" { // Query parses (and allocates) on every call
+		if v := r.URL.Query().Get("clientId"); v != "" {
+			return v, nil
+		}
 	}
 	if h := r.Header.Get("X-Ably-ClientId"); h != "" {
 		decoded, err := base64.StdEncoding.DecodeString(h)
@@ -1456,6 +1537,16 @@ func contentTypeFormat(ct string) (protocol.Format, error) {
 func parseMessages(body []byte, format protocol.Format) ([]*protocol.Message, error) {
 	if len(body) == 0 {
 		return nil, errors.New("empty body")
+	}
+	// The common single-message JSON publish decodes without reflection
+	// (DESIGN.md §2.2); any other shape takes the general path below.
+	if format == protocol.FormatJSON {
+		if m, ok, err := protocol.DecodeSimpleMessageJSON(body); ok {
+			if err != nil {
+				return nil, fmt.Errorf("decode message: %w", err)
+			}
+			return []*protocol.Message{m}, nil
+		}
 	}
 	if looksLikeArray(body, format) {
 		var arr []*protocol.Message

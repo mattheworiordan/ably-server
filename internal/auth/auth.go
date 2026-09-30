@@ -263,6 +263,19 @@ type Authenticator struct {
 	nonceMu     sync.Mutex
 	seenNonces  map[string]time.Time
 	nonceReaped time.Time
+
+	// basic is the REST fast path for Basic auth (DESIGN.md §2.2): per
+	// key, the exact Authorization header value a client sends ("Basic "
+	// + base64(key)) and a Principal built once, so the common publish
+	// authenticates with no allocation. Principals are shared and must
+	// not be mutated by callers.
+	basic []basicCred
+}
+
+// basicCred is one key's precomputed Basic credential.
+type basicCred struct {
+	header    string
+	principal *Principal
 }
 
 // NewAuthenticator constructs an Authenticator accepting any of the
@@ -280,7 +293,15 @@ func NewAuthenticator(keys ...APIKey) *Authenticator {
 	if len(keys) > 0 {
 		appID = keys[0].AppID
 	}
+	basic := make([]basicCred, len(keys))
+	for i, k := range keys {
+		basic[i] = basicCred{
+			header:    "Basic " + base64.StdEncoding.EncodeToString([]byte(k.raw)),
+			principal: &Principal{Method: MethodBasic, cap: k.Capability()},
+		}
+	}
 	return &Authenticator{
+		basic:      basic,
 		keys:       keys,
 		byName:     byName,
 		appID:      appID,
@@ -314,12 +335,53 @@ func (a *Authenticator) matchKey(presented string) (APIKey, bool) {
 	return matched, found == 1
 }
 
+// matchBasicHeader returns the principal of the key whose precomputed
+// Basic header equals h, or nil. Every key is compared, in constant time
+// per comparison, so the time taken does not depend on which key matched.
+func (a *Authenticator) matchBasicHeader(h string) *Principal {
+	if !strings.HasPrefix(h, "Basic ") {
+		return nil
+	}
+	var matched *Principal
+	for i := range a.basic {
+		if constantTimeEqual(h, a.basic[i].header) {
+			matched = a.basic[i].principal
+		}
+	}
+	return matched
+}
+
+// constantTimeEqual is subtle.ConstantTimeCompare on strings, without
+// the []byte conversions: equal-length inputs are compared in time that
+// does not depend on their contents.
+func constantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := 0; i < len(a); i++ {
+		v |= a[i] ^ b[i]
+	}
+	return subtle.ConstantTimeByteEq(v, 0) == 1
+}
+
 // Authenticate extracts and verifies the request's credentials. A bearer
 // token (Authorization: Bearer, or the access_token / accessToken query
 // param) is tried first, then an API key (Basic auth, or the `key` query
 // param). Returns ErrNoCredentials if none are presented, ErrInvalidKey
 // or ErrInvalidToken if verification fails.
 func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
+	// Fast path: a request with no query string (so no access_token or
+	// key parameter) whose Authorization header is exactly one key's
+	// Basic credential. It resolves identically to the general path below
+	// (no token can be present, and Basic auth yields that key's
+	// principal) without decoding or allocating. Anything else falls
+	// through unchanged.
+	if r.URL.RawQuery == "" {
+		if p := a.matchBasicHeader(r.Header.Get("Authorization")); p != nil {
+			return p, nil
+		}
+	}
 	if tok, ok := extractToken(r); ok {
 		return a.verifyToken(tok)
 	}

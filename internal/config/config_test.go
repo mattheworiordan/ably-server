@@ -333,3 +333,24 @@ func TestExampleConfigFileDocumentsEveryField(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultInt64(t *testing.T) {
+	cases := []struct {
+		env      string
+		file     int64
+		fallback int64
+		want     int64
+		wantErr  bool
+	}{
+		{"", 0, 7, 7, false},
+		{"", 5, 7, 5, false},
+		{"9", 5, 7, 9, false},
+		{"x", 5, 7, 0, true},
+	}
+	for _, tc := range cases {
+		got, err := DefaultInt64(tc.env, tc.file, tc.fallback)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("DefaultInt64(%q, %d, %d) = %d, %v; want %d, err=%v", tc.env, tc.file, tc.fallback, got, err, tc.want, tc.wantErr)
+		}
+	}
+}

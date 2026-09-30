@@ -829,3 +829,72 @@ func TestMintTokenRoundTrip(t *testing.T) {
 		t.Errorf("tokens with different nonces should differ")
 	}
 }
+
+// The Basic-auth fast path must resolve exactly as the general path does.
+func TestAuthenticateBasicFastPathMatchesGeneralPath(t *testing.T) {
+	full, err := ParseAPIKey("app.full:secret1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow, err := ParseAPIKeyWithCapability("app.narrow:secret2", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAuthenticator(full, narrow)
+	basic := func(user, pass string) string {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	}
+	cases := []struct {
+		name, header, query string
+		wantErr             error
+		wantPublishChat     bool
+	}{
+		{"full key", basic("app.full", "secret1"), "", nil, true},
+		{"narrow key", basic("app.narrow", "secret2"), "", nil, false},
+		{"wrong secret", basic("app.full", "nope"), "", ErrInvalidKey, false},
+		{"lower-case scheme (general path)", "basic " + base64.StdEncoding.EncodeToString([]byte("app.full:secret1")), "", nil, true},
+		{"query key wins over nothing", "", "key=app.narrow:secret2", nil, false},
+		{"header plus query token", basic("app.full", "secret1"), "access_token=garbage", ErrInvalidJWT, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/channels/chat:1/messages?"+tc.query, nil)
+			if tc.query == "" {
+				r.URL.RawQuery = ""
+			}
+			if tc.header != "" {
+				r.Header.Set("Authorization", tc.header)
+			}
+			p, err := a.Authenticate(r)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			if p.Method != MethodBasic || p.HasClientID || !p.ExpiresAt.IsZero() {
+				t.Fatalf("principal = %+v, want a plain Basic principal", p)
+			}
+			if got := p.Capabilities().Permits("chat:1", OpPublish); got != tc.wantPublishChat {
+				t.Fatalf("publish on chat:1 permitted = %v, want %v", got, tc.wantPublishChat)
+			}
+		})
+	}
+}
+
+func TestAuthenticateBasicFastPathDoesNotAllocate(t *testing.T) {
+	k, _ := ParseAPIKey("app.full:secret1")
+	a := NewAuthenticator(k)
+	r := httptest.NewRequest(http.MethodPost, "/channels/x/messages", nil)
+	r.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("app.full:secret1")))
+	if n := testing.AllocsPerRun(100, func() {
+		if _, err := a.Authenticate(r); err != nil {
+			t.Fatal(err)
+		}
+	}); n != 0 {
+		t.Fatalf("Authenticate allocated %.0f times per call on the fast path, want 0", n)
+	}
+}

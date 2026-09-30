@@ -7,6 +7,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -30,11 +31,14 @@ type Metrics struct {
 	messagesDelivered  prometheus.Counter
 	publishLatency     prometheus.Histogram
 	httpRequests       *prometheus.CounterVec
+	httpCounters       sync.Map // httpKey -> prometheus.Counter
 
 	channelsBound        prometheus.Gauge
 	channelBinds         prometheus.Counter
 	channelEvictions     prometheus.Counter
 	channelReleaseErrors prometheus.Counter
+
+	slowConsumerDisconnects *prometheus.CounterVec
 }
 
 // New builds a Metrics with its own registry (so instances are isolated
@@ -95,6 +99,10 @@ func New() *Metrics {
 			Name: "ably_channel_release_errors_total",
 			Help: "Total storage Release calls that returned an error during eviction.",
 		}),
+		slowConsumerDisconnects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_slow_consumer_disconnects_total",
+			Help: "Total WebSocket connections disconnected for not reading fast enough, by reason (queue_full: the outbound queue stayed at its byte limit for the write timeout; write_timeout: a frame write missed its deadline).",
+		}, []string{"reason"}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -111,6 +119,7 @@ func New() *Metrics {
 		m.channelBinds,
 		m.channelEvictions,
 		m.channelReleaseErrors,
+		m.slowConsumerDisconnects,
 	)
 	return m
 }
@@ -186,7 +195,22 @@ func (m *Metrics) HTTPRequest(route, method string, status int) {
 	if m == nil {
 		return
 	}
-	m.httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+	key := httpKey{route: route, method: method, status: status}
+	if c, ok := m.httpCounters.Load(key); ok {
+		c.(prometheus.Counter).Inc()
+		return
+	}
+	c := m.httpRequests.WithLabelValues(route, method, strconv.Itoa(status))
+	m.httpCounters.Store(key, c)
+	c.Inc()
+}
+
+// httpKey identifies one ably_http_requests_total series. HTTPRequest
+// caches each series' counter under it, so a request costs one map load
+// rather than a label hash, an Itoa and a vector lookup (DESIGN.md §2.2).
+type httpKey struct {
+	route, method string
+	status        int
 }
 
 // ChannelBound records a channel bind (first use or rebind after
@@ -215,4 +239,13 @@ func (m *Metrics) ChannelReleaseError() {
 		return
 	}
 	m.channelReleaseErrors.Inc()
+}
+
+// SlowConsumerDisconnect records a connection disconnected for not
+// reading fast enough; reason is "queue_full" or "write_timeout".
+func (m *Metrics) SlowConsumerDisconnect(reason string) {
+	if m == nil {
+		return
+	}
+	m.slowConsumerDisconnects.WithLabelValues(reason).Inc()
 }

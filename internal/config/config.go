@@ -60,6 +60,15 @@ type File struct {
 	// --channel-idle-timeout (DESIGN.md §5.1, §9), parsed like
 	// ShutdownGrace.
 	ChannelIdleTimeout string `toml:"channel-idle-timeout"`
+	// Connection-layer limits (DESIGN.md §5.2, §9). ConnWriteTimeout is a
+	// raw duration string; the sizes are byte counts, zero meaning absent.
+	ConnOutboundMaxBytes int64  `toml:"conn-outbound-max-bytes"`
+	ConnWriteTimeout     string `toml:"conn-write-timeout"`
+	WSReadBufferSize     int64  `toml:"ws-read-buffer-size"`
+	WSWriteBufferSize    int64  `toml:"ws-write-buffer-size"`
+	// HTTPIdleTimeout is the raw duration string for --http-idle-timeout
+	// (DESIGN.md §2.2, §9).
+	HTTPIdleTimeout string `toml:"http-idle-timeout"`
 	// Namespaces are [[namespaces]] entries mirroring the test-app-setup
 	// post_apps shape (DESIGN.md §9, §12.5). They are parsed and retained
 	// but behaviourally inert: the feature flags are recorded, not acted
@@ -213,6 +222,24 @@ func DefaultBool(env string, file bool, fallback bool) (bool, error) {
 	}
 	if file {
 		return true, nil
+	}
+	return fallback, nil
+}
+
+// DefaultInt64 is Default for an integer-valued flag: env, if set, is
+// parsed as a base-10 int64 (a malformed value is an error); otherwise a
+// non-zero file value wins; otherwise fallback. As with DefaultBool, the
+// File convention "zero means absent" applies to file.
+func DefaultInt64(env string, file int64, fallback int64) (int64, error) {
+	if env != "" {
+		v, err := strconv.ParseInt(env, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("config: invalid integer %q: %w", env, err)
+		}
+		return v, nil
+	}
+	if file != 0 {
+		return file, nil
 	}
 	return fallback, nil
 }

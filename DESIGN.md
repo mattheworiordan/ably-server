@@ -144,6 +144,36 @@ message, in batch order, each the message's stable identity `serial` (§8)
 .../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
 surfaces.
 
+**Keep-alive and the publish fast path.** REST publishers are expected
+to reuse connections: the HTTP server keeps an idle keep-alive connection
+open for `--http-idle-timeout` (default 120 s) and then closes it, so idle
+connections are not held forever. A client driving high publish rates
+should raise its per-host idle connection pool to its concurrency (Go's
+`http.Transport` keeps only 2 idle connections per host by default,
+`MaxIdleConnsPerHost`); otherwise every request beyond that opens a new
+TCP connection. The common publish, one JSON message with Basic key
+auth, takes a fast path that changes no behaviour:
+
+- Basic auth on a request with no query string compares the
+  `Authorization` header in constant time against each key's precomputed
+  header and returns a principal built once per key, with no decoding or
+  allocation. Any other credential form takes the general path.
+- A body that is a single JSON object whose members are plain strings
+  among `name`, `data`, `id`, `clientId`, `encoding` and `connectionKey`
+  (no escape sequences) is decoded without reflection, then normalised
+  exactly as `Message.UnmarshalJSON` would (for example base64 data).
+  Every other body, including any malformed one, is decoded by
+  `encoding/json` as before; a fuzz test checks the two agree.
+- The body is read into one buffer of its declared `Content-Length`, and
+  a JSON response whose strings need no escaping is written directly,
+  byte-identical to `encoding/json`'s output.
+
+Measured on a laptop (±50%), with a storage stub so the numbers are the
+REST path's own, the in-process handler went from about 2.4 µs, 42
+allocations to about 1.2 µs, 27 allocations per publish (half of what is
+left is building the request); over loopback HTTP the time is dominated by
+the kernel.
+
 Pagination follows Ably's `Link` header convention (`first`, `next`), each
 rel emitted as its own `Link` header line with a URL relative to the
 requested resource (its final path segment plus query), matching how Ably
@@ -802,10 +832,82 @@ back-pointer to it, so any unreferenced entries become eligible for GC.
 Each WebSocket connection has:
 
 - A read goroutine that decodes inbound frames and dispatches on `Action`.
-- A write goroutine that serializes outbound frames (only one writer per
-  connection per gorilla/websocket conventions).
+  It is started by the HTTP handler, which then returns: the socket is
+  hijacked, and returning lets net/http free the per-connection read and
+  write buffers it would otherwise keep for the connection's lifetime
+  (about 8 KiB).
+- A write goroutine that drains the bounded outbound queue (below) and
+  writes each frame (only one writer per connection per gorilla/websocket
+  conventions).
 - A heartbeat ticker that sends `HEARTBEAT` if idle.
-- An `attachments map[string]*Attachment` keyed by channel name.
+- An `attachments map[string]*Attachment` keyed by channel name, each
+  with its own goroutine tailing the channel's live list.
+- A publish worker (below) and a token-expiry goroutine, each started
+  only when first needed: on the first publish, and at connect for a
+  token credential or on the first inband re-auth. An idle subscriber
+  connection therefore runs two goroutines plus one per attachment.
+
+**Outbound queue, write deadline, slow consumers.** Attachments, the
+publish worker (`ACK`/`NACK`) and the read loop do not write to the
+socket; they encode the frame and push it onto the connection's outbound
+queue, which the write goroutine drains. The queue is bounded in bytes of
+encoded frames (`--conn-outbound-max-bytes`, default 1 MiB), not in
+messages: frames range from a few bytes to the 64 KiB message limit, so
+only a byte bound caps the memory one connection can pin. A frame is
+always admitted to an empty queue, so a single frame larger than the
+bound cannot wedge a connection.
+
+A push that would take the queue past its bound waits for the writer to
+make room (backpressure; this absorbs bursts such as a resume replay),
+but for at most `--conn-write-timeout` (default 10 s). Each socket write
+carries the same deadline. Either limit being hit means the client is not
+reading fast enough, and the connection is disconnected as a slow
+consumer: its queued backlog is dropped, a `DISCONNECTED` frame carrying
+error `80003` goes out as the last frame when the socket still accepts
+it, and the socket is closed. `80003` (connection disconnected) is
+retriable: the SDK reconnects and re-attaches each channel from the last
+`channelSerial` it received, gap-filling from the log (§4.3). Nothing is
+dropped on the server, so `80020` (continuity lost as the delivery rate
+was exceeded) would misdescribe it. Other subscribers are unaffected: a
+slow attachment waits on its own connection's queue, never on the
+channel, and the channel's live list is shared. The
+`ably_slow_consumer_disconnects_total{reason}` counter (`queue_full` or
+`write_timeout`) records each disconnect (§10).
+
+**Buffers.** The WebSocket read buffer is per connection
+(`--ws-read-buffer-size`, default 1 KiB: inbound frames on a subscriber
+connection are small, and a larger frame is read in several fills). Write
+buffers (`--ws-write-buffer-size`, default 4 KiB) come from a shared pool
+and are held only while a frame is being written, so they cost memory per
+concurrent write, not per connection.
+
+**Sizing a node for 100k+ connections.** Measured on a laptop (±50%),
+50k connections each attached to one channel cost about 9 KiB of heap
+and 16 KiB of goroutine stack per connection (three goroutines), about
+25 KiB in all; each extra attachment adds one goroutine (about 5 KiB of
+stack) plus its attachment state. A lagging client adds up to
+`--conn-outbound-max-bytes` while it lags. So 100k connections need about
+2.5 GiB before channel and message state. Operator settings:
+
+- `GOMEMLIMIT`: set to about 85% of the memory available to the process
+  (for example `13GiB` on a 16 GiB instance). The GC then works harder
+  as the heap nears the limit instead of letting it double, which is
+  what a spike in lagging clients would otherwise do.
+- `GOGC`: with `GOMEMLIMIT` set, `GOGC=200` is a reasonable start. The
+  per-connection heap is long-lived and per-message garbage is short-lived,
+  so a larger `GOGC` spends less CPU on marking the same live set, and the
+  memory limit still caps growth.
+- `GOMAXPROCS`: leave it at the default. Go 1.25 and later respect a
+  container CPU limit, and on a VM it equals the vCPU count.
+- File descriptors: one per connection, plus the Postgres pool and bus
+  connections. Set the process limit to at least twice the target
+  connection count (`LimitNOFILE=1048576` under systemd,
+  `--ulimit nofile=1048576:1048576` under Docker).
+- Kernel: raise the accept backlog (`net.core.somaxconn` and
+  `net.ipv4.tcp_max_syn_backlog` to 4096 or more) so a reconnect storm is
+  not dropped at `SYN`, and give load generators a wide
+  `net.ipv4.ip_local_port_range`, since each client connection uses one
+  local port per destination address and port.
 
 Inbound `MESSAGE` / `PRESENCE` is validated on the read goroutine
 (clientId resolution, connectionId stamping, presence attachment/mode
@@ -1568,6 +1670,11 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --addr-file                   path to write the bound listener address to once listening
 --enable-stats-stub           register the GET/POST /stats compatibility stub (§1); default: false (404)
 --channel-idle-timeout 60s    evict a channel idle this long and release its storage binding (§5.1); 0 disables
+--conn-outbound-max-bytes 1048576  bytes of encoded frames queued per connection before pushes wait (§5.2)
+--conn-write-timeout 10s      deadline per frame write, and the longest wait for queue room, before a slow-consumer disconnect (§5.2)
+--ws-read-buffer-size 1024    per-connection WebSocket read buffer, bytes (§5.2)
+--ws-write-buffer-size 4096   pooled WebSocket write buffer, bytes (§5.2)
+--http-idle-timeout 120s      how long an idle HTTP keep-alive connection is kept open (§2.2)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -1583,9 +1690,11 @@ Configuration may also be supplied via an optional TOML config file
 `nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
 `postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
-`channel-idle-timeout` — `shutdown-grace`, `postgres-notify-window`,
-`bus-sweep-interval` and `channel-idle-timeout` as
-duration strings, e.g. `"10s"`). API keys are
+`channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
+`ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout` —
+`shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
+`channel-idle-timeout`, `conn-write-timeout` and `http-idle-timeout` as
+duration strings, e.g. `"10s"`, the sizes as integers). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
@@ -1675,6 +1784,10 @@ name = "persisted:presence_fixtures"
   - `ably_channel_evictions_total` (counter) — idle channels evicted.
   - `ably_channel_release_errors_total` (counter) — storage `Release` calls
     that failed during eviction.
+  - `ably_slow_consumer_disconnects_total{reason}` (counter) — connections
+    disconnected for not reading fast enough: `queue_full` (the outbound
+    queue stayed at its bound for the write timeout) or `write_timeout` (a
+    socket write missed its deadline) (§5.2).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres

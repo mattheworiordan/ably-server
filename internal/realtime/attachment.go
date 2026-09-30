@@ -75,7 +75,10 @@ type attachment struct {
 	// by mu.
 	curSerial string
 	replayCap int
-	out       chan<- *protocol.ProtocolMessage
+	// out queues a frame on the owning connection's bounded outbound
+	// queue (connection.queue); false means the frame was not queued
+	// and the attachment should stop.
+	out func(context.Context, *protocol.ProtocolMessage) bool
 	// connID is the owning connection's id, and echo its `echo` setting.
 	// When echo is false the fan-out skips message cms this connection
 	// published itself (DESIGN.md §2.1).
@@ -106,7 +109,7 @@ type attachment struct {
 // resumeFrom may be empty for a fresh attach; if non-empty, run() will
 // replay the gap before entering the live Stream loop. rewindParam takes
 // effect only when resumeFrom is empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, attachResume bool, requestedModes, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, m *metrics.Metrics, logger *logging.Logger) *attachment {
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, attachResume bool, requestedModes, modes int64, params map[string]string, out func(context.Context, *protocol.ProtocolMessage) bool, connID string, echo bool, m *metrics.Metrics, logger *logging.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
 	// rewind is suppressed when the attach is a resume — either a supplied
 	// channelSerial cursor or the ATTACH_RESUME flag (RTL4j) — so a
@@ -789,14 +792,10 @@ func (a *attachment) resync(ctx context.Context) {
 	})
 }
 
-// send pushes a frame onto the connection's outbound chan, blocking
-// under backpressure. Returns false if the attachment's context is
-// cancelled.
+// send pushes a frame onto the connection's outbound queue, waiting
+// under backpressure for at most the write timeout (DESIGN.md §5.2).
+// Returns false if the attachment's context is cancelled or the
+// connection is closing (including a slow-consumer disconnect).
 func (a *attachment) send(msg *protocol.ProtocolMessage) bool {
-	select {
-	case a.out <- msg:
-		return true
-	case <-a.ctx.Done():
-		return false
-	}
+	return a.out(a.ctx, msg)
 }

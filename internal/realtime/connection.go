@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,7 +48,13 @@ type connection struct {
 	// so the disabled path creates no spans and no context allocations.
 	tracer trace.Tracer
 
-	outbound    chan *protocol.ProtocolMessage
+	// out is the bounded outbound queue drained by writeLoop (DESIGN.md
+	// §5.2); writeTimeout bounds each frame write and each wait for
+	// room in out.
+	out          *outQueue
+	writeTimeout time.Duration
+	// slow latches the slow-consumer disconnect so it runs once.
+	slow        atomic.Bool
 	attachments map[string]*attachment
 
 	// publishQ is the per-connection publish pipeline: one buffered
@@ -59,6 +66,18 @@ type connection struct {
 	// keeps this connection's channel appends in publish order, while the
 	// read loop stays free to decode the next frame.
 	publishQ chan func()
+
+	// loopCtx is the connection's run context, and loops tracks the
+	// publish worker and authLoop goroutines. Both are started on
+	// demand (startPublishLoop, startAuthLoop) rather than per
+	// connection, so an idle subscriber connection runs only its read
+	// and write loops plus one goroutine per attachment (DESIGN.md
+	// §5.2). publishStarted and authStarted are touched only by the
+	// read goroutine.
+	loopCtx        context.Context
+	loops          sync.WaitGroup
+	publishStarted bool
+	authStarted    bool
 
 	// entered tracks the presence members this connection has entered,
 	// per channel: channel -> set of clientIds. Used to synthesise LEAVE
@@ -170,20 +189,14 @@ func (c *connection) run(ctx context.Context) {
 		c.writeLoop(ctx)
 	}()
 
-	publishDone := make(chan struct{})
-	go func() {
-		defer close(publishDone)
-		c.publishLoop(ctx)
-	}()
-
+	// The publish worker starts on the first publish (startPublishLoop).
 	// authLoop enforces token expiry and prompts inband re-auth
-	// (DESIGN.md §3). For a Basic connection (zero expiry) it is
-	// idle until a re-auth supplies one.
-	authDone := make(chan struct{})
-	go func() {
-		defer close(authDone)
-		c.authLoop(ctx, c.initialTokenExpiry())
-	}()
+	// (DESIGN.md §3); a Basic connection (zero expiry) needs none until a
+	// re-auth supplies an expiry, so it starts only then.
+	c.loopCtx = ctx
+	if !c.initialTokenExpiry().IsZero() {
+		c.startAuthLoop()
+	}
 
 	c.readLoop(ctx)
 
@@ -193,8 +206,7 @@ func (c *connection) run(ctx context.Context) {
 	// no in-flight task races the teardown below and no further ACKs are
 	// queued for a dying connection.
 	cancel()
-	<-publishDone
-	<-authDone
+	c.loops.Wait()
 
 	// Synthesise LEAVE for every presence member this connection still
 	// holds, so other subscribers see the departures (DESIGN.md §12.5).
@@ -236,12 +248,42 @@ func (c *connection) publishLoop(ctx context.Context) {
 // flight) — never on the storage write itself. Returns false if the
 // connection's context is cancelled before the task is accepted.
 func (c *connection) enqueuePublish(ctx context.Context, task func()) bool {
+	c.startPublishLoop()
 	select {
 	case c.publishQ <- task:
 		return true
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// startPublishLoop starts the publish worker on first use. Called only
+// on the read goroutine.
+func (c *connection) startPublishLoop() {
+	if c.publishStarted {
+		return
+	}
+	c.publishStarted = true
+	c.loops.Add(1)
+	go func() {
+		defer c.loops.Done()
+		c.publishLoop(c.loopCtx)
+	}()
+}
+
+// startAuthLoop starts the token-expiry loop on first need: at connect
+// for a token credential, or on the first inband re-auth. Called only
+// on the read goroutine.
+func (c *connection) startAuthLoop() {
+	if c.authStarted {
+		return
+	}
+	c.authStarted = true
+	c.loops.Add(1)
+	go func() {
+		defer c.loops.Done()
+		c.authLoop(c.loopCtx, c.initialTokenExpiry())
+	}()
 }
 
 // enqueueNack routes a validation-rejection NACK through the publish
@@ -491,7 +533,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// The stream's Channel, not ch: if ch was evicted between GetChannel
 	// and Attach, the stream is on the freshly bound Channel (DESIGN.md
 	// §5.1).
-	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)
@@ -737,63 +779,141 @@ func messageSerials(msgs []*protocol.Message) []string {
 	return out
 }
 
-// queue pushes a frame onto the outbound channel, blocking under
-// backpressure. Returns false if the connection's context has been
-// cancelled.
+// queue encodes a frame and pushes it onto the outbound queue, waiting
+// under backpressure for at most the write timeout (DESIGN.md §5.2).
+// Returns false if the frame was not queued: the connection's context
+// was cancelled, the connection is closing, or the queue stayed full for
+// the write timeout — in which case the connection is disconnected as a
+// slow consumer.
 func (c *connection) queue(ctx context.Context, msg *protocol.ProtocolMessage) bool {
-	select {
-	case c.outbound <- msg:
-		return true
-	case <-ctx.Done():
+	f, err := c.encode(msg)
+	if err != nil {
+		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", err)
 		return false
 	}
+	switch err := c.out.push(ctx, f); {
+	case err == nil:
+		return true
+	case errors.Is(err, errSlowConsumer):
+		c.slowConsumer("queue_full")
+	}
+	return false
+}
+
+// encode marshals msg in the connection's wire format.
+func (c *connection) encode(msg *protocol.ProtocolMessage) (outFrame, error) {
+	data, err := protocol.Marshal(msg, c.format)
+	if err != nil {
+		return outFrame{}, err
+	}
+	wsType := websocket.TextMessage
+	if c.format == protocol.FormatMsgpack {
+		wsType = websocket.BinaryMessage
+	}
+	return outFrame{data: data, wsType: wsType, action: msg.Action}, nil
+}
+
+// slowConsumerError is the error carried on the DISCONNECTED sent to a
+// slow consumer: 80003 (connection disconnected), a retriable code, so
+// the SDK reconnects and resumes each channel from the last
+// channelSerial it received, gap-filling from the log. Nothing is
+// dropped on the server, so 80020 (continuity lost, rate exceeded) would
+// be wrong (DESIGN.md §5.2).
+var slowConsumerError = &protocol.ErrorInfo{
+	Message:    "connection disconnected: client not reading fast enough (outbound buffer full)",
+	Code:       80003,
+	StatusCode: 400,
+}
+
+// slowConsumer disconnects a client that is not keeping up (DESIGN.md
+// §5.2): its queued backlog is dropped, a DISCONNECTED goes out as the
+// last frame, and the write loop closes the socket after it (or the
+// write deadline does, if the client is not reading at all). Runs once;
+// safe from any goroutine.
+func (c *connection) slowConsumer(reason string) {
+	if !c.slow.CompareAndSwap(false, true) {
+		return
+	}
+	c.logger.Warn("disconnecting slow consumer", "reason", reason, "queuedBytes", c.out.queuedBytes())
+	c.metrics.SlowConsumerDisconnect(reason)
+	f, err := c.encode(&protocol.ProtocolMessage{Action: protocol.ActionDisconnected, Error: slowConsumerError})
+	if err != nil {
+		c.forceClose()
+		return
+	}
+	c.out.replaceWith(f)
 }
 
 // writeLoop serialises all outbound frames and emits HEARTBEAT on idle.
+// Every write carries a deadline of the write timeout; a write that
+// misses it means the client stopped reading, and the socket is closed
+// so the read loop unblocks and teardown runs (DESIGN.md §5.2).
 func (c *connection) writeLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
+	defer c.out.close()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case msg := <-c.outbound:
-			if err := c.write(msg); err != nil {
-				c.logger.Debug("write error", "err", err)
-				return
-			}
-			// A server-initiated DISCONNECTED (shutdown, DESIGN.md §11) is
-			// the connection's last frame: once it is on the wire, close the
-			// socket so the read loop unblocks and normal teardown runs
-			// (synthesising presence LEAVEs). Closing here — after the write
-			// — guarantees the client receives the frame before the close.
-			if msg.Action == protocol.ActionDisconnected {
-				_ = c.ws.Close()
-				return
+		case <-c.out.ready:
+			for {
+				f, ok := c.out.pop()
+				if !ok {
+					break
+				}
+				if err := c.writeFrame(f); err != nil {
+					return
+				}
+				// A server-initiated DISCONNECTED (shutdown, DESIGN.md §11;
+				// slow consumer, §5.2) is the connection's last frame: once
+				// it is on the wire, close the socket so the read loop
+				// unblocks and normal teardown runs (synthesising presence
+				// LEAVEs). Closing here — after the write — guarantees the
+				// client receives the frame before the close.
+				if f.action == protocol.ActionDisconnected {
+					_ = c.ws.Close()
+					return
+				}
 			}
 			ticker.Reset(c.heartbeatInterval)
 
 		case <-ticker.C:
-			if err := c.write(&protocol.ProtocolMessage{Action: protocol.ActionHeartbeat}); err != nil {
-				c.logger.Debug("heartbeat write error", "err", err)
+			f, err := c.encode(&protocol.ProtocolMessage{Action: protocol.ActionHeartbeat})
+			if err != nil {
+				return
+			}
+			if err := c.writeFrame(f); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func (c *connection) write(msg *protocol.ProtocolMessage) error {
-	data, err := protocol.Marshal(msg, c.format)
-	if err != nil {
-		return err
+// writeFrame writes one frame under the write deadline. On failure it
+// closes the socket (a timed-out gorilla/websocket conn is unusable) and
+// records a write timeout as a slow-consumer disconnect.
+func (c *connection) writeFrame(f outFrame) error {
+	if c.writeTimeout > 0 {
+		_ = c.ws.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
-	wsType := websocket.TextMessage
-	if c.format == protocol.FormatMsgpack {
-		wsType = websocket.BinaryMessage
+	err := c.ws.WriteMessage(f.wsType, f.data)
+	if err == nil {
+		return nil
 	}
-	return c.ws.WriteMessage(wsType, data)
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		c.logger.Warn("write timed out; closing connection", "timeout", c.writeTimeout)
+		if c.slow.CompareAndSwap(false, true) {
+			c.metrics.SlowConsumerDisconnect("write_timeout")
+		}
+	} else {
+		c.logger.Debug("write error", "err", err)
+	}
+	_ = c.ws.Close()
+	return err
 }
 
 // disconnect initiates a graceful, server-side close (DESIGN.md §11): it
@@ -809,16 +929,15 @@ func (c *connection) disconnect() {
 	// (DESIGN.md §12.5). Set before the close that unblocks the read loop so
 	// the teardown observes it.
 	c.shuttingDown.Store(true)
-	select {
-	case c.outbound <- &protocol.ProtocolMessage{
+	f, err := c.encode(&protocol.ProtocolMessage{
 		Action: protocol.ActionDisconnected,
 		Error: &protocol.ErrorInfo{
 			Message:    "server is shutting down; please reconnect",
 			Code:       80003, // ErrDisconnected — a retryable disconnect
 			StatusCode: 503,
 		},
-	}:
-	default:
+	})
+	if err != nil || !c.out.tryPush(f) {
 		c.forceClose()
 	}
 }
