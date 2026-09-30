@@ -76,6 +76,10 @@ DAEMON
 systemctl enable --now chronyd
 systemctl daemon-reload
 systemctl enable --now docker
+# The scripts drive Docker over SSH as ec2-user (pg_isready, inspect, the
+# pgbench driver), so it needs the docker group; each SSH call is a new
+# session, so the membership applies immediately.
+usermod -aG docker ec2-user
 usermod -aG docker ec2-user
 
 if [ "@@INSTALL_COMPOSE@@" = 1 ]; then
