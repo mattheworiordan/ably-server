@@ -327,13 +327,13 @@ func (s *Scenario) Validate() error {
 // ResolvedClass is a Class after scaling.
 type ResolvedClass struct {
 	Class
-	Index          int
-	ChannelCount   int
-	subScale       float64 // factor applied to subscribers per channel
-	maxSubs        int     // clamp (the connection count) for smoke scales, 0 for none
+	Index        int
+	ChannelCount int
+	subScale     float64 // factor applied to subscribers per channel
+	maxSubs      int     // clamp (the connection count) for smoke scales, 0 for none
 	// Clamped counts channels whose subscriber count was clamped to the
 	// connection count (only at a smoke scale below 1).
-	Clamped int
+	Clamped        int
 	RatePerChannel float64 // messages/s per channel
 	StreamCount    int
 	MsgBytes       int

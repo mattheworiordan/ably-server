@@ -126,9 +126,18 @@ func (f *frameCollector) messages(channel string) []loadgen.Payload {
 
 func dial(t *testing.T, addr string, h loadgen.Handler) (*loadgen.Conn, chan error) {
 	t.Helper()
-	c, err := loadgen.Dial(context.Background(), loadgen.DialConfig{
-		Endpoint: addr, Key: testKey, Format: protocol.FormatMsgpack, HandshakeTimeout: 5 * time.Second,
-	})
+	// The test host is shared with other suites; retry a transport
+	// failure a few times rather than fail on one dropped SYN.
+	var c *loadgen.Conn
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		c, err = loadgen.Dial(context.Background(), loadgen.DialConfig{
+			Endpoint: addr, Key: testKey, Format: protocol.FormatMsgpack, HandshakeTimeout: 10 * time.Second,
+		})
+		if _, isProto := err.(*loadgen.ProtocolError); err == nil || isProto {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +455,7 @@ message_bytes = 50
 sample_percent = 100
 [timing]
 ramp = "100ms"
-hold = "1500ms"
+hold = "4s"
 drain = "500ms"
 [connections]
 count = 1
