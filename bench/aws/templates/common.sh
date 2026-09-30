@@ -50,9 +50,23 @@ cat >/etc/systemd/system/docker.service.d/90-bench.conf <<'DROPIN'
 LimitNOFILE=2097152
 LimitNPROC=infinity
 DROPIN
+# The packaged unit on Amazon Linux 2023 starts dockerd with
+# --default-ulimit nofile=32768:65536 on its command line. dockerd refuses to
+# start when the same setting is also in daemon.json, so the container default
+# is raised by rewriting the packaged ExecStart in a drop-in instead. The
+# packaged line is read at boot so this stays correct across package versions
+# and on distributions whose unit has no such flag (the flag is then appended).
+docker_exec=$(systemctl cat docker 2>/dev/null | grep '^ExecStart=' | tail -n 1 \
+  | sed -E 's/ --default-ulimit[= ]nofile=[0-9]+:[0-9]+//')
+if [ -n "$docker_exec" ]; then
+  cat >/etc/systemd/system/docker.service.d/91-bench-ulimit.conf <<DROPIN
+[Service]
+ExecStart=
+${docker_exec} --default-ulimit nofile=1048576:1048576
+DROPIN
+fi
 cat >/etc/docker/daemon.json <<'DAEMON'
 {
-  "default-ulimits": {"nofile": {"Name": "nofile", "Hard": 1048576, "Soft": 1048576}},
   "log-driver": "local",
   "log-opts": {"max-size": "100m", "max-file": "5"}
 }
