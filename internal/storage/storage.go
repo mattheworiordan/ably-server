@@ -108,6 +108,19 @@ type SubscriberReporter interface {
 	HasSubscribers() bool
 }
 
+// UnboundPublisher is implemented by a backend that can store a message
+// publish on a channel this process has not bound (the cluster backend,
+// DESIGN.md §6.3). UnboundChannel returns a ChannelStore for name that is
+// not bound: no appender, no bus subscription, nothing to release. A
+// Store through it is committed and announced to other processes exactly
+// as through a bound store, and still reaches this process's own
+// subscribers if the channel is bound here by the time it commits. The
+// returned store is meant for Store; its other methods work but bind
+// nothing either.
+type UnboundPublisher interface {
+	UnboundChannel(name string) ChannelStore
+}
+
 // Storage is the per-process persistence root. It hands out
 // per-channel stores and owns any shared resources (e.g. a bolt DB
 // handle or a pgxpool).

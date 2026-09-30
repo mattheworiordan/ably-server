@@ -777,6 +777,25 @@ creates the Channel and binds it: `storage.Channel(name, channel)`
 registers the Channel as the Appender and Initializes it from the store's
 watermark.
 
+**Write-only REST publish.** In cluster mode a REST message publish to a
+name with no Channel on this node (so no attachment and no presence
+member here) does not bind it. The Manager hands the REST handler an
+unbound store (`storage.UnboundPublisher`), and the publish is minted,
+written and committed in its batch exactly as through a bound store; the
+bus's post-commit hook still announces it, so other nodes' subscribers
+receive it (§7.2). Nothing is created on this node: no Channel, no bus
+subscription, no sweep entry, nothing for eviction to release 60 s later.
+The local fast path is skipped because there is no local appender,
+unless the channel was bound here while the publish was in flight, in
+which case the fast path (or, on `pgnotify`, the NOTIFY round trip)
+delivers it to that binding and the bind's watermark read keeps it
+exactly once. A name whose Channel is bound or still binding takes the
+normal path; one being evicted takes the write-only path. Presence,
+annotations, mutations and realtime publishes keep the normal path.
+`--publish-bind-on-write=true` restores binding on every publish.
+`ably_channel_unbound_publishes_total` counts the publishes that take
+this path.
+
 **Idle-channel eviction.** A node that serves hundreds of thousands of
 channels an hour cannot hold every channel it has ever touched. With
 `--channel-idle-timeout` set (default 60 s, `0` disables), the Manager
@@ -1369,8 +1388,7 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
 - Everything that can reject a single publish (the id format; an id or
   channel name that is not valid UTF-8 or contains NUL, which Postgres
   cannot store, refused with 40031 or 40010) is checked before it is
-  queued, and a channel's row is created (without taking its lock) before
-  its first publish is queued, so one bad publish cannot fail a batch. A publish that repeats a client id of an earlier publish
+  queued, so one bad publish cannot fail a batch. A publish that repeats a client id of an earlier publish
   of the same channel in the batch takes that publish's result,
   idempotently. Server-generated ids are unique by construction and skip
   the lookup on a first attempt.
@@ -1388,6 +1406,27 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   if the client retries one whose COMMIT did land. Publishes caught by
   shutdown get the same error.
 - ACKs are per publish, sent when its batch commits.
+
+**Channel rows.** A channel's `channels` row (its serial and initial
+serial) is created by the first write or bind that needs it. A batched
+publish on a channel with no row creates it inside `publish_batch_lock`,
+in round trip 1: the missing rows are inserted in sorted name order
+(`ON CONFLICT DO NOTHING`) and then locked without waiting, so a cold
+channel's first publish costs no round trip of its own. This matters for
+write-only REST publishes (§5.1), which reach cold channels without a
+bind. The insert can wait on another transaction that is inserting the
+same new name uncommitted (two nodes' first publishes to one channel at
+the same instant): at most one commit, and never a deadlock, since every
+transaction inserts new rows in sorted order and waits for nothing else
+after them. Rows are never deleted, so each node keeps a bounded set of
+names it knows have a row (65,536 per database, oldest forgotten first):
+a bind of a known name reads the row with a plain `SELECT` instead of
+`ensure_channel`, which writes a new row version and waits for the row
+lock of a channel another node is publishing on. Either read comes after
+the bus subscription, so the bind misses nothing (§7.2). With
+`--publish-bind-on-write=true` the earlier behaviour returns: every bind
+runs `ensure_channel`, and a publish creates a missing row in a statement
+of its own before it is queued.
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -2046,6 +2085,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
+--publish-bind-on-write false cluster mode: true binds a channel on every REST publish (§5.1, §6.3)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2064,7 +2104,8 @@ Configuration may also be supplied via an optional TOML config file
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`, `publish-queue-max` —
+`publish-batch-max`, `publish-linger-max`, `publish-queue-max`,
+`publish-bind-on-write` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
 retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
@@ -2159,6 +2200,9 @@ name = "persisted:presence_fixtures"
   - `ably_channel_evictions_total` (counter) — idle channels evicted.
   - `ably_channel_release_errors_total` (counter) — storage `Release` calls
     that failed during eviction.
+  - `ably_channel_unbound_publishes_total` (counter) — REST publishes that
+    took the write-only path: stored on a channel not bound on this node,
+    without binding it (§5.1).
   - `ably_slow_consumer_disconnects_total{reason}` (counter) — connections
     disconnected for not reading fast enough: `queue_full` (the outbound
     queue stayed at its bound for the write timeout) or `write_timeout` (a

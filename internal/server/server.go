@@ -76,6 +76,7 @@ const (
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
+	publishBindEnv      = "ABLY_SERVER_PUBLISH_BIND_ON_WRITE"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -198,6 +199,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	publishBindDefault, err := config.DefaultBool(opts.Getenv(publishBindEnv), file.PublishBindOnWrite, false)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -247,6 +253,7 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
+	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -348,7 +355,8 @@ func Run(ctx context.Context, opts Opts) int {
 			Message:   *messageRetention,
 			Persisted: *persistedRetention,
 		},
-		persisted: persistedNamespaces(file.Namespaces),
+		persisted:   persistedNamespaces(file.Namespaces),
+		bindOnWrite: *publishBindOnWrite,
 		batching: postgres.Batching{
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
@@ -388,9 +396,10 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	manager := core.NewManagerWithOptions(store, core.Options{
-		IdleTimeout: *channelIdleTimeout,
-		Metrics:     m,
-		Logger:      logger,
+		IdleTimeout:      *channelIdleTimeout,
+		Metrics:          m,
+		Logger:           logger,
+		WriteOnlyPublish: !*publishBindOnWrite,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
@@ -818,16 +827,18 @@ type clusterOptions struct {
 	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
 	batching         postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted        func(channel string) bool // persisted-namespace resolver
+	bindOnWrite      bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 }
 
 // options returns the postgres.Options every bus shares.
 func (c clusterOptions) options() postgres.Options {
 	return postgres.Options{
-		DSN:       c.dsn,
-		Logger:    c.logger,
-		Retention: c.retention,
-		Persisted: c.persisted,
-		Batching:  c.batching,
+		DSN:         c.dsn,
+		Logger:      c.logger,
+		Retention:   c.retention,
+		Persisted:   c.persisted,
+		Batching:    c.batching,
+		BindOnWrite: c.bindOnWrite,
 	}
 }
 

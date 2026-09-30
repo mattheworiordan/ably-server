@@ -45,6 +45,13 @@ type Options struct {
 
 	// Logger receives Release failures. Nil means logging.Default().
 	Logger *logging.Logger
+
+	// WriteOnlyPublish enables the write-only publish path (DESIGN.md
+	// §5.1): when the storage implements storage.UnboundPublisher,
+	// WriteOnlyStore hands out an unbound store for a channel with no
+	// Channel on this node, so a publish to it does not bind it. False
+	// keeps every publish on GetChannel (--publish-bind-on-write).
+	WriteOnlyPublish bool
 }
 
 // Manager owns the set of active Channels in this process. It pairs
@@ -56,6 +63,7 @@ type Options struct {
 // pub/sub mechanics live in storage.
 type Manager struct {
 	store       storage.Storage
+	unbound     storage.UnboundPublisher // nil: the write-only path is off
 	idleTimeout time.Duration
 	sweepEvery  time.Duration
 	metrics     *metrics.Metrics
@@ -110,6 +118,9 @@ func newManager(store storage.Storage, opts Options, now func() int64) *Manager 
 	}
 	if m.logger == nil {
 		m.logger = logging.Default()
+	}
+	if up, ok := store.(storage.UnboundPublisher); ok && opts.WriteOnlyPublish {
+		m.unbound = up
 	}
 	for i := range m.shards {
 		m.shards[i].channels = make(map[string]*Channel)
@@ -227,6 +238,36 @@ func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error)
 		m.metrics.ChannelBound()
 		return ch, nil
 	}
+}
+
+// WriteOnlyStore returns a store through which a message publish on name
+// is stored without binding the channel (DESIGN.md §5.1), or nil when the
+// publish should go through GetChannel: the write-only path is off or the
+// storage has none, or this node has a Channel for name (bound, or still
+// binding) that is not being evicted. A name with no Channel here has no
+// attachment and no presence member on this node, so the publish has no
+// local subscriber to reach; the storage still announces it to the other
+// nodes, and if the channel is bound here while the publish is in flight
+// the storage delivers it to that binding. Nothing is created, so there
+// is nothing to evict afterwards.
+func (m *Manager) WriteOnlyStore(name string) storage.ChannelStore {
+	if m.unbound == nil {
+		return nil
+	}
+	sh := m.shardFor(name)
+	sh.mu.Lock()
+	ch, ok := sh.channels[name]
+	sh.mu.Unlock()
+	if ok {
+		ch.life.Lock()
+		evicted := ch.evicted
+		ch.life.Unlock()
+		if !evicted {
+			return nil
+		}
+	}
+	m.metrics.UnboundPublish()
+	return m.unbound.UnboundChannel(name)
 }
 
 // sweepLoop runs sweep on the configured cadence until Close.

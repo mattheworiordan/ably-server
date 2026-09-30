@@ -63,6 +63,9 @@ type File struct {
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
+	// PublishBindOnWrite restores binding a channel on every REST publish
+	// (DESIGN.md §6.3); absent/false keeps the write-only path.
+	PublishBindOnWrite bool `toml:"publish-bind-on-write"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual
