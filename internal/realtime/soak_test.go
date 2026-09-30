@@ -12,7 +12,11 @@ package realtime
 // several ports because one loopback address and one server port allow
 // only ~16k client ports on macOS.
 //
-//	go test -tags=soak -run TestSoakConnections -timeout 30m -v ./internal/realtime/
+//	bench/soak/run.sh     # runs the test below inside a golang:1.26 container
+//
+// It is never run on the host: its sockets would exhaust the host's
+// ephemeral ports for everything else on the machine. The test skips
+// unless SOAK_IN_CONTAINER=1, which the script sets.
 //
 // Environment: SOAK_CONNS (default 50000), SOAK_CHANNELS (1000),
 // SOAK_HOLD (30s), SOAK_PUBLISH_EVERY (5s: one publish per channel per
@@ -96,6 +100,12 @@ func sample(label string, conns int) soakSample {
 func TestSoakConnections(t *testing.T) {
 	if os.Getenv("SOAK_CLIENT") == "1" {
 		t.Skip("client process")
+	}
+	// Tens of thousands of loopback sockets exhaust the host's ephemeral
+	// ports and break other loopback tests on the machine, so the soak
+	// runs only inside its own container (bench/soak/run.sh sets this).
+	if os.Getenv("SOAK_IN_CONTAINER") != "1" {
+		t.Skip("run the soak with bench/soak/run.sh (inside a Linux container), not on the host")
 	}
 	nConns := envInt("SOAK_CONNS", 50000)
 	nChannels := envInt("SOAK_CHANNELS", 1000)

@@ -276,6 +276,14 @@ func (b *pgBus) unbind(cs *channelStore) {
 	if interrupt != nil {
 		interrupt()
 	}
+	// Drop what the channel's worker has queued: a released store
+	// discards it anyway, and eviction should free it now (DESIGN.md
+	// §5.1). A running worker sees the empty queue and exits.
+	cs.q.mu.Lock()
+	clear(cs.q.items)
+	cs.q.items = nil
+	cs.q.overflow = false
+	cs.q.mu.Unlock()
 }
 
 // beforeCommit emits the NOTIFY inside the write transaction in

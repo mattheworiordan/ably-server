@@ -72,24 +72,9 @@ func clusterBuses(t *testing.T) map[string]func(t *testing.T, dsn string) *Stora
 			return openCoalesced(t, dsn, 20*time.Millisecond, 0)
 		},
 		BusNATS: func(t *testing.T, dsn string) *Storage {
-			url := natsURLFor(t)
-			return openNATSNode(t, dsn, url)
+			return openNATSNode(t, dsn, natstest.Start(t).URL) // one NATS server per test binary
 		},
 	}
-}
-
-// natsURLFor starts one NATS server per test and shares it between the
-// test's nodes.
-var natsURLs sync.Map // *testing.T -> string
-
-func natsURLFor(t *testing.T) string {
-	if v, ok := natsURLs.Load(t); ok {
-		return v.(string)
-	}
-	url := natstest.Start(t).URL
-	natsURLs.Store(t, url)
-	t.Cleanup(func() { natsURLs.Delete(t) })
-	return url
 }
 
 // TestReleaseAcrossNodesReseedsAndResumesDelivery is the cluster rebind

@@ -887,7 +887,9 @@ and 16 KiB of goroutine stack per connection (three goroutines), about
 25 KiB in all; each extra attachment adds one goroutine (about 5 KiB of
 stack) plus its attachment state. A lagging client adds up to
 `--conn-outbound-max-bytes` while it lags. So 100k connections need about
-2.5 GiB before channel and message state. Operator settings:
+2.5 GiB before channel and message state. The measurement is the soak
+test (`bench/soak/run.sh`), which runs inside a Linux container because
+its sockets would exhaust the host's ephemeral ports. Operator settings:
 
 - `GOMEMLIMIT`: set to about 85% of the memory available to the process
   (for example `13GiB` on a 16 GiB instance). The GC then works harder
