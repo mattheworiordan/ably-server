@@ -938,12 +938,12 @@ func (cs *channelStore) advanceSerial(ctx context.Context, tx pgx.Tx) (channelSe
 	return channelSerial, prev, nil
 }
 
-// Store persists one publish atomically: look up any contained
-// Message.IDs for prior matches (idempotent return on hit), otherwise
-// advance the channel's serial via advance_channel_serial (which
-// takes a row-level lock on the channels row and is the per-channel
-// write serialiser), stamp each Message.Serial, insert one row per
-// Message, and emit a NOTIFY on the broker channel. The cm is
+// Store persists one publish atomically: advance the channel's serial
+// via advance_channel_serial (which takes a row-level lock on the
+// channels row and is the per-channel write serialiser), then look up
+// any contained Message.IDs for prior matches (idempotent return on a
+// hit, rolling the advance back), otherwise stamp each Message.Serial,
+// insert one row per Message, and emit a NOTIFY on the broker channel. The cm is
 // delivered to the channel's appender asynchronously by the LISTEN
 // goroutine after the NOTIFY round-trips through the database.
 func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
@@ -968,41 +968,23 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Idempotency pre-check. Any contained ID that's already indexed
-	// makes this whole publish a duplicate; we return the original
-	// ChannelMessage at the matching channelSerial. We do this before
-	// advancing the channels row so a duplicate publish does not
-	// burn a serial.
-	ids := nonEmptyIDs(msgs)
-	if len(ids) > 0 {
-		var existingCS string
-		err := tx.QueryRow(ctx,
-			`SELECT channel_serial FROM channel_messages
-			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
-			cs.name, ids).Scan(&existingCS)
-		switch {
-		case err == nil:
-			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
-			if lerr != nil {
-				return nil, false, lerr
-			}
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
-			}
-			return original, true, nil
-		case errors.Is(err, pgx.ErrNoRows):
-			// no prior match — fall through to insert
-		default:
-			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
-		}
-	}
-
-	// Fresh publish: advance the channels-row serial (cluster-wide
-	// monotonic via the row lock), stamp Message.Serials, persist.
+	// Take the channels-row lock first by advancing the serial, THEN
+	// look for a prior publish of any contained id. The order matters:
+	// a lookup before the lock let two concurrent publishes with the
+	// same id both miss it (the claims audit's idempotency race). With
+	// the row lock held, a concurrent publish of the same id has either
+	// committed, and this statement's fresh READ COMMITTED snapshot sees
+	// it, or is queued behind us. On a hit the deferred Rollback undoes
+	// the advance, so a duplicate does not burn a serial.
 	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
 	if err != nil {
 		return nil, false, err
 	}
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyIDs(msgs)); err != nil || original != nil {
+		return original, original != nil, err
+	}
+
+	// Fresh publish: stamp Message.Serials, persist.
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
 		m.Action = protocol.MessageCreate
@@ -1071,26 +1053,19 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Idempotency pre-check — shared id namespace with creates.
+	// Lock the channels row (advance the serial) before the idempotency
+	// lookup, for the same reason as Store; an early return rolls the
+	// advance back.
+	var mutIDs []string
 	if mut.ID != "" {
-		var existingCS string
-		switch err := tx.QueryRow(ctx,
-			`SELECT channel_serial FROM channel_messages WHERE channel = $1 AND id = $2 LIMIT 1`,
-			cs.name, mut.ID).Scan(&existingCS); {
-		case err == nil:
-			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
-			if lerr != nil {
-				return nil, false, lerr
-			}
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
-			}
-			return original, true, nil
-		case errors.Is(err, pgx.ErrNoRows):
-			// fall through
-		default:
-			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
-		}
+		mutIDs = []string{mut.ID}
+	}
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
+	}
+	if original, err := cs.findIdempotent(ctx, tx, mutIDs); err != nil || original != nil {
+		return original, original != nil, err
 	}
 
 	// Resolve the target's current latest version from the projection.
@@ -1108,10 +1083,6 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: decode target version: %w", err)
 	}
 
-	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
-	if err != nil {
-		return nil, false, err
-	}
 	version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
 	if err != nil {
 		return nil, false, err
@@ -1278,34 +1249,15 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Idempotency pre-check — shared id namespace with messages.
-	if ids := nonEmptyPresenceIDs(presence); len(ids) > 0 {
-		var existingCS string
-		err := tx.QueryRow(ctx,
-			`SELECT channel_serial FROM channel_messages
-			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
-			cs.name, ids).Scan(&existingCS)
-		switch {
-		case err == nil:
-			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
-			if lerr != nil {
-				return nil, false, lerr
-			}
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
-			}
-			return original, true, nil
-		case errors.Is(err, pgx.ErrNoRows):
-			// no prior match — fall through
-		default:
-			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
-		}
-	}
-
+	// Row lock first, then the idempotency lookup (see Store).
 	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
 	if err != nil {
 		return nil, false, err
 	}
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyPresenceIDs(presence)); err != nil || original != nil {
+		return original, original != nil, err
+	}
+
 	for i, p := range presence {
 		storage.StampPresenceMember(p, channelSerial, i)
 	}
@@ -1407,33 +1359,18 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Idempotency pre-check — shared id namespace with messages/presence.
-	if ids := nonEmptyAnnotationIDs(annotations); len(ids) > 0 {
-		var existingCS string
-		err := tx.QueryRow(ctx,
-			`SELECT channel_serial FROM channel_messages
-			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
-			cs.name, ids).Scan(&existingCS)
-		switch {
-		case err == nil:
-			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
-			if lerr != nil {
-				return nil, false, lerr
-			}
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
-			}
-			return original, true, nil
-		case errors.Is(err, pgx.ErrNoRows):
-			// no prior match — fall through
-		default:
-			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
-		}
+	// Row lock first, then the idempotency lookup (see Store).
+	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
+	if err != nil {
+		return nil, false, err
+	}
+	if original, err := cs.findIdempotent(ctx, tx, nonEmptyAnnotationIDs(annotations)); err != nil || original != nil {
+		return original, original != nil, err
 	}
 
 	// Target existence: every annotation must reference a message in the
-	// projection (DESIGN.md §14.1). Checked before advancing the serial so
-	// a bad target does not burn one.
+	// projection (DESIGN.md §14.1). A bad target returns early, and the
+	// deferred Rollback undoes the serial advance.
 	for _, a := range annotations {
 		var exists bool
 		if err := tx.QueryRow(ctx,
@@ -1447,10 +1384,6 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
-	if err != nil {
-		return nil, false, err
-	}
 	for i, a := range annotations {
 		a.Serial = serial.MessageSerial(channelSerial, i)
 	}
@@ -1954,6 +1887,29 @@ func nonEmptyAnnotationIDs(annotations []*protocol.Annotation) []string {
 		}
 	}
 	return ids
+}
+
+// findIdempotent returns the originally persisted cm when any of ids was
+// already stored on this channel, or nil on a miss (DESIGN.md §6, §8).
+// It must run after the caller has locked the channels row (via
+// advanceSerial) in tx: that lock, not an index, is what makes the check
+// race-free, because every writer of this channel queues on it.
+func (cs *channelStore) findIdempotent(ctx context.Context, tx pgx.Tx, ids []string) (*protocol.ChannelMessage, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var existingCS string
+	err := tx.QueryRow(ctx,
+		`SELECT channel_serial FROM channel_messages
+		 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
+		cs.name, ids).Scan(&existingCS)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
+	}
+	return loadChannelMessageTx(ctx, tx, cs.name, existingCS)
 }
 
 // loadChannelMessageTx fetches a previously-persisted ChannelMessage

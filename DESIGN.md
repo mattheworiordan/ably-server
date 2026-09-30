@@ -1190,10 +1190,14 @@ and matches what a load balancer rolling-restart of N nodes against
 the same Postgres needs: every restart is a no-op except the one
 that introduces a new migration file.
 
-Per-publish writes run inside a transaction that takes a per-channel
-advisory lock (`pg_advisory_xact_lock(hashtext(channel))`), so
-concurrent writers serialise per channel without contending across
-channels. Each node generates its own seriesId at process start; the
+Per-publish writes run inside one transaction that first locks the
+channel's row in `channels` (`advance_channel_serial` mints the next
+serial under that row lock) and only then checks the idempotency index.
+Concurrent writers therefore serialise per channel without contending
+across channels, and two concurrent publishes carrying the same id
+cannot both pass the check: the second waits for the row lock, and its
+next statement sees the first's committed rows. A duplicate returns the
+original cm and rolls the transaction back, so it does not burn a serial. Each node generates its own seriesId at process start; the
 serial format itself (the `@seriesId` suffix) disambiguates concurrent
 mints, so generator state is not shared across nodes.
 
