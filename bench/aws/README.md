@@ -20,6 +20,16 @@ Nothing here names a customer: workloads are shapes F, M and D.
 
 Both are static Go binaries with no runtime dependencies.
 
+## Local smoke
+
+    bench/aws/local-smoke.sh     # shapes M, D, F at 1%, then M with a node killed
+
+starts `bench/docker-compose.loadgen-smoke.yml` (three nodes, Postgres,
+three NATS servers, two agents inside the compose network so the load
+avoids Docker Desktop's port proxy), runs each through the conductor and
+writes a report. `SMOKE_IMAGE` and `BUS` point it at another server
+build.
+
 ## Quick start (laptop, against a local cluster)
 
     # three nodes on :8081-8083, debug listeners on :9091-9093
@@ -308,7 +318,8 @@ channels, publishes/s, deliveries/s, fan-out, streams, churn and
 presence for any multiplier and scale. At a smoke scale a fixed-size
 channel's fan-out is clamped to the connection count (reported).
 
-Committed scenarios: `shape-f.toml`, `shape-m.toml`, `shape-d.toml`
+Committed scenarios: `idle-connections.toml` (memory per idle
+connection), `shape-f.toml`, `shape-m.toml`, `shape-d.toml`
 (plan §3 shapes; the 1x envelope is M for connections, channels and
 deliveries and D for writes), `presence-m.toml` (run 6), and
 `smoke-1pct.toml` and `smoke-10pct.toml` (run 0b: shapes M and D together
