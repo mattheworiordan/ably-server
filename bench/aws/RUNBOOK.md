@@ -138,7 +138,8 @@ Optional, with defaults:
 | `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). |
 | `NODE_GOMAXPROCS`, `NODE_GOMEMLIMIT` | unset, `13GiB` | Go runtime settings on the nodes. |
 | `NATS_IP_OFFSET`, `NATS_IMAGE` | 10, `nats:2.11` | NATS servers take the addresses from this offset in the subnet. |
-| `LOADGEN_CMD`, `PUBLISHER_CMD`, `CONDUCTOR_CMD` | provisional | The commands run in the `ably-loadgen` image (section 7). |
+| `LOADGEN_CMD`, `PUBLISHER_CMD`, `CONDUCTOR_CMD` | see section 7 | The commands run in the `ably-loadgen` image. |
+| `NODE_VCPU`, `NODE_MEMORY_GB` | from `NODE_INSTANCE_TYPE` | Node size passed to the conductor (`--node-vcpu`, `--node-memory-gb`). |
 | `SCENARIO_DIR` | `bench/scenarios` | Where scenario names are looked up. |
 | `RECONFIGURE`, `SCALE_DOWN` | 0 | Re-apply the image and flags to live boxes (`40-nodes.sh`, `50-loadgen.sh`), or remove nodes above `NODE_COUNT`. |
 | `DURATION_S`, `WARMUP_S`, `CLIENTS`, `VARIANTS`, `CHANNELS`, `PAYLOAD_BYTES` | 60, 10, `1 8 32 128`, all, 200000, 600 | Run 0a settings (`pgbench/run.sh`). |
@@ -160,26 +161,38 @@ Credentials that expire (SSO sessions last hours) make the next script fail
 with an expired-token error. Sign in again and re-run the script: every step
 is safe to repeat.
 
-> **Ably internal.** Install `ablyctl`:
+> **Ably internal.** Install and set up `ablyctl`:
 >
 >     gh release download -R ably/infrastructure -p ablyctl-darwin-arm64 -O ~/.local/bin/ablyctl --clobber
 >     chmod +x ~/.local/bin/ablyctl
+>     ablyctl init          # writes the config and offers automatic_update; `ablyctl update` self-updates later
 >
-> There is no `init` step. Sign in and load credentials into the shell:
+> Sign in and load credentials into the shell:
 >
->     eval "$(ablyctl aws env --account dev --aws-role "${AWS_SSO_ROLE:-Operator}")"
+>     eval "$(ablyctl aws env --account dev)"
 >
 > The first use starts an SSO device-code login that you finish in a browser.
 > `ablyctl aws env --unset` clears the credentials. The default role is
-> `Operator`. `AWS_SSO_ROLE` and `ABLYCTL_ACCOUNT` override the role and the
-> account name.
+> `Operator`; `--aws-role` overrides it. `AWS_SSO_ROLE` and `ABLYCTL_ACCOUNT`
+> override the role and the account name that the scripts pass.
 >
-> You do not have to run that line yourself. `lib.sh` sources `ably-internal.sh`,
-> which runs it when `ablyctl` is on PATH and no `AWS_ACCESS_KEY_ID` or
-> `AWS_PROFILE` is set. If the sign-in has expired the script prints one line
-> telling you to run `ablyctl aws env --account dev` in a terminal and exits.
-> Do not put the account id or the permission set name in any file in this
-> repository: take them from the environment.
+> **Running under an AI agent.** `ablyctl` detects agents (in
+> `go/tools/ablyctl/lib/sso/sso.go` of `ably/infrastructure`): when `CLAUDECODE`,
+> `CODEX_CI`, `CODEX_SANDBOX`, `CURSOR_AGENT` or `GEMINI_CLI` is set it ignores
+> `--aws-role` and chains the operator session into the `AgentOperator` IAM role
+> of the target account. That role is not provisioned in the dev account today,
+> so `ablyctl aws env --account dev` run by an agent fails with an STS
+> AccessDenied. There are two supported paths: (a) infrastructure provisions
+> `AgentOperator` in the dev account, or (b) the operator mints credentials in
+> their own terminal with the command above and exports `AWS_ACCESS_KEY_ID`,
+> `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` in the shell that runs the
+> scripts. Do not unset the agent variables to get around the detection.
+>
+> `lib.sh` sources `ably-internal.sh`, which runs the `eval` line when `ablyctl`
+> is on PATH and no `AWS_ACCESS_KEY_ID` or `AWS_PROFILE` is set. If it cannot
+> mint credentials (expired sign-in, or the agent case above) the script prints
+> both paths and exits. Do not put the account id or the permission set name in
+> any file in this repository: take them from the environment.
 >
 > `ablyctl aws ecr env` prints the registry of ablyctl's default ECR account,
 > which may not be the account the fleet runs in. `00-preflight.sh` creates the
@@ -257,8 +270,7 @@ Check the fleet is up:
 Smoke runs the real stack at 1 percent of the 1x target (about 5000
 connections and 500 publishes a second), then at 10 percent. It is scenario
 files `smoke-1pct` and `smoke-10pct` run through `60-run.sh`. The scenario
-files belong to the load generator branch; the names here are the ones this
-runbook expects.
+files belong to the load generator branch (`bench/scenarios/*.toml`).
 
     RUN_TIME_LIMIT=20m bench/aws/60-run.sh smoke-1pct
     RUN_TIME_LIMIT=30m bench/aws/60-run.sh smoke-10pct
@@ -343,13 +355,26 @@ that the fleet is up, what it costs an hour and why.
 ## 7. The load generator commands
 
 `50-loadgen.sh` and `60-run.sh` run commands inside the `ably-loadgen` image.
-The defaults are provisional until the load generator branch fixes its flags:
+The defaults match the load generator's flags:
 
 | Variable | Default |
 |---|---|
-| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101` |
-| `PUBLISHER_CMD` | `ably-loadgen serve --role=publisher --listen=:9200 --metrics-listen=:9101` |
-| `CONDUCTOR_CMD` | `ably-conductor --scenario=/run-input/{SCENARIO} --inventory=/run-input/inventory.json --results=/results --run-id={RUN_ID}` |
+| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=generator` |
+| `PUBLISHER_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=publisher` |
+| `CONDUCTOR_CMD` | `ably-conductor run --scenario /run-input/{SCENARIO} --inventory /run-input/inventory.json --results /results --run-id {RUN_ID} --node-vcpu $NODE_VCPU --node-memory-gb $NODE_MEMORY_GB` |
+
+`--role` is `generator`, `publisher` or `all`. The conductor also takes
+`--fault-hook CMD --fault-at D --time-limit D --log --state`; add them by
+setting `CONDUCTOR_CMD` (the tokens `{SCENARIO}` and `{RUN_ID}` are replaced).
+`NODE_VCPU` and `NODE_MEMORY_GB` default from `NODE_INSTANCE_TYPE` (vCPUs from
+the size, memory at 2 GiB per vCPU, which holds for the c7i family); set them
+for any other family. With an explicit `--run-id` the conductor writes straight
+into `--results`, which is the mounted directory, so `60-run.sh` copies that
+directory back as the run's results.
+
+Scenarios are TOML files in `bench/scenarios/` (`shape-f`, `shape-m`,
+`shape-d`, `presence-m`, `smoke-1pct`, `smoke-10pct`, `idle-connections`).
+Pass the name with or without `.toml`.
 
 Port 9100 is taken by node-exporter on every box (all containers use host
 networking), so the agent listens on `LOADGEN_AGENT_PORT` (default 9200).

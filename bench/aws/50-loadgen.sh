@@ -9,8 +9,7 @@
 #           PUBLISHER_CMD, SKIP_OBSERVABILITY=1.
 #
 # LOADGEN_CMD and PUBLISHER_CMD are the commands run inside the ably-loadgen
-# image on each box. The defaults below are provisional until the load
-# generator branch fixes its flags; override them in the environment.
+# image on each box (--role generator or publisher). Override in the environment.
 SCRIPT_NAME=50-loadgen
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -21,8 +20,8 @@ require_env AWS_REGION
 state_init
 require_preflight
 require_network_state
-: "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT}}"
-: "${PUBLISHER_CMD:=ably-loadgen serve --role=publisher --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT}}"
+: "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=generator}"
+: "${PUBLISHER_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=publisher}"
 
 tag=$(image_tag ably-loadgen "${LOADGEN_TAG:-}")
 image="${ECR_REGISTRY}/${ECR_REPO_LOADGEN}:${tag}"

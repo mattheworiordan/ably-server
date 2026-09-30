@@ -6,16 +6,19 @@
 # code, enforces the time limit remotely with timeout(1), and copies the
 # results to $RESULTS_DIR/<run-id>/ on the way out.
 #
-#   RUN_TIME_LIMIT=45m bench/aws/60-run.sh smoke-1pct.yaml
+#   RUN_TIME_LIMIT=45m bench/aws/60-run.sh smoke-1pct
 #
-# Needs: RUN_TIME_LIMIT (300, 45m, 2h). Scenario: a path, or a name resolved
-# against SCENARIO_DIR (default: bench/scenarios in the repository).
+# Needs: RUN_TIME_LIMIT (300, 45m, 2h). Scenario: a path, or a name (with or
+# without .toml) resolved against SCENARIO_DIR (default: bench/scenarios).
 # Optional: CONDUCTOR_CMD (see below), AUTO_STOP_AFTER_RUN=1, OVERRIDE_BUDGET_GUARD=1.
 #
 # CONDUCTOR_CMD is the command run inside the ably-loadgen image. Tokens
 # {RUN_ID} and {SCENARIO} are replaced. The default is provisional until the
-# load generator branch fixes its flags:
-#   ably-conductor --scenario=/run-input/{SCENARIO} --inventory=/run-input/inventory.json --results=/results --run-id={RUN_ID}
+# load generator's flags:
+#   ably-conductor run --scenario /run-input/{SCENARIO} --inventory /run-input/inventory.json --results /results --run-id {RUN_ID} --node-vcpu $NODE_VCPU --node-memory-gb $NODE_MEMORY_GB
+# NODE_VCPU and NODE_MEMORY_GB default from NODE_INSTANCE_TYPE (memory at 2 GiB
+# per vCPU, the c7i ratio). With an explicit --run-id the conductor writes
+# straight into --results, the mounted run directory that is copied back.
 SCRIPT_NAME=60-run
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -33,7 +36,7 @@ limit_s=$RUN_LIMIT_S
 # Scenario file.
 : "${SCENARIO_DIR:=$REPO_ROOT/bench/scenarios}"
 scenario=""
-for cand in "$scenario_arg" "$SCENARIO_DIR/$scenario_arg" "$SCENARIO_DIR/$scenario_arg.yaml" "$SCENARIO_DIR/$scenario_arg.yml" "$SCENARIO_DIR/$scenario_arg.json"; do
+for cand in "$scenario_arg" "$SCENARIO_DIR/$scenario_arg" "$SCENARIO_DIR/$scenario_arg.toml"; do
   if [ -f "$cand" ]; then
     scenario=$cand
     break
@@ -89,7 +92,12 @@ for name in $(state_get '.instances // {} | to_entries[] | select(.value.role ==
   ssh_do "$name" "nohup timeout $stat_limit sh -c 'while true; do docker stats --no-stream --format \"{{json .}}\" >> /var/tmp/docker-stats-$run_id.jsonl; sleep 10; done' >/dev/null 2>&1 </dev/null &"
 done
 
-: "${CONDUCTOR_CMD:=ably-conductor --scenario=/run-input/{SCENARIO} --inventory=/run-input/inventory.json --results=/results --run-id={RUN_ID}}"
+: "${NODE_VCPU:=$(vcpus_of "$NODE_INSTANCE_TYPE")}"
+: "${NODE_MEMORY_GB:=$((NODE_VCPU * 2))}"
+if [ -z "${CONDUCTOR_CMD:-}" ]; then
+  # Not ${CONDUCTOR_CMD:=...}: the braces in the tokens would end that expansion early.
+  CONDUCTOR_CMD="ably-conductor run --scenario /run-input/{SCENARIO} --inventory /run-input/inventory.json --results /results --run-id {RUN_ID} --node-vcpu $NODE_VCPU --node-memory-gb $NODE_MEMORY_GB"
+fi
 cmd=${CONDUCTOR_CMD//\{RUN_ID\}/$run_id}
 cmd=${cmd//\{SCENARIO\}/$scenario_file}
 image=$(state_get '.loadgen.image')

@@ -104,10 +104,11 @@ FAKE
 chmod +x "$tmp/fakebin/ablyctl"
 minted=$( (
   unset AWS_ACCESS_KEY_ID AWS_PROFILE
+  unset AWS_SSO_ROLE ABLYCTL_ACCOUNT
   PATH="$tmp/fakebin:$PATH" FAKE_ABLYCTL_FAIL=0 ensure_credentials
   echo "$AWS_ACCESS_KEY_ID"
 ) )
-check "ablyctl default account and role" "AKIAFAKE_aws_env_--account_dev_--aws-role_Operator" "$minted"
+check "ablyctl default account, default role" "AKIAFAKE_aws_env_--account_dev" "$minted"
 minted=$( (
   unset AWS_ACCESS_KEY_ID AWS_PROFILE
   PATH="$tmp/fakebin:$PATH" ABLYCTL_ACCOUNT=acct AWS_SSO_ROLE=Other ensure_credentials
@@ -115,6 +116,8 @@ minted=$( (
 ) )
 check "ablyctl account and role overridable" "AKIAFAKE_aws_env_--account_acct_--aws-role_Other" "$minted"
 check "existing credentials are kept" keep "$( (export AWS_ACCESS_KEY_ID=keep; PATH="$tmp/fakebin:$PATH" ensure_credentials; echo "$AWS_ACCESS_KEY_ID") )"
+msg=$( (unset AWS_ACCESS_KEY_ID AWS_PROFILE; PATH="$tmp/fakebin:$PATH" FAKE_ABLYCTL_FAIL=1 ensure_credentials 2>&1 >/dev/null) || true)
+case "$msg" in *AgentOperator* ) case "$msg" in *"infrastructure provisions"*"own terminal"*) echo "ok   failure message names both paths" ;; *) echo "FAIL failure message lacks a path"; fails=$((fails + 1)) ;; esac ;; *) echo "FAIL failure message lacks AgentOperator"; fails=$((fails + 1)) ;; esac
 check "ablyctl failure exits non-zero" bad "$( (unset AWS_ACCESS_KEY_ID AWS_PROFILE; PATH="$tmp/fakebin:$PATH" FAKE_ABLYCTL_FAIL=1 ensure_credentials 2>/dev/null) || echo bad)"
 
 if [ "$fails" -gt 0 ]; then

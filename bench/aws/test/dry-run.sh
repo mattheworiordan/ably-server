@@ -44,7 +44,7 @@ for s in "${SEQUENCE[@]}"; do
   fi
   args=()
   case "$s" in
-    60-run.sh) args=(smoke-1pct.yaml) ;;
+    60-run.sh) args=(smoke-1pct) ;;
     65-run-0a.sh) args=(io2) ;;
     70-collect.sh) args=(run-TEST) ;;
     90-teardown.sh) args=(--yes) ;;

@@ -25,6 +25,9 @@ test/cost-test.sh
 echo "== pgbench summary tables"
 test/summarise-test.sh
 
+echo "== scenario names and conductor command"
+test/run-scenario-test.sh
+
 echo "== dry-run call sequence"
 test/dry-run.sh
 
