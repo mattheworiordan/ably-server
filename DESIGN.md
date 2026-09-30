@@ -1388,8 +1388,8 @@ node are dropped; the cm stays in the log for a later `ATTACH` (§4.3).
 Postgres delivers notifications at most once. When the LISTEN connection
 drops, the goroutine re-dials with capped exponential backoff,
 re-`LISTEN`s, and then reconciles each bound channel from
-`History(AfterChannelSerial: lastSeen)` (messages and presence, merged in
-serial order) before it resumes. A per-channel high-water mark drops any
+`History(AfterChannelSerial: lastSeen)` (messages, presence and
+annotations, merged in serial order) before it resumes. A per-channel high-water mark drops any
 cm at or below the last one delivered, so the reconcile and a buffered
 notification never deliver a cm twice. The store joins the dispatch map
 before the bind reads the channel's watermark, so no notification
@@ -1562,10 +1562,10 @@ that the log has moved, and every loss below is recovered from the log.
 | Failure | pgnotify | postgres, transactional | postgres, coalesced | nats |
 |---|---|---|---|---|
 | Publisher dies between commit and bus send | cannot happen (NOTIFY commits with the write) | cannot happen | wake-up never sent: next sweeps (at most about two intervals) | message never sent: next cm's predecessor (100 ms hold) or next sweeps |
-| Receiver's bus connection drops | reconcile from history on reconnect (messages and presence) | reconcile from the log on reconnect | same | same, after a flush confirms the re-sent SUBs |
+| Receiver's bus connection drops | reconcile from history on reconnect (all kinds) | reconcile from the log on reconnect | same | same, after a flush confirms the re-sent SUBs |
 | A NATS server in the cluster dies | n/a | n/a | n/a | client moves to another server, then reconciles |
 | Receiver falls behind | the node's one read-back loop lags; nothing is dropped | full queue: drop, then one catch-up read | same | NATS slow-consumer drop: predecessor gap or sweep |
-| Read of a pointer or gap fails | that cm is not delivered to that node until a reconnect reconcile | retried from the log with backoff | same | same |
+| Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 
 Worst case for the chained buses is about two sweep intervals late. The

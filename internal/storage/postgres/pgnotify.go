@@ -125,10 +125,25 @@ func (b *pgNotifyBus) consume(ctx context.Context, conn *pgx.Conn) error {
 			continue
 		}
 
+		// A channel whose earlier read-back failed is repaired by a range
+		// read from its high-water mark, never by delivering this cm
+		// alone: that would advance the mark past the missed one and lose
+		// it for good (claims audit, "a failed steady-state read-back can
+		// silently lose a delivery").
+		if cs.isDirty() {
+			b.repair(ctx, cs)
+			continue
+		}
 		cm, err := s.loadChannelMessage(ctx, p.Channel, p.Serial)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // Close() interrupted the read, not a fault
+			}
 			s.stats.fetchErrors.Add(1)
-			continue // best-effort; nothing we can do without the cm
+			s.logger.Warn("storage/postgres: read-back failed; repairing from history", "channel", p.Channel, "serial", p.Serial, "err", err)
+			cs.setDirty(true)
+			b.repair(ctx, cs)
+			continue
 		}
 		if cs.deliver(cm) {
 			s.stats.fetched.Add(1)
@@ -169,9 +184,7 @@ func (b *pgNotifyBus) redial(ctx context.Context) *pgx.Conn {
 func (b *pgNotifyBus) reconcile(ctx context.Context) {
 	stores := b.s.boundStores()
 	for _, cs := range stores {
-		if err := cs.reconcileFromHistory(ctx); err != nil {
-			b.s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
-		}
+		b.repair(ctx, cs)
 	}
 	b.s.stats.reconcileRuns.Add(1)
 	b.s.stats.reconciles.Add(uint64(len(stores)))
@@ -327,27 +340,24 @@ func (cs *channelStore) loadAfter(ctx context.Context, after string) ([]*protoco
 	return cs.missedAfter(ctx, after)
 }
 
-// missedAfter reads the message and presence cms committed after the
-// given serial, merged in channelSerial order (the pgnotify reconcile
-// does not read annotations, as before the bus seam).
+// missedAfter reads the cms of every kind (messages, presence and
+// annotations) committed after the given serial, in channelSerial order.
+// Annotations were once left out, so an annotation whose NOTIFY was lost
+// in a LISTEN drop never reached the node.
 func (cs *channelStore) missedAfter(ctx context.Context, after string) ([]*protocol.ChannelMessage, error) {
-	messages, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindMessage,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reconcile messages: %w", err)
+	var all []*protocol.ChannelMessage
+	for _, kind := range []storage.Kind{storage.KindMessage, storage.KindPresence, storage.KindAnnotation} {
+		page, err := cs.History(ctx, storage.HistoryQuery{
+			Kind:               kind,
+			Direction:          storage.DirectionForwards,
+			AfterChannelSerial: after,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reconcile %s: %w", kind, err)
+		}
+		all = mergeByChannelSerial(all, page.ChannelMessages)
 	}
-	presence, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindPresence,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reconcile presence: %w", err)
-	}
-	return mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages), nil
+	return all, nil
 }
 
 // mergeByChannelSerial merges two channelSerial-ascending cm slices
@@ -368,4 +378,31 @@ func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMe
 	out = append(out, a[i:]...)
 	out = append(out, b[j:]...)
 	return out
+}
+
+// repair replays cs's log from its high-water mark and clears the dirty
+// flag on success. On failure the channel stays dirty, so its next
+// notification (or the next reconnect's reconcile) retries.
+func (b *pgNotifyBus) repair(ctx context.Context, cs *channelStore) {
+	if err := cs.reconcileFromHistory(ctx); err != nil {
+		if ctx.Err() == nil {
+			b.s.logger.Warn("storage/postgres: repair from history failed; will retry", "channel", cs.name, "err", err)
+		}
+		return
+	}
+	cs.setDirty(false)
+}
+
+// isDirty and setDirty guard the pgnotify repair flag: set when a
+// read-back failed, cleared once a range read from the mark succeeded.
+func (cs *channelStore) isDirty() bool {
+	cs.hwmMu.Lock()
+	defer cs.hwmMu.Unlock()
+	return cs.dirty
+}
+
+func (cs *channelStore) setDirty(d bool) {
+	cs.hwmMu.Lock()
+	defer cs.hwmMu.Unlock()
+	cs.dirty = d
 }

@@ -99,6 +99,17 @@ var (
 	presenceReaperInterval    = 5 * time.Second
 )
 
+// Test hooks, nil in production. channelBindHook runs inside
+// Storage.Channel at the named phase ("registered": the store is in the
+// dispatch map and the bus subscription is in place, but the watermark
+// is unread; "ensured": the watermark is read but the appender is not
+// yet initialized). loadCMHook runs before a notified cm is read back
+// and can fail the read.
+var (
+	channelBindHook atomic.Pointer[func(phase string)]
+	loadCMHook      atomic.Pointer[func(channel, serial string) error]
+)
+
 // fixtureNodeID is the sentinel owner recorded on static fixture presence
 // rows (DESIGN.md §9, §12.5). It is not a real node id, so no live node's
 // lease-bump loop (WHERE node_id = $node) ever touches these rows; paired
@@ -411,9 +422,15 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if err := s.bus.bind(ctx, cs); err != nil {
 		return fail(err)
 	}
+	if hook := channelBindHook.Load(); hook != nil {
+		(*hook)("registered")
+	}
 	var current, initial string
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
 		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
+	}
+	if hook := channelBindHook.Load(); hook != nil {
+		(*hook)("ensured")
 	}
 	// Initialize the appender and let deliveries through. pgnotify also
 	// runs here a reconcile a LISTEN reconnect requested during the bind
@@ -657,6 +674,11 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 // (channel, channelSerial) via the pool. Used by the LISTEN loop
 // after each NOTIFY.
 func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial string) (*protocol.ChannelMessage, error) {
+	if hook := loadCMHook.Load(); hook != nil {
+		if err := (*hook)(channel, channelSerial); err != nil {
+			return nil, err
+		}
+	}
 	return loadChannelMessagePool(ctx, s.pool, channel, channelSerial)
 }
 
@@ -953,10 +975,12 @@ type channelStore struct {
 	ready       chan struct{}
 	readyClosed bool
 	// pgnotify only (pgnotify.go): deliveries received before the bind
-	// seeded, a reconcile a LISTEN reconnect requested meanwhile, and a
+	// seeded, a reconcile a LISTEN reconnect requested meanwhile, a
+	// failed read-back that must be repaired from the mark (dirty), and a
 	// log-read stub for unit tests.
 	preSeed        []*protocol.ChannelMessage
 	needsReconcile bool
+	dirty          bool
 	loadAfterFn    func(ctx context.Context, after string) ([]*protocol.ChannelMessage, error)
 
 	// Chained-delivery state, used only by a bus whose chains() is true
