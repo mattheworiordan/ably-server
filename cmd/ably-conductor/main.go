@@ -196,6 +196,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	timeLimit := fs.Duration("time-limit", 0, "hard limit for the whole run (default planned length + 5m)")
 	onTimeout := fs.String("on-timeout", "", "shell command run when the time limit is hit (for instance the teardown script)")
 	format := fs.String("format", "msgpack", "realtime wire format for the jobs: msgpack | json")
+	idleTimeout := fs.Duration("server-idle-timeout", -1, "the servers' --channel-idle-timeout: node memory and goroutine growth are measured from hold start plus this (default: the scenario's server_idle_timeout, else 60s; 0 measures from hold start)")
 	var envs multiFlag
 	fs.Var(&envs, "env", "environment label key=value for the run record (bus, storage, instance types); repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -284,7 +285,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		Scenario: sc, Multiplier: sf.multiplier, Scale: sf.scale, RunID: id, RunTag: tag, Inventory: inv,
 		ResultsDir: *results, RunDir: runDir, LogFile: *logFile, StateFile: *stateFile, StartDelay: *startDelay, Poll: *poll,
 		FaultHook: *faultHook, FaultAt: *faultAt, TimeLimit: *timeLimit, OnTimeout: *onTimeout,
-		Format: *format, Out: stdout,
+		Format: *format, Out: stdout, ServerIdleTimeout: conductorIdle(*idleTimeout),
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -408,6 +409,19 @@ func cmdEvaluate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// conductorIdle maps --server-idle-timeout to ConductorConfig's
+// ServerIdleTimeout: negative (unset) takes the scenario's, zero
+// measures from hold start, positive overrides.
+func conductorIdle(d time.Duration) time.Duration {
+	switch {
+	case d < 0:
+		return 0
+	case d == 0:
+		return -1
+	}
+	return d
 }
 
 func splitList(s string) []string {

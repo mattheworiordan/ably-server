@@ -30,6 +30,10 @@ type RunRecord struct {
 	MeasureStartUS int64 `json:"measure_start_us"`
 	MeasureEndUS   int64 `json:"measure_end_us"`
 	EndUS          int64 `json:"end_us"`
+	// GrowthBaselineUS is where node memory and goroutine growth are
+	// measured from: hold start plus the servers' channel idle timeout
+	// (0 in records written before it existed: hold start).
+	GrowthBaselineUS int64 `json:"growth_baseline_us,omitempty"`
 
 	Plan      Totals       `json:"plan"`
 	Result    RunResult    `json:"result"`
@@ -73,7 +77,8 @@ type RunResult struct {
 type NodeStats struct {
 	Samples []NodeSample `json:"samples,omitempty"`
 	// MemoryGrowth is the largest fractional RSS growth of any node from
-	// the first to the last sample of the hold.
+	// its first sample at or after the growth baseline (hold start plus
+	// the servers' channel idle timeout) to its last sample of the hold.
 	MemoryGrowth float64 `json:"memory_growth"`
 	// GoroutineGrowth is the same for goroutines.
 	GoroutineGrowth float64 `json:"goroutine_growth"`
@@ -90,6 +95,18 @@ type NodeStats struct {
 	ChannelsBoundAtStart float64 `json:"channels_bound_at_start"`
 	ChannelsBoundAtEnd   float64 `json:"channels_bound_at_end"`
 	Measured             bool    `json:"measured"`
+	// Growth is measured from the baseline, not the hold start.
+	// GrowthMeasured is false when no node has two samples between the
+	// baseline and the end of the hold (a hold not longer than the idle
+	// timeout): growth is then not judged. The baseline values are summed
+	// over the nodes, so a plateau of bound channels is visible beside
+	// the start and end.
+	GrowthMeasured          bool    `json:"growth_measured"`
+	GrowthBaselineUS        int64   `json:"growth_baseline_us,omitempty"`
+	ChannelsBoundAtBaseline float64 `json:"channels_bound_at_baseline"`
+	RSSBytesAtBaseline      float64 `json:"rss_bytes_at_baseline"`
+	GoroutinesAtBaseline    float64 `json:"goroutines_at_baseline"`
+	GoroutinesAtEnd         float64 `json:"goroutines_at_end"`
 }
 
 // Footprint is plan §8's footprint: provisioned and used resources per
@@ -239,9 +256,17 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 	return r
 }
 
-// ComputeNodeStats derives growth and use over the hold from node samples.
-func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS int64) NodeStats {
+// ComputeNodeStats derives growth and use over the hold from node
+// samples. Use (CPU, connections, bound channels at start and end) spans
+// the whole hold; memory and goroutine growth span baselineUS to the
+// end of the hold (baselineUS at or before measureStartUS means the
+// hold start).
+func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS, baselineUS int64) NodeStats {
 	ns := NodeStats{Samples: samples}
+	if baselineUS < measureStartUS {
+		baselineUS = measureStartUS
+	}
+	ns.GrowthBaselineUS = baselineUS
 	byNode := map[string][]NodeSample{}
 	for _, s := range samples {
 		if s.Error != "" || s.Values == nil {
@@ -259,15 +284,25 @@ func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS int64) 
 		sort.Slice(ss, func(i, j int) bool { return ss[i].AtUS < ss[j].AtUS })
 		first, last := ss[0], ss[len(ss)-1]
 		ns.Measured = true
-		growth := func(name string) float64 {
-			a, b := first.Values[name], last.Values[name]
-			if a <= 0 {
-				return 0
+		// The growth baseline is this node's first sample at or after
+		// baselineUS; growth needs a later sample too.
+		if i := sort.Search(len(ss), func(i int) bool { return ss[i].AtUS >= baselineUS }); i < len(ss)-1 {
+			base := ss[i]
+			ns.GrowthMeasured = true
+			growth := func(name string) float64 {
+				a, b := base.Values[name], last.Values[name]
+				if a <= 0 {
+					return 0
+				}
+				return (b - a) / a
 			}
-			return (b - a) / a
+			ns.MemoryGrowth = max(ns.MemoryGrowth, growth("process_resident_memory_bytes"))
+			ns.GoroutineGrowth = max(ns.GoroutineGrowth, growth("go_goroutines"))
+			ns.ChannelsBoundAtBaseline += base.Values["ably_channels_bound"]
+			ns.RSSBytesAtBaseline += base.Values["process_resident_memory_bytes"]
+			ns.GoroutinesAtBaseline += base.Values["go_goroutines"]
 		}
-		ns.MemoryGrowth = max(ns.MemoryGrowth, growth("process_resident_memory_bytes"))
-		ns.GoroutineGrowth = max(ns.GoroutineGrowth, growth("go_goroutines"))
+		ns.GoroutinesAtEnd += last.Values["go_goroutines"]
 		if dt := float64(last.AtUS-first.AtUS) / 1e6; dt > 0 {
 			ns.CoresUsed += (last.Values["process_cpu_seconds_total"] - first.Values["process_cpu_seconds_total"]) / dt
 		}
@@ -438,7 +473,11 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: fmt.Sprintf("within ±%.0f%%", spec.MaxLoadDrift*100), Pass: abs(dc) <= spec.MaxLoadDrift && abs(da) <= spec.MaxLoadDrift, Gating: gate})
 	}
 	ns := rec.NodeStats
-	if ns.Measured {
+	switch {
+	case ns.Measured && !ns.GrowthMeasured:
+		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
+			Note: "hold not longer than the servers' channel idle timeout: growth is measured from hold start + idle timeout"})
+	case ns.Measured:
 		// A killed node moves its connections to the survivors, so growth
 		// across the hold is expected in a fault run: reported, not gated.
 		gate, note := rec.Fault == nil, ""
@@ -449,7 +488,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxMemoryGrowth*100), Pass: ns.MemoryGrowth <= spec.MaxMemoryGrowth, Gating: gate, Note: note})
 		add(Check{Name: "node goroutine growth over hold", Value: fmt.Sprintf("%.1f%%", ns.GoroutineGrowth*100),
 			Limit: fmt.Sprintf("<= %.0f%%", spec.MaxGoroutineGrowth*100), Pass: ns.GoroutineGrowth <= spec.MaxGoroutineGrowth, Gating: gate, Note: note})
-	} else {
+	default:
 		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
 			Note: "no node metrics URLs in the inventory"})
 	}
@@ -525,6 +564,13 @@ func (rec *RunRecord) Markdown() string {
 	if ns.Measured {
 		fmt.Fprintf(&b, "| Server connections (sum of nodes) | %.0f | %.0f |\n", ns.ConnectionsAtStart, ns.ConnectionsOpen)
 		fmt.Fprintf(&b, "| Server channels bound (sum of nodes) | %.0f | %.0f |\n", ns.ChannelsBoundAtStart, ns.ChannelsBoundAtEnd)
+	}
+	if ns.GrowthMeasured {
+		off := time.Duration(ns.GrowthBaselineUS-rec.MeasureStartUS) * time.Microsecond
+		fmt.Fprintf(&b, "\n| Growth window (from hold start + %s) | Baseline | End |\n|---|---|---|\n", off.Round(time.Second))
+		fmt.Fprintf(&b, "| Server channels bound (sum of nodes) | %.0f | %.0f |\n", ns.ChannelsBoundAtBaseline, ns.ChannelsBoundAtEnd)
+		fmt.Fprintf(&b, "| Node RSS (sum, MiB) | %.0f | %.0f |\n", ns.RSSBytesAtBaseline/(1<<20), ns.RSSBytes/(1<<20))
+		fmt.Fprintf(&b, "| Node goroutines (sum) | %.0f | %.0f |\n", ns.GoroutinesAtBaseline, ns.GoroutinesAtEnd)
 	}
 	if ratio := rec.BoundRatio(); ratio > 0 {
 		fmt.Fprintf(&b, "\nServer channels bound / generator attachments at the end of the hold: %.3f.\n", ratio)

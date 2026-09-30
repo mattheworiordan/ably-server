@@ -63,7 +63,11 @@ starts `bench/docker-compose.loadgen-smoke.yml` (three nodes, Postgres,
 three NATS servers, two agents inside the compose network so the load
 avoids Docker Desktop's port proxy), runs each through the conductor and
 writes a report. `SMOKE_IMAGE` and `BUS` point it at another server
-build.
+build. `SHAPES` picks the shape files (`SHAPES=""` runs none) and
+`SCENARIOS` adds named scenario files, for instance
+`SHAPES="" SCENARIOS=smoke-1pct FAULT=0 HOLD=3m bench/aws/local-smoke.sh`
+for the run 0b smoke on the laptop (a scenario keeps its own scale unless
+`SCALE` is set). The header of the script lists every variable.
 
 ### Quick start (laptop, against a local cluster)
 
@@ -230,6 +234,7 @@ is a run. `run` flags:
 | `--on-timeout CMD` | | for instance `bench/aws/90-teardown.sh` |
 | `--env k=v` | | labels for the run record (bus, storage, instance types) |
 | `--format` | msgpack | realtime wire format |
+| `--server-idle-timeout D` | the scenario's `server_idle_timeout`, else 60s | the nodes' `--channel-idle-timeout`; node memory and goroutine growth are measured from hold start + D (0: from hold start) |
 
 Exit status: 0 PASS, 1 FAIL or ABORTED, 2 usage.
 
@@ -292,13 +297,33 @@ on the sample; achieved publish rate >= 95% of offered and offered >=
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 90% of the plan's; the generator's own connections and attachments
 within ±3% from hold start to end (else node growth would measure the
-generator); node RSS and goroutines grow <= 10% across the hold (reported,
-not gated, in a fault run). The record sets the generator's connections
+generator); node RSS and goroutines grow <= 10% from the growth baseline
+to the end of the hold (reported, not gated, in a fault run). The record sets the generator's connections
 and attachments at hold start and end beside the nodes'
 `ably_connections_open` and `ably_channels_bound`, and gives server
 channels bound over generator attachments at the end of the hold. The footprint (vCPU and memory,
 provisioned and used, per 100k connections, per 100k deliveries/s and
 per 10k writes/s) is reported, not gated.
+
+**Why the growth baseline is hold start plus the idle timeout.** A node
+binds a channel when a subscriber attaches or a REST publish reaches it,
+and releases it only after `--channel-idle-timeout` (default 60 s) with
+no attachment and no publish. So the legitimate working set of bound
+channels is the subscribers' channels plus one idle timeout's worth of
+REST publish targets. At hold start that second part is still filling:
+channels the ramp's publishers touched are bound, the hold's new targets
+are being added, and the first evictions have not happened yet. Memory
+and goroutines grow with it for one idle timeout and then plateau.
+Measured from hold start, that fill reads as a leak (the 60 s smoke holds
+showed node RSS up 30 to 50 percent). The conductor therefore scrapes the
+nodes one second after hold start + idle timeout and measures growth
+from the first sample at or after that point. The report prints
+`ably_channels_bound` (summed over nodes) at hold start, at the baseline
+and at the end, with RSS and goroutines at the baseline and the end, so
+the plateau is visible. A hold not longer than the idle timeout has no
+growth window: growth is reported as not measured and not gated, so a
+run that must judge memory needs a hold of several idle timeouts (the
+15-minute holds of plan §8 give fourteen minutes).
 
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
@@ -317,6 +342,7 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     shards = 1                 # Postgres shards (shard curve parameter)
     message_bytes = 470
     sample_percent = 5         # channels under the serial-continuity check
+    server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline)
 
     [timing]
     ramp = "10m"               # connections and publish rates rise linearly

@@ -49,6 +49,11 @@ type ConductorConfig struct {
 	OnTimeout string
 	// Format is the realtime wire format for the jobs.
 	Format string
+	// ServerIdleTimeout, when positive, overrides the scenario's
+	// server_idle_timeout; the growth baseline is hold start plus it.
+	// Zero takes the scenario's; negative measures growth from hold
+	// start.
+	ServerIdleTimeout time.Duration
 	// Out receives progress lines.
 	Out io.Writer
 	// HTTP is the client for agents and node metrics (default: 10s timeout).
@@ -320,8 +325,19 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 	if cfg.FaultHook != "" {
 		faultTimer = time.After(time.Until(measureStart.Add(cfg.FaultAt)))
 	}
-	// Extra scrapes just inside the hold bound the growth estimate.
+	// Extra scrapes just inside the hold, and just after the growth
+	// baseline (hold start + the servers' idle timeout), bound the growth
+	// estimate.
+	idle := cfg.Scenario.IdleTimeout()
+	switch {
+	case cfg.ServerIdleTimeout > 0:
+		idle = cfg.ServerIdleTimeout
+	case cfg.ServerIdleTimeout < 0:
+		idle = 0
+	}
+	growthBaseline := measureStart.Add(idle)
 	holdStart := time.After(time.Until(measureStart.Add(2 * time.Second)))
+	baselineScrape := time.After(time.Until(growthBaseline.Add(time.Second)))
 	holdEnd := time.After(time.Until(measureEnd.Add(-2 * time.Second)))
 	tick := time.NewTicker(cfg.Poll)
 	defer tick.Stop()
@@ -339,6 +355,8 @@ loop:
 				break loop
 			}
 		case <-holdStart:
+			scrape()
+		case <-baselineScrape:
 			scrape()
 		case <-holdEnd:
 			scrape()
@@ -406,7 +424,12 @@ loop:
 		rec.Shards = n
 	}
 	rec.Result = MergeSummaries(sums, plan.Pass.TailMargin.Duration)
-	rec.NodeStats = ComputeNodeStats(allSamples, rec.MeasureStartUS, rec.MeasureEndUS)
+	rec.GrowthBaselineUS = growthBaseline.UnixMicro()
+	rec.NodeStats = ComputeNodeStats(allSamples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
+	if ns := rec.NodeStats; ns.Measured {
+		cfg.logf("server channels bound (sum of nodes): hold start %.0f, baseline (hold start + %s) %.0f, end %.0f",
+			ns.ChannelsBoundAtStart, idle, ns.ChannelsBoundAtBaseline, ns.ChannelsBoundAtEnd)
+	}
 	rec.Footprint = ComputeFootprint(cfg.Inventory, rec.Result, rec.NodeStats)
 	Evaluate(rec, plan.Pass)
 	rec.Errors = errs
@@ -525,7 +548,7 @@ func EvaluateRunDir(runDir string, inv *Inventory) (*RunRecord, error) {
 		spec = sc.Pass.withDefaults()
 	}
 	rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
-	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS)
+	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
 	rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
 	Evaluate(&rec, spec)
 	return &rec, nil

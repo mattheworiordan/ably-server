@@ -29,6 +29,13 @@ type Scenario struct {
 	Scale         float64 `toml:"scale"         json:"scale,omitempty"`
 	MessageBytes  int     `toml:"message_bytes" json:"message_bytes"`
 	SamplePercent float64 `toml:"sample_percent" json:"sample_percent"`
+	// ServerIdleTimeout is the servers' --channel-idle-timeout (default
+	// DefaultServerIdleTimeout). Node memory and goroutine growth are
+	// measured from hold start plus this, not from hold start: until one
+	// idle timeout has passed, the channels REST publishers touched
+	// during the ramp are still bound, so bound channels (and memory)
+	// legitimately grow into their working set early in the hold.
+	ServerIdleTimeout Duration `toml:"server_idle_timeout" json:"server_idle_timeout"`
 
 	Timing      Timing      `toml:"timing"      json:"timing"`
 	Connections Connections `toml:"connections" json:"connections"`
@@ -36,6 +43,19 @@ type Scenario struct {
 	Presence    Presence    `toml:"presence"    json:"presence"`
 	Classes     []Class     `toml:"class"       json:"classes"`
 	Pass        PassSpec    `toml:"pass"        json:"pass"`
+}
+
+// DefaultServerIdleTimeout is the server's default --channel-idle-timeout,
+// taken when a scenario does not name its servers' value.
+const DefaultServerIdleTimeout = 60 * time.Second
+
+// IdleTimeout returns the servers' channel idle timeout the scenario
+// assumes: ServerIdleTimeout, or DefaultServerIdleTimeout when unset.
+func (s *Scenario) IdleTimeout() time.Duration {
+	if s.ServerIdleTimeout.Duration > 0 {
+		return s.ServerIdleTimeout.Duration
+	}
+	return DefaultServerIdleTimeout
 }
 
 // Duration is a time.Duration that reads and writes as "10m", "30s".

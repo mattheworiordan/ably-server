@@ -6,20 +6,31 @@
 # killed mid-hold. Laptop numbers are not results (plus or minus
 # 50%); the point is that the pipeline works end to end.
 #
-#   bench/aws/local-smoke.sh              # M, D, then the node-kill run
+#   bench/aws/local-smoke.sh              # M, D, F, then the node-kill run
 #   SHAPES="d" FAULT=0 bench/aws/local-smoke.sh
+#   SHAPES="" SCENARIOS="smoke-1pct" FAULT=0 HOLD=3m bench/aws/local-smoke.sh
 #
-# Environment: SHAPES (default "m d f"), FAULT (1: add the node-kill run),
-# SCALE (0.01), RAMP (30s), HOLD (60s), DRAIN (10s), RESULTS (results
-# root, default ./results/smoke), LOG (a LOG.md to append to), BUS and
+# Environment: SHAPES (default "m d f"; an empty SHAPES="" runs no shape
+# file), SCENARIOS (scenario names under bench/scenarios, or paths, run
+# after the shapes: for instance "smoke-1pct"; each keeps its own scale
+# unless SCALE is set), FAULT (1: add the node-kill run), SCALE (0.01 for
+# the shapes), RAMP (30s), HOLD (60s), DRAIN (10s), SERVER_IDLE_TIMEOUT
+# (the nodes' channel idle timeout, passed to the conductor's growth
+# baseline; default the scenario's, else 60s), RESULTS (results root,
+# default ./results/smoke), LOG (a LOG.md to append to), BUS and
 # SMOKE_IMAGE (see bench/docker-compose.loadgen-smoke.yml), KEEP (1:
 # leave the stack up).
+#
+# Node memory and goroutine growth are judged only from hold start plus
+# the idle timeout, so a hold of 60 s with the default 60 s timeout
+# reports growth as not measured; use HOLD=3m or more to judge it.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 compose=(docker compose -f bench/docker-compose.loadgen-smoke.yml)
-shapes="${SHAPES:-m d f}"
+shapes="${SHAPES-m d f}"
+scenarios="${SCENARIOS:-}"
 scale="${SCALE:-0.01}"
 ramp="${RAMP:-30s}"
 hold="${HOLD:-60s}"
@@ -51,10 +62,25 @@ up() {
   "${compose[@]}" up -d --wait
 }
 
+# scenario_file resolves a SCENARIOS entry: a path, or a name under
+# bench/scenarios with or without .toml.
+scenario_file() {
+  local s="$1"
+  for f in "$s" "bench/scenarios/$s" "bench/scenarios/$s.toml"; do
+    if [ -f "$f" ]; then
+      echo "$f"
+      return 0
+    fi
+  done
+  echo "local-smoke: no scenario file for '$s'" >&2
+  return 1
+}
+
+# run <scenario file> <run id> [conductor args...]
 run() {
-  local shape="$1" id="$2"
+  local file="$1" id="$2"
   shift 2
-  local args=(run --scenario "bench/scenarios/shape-$shape.toml" --scale "$scale"
+  local args=(run --scenario "$file"
     --ramp "$ramp" --hold "$hold" --drain "$drain"
     --endpoints "$endpoints" --node-metrics "$metrics"
     --agent http://localhost:9281 --agent http://localhost:9282
@@ -63,6 +89,9 @@ run() {
   if [ -n "$log" ]; then
     args+=(--log "$log")
   fi
+  if [ -n "${SERVER_IDLE_TIMEOUT:-}" ]; then
+    args+=(--server-idle-timeout "$SERVER_IDLE_TIMEOUT")
+  fi
   # A failing run is a result, not a script error: keep going.
   bin/ably-conductor "${args[@]}" "$@" || true
 }
@@ -70,11 +99,20 @@ run() {
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 for shape in $shapes; do
   up
-  run "$shape" "smoke-$shape-$stamp" || true
+  run "bench/scenarios/shape-$shape.toml" "smoke-$shape-$stamp" --scale "$scale" || true
+done
+for sc in $scenarios; do
+  file="$(scenario_file "$sc")"
+  scale_args=()
+  if [ -n "${SCALE:-}" ]; then
+    scale_args=(--scale "$SCALE")
+  fi
+  up
+  run "$file" "smoke-$(basename "$file" .toml)-$stamp" ${scale_args[@]+"${scale_args[@]}"} || true
 done
 if [ "${FAULT:-1}" = "1" ]; then
   up
-  run m "smoke-m-nodekill-$stamp" --fault-hook "${compose[*]} kill node2" --fault-at 20s
+  run bench/scenarios/shape-m.toml "smoke-m-nodekill-$stamp" --scale "$scale" --fault-hook "${compose[*]} kill node2" --fault-at 20s
 fi
 bin/ably-conductor report "$results"/smoke-*-"$stamp"/summary.json > "$results/report-$stamp.md" || true
 echo "results: $results (report-$stamp.md)"

@@ -133,12 +133,12 @@ func TestEvaluateFailures(t *testing.T) {
 		}, "connections open"},
 		{"memory growth", func(s []*Summary, r *RunRecord) {
 			if s == nil {
-				r.NodeStats = NodeStats{Measured: true, MemoryGrowth: 0.2}
+				r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, MemoryGrowth: 0.2}
 			}
 		}, "node memory growth"},
 		{"goroutine growth", func(s []*Summary, r *RunRecord) {
 			if s == nil {
-				r.NodeStats = NodeStats{Measured: true, GoroutineGrowth: 0.5}
+				r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, GoroutineGrowth: 0.5}
 			}
 		}, "node goroutine growth"},
 		{"generator attachments drift", func(s []*Summary, _ *RunRecord) {
@@ -249,12 +249,84 @@ func TestComputeNodeStats(t *testing.T) {
 		s("b", 20_000_000, 130, 500, 10),
 		{Node: "c", AtUS: 15_000_000, Error: "down"},
 	}
-	ns := ComputeNodeStats(samples, 5_000_000, 25_000_000)
+	ns := ComputeNodeStats(samples, 5_000_000, 25_000_000, 0) // baseline 0: from hold start
 	if !ns.Measured || ns.MemoryGrowth < 0.299 || ns.MemoryGrowth > 0.301 || ns.GoroutineGrowth < 0.049 || ns.GoroutineGrowth > 0.051 {
 		t.Fatalf("stats %+v", ns)
 	}
 	if ns.CoresUsed != 3 || ns.RSSBytes != 340 || ns.ConnectionsOpen != 20 {
 		t.Fatalf("use %+v", ns)
+	}
+}
+
+// TestComputeNodeStatsGrowthFromBaseline: growth is measured from the
+// first sample at or after hold start + the servers' idle timeout, so
+// bound channels (and memory) growing into their working set early in
+// the hold do not count, while the bound-channel counts at hold start,
+// baseline and end are all reported.
+func TestComputeNodeStatsGrowthFromBaseline(t *testing.T) {
+	s := func(node string, at int64, rss, gor, bound float64) NodeSample {
+		return NodeSample{Node: node, AtUS: at, Values: map[string]float64{
+			"process_resident_memory_bytes": rss, "go_goroutines": gor, "ably_channels_bound": bound,
+		}}
+	}
+	// Hold 0..120 s, idle timeout 60 s: RSS and bound channels climb for
+	// the first minute, then plateau.
+	samples := []NodeSample{
+		s("a", 1_000_000, 100, 100, 1000),
+		s("a", 30_000_000, 150, 150, 1500),
+		s("a", 61_000_000, 200, 200, 2000),
+		s("a", 90_000_000, 202, 200, 2010),
+		s("a", 118_000_000, 204, 201, 2000),
+		s("b", 1_000_000, 100, 100, 1000),
+		s("b", 61_000_000, 180, 190, 1900),
+		s("b", 118_000_000, 180, 190, 1900),
+	}
+	ns := ComputeNodeStats(samples, 0, 120_000_000, 60_000_000)
+	if !ns.Measured || !ns.GrowthMeasured {
+		t.Fatalf("measured %v growth measured %v", ns.Measured, ns.GrowthMeasured)
+	}
+	if ns.MemoryGrowth < 0.019 || ns.MemoryGrowth > 0.021 || ns.GoroutineGrowth < 0.004 || ns.GoroutineGrowth > 0.006 {
+		t.Fatalf("growth from baseline: memory %.4f goroutines %.4f, want 0.02 and 0.005", ns.MemoryGrowth, ns.GoroutineGrowth)
+	}
+	if ns.ChannelsBoundAtStart != 2000 || ns.ChannelsBoundAtBaseline != 3900 || ns.ChannelsBoundAtEnd != 3900 {
+		t.Fatalf("bound start/baseline/end = %.0f/%.0f/%.0f, want 2000/3900/3900", ns.ChannelsBoundAtStart, ns.ChannelsBoundAtBaseline, ns.ChannelsBoundAtEnd)
+	}
+	if ns.GoroutinesAtBaseline != 390 || ns.GoroutinesAtEnd != 391 {
+		t.Fatalf("goroutines baseline/end = %.0f/%.0f", ns.GoroutinesAtBaseline, ns.GoroutinesAtEnd)
+	}
+	// From hold start the same samples show 100% growth.
+	if ns0 := ComputeNodeStats(samples, 0, 120_000_000, 0); ns0.MemoryGrowth < 1 {
+		t.Fatalf("growth from hold start = %.2f, want >= 1", ns0.MemoryGrowth)
+	}
+
+	// A hold no longer than the idle timeout leaves nothing to measure
+	// growth over: reported, not gated.
+	short := ComputeNodeStats(samples[:2], 0, 60_000_000, 60_000_000)
+	if !short.Measured || short.GrowthMeasured {
+		t.Fatalf("short hold: measured %v growth measured %v", short.Measured, short.GrowthMeasured)
+	}
+	rec := &RunRecord{MeasureStartUS: 0, MeasureEndUS: 60_000_000, NodeStats: short}
+	Evaluate(rec, DefaultPass())
+	var found bool
+	for _, c := range rec.Checks {
+		if c.Name == "node memory and goroutines" {
+			found = true
+			if c.Gating || c.Value != "not measured" {
+				t.Fatalf("short-hold growth check %+v, want non-gating not measured", c)
+			}
+		}
+		if c.Name == "node memory growth over hold" {
+			t.Fatalf("short hold gated memory growth: %+v", c)
+		}
+	}
+	if !found {
+		t.Fatal("no growth check for a short hold")
+	}
+
+	full := &RunRecord{MeasureStartUS: 0, MeasureEndUS: 120_000_000, NodeStats: ns}
+	Evaluate(full, DefaultPass())
+	if md := full.Markdown(); !strings.Contains(md, "Growth window (from hold start + 1m0s)") || !strings.Contains(md, "| Server channels bound (sum of nodes) | 3900 | 3900 |") {
+		t.Fatalf("report lacks the growth window table:\n%s", md)
 	}
 }
 
@@ -351,7 +423,7 @@ func TestReportGroupsRepeatsAndCurves(t *testing.T) {
 func TestEvaluateFaultRunReportsGrowthWithoutGating(t *testing.T) {
 	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
 		if s == nil {
-			r.NodeStats = NodeStats{Measured: true, MemoryGrowth: 1.4, GoroutineGrowth: 1.1}
+			r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, MemoryGrowth: 1.4, GoroutineGrowth: 1.1}
 			r.Fault = &FaultRecord{Command: "kill node2"}
 		}
 	})
