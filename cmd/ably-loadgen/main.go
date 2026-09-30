@@ -4,10 +4,10 @@
 // It runs in one of two modes:
 //
 //	# Long-running agent on a generator box; the conductor drives it.
-//	ably-loadgen agent --listen :7070 --summary-dir /results
+//	ably-loadgen serve --listen=:9200 --metrics-listen=:9101 [--role=publisher]
 //
 //	# One job from flags (or a JobSpec file), summary to a file.
-//	ably-loadgen run --scenario bench/aws/scenarios/shape-m.toml \
+//	ably-loadgen run --scenario bench/scenarios/shape-m.toml \
 //	    --role subscriber --index 0 --count 3 --scale 0.01 \
 //	    --endpoints 10.0.0.1:8080,10.0.0.2:8080 --summary sub-0.json
 //
@@ -45,7 +45,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch args[0] {
-	case "agent":
+	case "agent", "serve":
 		return runAgent(ctx, args[1:], stdout, stderr)
 	case "run":
 		return runJob(ctx, args[1:], stdout, stderr)
@@ -63,23 +63,42 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `usage: ably-loadgen <command> [flags]
 
 commands:
-  agent   run the HTTP control endpoint the conductor drives
+  serve   run the HTTP control endpoint the conductor drives ("agent" is an alias)
   run     run one job from flags or a JobSpec file and write its summary
 
 run "ably-loadgen <command> -h" for the command's flags`)
 }
 
 func runAgent(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("ably-loadgen agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet("ably-loadgen serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	listen := fs.String("listen", envOr("ABLY_LOADGEN_LISTEN", ":7070"), "control and /metrics listen address (env ABLY_LOADGEN_LISTEN)")
+	listen := fs.String("listen", envOr("ABLY_LOADGEN_LISTEN", ":9200"), "control listen address; also serves /metrics (env ABLY_LOADGEN_LISTEN)")
+	metricsListen := fs.String("metrics-listen", envOr("ABLY_LOADGEN_METRICS_LISTEN", ""), "also serve /metrics on this address, for Prometheus (env ABLY_LOADGEN_METRICS_LISTEN)")
+	role := fs.String("role", envOr("ABLY_LOADGEN_ROLE", "all"), "job roles this agent accepts: generator (subscriber, realtime-publisher, presence), publisher (rest-publisher), all, or a comma-separated list of roles (env ABLY_LOADGEN_ROLE)")
 	summaryDir := fs.String("summary-dir", envOr("ABLY_LOADGEN_SUMMARY_DIR", ""), "directory to also write each finished job's summary to (env ABLY_LOADGEN_SUMMARY_DIR)")
 	addrFile := fs.String("addr-file", "", "write the bound address to this file once listening (for local spawning with --listen 127.0.0.1:0)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	roles, err := agentRoles(*role)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	a := loadgen.NewAgent(ctx, nil)
 	a.SummaryDir = *summaryDir
+	a.Roles = roles
+	if *metricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", a.M.Handler())
+		msrv := &http.Server{Addr: *metricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(stderr, "metrics listen: %v\n", err)
+			}
+		}()
+		defer func() { _ = msrv.Close() }()
+	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(stderr, "listen: %v\n", err)
@@ -98,7 +117,7 @@ func runAgent(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	fmt.Fprintf(stdout, "ably-loadgen agent listening on %s\n", ln.Addr())
+	fmt.Fprintf(stdout, "ably-loadgen serve listening on %s (roles %v)\n", ln.Addr(), roles)
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(stderr, "serve: %v\n", err)
 		return 1
@@ -219,6 +238,27 @@ func runJob(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// agentRoles expands the --role value of serve.
+func agentRoles(v string) ([]string, error) {
+	switch v {
+	case "", "all":
+		return nil, nil
+	case "generator":
+		return []string{loadgen.RoleSubscriber, loadgen.RoleRealtime, loadgen.RolePresence}, nil
+	case "publisher":
+		return []string{loadgen.RoleREST}, nil
+	}
+	roles := splitList(v)
+	for _, r := range roles {
+		switch r {
+		case loadgen.RoleSubscriber, loadgen.RoleREST, loadgen.RoleRealtime, loadgen.RolePresence:
+		default:
+			return nil, fmt.Errorf("--role %q: want generator, publisher, all or a list of roles", v)
+		}
+	}
+	return roles, nil
 }
 
 func splitList(s string) []string {

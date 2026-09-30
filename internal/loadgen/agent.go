@@ -28,6 +28,8 @@ type Agent struct {
 	M *Metrics
 	// SummaryDir, if set, receives <job id>.json for each finished job.
 	SummaryDir string
+	// Roles, if non-empty, limits the job roles this agent accepts.
+	Roles []string
 
 	ctx  context.Context
 	mu   sync.Mutex
@@ -46,6 +48,9 @@ func NewAgent(ctx context.Context, m *Metrics) *Agent {
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", a.M.Handler())
+	mux.HandleFunc("GET /v1/info", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"roles": a.Roles})
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("POST /v1/jobs", a.handleStart)
 	mux.HandleFunc("GET /v1/jobs", a.handleList)
@@ -70,6 +75,15 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 func (a *Agent) Start(spec JobSpec) (*Job, error) {
 	if spec.ID == "" {
 		spec.ID = fmt.Sprintf("%s-%d", spec.Role, spec.Index)
+	}
+	if len(a.Roles) > 0 {
+		ok := false
+		for _, r := range a.Roles {
+			ok = ok || r == spec.Role
+		}
+		if !ok {
+			return nil, fmt.Errorf("this agent takes roles %v, not %s", a.Roles, spec.Role)
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -23,7 +23,7 @@ Both are static Go binaries with no runtime dependencies.
 ## Quick start (laptop, against a local cluster)
 
     # three nodes on :8081-8083, debug listeners on :9091-9093
-    ably-conductor run --scenario bench/aws/scenarios/shape-d.toml \
+    ably-conductor run --scenario bench/scenarios/shape-d.toml \
       --scale 0.01 --ramp 30s --hold 60s --drain 10s \
       --endpoints localhost:8081,localhost:8082,localhost:8083 \
       --node-metrics http://localhost:9091/metrics,http://localhost:9092/metrics,http://localhost:9093/metrics \
@@ -82,7 +82,15 @@ the agents run on their own boxes and the conductor gets an inventory.
 
 ## `ably-loadgen`
 
-    ably-loadgen agent [--listen :7070] [--summary-dir DIR] [--addr-file FILE]
+    ably-loadgen serve [--listen :9200] [--metrics-listen :9101] [--role generator|publisher|all]
+                       [--summary-dir DIR] [--addr-file FILE]
+
+(`agent` is an alias.) On the cloud boxes (host networking; 9100 is
+node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
+--metrics-listen=:9101`, REST publisher boxes the same with
+`--role=publisher`. `--role` limits the jobs the agent accepts:
+`generator` takes subscriber, realtime-publisher and presence jobs,
+`publisher` takes rest-publisher jobs, `all` (the default) takes any.
 
 | Endpoint | Purpose |
 |---|---|
@@ -94,7 +102,9 @@ the agents run on their own boxes and the conductor gets an inventory.
 | `GET /metrics` | Prometheus: `ably_loadgen_*` plus Go and process collectors |
 | `GET /healthz` | liveness |
 
-Environment: `ABLY_LOADGEN_LISTEN`, `ABLY_LOADGEN_SUMMARY_DIR`.
+Environment: `ABLY_LOADGEN_LISTEN`, `ABLY_LOADGEN_METRICS_LISTEN`,
+`ABLY_LOADGEN_ROLE`, `ABLY_LOADGEN_SUMMARY_DIR`. `GET /v1/info` returns
+the accepted roles.
 
     ably-loadgen run --scenario FILE --role ROLE --index I --count N \
       --endpoints h:p,... [flags]      # one job, no conductor
@@ -139,11 +149,13 @@ discontinuities, first violations, per sampled channel records),
 ## `ably-conductor`
 
     ably-conductor plan --scenario FILE [--multiplier M] [--scale S] [--json]
-    ably-conductor run  --scenario FILE (--inventory FILE | --endpoints ... --agent ... | --local N) [flags]
+    ably-conductor [run] --scenario FILE (--inventory FILE | --endpoints ... --agent ... | --local N) [flags]
     ably-conductor evaluate [--write] RUN_DIR
     ably-conductor report [--out FILE] RUN_DIR/summary.json ...
 
-`run` flags:
+`run` is the default command, so bench/aws/60-run.sh's
+`ably-conductor --scenario=/run-input/<file> --inventory=/run-input/inventory.json --results=/results --run-id=<id>`
+is a run. `run` flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -153,9 +165,10 @@ discontinuities, first violations, per sampled channel records),
 | `--agent [roles=]URL` | | without an inventory: an agent, repeatable (roles comma-separated; default all) |
 | `--local N` | 0 | spawn N local agents (`--loadgen-bin` to point at the binary) |
 | `--key` | inventory, then `ABLY_SERVER_KEYS` | API key |
-| `--run-id` | `<shape>-<mult>x-<UTC>` | results go to `<results>/<run-id>/` |
+| `--run-id` | `<shape>-<mult>x-<UTC>` | with an explicit `--run-id` the run writes straight into `--results`; without one, into `<results>/<generated id>/` |
 | `--run-tag` | random | see loadgen |
-| `--results DIR` | results | results root |
+| `--results DIR` | results | the run directory (explicit `--run-id`) or the results root |
+| `--node-vcpu`, `--node-memory-gb` | 0 | per-node size for the footprint when the inventory does not carry it |
 | `--log FILE` | | append the one-line result (LOG.md) |
 | `--state FILE` | | append the run to STATE.json's `runs` |
 | `--start-delay` | 10s | job send to ramp start |
@@ -170,6 +183,26 @@ Exit status: 0 PASS, 1 FAIL or ABORTED, 2 usage.
 
 ### Inventory
 
+Two shapes are accepted. The one bench/aws/60-run.sh renders from STATE
+(recognised by its `generators` or `api_key` keys):
+
+    {"run_id": "...", "bus": "nats", "server_image": "...", "api_key": "app.key:secret",
+     "nodes": [{"http": "http://10.0.1.11:8080", "ws": "ws://10.0.1.11:8080", "metrics": "http://10.0.1.11:6060/metrics"}],
+     "nats": "nats://...,nats://...", 
+     "generators": [{"agent": "10.0.2.31:9200", "metrics": "http://10.0.2.31:9101/metrics"}],
+     "publishers": [{"agent": "10.0.3.41:9200", "metrics": "http://10.0.3.41:9101/metrics"}],
+     "postgres": {"shards": [{"id": "...", "storage": "io2", "shard": 0, "endpoint": "..."}]},
+     "prometheus": "http://127.0.0.1:9090"}
+
+Generators take the subscriber, realtime-publisher and presence roles,
+publishers the rest-publisher role (generators take it too when there
+are no publishers). `bus`, the NATS server count, the shard count and
+the storage go into the run record. Nodes may add `instance_type`,
+`vcpu` and `memory_gb` for the footprint (or pass `--node-vcpu` and
+`--node-memory-gb`).
+
+The conductor's own shape, for anything else:
+
     {
       "key": "app.key:secret",
       "environment": {"bus": "nats", "storage": "rds-io2", "region": "eu-west-1"},
@@ -178,8 +211,8 @@ Exit status: 0 PASS, 1 FAIL or ABORTED, 2 usage.
          "instance_type": "c7i.2xlarge", "vcpu": 8, "memory_gb": 16}
       ],
       "agents": [
-        {"name": "gen-1", "url": "http://10.0.2.21:7070", "roles": ["subscriber", "realtime-publisher", "presence"]},
-        {"name": "pub-1", "url": "http://10.0.3.31:7070", "roles": ["rest-publisher"], "workers": 2000}
+        {"name": "gen-1", "url": "http://10.0.2.21:9200", "roles": ["subscriber", "realtime-publisher", "presence"]},
+        {"name": "pub-1", "url": "http://10.0.3.31:9200", "roles": ["rest-publisher"], "workers": 2000}
       ]
     }
 
@@ -213,7 +246,7 @@ per 10k writes/s) is reported, not gated.
 shards: envelope with pass counts and run-to-run spread, footprint, and
 the node and shard curves.
 
-## Scenario format (`scenarios/*.toml`)
+## Scenario format (`bench/scenarios/*.toml`)
 
 Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
 (0.01, 0.1) multiply them; each class says what absorbs the factor.
@@ -277,7 +310,11 @@ channel's fan-out is clamped to the connection count (reported).
 
 Committed scenarios: `shape-f.toml`, `shape-m.toml`, `shape-d.toml`
 (plan §3 shapes; the 1x envelope is M for connections, channels and
-deliveries and D for writes) and `presence-m.toml` (run 6).
+deliveries and D for writes), `presence-m.toml` (run 6), and
+`smoke-1pct.toml` and `smoke-10pct.toml` (run 0b: shapes M and D together
+at 1% and 10%, about 5.5k connections and 590 publishes/s at 1%; a test
+keeps their classes equal to the shape files'). The files are TOML, so
+60-run.sh needs the extension: `60-run.sh smoke-1pct.toml`.
 
 ## Generator host tuning
 

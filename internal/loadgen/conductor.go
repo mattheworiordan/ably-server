@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ type ConductorConfig struct {
 	Inventory  *Inventory
 	// ResultsDir is the results root; the run writes ResultsDir/RunID/.
 	ResultsDir string
+	// RunDir, if set, is the exact directory the run writes to instead.
+	RunDir string
 	// LogFile, if set, gets the run's one-line summary appended (LOG.md).
 	LogFile string
 	// StateFile, if set, gets the run appended to its "runs" array
@@ -195,7 +198,10 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 		return nil, err
 	}
 	totals, classTotals := plan.Totals()
-	runDir := filepath.Join(cfg.ResultsDir, cfg.RunID)
+	runDir := cfg.RunDir
+	if runDir == "" {
+		runDir = filepath.Join(cfg.ResultsDir, cfg.RunID)
+	}
 	if err := os.MkdirAll(filepath.Join(runDir, "agents"), 0o755); err != nil {
 		return nil, err
 	}
@@ -380,6 +386,9 @@ loop:
 	}
 	if b := cfg.Inventory.Environment["bus"]; b != "" {
 		rec.Bus = b
+	}
+	if n, err := strconv.Atoi(cfg.Inventory.Environment["postgres_shards"]); err == nil && n > 0 {
+		rec.Shards = n
 	}
 	rec.Result = MergeSummaries(sums, plan.Pass.TailMargin.Duration)
 	rec.NodeStats = ComputeNodeStats(allSamples, rec.MeasureStartUS, rec.MeasureEndUS)

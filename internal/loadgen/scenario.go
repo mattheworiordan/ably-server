@@ -14,7 +14,7 @@ import (
 )
 
 // Scenario is a workload shape as written in a scenario file
-// (bench/aws/scenarios/*.toml). Rates, counts and sizes are given at 1×
+// (bench/scenarios/*.toml). Rates, counts and sizes are given at 1×
 // and full scale; Resolve applies the multiplier (1× or 2×, plan §3) and
 // the scale (1.0 for a real run, 0.01 and 0.1 for the smoke steps,
 // plan §7) to produce a Plan.

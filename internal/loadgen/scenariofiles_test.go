@@ -9,7 +9,7 @@ import (
 // The committed scenario files must parse, resolve at every multiplier
 // and scale the runs use, and stay on the plan §3 envelope.
 func TestScenarioFilesMatchThePlanTargets(t *testing.T) {
-	dir := filepath.Join("..", "..", "bench", "aws", "scenarios")
+	dir := filepath.Join("..", "..", "bench", "scenarios")
 	near := func(t *testing.T, what string, got, want, tol float64) {
 		t.Helper()
 		if math.Abs(got-want) > tol*want {
@@ -70,5 +70,56 @@ func TestScenarioFilesMatchThePlanTargets(t *testing.T) {
 	}
 	if tot, _ := p.Totals(); tot.PresenceMembers != 1000000 || tot.PresenceEventsPerS != 1200 {
 		t.Errorf("presence totals %+v", tot)
+	}
+}
+
+// The smoke scenarios are shapes M and D together at 1% and 10%: their
+// classes must stay copies of the shape files'.
+func TestSmokeScenariosAreShapesMAndD(t *testing.T) {
+	dir := filepath.Join("..", "..", "bench", "scenarios")
+	m, err := LoadScenario(filepath.Join(dir, "shape-m.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := LoadScenario(filepath.Join(dir, "shape-d.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []Class
+	for _, c := range m.Classes {
+		c.MessageBytes = m.MessageBytes
+		want = append(want, c)
+	}
+	for _, c := range d.Classes {
+		if c.Name == "hot" {
+			c.Name = "hotpub"
+		}
+		c.MessageBytes = d.MessageBytes
+		want = append(want, c)
+	}
+	for file, scale := range map[string]float64{"smoke-1pct.toml": 0.01, "smoke-10pct.toml": 0.1} {
+		s, err := LoadScenario(filepath.Join(dir, file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Scale != scale || s.Connections != m.Connections || s.Churn != m.Churn {
+			t.Errorf("%s: scale %v connections %+v churn %+v", file, s.Scale, s.Connections, s.Churn)
+		}
+		if len(s.Classes) != len(want) {
+			t.Fatalf("%s: %d classes, want %d", file, len(s.Classes), len(want))
+		}
+		for i := range want {
+			if s.Classes[i] != want[i] {
+				t.Errorf("%s class %d = %+v, want %+v", file, i, s.Classes[i], want[i])
+			}
+		}
+		p, err := s.Resolve(0, 0, "t")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tot, _ := p.Totals()
+		if math.Abs(float64(tot.Connections)-550000*scale) > 1 || math.Abs(tot.PublishesPerSec-59000*scale)/(59000*scale) > 0.03 {
+			t.Errorf("%s: %d connections, %.0f publishes/s", file, tot.Connections, tot.PublishesPerSec)
+		}
 	}
 }

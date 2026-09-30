@@ -4,7 +4,7 @@
 // collects every job's summary and the nodes' metrics, evaluates the
 // pass criteria (plan §8) and writes a run record.
 //
-//	ably-conductor plan --scenario bench/aws/scenarios/shape-m.toml --multiplier 2
+//	ably-conductor plan --scenario bench/scenarios/shape-m.toml --multiplier 2
 //	ably-conductor run --scenario ... --inventory inventory.json --results results/
 //	ably-conductor run --scenario ... --scale 0.01 --local 2 --endpoints localhost:8081,localhost:8082
 //	ably-conductor evaluate results/<run-id>
@@ -42,6 +42,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+	// Bare flags mean run: "ably-conductor --scenario=... --inventory=..."
+	// is how bench/aws/60-run.sh invokes it.
+	if strings.HasPrefix(args[0], "-") && args[0] != "-h" && args[0] != "--help" {
+		return cmdRun(ctx, args, stdout, stderr)
+	}
 	switch args[0] {
 	case "plan":
 		return cmdPlan(args[1:], stdout, stderr)
@@ -67,6 +72,7 @@ func usage(w io.Writer) {
 commands:
   plan      print a scenario's derived load at a multiplier and scale
   run       run a scenario against an inventory (or local agents) and evaluate it
+            (the default: "ably-conductor --scenario=... --inventory=..." means run)
   evaluate  re-evaluate a run directory from its saved agent summaries
   report    build the report tables from one or more run summary.json files
 
@@ -81,7 +87,7 @@ type scenarioFlags struct {
 }
 
 func (sf *scenarioFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&sf.scenario, "scenario", "", "scenario TOML file (bench/aws/scenarios/*.toml)")
+	fs.StringVar(&sf.scenario, "scenario", "", "scenario TOML file (bench/scenarios/*.toml)")
 	fs.Float64Var(&sf.multiplier, "multiplier", 0, "load multiplier: 1 (envelope) or 2 (headline); 0 takes the scenario's")
 	fs.Float64Var(&sf.scale, "scale", 0, "scale factor: 0.01 and 0.1 for the smoke steps; 0 takes the scenario's (1)")
 	fs.DurationVar(&sf.ramp, "ramp", -1, "override the scenario's ramp")
@@ -176,9 +182,11 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	local := fs.Int("local", 0, "spawn this many local ably-loadgen agents (every role) instead of --agent")
 	loadgenBin := fs.String("loadgen-bin", "", "ably-loadgen binary for --local (default: next to this binary, then PATH)")
 	key := fs.String("key", "", "API key (default: inventory key, then ABLY_SERVER_KEYS)")
-	runID := fs.String("run-id", "", "run id (default <shape>-<mult>x-<UTC time>)")
+	runID := fs.String("run-id", "", "run id; when given, the run writes straight into --results (default <shape>-<mult>x-<UTC time> under --results)")
 	runTag := fs.String("run-tag", "", "run tag for channel names and message ids ([A-Za-z0-9_], default random)")
-	results := fs.String("results", "results", "results root; the run writes <results>/<run-id>/")
+	results := fs.String("results", "results", "results directory: the run's own directory when --run-id is given, else the root for <results>/<run-id>/")
+	nodeVCPU := fs.Float64("node-vcpu", 0, "vCPU per node for the footprint, when the inventory does not say")
+	nodeMemGB := fs.Float64("node-memory-gb", 0, "memory (GB) per node for the footprint, when the inventory does not say")
 	logFile := fs.String("log", "", "append the run's one-line summary to this file (LOG.md)")
 	stateFile := fs.String("state", "", "append the run to this STATE.json's runs array")
 	startDelay := fs.Duration("start-delay", 10*time.Second, "time between sending jobs and the ramp start")
@@ -227,6 +235,14 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if *key != "" {
 		inv.Key = *key
 	}
+	for i := range inv.Nodes {
+		if inv.Nodes[i].VCPU == 0 {
+			inv.Nodes[i].VCPU = *nodeVCPU
+		}
+		if inv.Nodes[i].MemoryGB == 0 {
+			inv.Nodes[i].MemoryGB = *nodeMemGB
+		}
+	}
 	for _, e := range envs {
 		k, v, ok := strings.Cut(e, "=")
 		if !ok {
@@ -239,7 +255,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		inv.Environment[k] = v
 	}
 	if *local > 0 {
-		stopAgents, err := spawnLocalAgents(ctx, inv, *local, *loadgenBin, filepath.Join(*results, ".agents"), stderr)
+		stopAgents, err := spawnLocalAgents(ctx, inv, *local, *loadgenBin, filepath.Join(os.TempDir(), fmt.Sprintf("ably-conductor-agents-%d", os.Getpid())), stderr)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -255,8 +271,10 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		mult = max(sc.Multiplier, 1)
 	}
 	id := *runID
+	runDir := *results
 	if id == "" {
 		id = fmt.Sprintf("%s-%gx-%s", sc.Shape, mult, time.Now().UTC().Format("20060102T150405Z"))
+		runDir = filepath.Join(*results, id)
 	}
 	tag := *runTag
 	if tag == "" {
@@ -264,7 +282,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, Multiplier: sf.multiplier, Scale: sf.scale, RunID: id, RunTag: tag, Inventory: inv,
-		ResultsDir: *results, LogFile: *logFile, StateFile: *stateFile, StartDelay: *startDelay, Poll: *poll,
+		ResultsDir: *results, RunDir: runDir, LogFile: *logFile, StateFile: *stateFile, StartDelay: *startDelay, Poll: *poll,
 		FaultHook: *faultHook, FaultAt: *faultAt, TimeLimit: *timeLimit, OnTimeout: *onTimeout,
 		Format: *format, Out: stdout,
 	})
@@ -324,7 +342,7 @@ func spawnLocalAgents(ctx context.Context, inv *loadgen.Inventory, n int, bin, d
 			stop()
 			return nil, err
 		}
-		cmd := exec.CommandContext(ctx, bin, "agent", "--listen", "127.0.0.1:0", "--addr-file", addrFile)
+		cmd := exec.CommandContext(ctx, bin, "serve", "--listen", "127.0.0.1:0", "--addr-file", addrFile)
 		cmd.Stdout, cmd.Stderr = logf, logf
 		if err := cmd.Start(); err != nil {
 			stop()
