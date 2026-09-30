@@ -1,0 +1,2 @@
+The CSV files here hold invented numbers for testing the summary renderer
+(test/summarise-test.sh). They are not measurements. Do not quote them.

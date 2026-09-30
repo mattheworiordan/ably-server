@@ -1,0 +1,5 @@
+storage,variant,batch,clients,duration_s,transactions,tps,msgs_per_s,lat_avg_ms,p50_ms,p95_ms,p99_ms,max_ms,failed,wal_bytes_per_msg,status
+gp3,shipped,0,1,60,100000,1666.7,1667,0.600,0.580,0.900,1.500,5.000,0,1800,ok
+gp3,shipped,0,8,60,420000,7000.0,7000,1.140,1.000,1.800,3.400,11.000,0,1800,ok
+gp3,batch30,30,1,60,50000,833.3,25000,1.200,1.100,1.800,2.700,8.000,0,1500,ok
+gp3,batch30,30,8,60,240000,4000.0,120000,2.000,1.900,3.000,4.800,14.000,1,1500,failed

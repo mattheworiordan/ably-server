@@ -32,7 +32,7 @@ export LOG_FILE="$tmp/LOG.md" RESULTS_DIR="$tmp/results"
 export KEEP_WORK_DIR=0 SKIP_BOOT_WAIT=0
 : >"$tmp/bench.pub"
 
-DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh build-push.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 70-collect.sh 80-stop.sh 80-start.sh 90-teardown.sh"
+DEFAULT_SEQUENCE="00-preflight.sh 10-network.sh build-push.sh 20-postgres.sh 25-pgdriver.sh 30-nats.sh 40-nodes.sh 50-loadgen.sh 60-run.sh 65-run-0a.sh 70-collect.sh 80-stop.sh 80-start.sh 90-teardown.sh"
 read -r -a SEQUENCE <<<"${SEQUENCE:-$DEFAULT_SEQUENCE}"
 out="$tmp/calls.txt"
 : >"$out"
@@ -45,6 +45,7 @@ for s in "${SEQUENCE[@]}"; do
   args=()
   case "$s" in
     60-run.sh) args=(smoke-1pct.yaml) ;;
+    65-run-0a.sh) args=(io2) ;;
     70-collect.sh) args=(run-TEST) ;;
     90-teardown.sh) args=(--yes) ;;
   esac

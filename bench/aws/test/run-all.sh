@@ -19,6 +19,9 @@ test/userdata-lint.sh
 echo "== lib unit tests"
 test/lib-test.sh
 
+echo "== pgbench summary tables"
+test/summarise-test.sh
+
 echo "== dry-run call sequence"
 test/dry-run.sh
 

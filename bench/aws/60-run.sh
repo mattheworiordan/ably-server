@@ -26,9 +26,8 @@ scenario_arg=${1:?usage: 60-run.sh <scenario-file-or-name>}
 state_init
 load_postgres_password
 
-[ -n "${RUN_TIME_LIMIT:-}" ] || die "RUN_TIME_LIMIT is not set. Every run needs a hard time limit (for example RUN_TIME_LIMIT=45m)."
-limit_s=$(parse_duration "$RUN_TIME_LIMIT") || die "RUN_TIME_LIMIT=$RUN_TIME_LIMIT is not a duration (use 300, 45m or 2h)"
-[ "$limit_s" -gt 0 ] || die "RUN_TIME_LIMIT must be positive"
+require_run_limit
+limit_s=$RUN_LIMIT_S
 
 # Scenario file.
 : "${SCENARIO_DIR:=$REPO_ROOT/bench/scenarios}"
@@ -49,20 +48,8 @@ if [ -z "$scenario" ]; then
 fi
 scenario_file=$(basename "$scenario")
 
-# Budget guard.
-cost_checkpoint
-rate=$(fleet_hourly_rate)
-accrued=$(state_get '.budget.accrued_usd')
-: "${accrued:=0}"
-projected=$(awk -v a="$accrued" -v r="$rate" -v s="$limit_s" 'BEGIN{printf "%.2f", a + r*s/3600}')
-log "fleet \$$rate/h; spent so far (est.) \$$accrued; with this run up to \$$projected (alarm \$$BUDGET_ALARM_USD, cap \$$BUDGET_CAP_USD)"
-if awk -v p="$projected" -v cap="$BUDGET_CAP_USD" 'BEGIN{exit !(p+0 > cap+0)}'; then
-  if [ "${OVERRIDE_BUDGET_GUARD:-0}" = 1 ]; then
-    log "WARNING: OVERRIDE_BUDGET_GUARD=1; running past the cap estimate"
-  else
-    die "this run could take the estimated spend to \$$projected, over the \$$BUDGET_CAP_USD cap. Shorten RUN_TIME_LIMIT, or set OVERRIDE_BUDGET_GUARD=1 after deciding with the budget owner."
-  fi
-fi
+budget_guard "$limit_s"
+accrued=$BUDGET_ACCRUED
 
 cname=$(iname conductor 1)
 [ -n "$(inst_field "$cname" id)" ] || die "no conductor in STATE; run 50-loadgen.sh first"
@@ -106,24 +93,10 @@ cmd=${CONDUCTOR_CMD//\{RUN_ID\}/$run_id}
 cmd=${cmd//\{SCENARIO\}/$scenario_file}
 image=$(state_get '.loadgen.image')
 [ -n "$image" ] || die "STATE has no loadgen image; run 50-loadgen.sh"
-remote="timeout -k 30 $limit_s docker run --rm --name conductor-run --network host -v $idir:/run-input:ro -v $rdir:/results $image $cmd"
-ssh_do "$cname" "nohup bash -c '$remote; echo \$? > $rdir/exit-code' >$rdir/conductor.log 2>&1 </dev/null &"
-
-# Poll for the exit code. A dropped SSH session only costs one poll.
-deadline=$(($(date +%s) + limit_s + 300))
-rc=""
-while :; do
-  rc=$(ssh_do "$cname" "cat $rdir/exit-code 2>/dev/null || true" || true)
-  rc=$(printf '%s' "$rc" | tr -d '[:space:]')
-  if [ -n "$rc" ] || is_dry; then break; fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    log "WARNING: no exit code $((limit_s + 300))s after start; collecting what exists"
-    rc=unknown
-    break
-  fi
-  sleep 30
-done
-if is_dry; then rc=0; fi
+printf '#!/usr/bin/env bash\nexec docker run --rm --name conductor-run --network host -v %s:/run-input:ro -v %s:/results %s %s\n' \
+  "$idir" "$rdir" "$image" "$cmd" >"$BENCH_WORK_DIR/conductor-cmd.sh"
+run_detached "$cname" "$rdir" "$BENCH_WORK_DIR/conductor-cmd.sh" "$limit_s"
+rc=$RUN_RC
 
 status=ok
 case "$rc" in

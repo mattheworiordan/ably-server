@@ -18,9 +18,9 @@ ensure_credentials() {
   if [ -n "${AWS_ACCESS_KEY_ID:-}" ] || [ -n "${AWS_PROFILE:-}" ]; then return 0; fi
   command -v ablyctl >/dev/null 2>&1 || return 0
   local account=${ABLYCTL_ACCOUNT:-dev} role=${AWS_SSO_ROLE:-Operator} out rc=0
-  local -a limit=()
-  if command -v timeout >/dev/null 2>&1; then limit=(timeout 60); fi
-  out=$("${limit[@]}" ablyctl aws env --account "$account" --aws-role "$role" 2>/dev/null) || rc=$?
+  local -a tlimit=()
+  if command -v timeout >/dev/null 2>&1; then tlimit=(timeout 60); fi
+  out=$("${tlimit[@]}" ablyctl aws env --account "$account" --aws-role "$role" 2>/dev/null) || rc=$?
   if [ "$rc" != 0 ] || [ -z "$out" ]; then
     echo "ablyctl could not mint credentials (sign-in expired?): run 'ablyctl aws env --account $account --aws-role $role' in a terminal, finish the browser login, then re-run." >&2
     exit 1

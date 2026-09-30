@@ -658,6 +658,47 @@ load_postgres_password() {
   return 0
 }
 
+# shellcheck disable=SC2034  # outputs are read by the callers
+# parse_dsn <dsn>: sets DSN_USER, DSN_PASSWORD, DSN_HOST, DSN_PORT, DSN_DB.
+parse_dsn() {
+  local rest=${1#*://} auth hostpart
+  auth=${rest%%@*}
+  hostpart=${rest#*@}
+  DSN_USER=${auth%%:*}
+  DSN_PASSWORD=${auth#*:}
+  DSN_HOST=${hostpart%%[:/]*}
+  hostpart=${hostpart#"$DSN_HOST"}
+  DSN_PORT=5432
+  case "$hostpart" in :*) DSN_PORT=${hostpart#:}; DSN_PORT=${DSN_PORT%%/*} ;; esac
+  DSN_DB=${hostpart#*/}
+  DSN_DB=${DSN_DB%%\?*}
+}
+
+# run_detached <instance> <result-dir> <local-script> <limit-seconds>
+# Copies the script to the instance, runs it detached under timeout(1) (a
+# dropped SSH session does not stop it), polls for its exit code and sets
+# RUN_RC (an exit code, or "unknown" if none arrived in limit + 300 s).
+run_detached() {
+  local name=$1 rdir=$2 script=$3 limit=$4 deadline
+  ssh_do "$name" "mkdir -p $rdir"
+  scp_to "$name" "$script" "$rdir/cmd.sh"
+  ssh_do "$name" "nohup bash -c 'timeout -k 30 $limit bash $rdir/cmd.sh; echo \$? > $rdir/exit-code' >$rdir/run.log 2>&1 </dev/null &"
+  deadline=$(($(date +%s) + limit + 300))
+  RUN_RC=""
+  while :; do
+    RUN_RC=$(ssh_do "$name" "cat $rdir/exit-code 2>/dev/null || true" || true)
+    RUN_RC=$(printf '%s' "$RUN_RC" | tr -d '[:space:]')
+    if [ -n "$RUN_RC" ] || is_dry; then break; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "WARNING: no exit code $((limit + 300))s after start; collecting what exists"
+      RUN_RC=unknown
+      break
+    fi
+    sleep 30
+  done
+  if is_dry; then RUN_RC=0; fi
+}
+
 # ------------------------------------------------------------------ cost
 
 # price_of <key>: USD per hour. PRICE_<KEY> overrides (dots become _).
@@ -749,4 +790,32 @@ cost_checkpoint() {
   state_set_json '.budget.accrued_usd' "$acc"
   state_set_json '.budget.since_epoch' "$now"
   state_set_json '.budget.rate_usd_h' "$(fleet_hourly_rate)"
+}
+
+# shellcheck disable=SC2034  # BUDGET_ACCRUED is read by the callers
+# budget_guard <limit-seconds>: refuse when the estimated spend plus this
+# run, at the current fleet rate, would pass BUDGET_CAP_USD.
+budget_guard() {
+  local limit_s=$1 rate accrued projected
+  cost_checkpoint
+  rate=$(fleet_hourly_rate)
+  accrued=$(state_get '.budget.accrued_usd')
+  : "${accrued:=0}"
+  projected=$(awk -v a="$accrued" -v r="$rate" -v s="$limit_s" 'BEGIN{printf "%.2f", a + r*s/3600}')
+  log "fleet \$$rate/h; spent so far (est.) \$$accrued; with this run up to \$$projected (alarm \$$BUDGET_ALARM_USD, cap \$$BUDGET_CAP_USD)"
+  if awk -v p="$projected" -v cap="$BUDGET_CAP_USD" 'BEGIN{exit !(p+0 > cap+0)}'; then
+    if [ "${OVERRIDE_BUDGET_GUARD:-0}" = 1 ]; then
+      log "WARNING: OVERRIDE_BUDGET_GUARD=1; running past the cap estimate"
+    else
+      die "this run could take the estimated spend to \$$projected, over the \$$BUDGET_CAP_USD cap. Shorten RUN_TIME_LIMIT, or set OVERRIDE_BUDGET_GUARD=1 after deciding with the budget owner."
+    fi
+  fi
+  BUDGET_ACCRUED=$accrued
+}
+
+# require_run_limit: sets RUN_LIMIT_S from RUN_TIME_LIMIT or dies.
+require_run_limit() {
+  [ -n "${RUN_TIME_LIMIT:-}" ] || die "RUN_TIME_LIMIT is not set. Every run needs a hard time limit (for example RUN_TIME_LIMIT=45m)."
+  RUN_LIMIT_S=$(parse_duration "$RUN_TIME_LIMIT") || die "RUN_TIME_LIMIT=$RUN_TIME_LIMIT is not a duration (use 300, 45m or 2h)"
+  [ "$RUN_LIMIT_S" -gt 0 ] || die "RUN_TIME_LIMIT must be positive"
 }
