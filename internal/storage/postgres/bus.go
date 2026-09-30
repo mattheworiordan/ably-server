@@ -141,39 +141,40 @@ func (cs *channelStore) st() *busStats {
 func (s *Storage) BusStats() storage.BusStats {
 	c := &s.stats
 	out := storage.BusStats{
-		Bus:              s.busKind,
-		Mode:             s.notifyMode,
-		Connected:        s.busConnected(),
-		BoundChannels:    s.boundCount(),
-		Published:        c.published.Load(),
-		PublishErrors:    c.publishErrors.Load(),
-		Pointers:         c.pointers.Load(),
-		Received:         c.received.Load(),
-		Unrouted:         c.unrouted.Load(),
-		Malformed:        c.malformed.Load(),
-		Inline:           c.inline.Load(),
-		Fetched:          c.fetched.Load(),
-		FastPath:         c.fastPath.Load(),
-		Filled:           c.filled.Load(),
-		Duplicates:       c.duplicates.Load(),
-		Held:             c.held.Load(),
-		GapFills:         c.gapFills.Load(),
-		FetchErrors:      c.fetchErrors.Load(),
-		ReconcileRuns:    c.reconcileRuns.Load(),
-		Reconciles:       c.reconciles.Load(),
-		ReconcileSeconds: time.Duration(c.reconcileNanos.Load()).Seconds(),
-		Sweeps:           c.sweeps.Load(),
-		SweepCatchUps:    c.sweepCatchUps.Load(),
-		SweepSeconds:     time.Duration(c.sweepNanos.Load()).Seconds(),
-		Drops:            c.drops.Load(),
-		Listens:          c.listens.Load(),
-		Unlistens:        c.unlistens.Load(),
-		WakeupsSent:      c.wakeupsSent.Load(),
-		WakeupsReceived:  c.wakeupsReceived.Load(),
-		Flushes:          c.flushes.Load(),
-		FlushErrors:      c.flushErrors.Load(),
-		Overflow:         c.overflow.Load(),
-		FlushSeconds:     time.Duration(c.flushNanos.Load()).Seconds(),
+		Bus:               s.busKind,
+		Mode:              s.notifyMode,
+		Connected:         s.busConnected(),
+		BoundChannels:     s.boundCount(),
+		ReceiveQueueDepth: s.busQueueDepth(),
+		Published:         c.published.Load(),
+		PublishErrors:     c.publishErrors.Load(),
+		Pointers:          c.pointers.Load(),
+		Received:          c.received.Load(),
+		Unrouted:          c.unrouted.Load(),
+		Malformed:         c.malformed.Load(),
+		Inline:            c.inline.Load(),
+		Fetched:           c.fetched.Load(),
+		FastPath:          c.fastPath.Load(),
+		Filled:            c.filled.Load(),
+		Duplicates:        c.duplicates.Load(),
+		Held:              c.held.Load(),
+		GapFills:          c.gapFills.Load(),
+		FetchErrors:       c.fetchErrors.Load(),
+		ReconcileRuns:     c.reconcileRuns.Load(),
+		Reconciles:        c.reconciles.Load(),
+		ReconcileSeconds:  time.Duration(c.reconcileNanos.Load()).Seconds(),
+		Sweeps:            c.sweeps.Load(),
+		SweepCatchUps:     c.sweepCatchUps.Load(),
+		SweepSeconds:      time.Duration(c.sweepNanos.Load()).Seconds(),
+		Drops:             c.drops.Load(),
+		Listens:           c.listens.Load(),
+		Unlistens:         c.unlistens.Load(),
+		WakeupsSent:       c.wakeupsSent.Load(),
+		WakeupsReceived:   c.wakeupsReceived.Load(),
+		Flushes:           c.flushes.Load(),
+		FlushErrors:       c.flushErrors.Load(),
+		Overflow:          c.overflow.Load(),
+		FlushSeconds:      time.Duration(c.flushNanos.Load()).Seconds(),
 	}
 	return out
 }
@@ -190,6 +191,15 @@ func (s *Storage) boundCount() int {
 		}
 	}
 	return n
+}
+
+// busQueueDepth reports the bus messages waiting for dispatch, for a
+// bus that queues them centrally (nats); zero otherwise.
+func (s *Storage) busQueueDepth() int {
+	if q, ok := s.bus.(interface{ queueDepth() int }); ok {
+		return q.queueDepth()
+	}
+	return 0
 }
 
 // busConnected reports whether the bus's connection is up: NATS, or the

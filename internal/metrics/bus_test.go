@@ -25,7 +25,7 @@ func (f *fakeBus) BusStats() storage.BusStats {
 func TestRegisterBusExposesBusStats(t *testing.T) {
 	m := New()
 	src := &fakeBus{st: storage.BusStats{
-		Bus: "postgres", Mode: "coalesced", Connected: true, BoundChannels: 4,
+		Bus: "postgres", Mode: "coalesced", Connected: true, BoundChannels: 4, ReceiveQueueDepth: 9,
 		Received: 7, Inline: 3, FastPath: 2, WakeupsSent: 5, Overflow: 1, Drops: 6, ReconcileSeconds: 1.5,
 	}}
 	m.RegisterBus(src)
@@ -36,6 +36,8 @@ func TestRegisterBusExposesBusStats(t *testing.T) {
 		`ably_bus_info{bus="postgres",mode="coalesced"} 1`,
 		"ably_bus_connected 1",
 		"ably_bus_bound_channels 4",
+		"ably_bus_receive_queue_depth 9",
+		"# TYPE ably_bus_receive_queue_depth gauge",
 		"ably_bus_received_total 7",
 		"ably_bus_inline_deliveries_total 3",
 		"ably_bus_fast_path_deliveries_total 2",

@@ -179,6 +179,10 @@ type BusStats struct {
 	Connected bool
 	// BoundChannels is the number of channels bound on this node.
 	BoundChannels int
+	// ReceiveQueueDepth is the number of bus messages received and
+	// waiting to be dispatched to their channel's delivery point (the
+	// nats bus's dispatch shards); zero on the other buses.
+	ReceiveQueueDepth int
 
 	// Published counts bus messages sent for committed cms (NATS
 	// publishes, or NOTIFYs inside publish transactions); PublishErrors
@@ -213,7 +217,8 @@ type BusStats struct {
 	SweepSeconds          float64
 
 	// Drops counts bus messages dropped before delivery: a NATS slow
-	// consumer, or a full per-channel queue on the postgres bus. Each is
+	// consumer episode (a full dispatch shard), or a full per-channel
+	// queue on the postgres bus. Each is
 	// recovered from the log.
 	Drops uint64
 

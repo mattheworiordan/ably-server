@@ -1455,7 +1455,7 @@ behind a small seam inside the postgres backend
 |---|---|---|---|
 | `pgnotify` (default) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
 | `postgres` | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
-| `nats` | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel | a NATS core server or cluster | One primary's commit rate |
+| `nats` | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel, fanned into a fixed set of dispatch workers | a NATS core server or cluster | One primary's commit rate |
 
 `pgnotify` is the default so the shipped behaviour stays the default
 until the deployment sizes are written from measured numbers.
@@ -1612,7 +1612,23 @@ msgpack envelope of channel, serial, predecessor and the cm as stored,
 with annotation summary snapshots. A cm whose encoding exceeds
 `--nats-inline-max-bytes` (default 256 KiB) goes as a pointer, and
 receivers read it by serial. The publish transaction emits no NOTIFY.
-Each subscription has its own delivery goroutine.
+
+**Receive fan-in.** A node holds one NATS subscription per bound channel,
+so it receives only its own channels, but the subscriptions do not each
+get a goroutine (nats.go's async `Subscribe` would start one per
+subscription, so goroutines would grow one for one with bound channels).
+Every subscription is a `ChanSubscribe` into one of 16 bounded dispatch
+queues (8,192 messages each), chosen by a hash of the channel name, and
+one worker per queue decodes each message and hands it to the channel's
+delivery point. A channel always uses the same queue, so its messages are
+dispatched in the order the connection read them. The goroutine count is
+fixed whatever the number of bound channels. A pointer's body is read off
+the worker (at most 32 reads in flight), so a slow log read stalls no
+other channel on its queue; the chain holds any later cm of that channel
+until the pointer's body is in. A full queue makes NATS drop the message
+(a slow consumer, counted once per episode in `ably_bus_drops_total`),
+which the chain repairs from the log. `ably_bus_receive_queue_depth` is
+the number of messages waiting across the queues.
 
 `--nats-url` may list the servers of one NATS cluster, comma-separated.
 The client connects to one, learns the others from the cluster, and on a
@@ -1660,7 +1676,7 @@ that the log has moved, and every loss below is recovered from the log.
 | Publisher dies between commit and bus send | cannot happen (NOTIFY commits with the write) | cannot happen | wake-up never sent: next sweeps (at most about two intervals) | message never sent: next cm's predecessor (100 ms hold) or next sweeps |
 | Receiver's bus connection drops | reconcile from history on reconnect (all kinds) | reconcile from the log on reconnect | same | same, after a flush confirms the re-sent SUBs |
 | A NATS server in the cluster dies | n/a | n/a | n/a | client moves to another server, then reconciles |
-| Receiver falls behind | the node's one read-back loop lags; nothing is dropped | full queue: drop, then one catch-up read | same | NATS slow-consumer drop: predecessor gap or sweep |
+| Receiver falls behind | the node's one read-back loop lags; nothing is dropped | full queue: drop, then one catch-up read | same | full dispatch queue, NATS slow-consumer drop: predecessor gap or sweep |
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 
@@ -2014,8 +2030,9 @@ name = "persisted:presence_fixtures"
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
-    bus notify mode; `ably_bus_connected` and `ably_bus_bound_channels`
-    (gauges).
+    bus notify mode; `ably_bus_connected`, `ably_bus_bound_channels` and
+    `ably_bus_receive_queue_depth` (gauges; the last is the bus messages
+    waiting in the nats bus's dispatch queues, 0 on the other buses).
   - Traffic: `ably_bus_published_total`, `ably_bus_publish_errors_total`,
     `ably_bus_pointers_total`, `ably_bus_received_total`,
     `ably_bus_unrouted_total`, `ably_bus_malformed_total`.

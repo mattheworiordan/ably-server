@@ -47,6 +47,7 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 		return 0
 	})
 	add("bound_channels", "Channels bound on this node.", true, func(s storage.BusStats) float64 { return float64(s.BoundChannels) })
+	add("receive_queue_depth", "Bus messages received and waiting to be dispatched to their channel (nats bus dispatch shards; 0 on other buses).", true, func(s storage.BusStats) float64 { return float64(s.ReceiveQueueDepth) })
 	add("published_total", "Bus messages sent for committed cms (NATS publishes, or NOTIFYs in committed publish transactions).", false, u(func(s storage.BusStats) uint64 { return s.Published }))
 	add("publish_errors_total", "NATS publishes that failed after commit (receivers recover the cm from the log).", false, u(func(s storage.BusStats) uint64 { return s.PublishErrors }))
 	add("pointers_total", "cms sent as a (channel, serial) pointer because they were too big to inline.", false, u(func(s storage.BusStats) uint64 { return s.Pointers }))

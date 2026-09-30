@@ -50,6 +50,26 @@ var (
 	natsMaxPingsOut        = 2
 )
 
+// NATS receive fan-in (DESIGN.md §7.2). Every channel subscription
+// feeds one of natsDispatchShards bounded Go channels (ChanSubscribe),
+// chosen by a hash of the channel name, and one worker goroutine per
+// shard drains it into the channel's delivery point. The goroutine count
+// is therefore fixed, whatever the number of bound channels; nats.go's
+// async Subscribe would start one goroutine per subscription. One
+// channel always lands on the same shard, so a channel's bus messages
+// are dispatched in the order the connection read them. A shard whose
+// queue is full makes NATS drop the message (a slow consumer); the
+// chain recovers it from the log. natsPointerFetches bounds the pointer
+// reads in flight: they run off the shard worker so a slow log read
+// never stalls the other channels of its shard, and the chain holds any
+// later cm of that channel until the pointer's body is in. Package vars
+// so tests can shrink them; Open snapshots them.
+var (
+	natsDispatchShards   = 16
+	natsDispatchQueueLen = 8192
+	natsPointerFetches   = 32
+)
+
 // DefaultNATSSweepInterval is the nats bus's default watermark sweep
 // interval (DESIGN.md §7.2).
 const DefaultNATSSweepInterval = 5 * time.Second
@@ -144,10 +164,11 @@ func decodeNATSEnvelope(data []byte) (busEvent, string, error) {
 // commits, the publishing node publishes the cm (or a pointer) to the
 // channel's subject and appends it locally straight away. A node
 // subscribes to a channel's subject when it first binds the channel, so
-// it receives only publishes for channels it holds; each subscription
-// runs its own delivery goroutine, so channels do not queue behind one
-// another. Deliveries are chained on the predecessor serial (chain.go)
-// because NATS orders per publishing connection, not across nodes.
+// it receives only publishes for channels it holds. Subscriptions feed a
+// fixed set of dispatch shards (natsDispatchShards), so the goroutine
+// count does not grow with bound channels. Deliveries are chained on the
+// predecessor serial (chain.go) because NATS orders per publishing
+// connection, not across nodes.
 //
 // The URL may list several servers of one NATS cluster, comma-separated.
 // The client connects to one, learns the rest from the cluster, and on a
@@ -163,6 +184,12 @@ type natsBus struct {
 
 	// Tuning snapshotted at dial so goroutines never read the vars.
 	flushTimeout, retryWait time.Duration
+
+	// shards are the dispatch queues every subscription feeds; one
+	// worker per shard drains each (dispatch). fetches bounds the pointer
+	// reads in flight (a counting semaphore).
+	shards  []chan *nats.Msg
+	fetches chan struct{}
 }
 
 // dialNATSBus connects the bus. Like the LISTEN connection, the first
@@ -180,6 +207,11 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 	if b.inlineMax <= 0 {
 		b.inlineMax = DefaultNATSInlineMaxBytes
 	}
+	b.shards = make([]chan *nats.Msg, max(natsDispatchShards, 1))
+	for i := range b.shards {
+		b.shards[i] = make(chan *nats.Msg, max(natsDispatchQueueLen, 1))
+	}
+	b.fetches = make(chan struct{}, max(natsPointerFetches, 1))
 	nc, err := nats.Connect(opts.NATSURL,
 		nats.Name("ably-server/"+s.node),
 		nats.MaxReconnects(-1),
@@ -195,8 +227,10 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
 			if errors.Is(err, nats.ErrSlowConsumer) {
-				// NATS dropped messages for this subscription; the chain
-				// sees the gap on the next message, or the sweep does.
+				// A dispatch shard was full and NATS dropped messages for
+				// this subscription (reported once per slow-consumer
+				// episode); the chain sees the gap on the next message, or
+				// the sweep does.
 				s.stats.drops.Add(1)
 			}
 			subject := ""
@@ -213,11 +247,95 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 	return b, nil
 }
 
-// start runs the shared chain loop: the reconnect reconcile, which first
-// flushes so the server has registered every re-sent SUB, and the
-// watermark sweep.
+// start runs one dispatch worker per shard and the shared chain loop:
+// the reconnect reconcile, which first flushes so the server has
+// registered every re-sent SUB, and the watermark sweep.
 func (b *natsBus) start(ctx context.Context) {
+	for _, q := range b.shards {
+		b.s.wg.Add(1)
+		go b.dispatch(ctx, q)
+	}
 	b.s.startChainLoop(ctx, b.retryWait, b.flush)
+}
+
+// shardFor returns the dispatch queue a channel's subscription feeds.
+// The same channel always maps to the same shard, which keeps its bus
+// messages in the order the connection read them.
+func (b *natsBus) shardFor(channel string) chan *nats.Msg {
+	return b.shards[shardIndex(channel, len(b.shards))]
+}
+
+// shardIndex hashes a channel name onto n shards (FNV-1a).
+func shardIndex(channel string, n int) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(channel); i++ {
+		h ^= uint32(channel[i])
+		h *= 16777619
+	}
+	return int(h % uint32(n))
+}
+
+// dispatch drains one shard until the Storage closes. Messages still
+// queued at close are dropped; they are in the log.
+func (b *natsBus) dispatch(ctx context.Context, q <-chan *nats.Msg) {
+	defer b.s.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-q:
+			b.handle(ctx, m)
+		}
+	}
+}
+
+// handle routes one bus message to the delivery point of the channel it
+// is addressed to. The envelope names the channel; a message whose
+// subject is not that channel's (a hashed-subject collision), or for a
+// channel no longer bound here (released while the message was queued),
+// is unrouted. A pointer's body is read off the shard worker, bounded by
+// natsPointerFetches.
+func (b *natsBus) handle(ctx context.Context, m *nats.Msg) {
+	b.s.stats.received.Add(1)
+	ev, channel, err := decodeNATSEnvelope(m.Data)
+	if err != nil {
+		b.s.stats.malformed.Add(1)
+		b.s.logger.Warn("storage/postgres: undecodable NATS bus message", "subject", m.Subject, "err", err)
+		return
+	}
+	var cs *channelStore
+	if m.Subject == natsSubject(b.prefix, channel) {
+		cs = b.s.boundStore(channel)
+	}
+	if cs == nil {
+		b.s.stats.unrouted.Add(1)
+		return
+	}
+	if ev.cm != nil {
+		cs.deliverChained(ev)
+		return
+	}
+	select {
+	case b.fetches <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	b.s.wg.Add(1)
+	go func() {
+		defer b.s.wg.Done()
+		defer func() { <-b.fetches }()
+		cs.deliverChained(cs.resolvePointer(ev))
+	}()
+}
+
+// queueDepth is the number of bus messages received and waiting in the
+// dispatch shards (ably_bus_receive_queue_depth).
+func (b *natsBus) queueDepth() int {
+	n := 0
+	for _, q := range b.shards {
+		n += len(q)
+	}
+	return n
 }
 
 // flush round-trips to the server, confirming it has processed
@@ -230,26 +348,16 @@ func (b *natsBus) flush(ctx context.Context) error {
 
 func (b *natsBus) chains() bool { return true }
 
-// bind subscribes to the channel's subject, then round-trips to the
-// server so the SUB is registered before Storage.Channel reads the
-// watermark: any cm committed after that read is then published after
-// the SUB took effect and is received. Messages that arrive before the
-// channel is seeded are held by the delivery point.
+// bind subscribes to the channel's subject, feeding the channel's
+// dispatch shard, then round-trips to the server so the SUB is
+// registered before Storage.Channel reads the watermark: any cm
+// committed after that read is then published after the SUB took effect
+// and is received. Messages that arrive before the channel is seeded are
+// held by the delivery point. The store is already in the Storage's
+// channel map (Storage.Channel puts it there before bind), so a message
+// that reaches the shard at once finds it.
 func (b *natsBus) bind(ctx context.Context, cs *channelStore) error {
-	sub, err := b.nc.Subscribe(natsSubject(b.prefix, cs.name), func(m *nats.Msg) {
-		b.s.stats.received.Add(1)
-		ev, channel, err := decodeNATSEnvelope(m.Data)
-		if err != nil {
-			b.s.stats.malformed.Add(1)
-			b.s.logger.Warn("storage/postgres: undecodable NATS bus message", "subject", m.Subject, "err", err)
-			return
-		}
-		if channel != cs.name {
-			b.s.stats.unrouted.Add(1)
-			return // a hashed-subject collision: not addressed to this channel
-		}
-		cs.deliverChained(cs.resolvePointer(ev))
-	})
+	sub, err := b.nc.ChanSubscribe(natsSubject(b.prefix, cs.name), b.shardFor(cs.name))
 	if err != nil {
 		return fmt.Errorf("storage/postgres: NATS subscribe %q: %w", cs.name, err)
 	}
@@ -271,8 +379,8 @@ func (b *natsBus) bind(ctx context.Context, cs *channelStore) error {
 	return nil
 }
 
-// unbind unsubscribes the channel's subject. A callback already running
-// finds the store released and delivers nothing.
+// unbind unsubscribes the channel's subject. A message already queued in
+// a shard finds the store released (or gone) and delivers nothing.
 func (b *natsBus) unbind(cs *channelStore) {
 	cs.subMu.Lock()
 	sub := cs.sub
