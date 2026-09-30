@@ -4,7 +4,9 @@ package postgres
 // (DESIGN.md §7.2). Each Ably channel has its own Postgres notification
 // channel, and a node LISTENs on it only once it binds that channel
 // (Storage.Channel with an appender), so a node receives notifications
-// only for channels it holds.
+// only for channels it holds. A cm small enough to fit in a NOTIFY
+// travels inline, so receivers skip the SELECT read-back; bigger cms
+// send a pointer.
 
 import (
 	"context"
@@ -20,6 +22,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+
+	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 const (
@@ -28,6 +33,12 @@ const (
 	// whole name is a lower-case identifier well inside Postgres's
 	// 63-byte identifier limit, whatever the Ably channel name is.
 	pgChannelPrefix = "ably_c_"
+
+	// inlinePayloadLimit is the size below which the bus carries a cm
+	// inline in its NOTIFY. pg_notify rejects payloads of 8000 bytes or
+	// more (with the default 8 kB block size), so the bus keeps a margin
+	// and sends a pointer (channel, serial) for anything bigger.
+	inlinePayloadLimit = 7900
 
 	// listenBatchSize caps the LISTEN statements sent in one round trip
 	// (bind bursts, and the re-LISTEN after a reconnect).
@@ -49,20 +60,65 @@ func pgChannelName(namespace, name string) string {
 	return pgChannelPrefix + hex.EncodeToString(sum[:16])
 }
 
-// busNotification is the JSON NOTIFY payload: a pointer (channel,
-// serial) to the committed cm, which the receiver reads back.
+// busNotification is the JSON NOTIFY payload. Channel and Serial are the
+// pointer form. Kind, Rows and Sums, when present, carry the cm inline
+// exactly as stored: one msgpack payload per channel_messages row in idx
+// order, plus that row's annotation summary column (nil for other
+// kinds). encoding/json base64-encodes the []byte fields.
 type busNotification struct {
-	Channel string `json:"channel"`
-	Serial  string `json:"serial"`
+	Channel string   `json:"channel"`
+	Serial  string   `json:"serial"`
+	Kind    string   `json:"kind,omitempty"`
+	Rows    [][]byte `json:"rows,omitempty"`
+	Sums    [][]byte `json:"sums,omitempty"`
 }
 
-// encodeNotification builds the NOTIFY payload for a freshly written cm.
-func encodeNotification(channel, serial string) (string, error) {
-	b, err := json.Marshal(busNotification{Channel: channel, Serial: serial})
-	if err != nil {
-		return "", fmt.Errorf("storage/postgres: encode notify: %w", err)
+// encodeNotification builds the NOTIFY payload for a freshly written cm:
+// inline when it fits under inlinePayloadLimit, otherwise the pointer
+// form. sums is optional (only annotation rows carry a summary).
+func encodeNotification(channel, serial string, kind storage.Kind, rows, sums [][]byte) (payload string, inline bool, err error) {
+	n := busNotification{Channel: channel, Serial: serial, Kind: string(kind), Rows: rows}
+	for _, s := range sums {
+		if s != nil {
+			n.Sums = sums
+			break
+		}
 	}
-	return string(b), nil
+	b, err := json.Marshal(n)
+	if err != nil {
+		return "", false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	if len(b) < inlinePayloadLimit {
+		return string(b), true, nil
+	}
+	n.Kind, n.Rows, n.Sums = "", nil, nil
+	if b, err = json.Marshal(n); err != nil {
+		return "", false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	return string(b), false, nil
+}
+
+// inlineCM decodes an inline payload into the cm a SELECT by
+// (channel, serial) returns. It returns nil (and no error) for a pointer
+// payload.
+func (n *busNotification) inlineCM() (*protocol.ChannelMessage, error) {
+	if n.Kind == "" || len(n.Rows) == 0 {
+		return nil, nil
+	}
+	if len(n.Sums) != 0 && len(n.Sums) != len(n.Rows) {
+		return nil, fmt.Errorf("storage/postgres: inline payload %s:%s has %d summaries for %d rows", n.Channel, n.Serial, len(n.Sums), len(n.Rows))
+	}
+	cm := &protocol.ChannelMessage{ChannelSerial: n.Serial}
+	for i, row := range n.Rows {
+		var sum []byte
+		if len(n.Sums) != 0 {
+			sum = n.Sums[i]
+		}
+		if err := decodeRow(cm, n.Kind, row, sum); err != nil {
+			return nil, fmt.Errorf("storage/postgres: inline payload %s:%s idx=%d: %w", n.Channel, n.Serial, i, err)
+		}
+	}
+	return cm, nil
 }
 
 // busCounters are this node's bus counters (see BusStats).
@@ -70,6 +126,7 @@ type busCounters struct {
 	notifications atomic.Uint64
 	unrouted      atomic.Uint64
 	malformed     atomic.Uint64
+	inline        atomic.Uint64
 	fetched       atomic.Uint64
 	duplicates    atomic.Uint64
 	fetchErrors   atomic.Uint64
@@ -89,7 +146,10 @@ type BusStats struct {
 	Unrouted uint64
 	// Malformed counts NOTIFY payloads that did not parse.
 	Malformed uint64
-	// Fetched counts cms delivered after a SELECT by (channel, serial).
+	// Inline counts cms delivered from an inline payload, with no SELECT.
+	Inline uint64
+	// Fetched counts cms delivered after a SELECT by (channel, serial):
+	// the pointer path for cms too big to inline.
 	Fetched uint64
 	// Duplicates counts NOTIFYs dropped because the cm was already
 	// delivered.
@@ -113,6 +173,7 @@ func (s *Storage) BusStats() BusStats {
 		Notifications: c.notifications.Load(),
 		Unrouted:      c.unrouted.Load(),
 		Malformed:     c.malformed.Load(),
+		Inline:        c.inline.Load(),
 		Fetched:       c.fetched.Load(),
 		Duplicates:    c.duplicates.Load(),
 		FetchErrors:   c.fetchErrors.Load(),
@@ -345,8 +406,9 @@ func (s *Storage) consume(ctx context.Context, conn *pgx.Conn) error {
 }
 
 // dispatch routes one notification to the channel store bound to its
-// Postgres channel, reads the cm back and delivers it. It waits for a
-// bind still in progress: the LISTEN is active before the bind reads its
+// Postgres channel and delivers the cm: decoded from an inline payload,
+// or read back by (channel, serial) for a pointer. It waits for a bind
+// still in progress: the LISTEN is active before the bind reads its
 // watermark, so a cm committed in between must not be dropped.
 func (s *Storage) dispatch(ctx context.Context, n *pgconn.Notification) {
 	s.stats.notifications.Add(1)
@@ -375,8 +437,16 @@ func (s *Storage) dispatch(ctx context.Context, n *pgconn.Notification) {
 		s.stats.duplicates.Add(1)
 		return
 	}
-	cm, err := s.loadChannelMessage(ctx, cs.name, p.Serial)
+	cm, err := p.inlineCM()
 	if err != nil {
+		s.logger.Warn("storage/postgres: bad inline payload; reading the cm instead", "channel", cs.name, "serial", p.Serial, "err", err)
+	}
+	if cm != nil {
+		s.stats.inline.Add(1)
+		cs.deliver(cm)
+		return
+	}
+	if cm, err = s.loadChannelMessage(ctx, cs.name, p.Serial); err != nil {
 		s.stats.fetchErrors.Add(1)
 		return // best-effort; nothing we can do without the cm
 	}
@@ -459,11 +529,11 @@ func (cs *channelStore) watermark() string {
 }
 
 // notifyTx emits the bus NOTIFY for a freshly written cm inside tx, on
-// the channel's own Postgres notification channel. Postgres holds the
-// notification until commit, so listeners see it only if the write
-// commits.
-func (cs *channelStore) notifyTx(ctx context.Context, tx pgx.Tx, serial string) error {
-	payload, err := encodeNotification(cs.name, serial)
+// the channel's own Postgres notification channel, carrying the cm's
+// stored rows inline when they fit. Postgres holds the notification
+// until commit, so listeners see it only if the write commits.
+func (cs *channelStore) notifyTx(ctx context.Context, tx pgx.Tx, serial string, kind storage.Kind, rows, sums [][]byte) error {
+	payload, _, err := encodeNotification(cs.name, serial, kind, rows, sums)
 	if err != nil {
 		return err
 	}

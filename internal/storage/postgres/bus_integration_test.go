@@ -6,11 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
@@ -156,5 +159,96 @@ func TestBusChannelNamesAreShortIdentifiers(t *testing.T) {
 			}
 			seen[pc] = key
 		}
+	}
+}
+
+// cmRecorder is a storage.Appender that keeps every delivered cm.
+type cmRecorder struct {
+	mu  sync.Mutex
+	cms []*protocol.ChannelMessage
+}
+
+func (r *cmRecorder) Initialize(current, initial string) {}
+
+func (r *cmRecorder) Append(cm *protocol.ChannelMessage) {
+	r.mu.Lock()
+	r.cms = append(r.cms, cm)
+	r.mu.Unlock()
+}
+
+func (r *cmRecorder) all() []*protocol.ChannelMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]*protocol.ChannelMessage(nil), r.cms...)
+}
+
+func (r *cmRecorder) waitFor(t *testing.T, n int, timeout time.Duration) []*protocol.ChannelMessage {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := r.all(); len(got) >= n {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d cms; have %d", n, len(r.all()))
+	return nil
+}
+
+// TestBusInlineAndPointerPayloadsDeliverOnce is test (b): a cm whose
+// NOTIFY fits under the inline limit is delivered from the payload with
+// no read-back, a cm above it goes by pointer and is read back, and each
+// reaches the receiving node's appender exactly once with the content
+// that was stored.
+func TestBusInlineAndPointerPayloadsDeliverOnce(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	a := openNode(t, dsn)
+	b := openNode(t, dsn)
+
+	pub, err := a.Channel(ctx, "room", nil) // A publishes without holding the channel
+	if err != nil {
+		t.Fatalf("A opens room: %v", err)
+	}
+	rec := &cmRecorder{}
+	if _, err := b.Channel(ctx, "room", rec); err != nil {
+		t.Fatalf("B binds room: %v", err)
+	}
+
+	small := "small payload"
+	big := strings.Repeat("x", 2*inlinePayloadLimit) // row payload alone is over the limit
+	smallCM, _, err := pub.Store(ctx, []*protocol.Message{{Name: "s", Data: small}})
+	if err != nil {
+		t.Fatalf("Store small: %v", err)
+	}
+	bigCM, _, err := pub.Store(ctx, []*protocol.Message{{Name: "b", Data: big}})
+	if err != nil {
+		t.Fatalf("Store big: %v", err)
+	}
+
+	got := rec.waitFor(t, 2, 10*time.Second)
+	time.Sleep(300 * time.Millisecond) // room for a (wrong) second delivery
+	got = rec.all()
+	if len(got) != 2 {
+		t.Fatalf("B's appender saw %d cms, want exactly 2", len(got))
+	}
+	if got[0].ChannelSerial != smallCM.ChannelSerial || got[1].ChannelSerial != bigCM.ChannelSerial {
+		t.Fatalf("B's appender serials = [%s %s], want [%s %s]", got[0].ChannelSerial, got[1].ChannelSerial, smallCM.ChannelSerial, bigCM.ChannelSerial)
+	}
+	if d, _ := got[0].Messages[0].Data.(string); d != small || got[0].Messages[0].Serial != smallCM.Messages[0].Serial {
+		t.Fatalf("inline delivery = %+v, want data %q serial %s", got[0].Messages[0], small, smallCM.Messages[0].Serial)
+	}
+	if d, _ := got[1].Messages[0].Data.(string); d != big || got[1].Messages[0].Serial != bigCM.Messages[0].Serial {
+		t.Fatalf("pointer delivery lost its data or serial (serial %s)", got[1].Messages[0].Serial)
+	}
+
+	st := b.BusStats()
+	if st.Inline != 1 || st.Fetched != 1 {
+		t.Fatalf("B delivery paths inline=%d fetched=%d, want 1 and 1", st.Inline, st.Fetched)
+	}
+	if st.Notifications != 2 {
+		t.Fatalf("B received %d notifications, want 2", st.Notifications)
 	}
 }

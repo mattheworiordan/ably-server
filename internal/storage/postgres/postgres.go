@@ -447,32 +447,9 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 		if err := rows.Scan(&idx, &kind, &payload, &summary); err != nil {
 			return nil, fmt.Errorf("storage/postgres: scan %s:%s: %w", channel, channelSerial, err)
 		}
-		if kind == string(storage.KindPresence) {
-			var p protocol.PresenceMessage
-			if err := msgpack.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("storage/postgres: decode presence payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-			}
-			cm.Presence = append(cm.Presence, &p)
-			continue
+		if err := decodeRow(cm, kind, payload, summary); err != nil {
+			return nil, fmt.Errorf("storage/postgres: %s:%s idx=%d: %w", channel, channelSerial, idx, err)
 		}
-		if kind == string(storage.KindAnnotation) {
-			var a protocol.Annotation
-			if err := msgpack.Unmarshal(payload, &a); err != nil {
-				return nil, fmt.Errorf("storage/postgres: decode annotation payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-			}
-			if len(summary) > 0 {
-				if err := msgpack.Unmarshal(summary, &a.Summary); err != nil {
-					return nil, fmt.Errorf("storage/postgres: decode annotation summary %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-				}
-			}
-			cm.Annotations = append(cm.Annotations, &a)
-			continue
-		}
-		var m protocol.Message
-		if err := msgpack.Unmarshal(payload, &m); err != nil {
-			return nil, fmt.Errorf("storage/postgres: decode payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
-		}
-		cm.Messages = append(cm.Messages, &m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage/postgres: rows %s:%s: %w", channel, channelSerial, err)
@@ -481,6 +458,40 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 		return nil, fmt.Errorf("storage/postgres: ChannelMessage not found: %s:%s", channel, channelSerial)
 	}
 	return cm, nil
+}
+
+// decodeRow decodes one channel_messages row (its kind, msgpack payload
+// and annotation summary column) onto cm. It is shared by every path that
+// rebuilds a cm from its stored rows: the pointer read-back, the inline
+// NOTIFY payload and the range reads, so all of them deliver identical
+// cms.
+func decodeRow(cm *protocol.ChannelMessage, kind string, payload, summary []byte) error {
+	switch kind {
+	case string(storage.KindPresence):
+		var p protocol.PresenceMessage
+		if err := msgpack.Unmarshal(payload, &p); err != nil {
+			return fmt.Errorf("decode presence payload: %w", err)
+		}
+		cm.Presence = append(cm.Presence, &p)
+	case string(storage.KindAnnotation):
+		var a protocol.Annotation
+		if err := msgpack.Unmarshal(payload, &a); err != nil {
+			return fmt.Errorf("decode annotation payload: %w", err)
+		}
+		if len(summary) > 0 {
+			if err := msgpack.Unmarshal(summary, &a.Summary); err != nil {
+				return fmt.Errorf("decode annotation summary: %w", err)
+			}
+		}
+		cm.Annotations = append(cm.Annotations, &a)
+	default:
+		var m protocol.Message
+		if err := msgpack.Unmarshal(payload, &m); err != nil {
+			return fmt.Errorf("decode payload: %w", err)
+		}
+		cm.Messages = append(cm.Messages, &m)
+	}
+	return nil
 }
 
 // migrate applies any pending embedded migrations under a session-
@@ -786,11 +797,13 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	cm := &protocol.ChannelMessage{ID: batchID, ChannelSerial: channelSerial, Messages: msgs}
 
+	rows := make([][]byte, 0, len(msgs))
 	for i, m := range msgs {
 		payload, err := msgpack.Marshal(m)
 		if err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: encode message %d: %w", i, err)
 		}
+		rows = append(rows, payload)
 		// id is stored as NULL when empty so the partial UNIQUE
 		// idempotency index never matches a no-id publish. message_serial
 		// is the message identity (its own serial for a create) — the
@@ -815,12 +828,13 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		}
 	}
 
-	// NOTIFY inside the tx, on this channel's own notification channel:
-	// PG buffers the payload until commit, so listeners only see it if
-	// the publish actually lands. The LISTEN goroutine on every node that
-	// holds the channel (including this one) routes the cm to the
-	// channel's appender (DESIGN.md §7.2).
-	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+	// NOTIFY inside the tx, on this channel's own notification channel,
+	// with the stored rows inline when they fit: PG buffers the payload
+	// until commit, so listeners only see it if the publish actually
+	// lands. The LISTEN goroutine on every node that holds the channel
+	// (including this one) routes the cm to the channel's appender
+	// (DESIGN.md §7.2).
+	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindMessage, rows, nil); err != nil {
 		return nil, false, err
 	}
 
@@ -927,7 +941,7 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindMessage, [][]byte{payload}, nil); err != nil {
 		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1101,11 +1115,13 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
 
+	rows := make([][]byte, 0, len(presence))
 	for i, p := range presence {
 		payload, err := msgpack.Marshal(p)
 		if err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: encode presence %d: %w", i, err)
 		}
+		rows = append(rows, payload)
 		var idArg any
 		if p.ID != "" {
 			idArg = p.ID
@@ -1167,7 +1183,7 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindPresence, rows, nil); err != nil {
 		return nil, false, err
 	}
 
@@ -1250,6 +1266,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
 
+	rows := make([][]byte, 0, len(annotations))
+	sums := make([][]byte, 0, len(annotations))
 	for i, a := range annotations {
 		payload, err := msgpack.Marshal(a)
 		if err != nil {
@@ -1264,6 +1282,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		if err != nil {
 			return nil, false, err
 		}
+		rows = append(rows, payload)
+		sums = append(sums, summaryBlob)
 		var idArg any
 		if a.ID != "" {
 			idArg = a.ID
@@ -1280,7 +1300,7 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	if err := cs.notifyTx(ctx, tx, channelSerial); err != nil {
+	if err := cs.notifyTx(ctx, tx, channelSerial, storage.KindAnnotation, rows, sums); err != nil {
 		return nil, false, err
 	}
 
