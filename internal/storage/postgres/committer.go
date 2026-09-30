@@ -330,9 +330,13 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 		}
 		sl.cm = &protocol.ChannelMessage{ID: p.batchID, ChannelSerial: sl.serial, Messages: p.msgs}
 		items = append(items, batchItem{cs: p.cs, cm: sl.cm, w: w})
-		if p.minted == "" && !p.retried {
-			p.minted, p.mintedPrev = sl.serial, sl.prev
-		}
+		// Every mint replaces the last: a mint under the row lock, with the
+		// ids checked (a retry always checks them), proves no earlier
+		// attempt stored this publish, so the newest minted serial is the
+		// only one a later retry can find it under. Recording only the
+		// first attempt's serial missed a publish whose first attempt
+		// failed before COMMIT and whose later commit lost its reply.
+		p.minted, p.mintedPrev = sl.serial, sl.prev
 	}
 	for i, j := 0, 0; i < len(slots); i++ {
 		if slots[i].dupOf < 0 && slots[i].status == "ok" {
