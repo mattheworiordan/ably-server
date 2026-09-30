@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -17,10 +18,14 @@ import (
 // per app keeps apps apart in Postgres, and namespaces their bus
 // channels (LISTEN names and NATS subjects both hash the schema, §7.2),
 // so apps sharing one Postgres and one NATS never hear each other.
+//
+// With a list of databases (a sharded --child-postgres-dsn, §6.4) the
+// app's schema is created in, and dropped from, every one of them, and
+// the child gets the same list with the schema set on each DSN.
 type clusterChildren struct {
-	dsn     string // base DSN; each app's schema is created in its database
-	bus     string // --bus for every child: pgnotify, postgres or nats
-	natsURL string // --nats-url for --bus=nats
+	dsns    []string // base DSNs, shard order; each app's schema is created in every database
+	bus     string   // --bus for every child: pgnotify, postgres or nats
+	natsURL string   // --nats-url for --bus=nats
 }
 
 // schemaSeq makes schema names unique within this provisioner process.
@@ -61,22 +66,26 @@ func withSearchPath(dsn, schema string) (string, error) {
 
 // args returns the child's cluster-mode flags for schema.
 func (c *clusterChildren) args(schema string) ([]string, error) {
-	dsn, err := withSearchPath(c.dsn, schema)
-	if err != nil {
-		return nil, err
+	dsns := make([]string, len(c.dsns))
+	for i, base := range c.dsns {
+		dsn, err := withSearchPath(base, schema)
+		if err != nil {
+			return nil, err
+		}
+		dsns[i] = dsn
 	}
-	out := []string{"--mode", "cluster", "--postgres-dsn", dsn, "--bus", c.bus}
+	out := []string{"--mode", "cluster", "--postgres-dsn", strings.Join(dsns, ","), "--bus", c.bus}
 	if c.natsURL != "" {
 		out = append(out, "--nats-url", c.natsURL)
 	}
 	return out, nil
 }
 
-// exec runs one DDL statement on the base database.
-func (c *clusterChildren) exec(sql string) error {
+// execSQL runs one DDL statement on one base database.
+func execSQL(dsn, sql string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, c.dsn)
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("connect to child database: %w", err)
 	}
@@ -85,16 +94,28 @@ func (c *clusterChildren) exec(sql string) error {
 	return err
 }
 
+// createSchema creates schema in every database. If one fails, the
+// schema is dropped again from those it was created in.
 func (c *clusterChildren) createSchema(schema string) error {
-	if err := c.exec("CREATE SCHEMA " + pgx.Identifier{schema}.Sanitize()); err != nil {
-		return fmt.Errorf("create schema %s: %w", schema, err)
+	for i, dsn := range c.dsns {
+		if err := execSQL(dsn, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+			for _, done := range c.dsns[:i] {
+				_ = execSQL(done, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+			}
+			return fmt.Errorf("create schema %s (database %d): %w", schema, i+1, err)
+		}
 	}
 	return nil
 }
 
+// dropSchema drops schema from every database, trying each even if an
+// earlier one fails.
 func (c *clusterChildren) dropSchema(schema string) error {
-	if err := c.exec("DROP SCHEMA IF EXISTS " + pgx.Identifier{schema}.Sanitize() + " CASCADE"); err != nil {
-		return fmt.Errorf("drop schema %s: %w", schema, err)
+	var errs []error
+	for i, dsn := range c.dsns {
+		if err := execSQL(dsn, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+			errs = append(errs, fmt.Errorf("drop schema %s (database %d): %w", schema, i+1, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

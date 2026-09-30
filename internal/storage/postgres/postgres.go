@@ -202,6 +202,10 @@ type Options struct {
 	// §6.3). The zero value (Lanes 0) commits every publish in its own
 	// transaction; the server enables 4 lanes by default.
 	Batching Batching
+
+	// shard is this Storage's place in a shard list, set by OpenSharded
+	// (DESIGN.md §6.4). The zero value is a lone Storage.
+	shard shardSlot
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
@@ -226,8 +230,9 @@ type Storage struct {
 	// none. Persisted channels' rows from before it sit in the live class.
 	legacyBound string
 
-	busKind    string // BusPGNotify, BusPostgres or BusNATS
-	notifyMode string // the BusPostgres notify mode, "" for the other buses
+	shard      shardSlot // place in the shard list (§6.4); {0, 1} when alone
+	busKind    string    // BusPGNotify, BusPostgres or BusNATS
+	notifyMode string    // the BusPostgres notify mode, "" for the other buses
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
@@ -305,6 +310,11 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
+	slot := opts.shard.resolve()
+	if err := checkShardIdentity(ctx, pool, slot); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: %w", err)
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -322,6 +332,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		series:        serial.NewSeriesID(),
 		node:          serial.NewSeriesID(),
 		logger:        logger,
+		shard:         slot,
 		busKind:       busKind,
 		notifyMode:    string(mode),
 		reconnectBase: listenReconnectBaseDelay,
@@ -576,10 +587,16 @@ func (s *Storage) Close() error {
 }
 
 // Collectors returns the backend's Prometheus collectors (the
-// ably_storage_* retention series, DESIGN.md §10), for registration on
-// the process registry.
+// ably_storage_* retention series and the ably_publish_* batching series,
+// DESIGN.md §10), for registration on the process registry. A lone
+// Storage also reports ably_storage_shards (1); a shard of a list leaves
+// that to Sharded.
 func (s *Storage) Collectors() []prometheus.Collector {
-	return append(s.metrics.collectors(), s.wmetrics.collectors()...)
+	out := append(s.metrics.collectors(), s.wmetrics.collectors()...)
+	if s.shard.count == 1 {
+		out = append(out, shardsGauge(1))
+	}
+	return out
 }
 
 // Ping reports whether the node can serve cluster traffic: the Postgres

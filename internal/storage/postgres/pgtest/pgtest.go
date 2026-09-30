@@ -63,31 +63,62 @@ var (
 func Start(t testing.TB) *Container {
 	t.Helper()
 	containerOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		pgC, err := tcpostgres.Run(ctx,
-			"postgres:17-alpine",
-			tcpostgres.WithDatabase("ably"),
-			tcpostgres.WithUsername("ably"),
-			tcpostgres.WithPassword("ably"),
-			tcpostgres.BasicWaitStrategies(),
-		)
-		if err != nil {
-			containerErr = fmt.Errorf("start postgres container: %w", err)
-			return
-		}
-		dsn, err := pgC.ConnectionString(ctx, "sslmode=disable")
-		if err != nil {
-			_ = pgC.Terminate(context.Background())
-			containerErr = fmt.Errorf("get connection string: %w", err)
-			return
-		}
-		containerInst = &Container{dsn: dsn}
+		containerInst, containerErr = run()
 	})
 	if containerErr != nil {
 		t.Fatalf("postgres container: %v", containerErr)
 	}
 	return containerInst
+}
+
+// extra holds the further containers StartShard brings up, by index.
+var (
+	extraMu sync.Mutex
+	extra   = map[int]*Container{}
+)
+
+// StartShard returns the i-th Postgres container of this test binary,
+// for tests that need several independent database servers (channel
+// sharding, DESIGN.md §6.4). Index 0 is Start's container; each further
+// index is started once, lazily, and reaped with the binary.
+func StartShard(t testing.TB, i int) *Container {
+	t.Helper()
+	if i == 0 {
+		return Start(t)
+	}
+	extraMu.Lock()
+	defer extraMu.Unlock()
+	if c, ok := extra[i]; ok {
+		return c
+	}
+	c, err := run()
+	if err != nil {
+		t.Fatalf("postgres container %d: %v", i, err)
+	}
+	extra[i] = c
+	return c
+}
+
+// run starts one postgres:17-alpine container.
+func run() (*Container, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	pgC, err := tcpostgres.Run(ctx,
+		"postgres:17-alpine",
+		tcpostgres.WithDatabase("ably"),
+		tcpostgres.WithUsername("ably"),
+		tcpostgres.WithPassword("ably"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start postgres container: %w", err)
+	}
+	dsn, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		_ = pgC.Terminate(context.Background())
+		return nil, fmt.Errorf("get connection string: %w", err)
+	}
+	return &Container{dsn: dsn}, nil
 }
 
 // FreshSchemaDSN allocates a brand-new schema in the container's
@@ -96,8 +127,21 @@ func Start(t testing.TB) *Container {
 // is dropped on t.Cleanup.
 func (c *Container) FreshSchemaDSN(t testing.TB) string {
 	t.Helper()
+	return c.SchemaDSN(t, NewSchemaName())
+}
 
-	schema := fmt.Sprintf("test_%d", schemaCounter.Add(1))
+// NewSchemaName returns a schema name no other call in this test binary
+// returns, for SchemaDSN.
+func NewSchemaName() string {
+	return fmt.Sprintf("test_%d", schemaCounter.Add(1))
+}
+
+// SchemaDSN creates the named schema in the container's default database
+// and returns a DSN whose connections default to it, dropping it on
+// t.Cleanup. Tests with several containers use it to give each the same
+// schema name, as a sharded deployment's databases would have.
+func (c *Container) SchemaDSN(t testing.TB, schema string) string {
+	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

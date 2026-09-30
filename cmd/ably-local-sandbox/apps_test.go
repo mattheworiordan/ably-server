@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ably/ably-server/internal/config"
+	"github.com/ably/ably-server/internal/storage/postgres"
 )
 
 // loadPostApps reads the vendored test-app-setup.json and returns its
@@ -216,7 +217,7 @@ func TestClusterChildArgs(t *testing.T) {
 			t.Fatalf("schema %q has a character that needs quoting", a)
 		}
 	}
-	c := &clusterChildren{dsn: "postgres://u:p@h:5432/db?sslmode=disable", bus: "nats", natsURL: "nats://n1:4222,nats://n2:4222"}
+	c := &clusterChildren{dsns: []string{"postgres://u:p@h:5432/db?sslmode=disable"}, bus: "nats", natsURL: "nats://n1:4222,nats://n2:4222"}
 	args, err := c.args("sandbox_x_1")
 	if err != nil {
 		t.Fatal(err)
@@ -225,6 +226,27 @@ func TestClusterChildArgs(t *testing.T) {
 	for _, want := range []string{"--mode cluster", "--bus nats", "--nats-url nats://n1:4222,nats://n2:4222", "search_path%3Dsandbox_x_1", "sslmode=disable"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("child args %q lack %q", joined, want)
+		}
+	}
+	// A sharded base list: the schema is set on every DSN, in order.
+	sharded := &clusterChildren{dsns: []string{"postgres://u:p@h1:5432/db", "postgres://u:p@h2:5432/db"}, bus: "pgnotify"}
+	sargs, err := sharded.args("sandbox_x_2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dsnArg string
+	for i, a := range sargs {
+		if a == "--postgres-dsn" && i+1 < len(sargs) {
+			dsnArg = sargs[i+1]
+		}
+	}
+	parts, err := postgres.SplitDSNs(dsnArg)
+	if err != nil || len(parts) != 2 {
+		t.Fatalf("sharded child --postgres-dsn %q splits into %q, %v; want 2 DSNs", dsnArg, parts, err)
+	}
+	for i, host := range []string{"@h1:5432", "@h2:5432"} {
+		if !strings.Contains(parts[i], host) || !strings.Contains(parts[i], "search_path%3Dsandbox_x_2") {
+			t.Errorf("shard %d child DSN = %q, want host %s with search_path sandbox_x_2", i, parts[i], host)
 		}
 	}
 	kv, err := withSearchPath("host=h dbname=db", "s1")
