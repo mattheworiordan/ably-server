@@ -1,0 +1,105 @@
+# Three ably-server nodes on one Postgres, plus a three-server NATS core
+# cluster, for the load generator's local smoke (bench/aws/local-smoke.sh).
+#
+#   docker compose -f bench/docker-compose.loadgen-smoke.yml up -d --build --wait
+#   docker compose -f bench/docker-compose.loadgen-smoke.yml down -v
+#
+# Host ports: nodes 8281-8283, their debug listeners (/metrics) 8291-8293,
+# Postgres 5443, two ably-loadgen agents 9281-9282 (control) running
+# inside the compose network, so the load does not cross Docker
+# Desktop's port proxy or use the host's ephemeral ports. The agents run
+# Linux binaries from bin/linux/ (local-smoke.sh builds them). The ports
+# and project name differ from every other stack in the repo so they can
+# run side by side.
+#
+# SMOKE_IMAGE picks the server image (default: built from this tree) and
+# BUS its bus (ABLY_SERVER_BUS; empty keeps the image's default). NATS is
+# always started so an image with --bus=nats can use it. Nodes do not
+# restart: a killed node stays down, which is what the fault run needs.
+
+name: ablylgsmoke
+
+x-ably-node: &ably-node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: ${SMOKE_IMAGE:-ably-server:lgsmoke}
+  restart: "no"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    nats1:
+      condition: service_healthy
+  environment:
+    ABLY_SERVER_KEYS: app.key:secret
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable
+    ABLY_SERVER_BUS: ${BUS:-}
+    ABLY_SERVER_NATS_URL: nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
+  command:
+    - --mode=cluster
+    - --listen=:8080
+    - --debug-listen=:6060
+    - --log-level=warn
+  ulimits:
+    nofile: {soft: 1048576, hard: 1048576}
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+x-nats: &nats
+  image: nats:2.11-alpine
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "5443:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  nats1:
+    <<: *nats
+    command: ["-n", "nats1", "-m", "8222", "--cluster_name", "lgsmoke", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats2:6222,nats://nats3:6222"]
+  nats2:
+    <<: *nats
+    command: ["-n", "nats2", "-m", "8222", "--cluster_name", "lgsmoke", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats1:6222,nats://nats3:6222"]
+  nats3:
+    <<: *nats
+    command: ["-n", "nats3", "-m", "8222", "--cluster_name", "lgsmoke", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats1:6222,nats://nats2:6222"]
+
+  node1:
+    <<: *ably-node
+    ports: ["8281:8080", "8291:6060"]
+  node2:
+    <<: *ably-node
+    ports: ["8282:8080", "8292:6060"]
+  node3:
+    <<: *ably-node
+    ports: ["8283:8080", "8293:6060"]
+
+  loadgen1: &loadgen
+    image: alpine:3.20
+    restart: "no"
+    volumes: ["../bin/linux:/lg:ro"]
+    command: ["/lg/ably-loadgen", "serve", "--listen=:9200"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    ports: ["9281:9200"]
+  loadgen2:
+    <<: *loadgen
+    ports: ["9282:9200"]

@@ -1,0 +1,58 @@
+# Shape D: REST publishers into mostly unsubscribed channels (plan §3).
+# Run as the 1x envelope for writes; 2x is --multiplier 2 (104k writes/s).
+#
+# Derived at 1x: 52k REST publishes/s, about 33k deliveries/s (fan-out
+# about 0.64), 330k connections, 680k channels, 160 connects/s, 672
+# channel opens/s, 1.3 KB messages.
+name = "D"
+shape = "D"
+description = "REST writes at 52k/s into channels that mostly have no live subscriber, one hot channel at 170/s"
+bus = "nats"
+nodes = 10
+shards = 1
+message_bytes = 1300
+sample_percent = 5
+
+[timing]
+ramp = "10m"
+hold = "15m"
+drain = "30s"
+
+[connections]
+count = 330000
+
+[churn]
+connects_per_sec = 160
+channel_opens_per_sec = 672
+resume = true
+
+# The hot publish channel: 170/s over 8 sequential streams (about 21/s
+# each, well inside one REST round trip per publish). Its rate scales.
+[[class]]
+name = "hot"
+channels = 1
+subscribers = 8
+publish_rate = 170
+publisher = "rest"
+streams = 8
+scale_by = "rate"
+
+# Channels with one live subscriber.
+[[class]]
+name = "live"
+channels = 330000
+subscribers = 1
+publish_rate_total = 32000
+publisher = "rest"
+
+# Channels nobody is subscribed to: the store absorbs writes that are
+# never delivered live.
+[[class]]
+name = "dark"
+channels = 350000
+subscribers = 0
+publish_rate_total = 19830
+publisher = "rest"
+
+[presence]
+enabled = false

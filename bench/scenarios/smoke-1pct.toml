@@ -1,0 +1,96 @@
+# Smoke at 1% of the 1x envelope (plan §7 "smoke before load", run 0b):
+# shape M's connections, channels, churn and deliveries plus shape D's REST
+# writes, in one run. The classes are copied from shape-m.toml and
+# shape-d.toml (D's hot channel renamed hotpub); a test keeps them equal.
+# At this scale: about 5500 connections and 590 publishes/s.
+#
+#   RUN_TIME_LIMIT=20m bench/aws/60-run.sh smoke-1pct.toml
+name = "smoke1"
+shape = "M+D"
+description = "smoke: shapes M and D together at 0.01 of 1x"
+bus = "nats"
+nodes = 10
+shards = 1
+scale = 0.01
+message_bytes = 470
+sample_percent = 5
+
+[timing]
+ramp = "2m"
+hold = "5m"
+drain = "30s"
+
+[connections]
+count = 550000
+
+[churn]
+connects_per_sec = 1000
+channel_opens_per_sec = 2400
+resume = true
+
+[[class]]
+name = "hot"
+message_bytes = 470
+channels = 1
+subscribers = 200000
+publish_rate = 0.5
+publisher = "realtime"
+streams = 1
+scale_by = "subscribers"
+
+# About 500 rooms: 10000/(i+1) subscribers clamped to [1000, 10000], so a
+# few large rooms and most at 1k (about 520k attachments at 1x).
+[[class]]
+name = "rooms"
+message_bytes = 470
+channels = 500
+subscribers_min = 1000
+subscribers_max = 10000
+subscribers_dist = "harmonic"
+publish_rate = 0.025
+publisher = "realtime"
+scale_by = "subscribers"
+
+# The long tail: tiny channels with 0 to 2 subscribers (median 1),
+# written over REST.
+[[class]]
+name = "tail"
+message_bytes = 470
+channels = 690000
+subscribers_min = 0
+subscribers_max = 2
+subscribers_dist = "uniform"
+publish_rate_total = 7000
+publisher = "rest"
+
+[[class]]
+name = "hotpub"
+message_bytes = 1300
+channels = 1
+subscribers = 8
+publish_rate = 170
+publisher = "rest"
+streams = 8
+scale_by = "rate"
+
+# Channels with one live subscriber.
+[[class]]
+name = "live"
+message_bytes = 1300
+channels = 330000
+subscribers = 1
+publish_rate_total = 32000
+publisher = "rest"
+
+# Channels nobody is subscribed to: the store absorbs writes that are
+# never delivered live.
+[[class]]
+name = "dark"
+message_bytes = 1300
+channels = 350000
+subscribers = 0
+publish_rate_total = 19830
+publisher = "rest"
+
+[presence]
+enabled = false

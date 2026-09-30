@@ -721,7 +721,9 @@ Major packages:
 
 ```
 cmd/ably-server/        # main, flag/env wiring
-cmd/ably-bench/         # pub/sub load benchmark
+cmd/ably-bench/         # pub/sub load benchmark (exact-once slice)
+cmd/ably-loadgen/       # raw-protocol load generator for cluster-scale runs (bench/aws/README.md)
+cmd/ably-conductor/     # scenario runner: assigns, ramps, holds, collects, evaluates, reports
 cmd/ably-local-sandbox/       # disposable-instance provisioner for SDK test suites (§15)
 cmd/compat-gate/        # known-failures gate for the SDK compatibility harnesses
 internal/protocol/      # wire types + json/msgpack codec; presence and mutable-message types
@@ -735,6 +737,7 @@ internal/storage/       # Storage interface + memory / bbolt / postgres backends
 internal/serial/        # channelSerial minting + global ordering
 internal/id/            # connection IDs, message IDs
 internal/compatgate/    # known-failures diff logic behind cmd/compat-gate
+internal/loadgen/       # loadgen protocol client, roles, checker, scenarios, conductor logic
 ```
 
 ### 5.1 Channel

@@ -1,0 +1,55 @@
+# Shape F: server-side REST publishers at high rate into many tiny
+# channels, plus one shared channel with about 1,800 publishers (plan §3).
+#
+# Derived at 1x: about 46k REST publishes/s, about 105k deliveries/s
+# (fan-out about 2.3), 120k connections, about 420k active channels,
+# 106 connects/s, 1.1k channel opens/s, 1.1 KB messages.
+#
+# The shape touches millions of channels an hour; the generator keeps
+# 420k channels active and approximates the rest with channel-open churn
+# (1.1k/s, about 4M opens an hour).
+name = "F"
+shape = "F"
+description = "REST writes into about 420k tiny channels (fan-out about 2), one shared channel with 1,800 publishers"
+bus = "nats"
+nodes = 10
+shards = 1
+message_bytes = 1100
+sample_percent = 5
+
+[timing]
+ramp = "10m"
+hold = "15m"
+drain = "30s"
+
+[connections]
+count = 120000
+
+[churn]
+connects_per_sec = 106
+channel_opens_per_sec = 1131
+resume = true
+
+# The shared channel: 1,800 publishers (sequential streams) at 20/s in
+# total, 1,800 subscribers.
+[[class]]
+name = "shared"
+channels = 1
+subscribers = 1800
+publish_rate = 20
+publisher = "rest"
+streams = 1800
+scale_by = "rate"
+
+# Tiny channels with 0 to 3 subscribers.
+[[class]]
+name = "tail"
+channels = 420000
+subscribers_min = 0
+subscribers_max = 3
+subscribers_dist = "uniform"
+publish_rate_total = 45980
+publisher = "rest"
+
+[presence]
+enabled = false

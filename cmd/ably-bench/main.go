@@ -36,6 +36,7 @@ type options struct {
 	msgSize     int
 	duration    time.Duration
 	warmup      time.Duration
+	stagger     bool
 
 	search    bool
 	rate      float64
@@ -52,11 +53,12 @@ func run(args []string, out *os.File) int {
 	fs.StringVar(&o.key, "key", envOr("ABLY_SERVER_KEYS", "app.key:secret"), "API key in appId.keyId:keySecret format (env: ABLY_SERVER_KEYS)")
 	fs.BoolVar(&o.binary, "binary", false, "use the msgpack protocol instead of JSON")
 	fs.IntVar(&o.channels, "channels", 4, "number of channels")
-	fs.IntVar(&o.publishers, "publishers", 4, "number of publisher connections (assigned round-robin to channels)")
+	fs.IntVar(&o.publishers, "publishers", 4, "number of publisher connections, any number >= 1 (assigned round-robin to channels; each runs its publishes one at a time on its own connection, so the default of 4 caps the rate at 4 / publish latency: raise it for throughput runs)")
 	fs.IntVar(&o.subscribers, "subscribers", 4, "number of subscriber connections (assigned round-robin to channels)")
 	fs.IntVar(&o.msgSize, "msg-size", 128, "approximate message payload size in bytes")
 	fs.DurationVar(&o.duration, "duration", 10*time.Second, "measurement window per trial")
-	fs.DurationVar(&o.warmup, "warmup", 2*time.Second, "warmup period excluded from stats")
+	fs.DurationVar(&o.warmup, "warmup", 2*time.Second, "warm-up excluded from stats, counted from the moment every client is connected and attached")
+	fs.BoolVar(&o.stagger, "stagger", false, "phase-shift publishers evenly across one publish interval instead of starting them all in lockstep (matters with many publishers: lockstep sends a burst of --publishers messages every interval)")
 
 	fs.BoolVar(&o.search, "search", false, "search for the max throughput within the p50/p99 budget instead of a single fixed-rate run")
 	fs.Float64Var(&o.rate, "rate", 1000, "offered load in messages/sec (fixed-run rate, or the starting rate in --search)")
@@ -94,6 +96,7 @@ func run(args []string, out *os.File) int {
 		msgSize:     o.msgSize,
 		warmup:      o.warmup,
 		duration:    o.duration,
+		stagger:     o.stagger,
 	}
 
 	fmt.Fprintf(out, "ably-bench: %d endpoint(s), %d channels, %d publishers, %d subscribers, %dB messages, %s protocol\n",

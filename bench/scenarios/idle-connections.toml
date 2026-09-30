@@ -1,0 +1,21 @@
+# Idle connections: subscribers with one attachment each and no publishes,
+# to measure memory per idle connection on the generator (the summary's
+# resources.bytes_per_connection and rss_per_connection) and on the nodes
+# (node RSS per 100k connections in the run record's footprint). Scale it
+# with --scale; the delivery check is off because nothing is published.
+name = "idle"
+shape = "idle"
+message_bytes = 100
+sample_percent = 0
+[timing]
+ramp = "20s"
+hold = "30s"
+drain = "2s"
+[connections]
+count = 10000
+[[class]]
+name = "one"
+channels = 10000
+subscribers = 1
+[pass]
+min_delivery_ratio = 0.01

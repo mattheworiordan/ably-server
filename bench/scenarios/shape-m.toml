@@ -1,0 +1,70 @@
+# Shape M: streaming rooms (plan §3). Run as the 1x envelope for
+# connections, channels and deliveries; 2x is --multiplier 2; the smoke
+# steps are --scale 0.01 and --scale 0.1.
+#
+# Derived at 1x (ably-conductor plan --scenario shape-m.toml):
+#   550k connections, about 1.41M attachments over about 690k channels,
+#   about 7k publishes/s, about 120k deliveries/s, 1k connects/s,
+#   2.4k channel opens/s, 470-byte messages.
+#
+# The hot channel publishes at 0.5/s rather than the plan's "about 1/s":
+# at 200k subscribers, 1/s alone is 200k deliveries/s, above the shape's
+# 120k/s peak-hour envelope, so the hour average implies about half that.
+# The shape's presence load is the separate presence run (presence-m.toml).
+name = "M"
+shape = "M"
+description = "streaming rooms: one 200k-subscriber channel, about 500 rooms of 1k-10k, a long tail of about 690k tiny channels, high channel churn"
+bus = "nats"
+nodes = 10
+shards = 1
+message_bytes = 470
+sample_percent = 5
+
+[timing]
+ramp = "10m"
+hold = "15m"
+drain = "30s"
+
+[connections]
+count = 550000
+
+[churn]
+connects_per_sec = 1000
+channel_opens_per_sec = 2400
+resume = true
+
+# One hot channel: fan-out scales with the multiplier.
+[[class]]
+name = "hot"
+channels = 1
+subscribers = 200000
+publish_rate = 0.5
+publisher = "realtime"
+streams = 1
+scale_by = "subscribers"
+
+# About 500 rooms: 10000/(i+1) subscribers clamped to [1000, 10000], so a
+# few large rooms and most at 1k (about 520k attachments at 1x).
+[[class]]
+name = "rooms"
+channels = 500
+subscribers_min = 1000
+subscribers_max = 10000
+subscribers_dist = "harmonic"
+publish_rate = 0.025
+publisher = "realtime"
+scale_by = "subscribers"
+
+# The long tail: tiny channels with 0 to 2 subscribers (median 1),
+# written over REST.
+[[class]]
+name = "tail"
+channels = 690000
+subscribers_min = 0
+subscribers_max = 2
+subscribers_dist = "uniform"
+publish_rate_total = 7000
+publisher = "rest"
+
+[presence]
+enabled = false
