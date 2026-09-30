@@ -31,6 +31,9 @@ test/run-scenario-test.sh
 echo "== dry-run call sequence"
 test/dry-run.sh
 
+echo "== 10-network with the instance profile optional (fake aws)"
+test/network-iam-test.sh
+
 if [ -x test/pgbench-local.sh ] && [ "${SKIP_DOCKER:-0}" != 1 ]; then
   echo "== pgbench SQL against a local Postgres 17"
   test/pgbench-local.sh

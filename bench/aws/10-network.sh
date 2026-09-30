@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 10-network: default VPC, one Availability Zone, one security group
-# (all traffic inside the group, SSH from ADMIN_CIDR only) and an instance
-# profile that may pull from ECR. Optionally a cluster placement group
+# (all traffic inside the group, SSH from ADMIN_CIDR only) and, when images come from
+# ECR (or CREATE_INSTANCE_PROFILE=1), an instance profile that may pull from ECR and
+# use SSM. With ghcr or no registry no IAM entity is created. Optionally a cluster placement group
 # (USE_PLACEMENT_GROUP=1; off by default, and skipped with a warning when the
 # role may not create one). There is no EC2 key pair: every box authorises
 # the public key in SSH_PUBLIC_KEY_PATH through its user-data. Create or
@@ -9,7 +10,8 @@
 #
 # Needs: AWS_REGION, ADMIN_CIDR, SSH_PUBLIC_KEY_PATH (an OpenSSH public key).
 # Optional: AZ, VPC_ID, SUBNET_ID, USE_PLACEMENT_GROUP, INSTANCE_PROFILE_NAME
-#           (use an existing profile with ECR read access instead of creating one).
+#           (use an existing profile with ECR read access instead of creating one),
+#           CREATE_INSTANCE_PROFILE (1 for ecr, else 0).
 SCRIPT_NAME=10-network
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -97,60 +99,104 @@ else
   log "no placement group (USE_PLACEMENT_GROUP=0)"
 fi
 
-# Instance profile: lets instances pull from ECR (and use SSM Session Manager).
-if [ -n "${INSTANCE_PROFILE_NAME:-}" ]; then
-  aws_r "$INSTANCE_PROFILE_NAME" iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" \
-    --query InstanceProfile.InstanceProfileName >/dev/null ||
-    die "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME does not exist"
+# Instance profile: lets instances pull from ECR (and use SSM Session Manager). Optional
+# everywhere: INSTANCE_PROFILE_NAME set uses that profile; unset creates one only for ecr (or
+# CREATE_INSTANCE_PROFILE=1); and when the role may not create it the fleet launches without one
+# (a warning; with ecr the boxes then cannot pull, so use ghcr or INSTANCE_PROFILE_NAME).
+# Every lookup is by exact name (iam get-role, get-instance-profile): never a listing.
+if [ -z "${INSTANCE_PROFILE_NAME:-}" ] && [ "$CREATE_INSTANCE_PROFILE" != 1 ]; then
+  if [ "$(state_get '.network.created_profile')" != true ]; then # keep one an earlier run made, so teardown still removes it
+    state_set '.network.instance_profile' ""
+    state_set_json '.network.created_profile' false
+  fi
+  log "no instance profile (IMAGE_REGISTRY_KIND=$IMAGE_REGISTRY_KIND needs none; CREATE_INSTANCE_PROFILE=1 adds one for SSM)"
+elif [ -n "${INSTANCE_PROFILE_NAME:-}" ]; then
+  rc=0
+  AWS_R_NOTFOUND=NoSuchEntity aws_r_soft "$INSTANCE_PROFILE_NAME" iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+    --query InstanceProfile.InstanceProfileName >/dev/null || rc=$?
+  case "$rc" in
+    0) ;;
+    3) log "WARNING: iam:GetInstanceProfile is denied, so INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME cannot be checked; using it" ;;
+    4) die "INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME does not exist" ;;
+    *) die "iam get-instance-profile failed for INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE_NAME" ;;
+  esac
   state_set '.network.instance_profile' "$INSTANCE_PROFILE_NAME"
   state_set_json '.network.created_profile' false
   log "using existing instance profile $INSTANCE_PROFILE_NAME"
 else
   role="${PROJECT_TAG}-instance"
   iam_tags "$role"
-  have=$(AWS_R_QUIET=1 aws_r "" iam get-role --role-name "$role" --query Role.RoleName) || have=""
-  if [ -z "$have" ]; then
-    init_work_dir
-    wd=$BENCH_WORK_DIR
-    cat >"$wd/trust.json" <<'JSON'
+  init_work_dir
+  wd=$BENCH_WORK_DIR
+  cat >"$wd/trust.json" <<'JSON'
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
 JSON
+  profile_ok=1
+  made_any=0
+  iam_step() { # <aws iam args...>: one step of the optional profile; a failure ends the attempt, never the script
+    [ "$profile_ok" = 1 ] || return 0
+    local rc=0
+    aws_w_soft "" iam "$@" >/dev/null || rc=$?
+    if [ "$rc" != 0 ]; then
+      log "WARNING: iam $1 failed (exit $rc; 3 means the role is denied it)"
+      profile_ok=0
+    fi
+  }
+  have=$(AWS_R_QUIET=1 aws_r "" iam get-role --role-name "$role" --query Role.RoleName) || have=""
+  if [ -z "$have" ]; then
     # Tagging on create needs iam:TagRole; without it, create the role untagged (STATE finds it at teardown).
     rc=0
-    aws_w_soft "" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" \
-      --tags "${IAM_TAGS[@]}" >/dev/null || rc=$?
-    if [ "$rc" = 3 ]; then
-      log "WARNING: creating the role with tags was denied (iam:TagRole); creating it without tags"
-      aws_w "" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" >/dev/null
-    elif [ "$rc" != 0 ]; then
-      die "iam create-role failed"
+    aws_create_tagged "" "the IAM role" iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" \
+      --tags "${IAM_TAGS[@]}" -- iam create-role --role-name "$role" --assume-role-policy-document "file://$wd/trust.json" >/dev/null || rc=$?
+    if [ "$rc" = 0 ]; then
+      log "created IAM role $role"
+      made_any=1
+      state_add_resource iam-role "$role" network "$role"
+    else
+      log "WARNING: iam create-role failed (exit $rc; 3 means the role is denied it)"
+      profile_ok=0
     fi
-    aws_w "" iam attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-    aws_w "" iam attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-    log "created IAM role $role"
   else
     log "reuse IAM role $role"
+    made_any=1 # it carries the project name, so it is ours: teardown removes it
+    state_add_resource iam-role "$role" network "$role"
   fi
-  have=$(AWS_R_QUIET=1 aws_r "" iam get-instance-profile --instance-profile-name "$role" --query InstanceProfile.InstanceProfileName) || have=""
-  if [ -z "$have" ]; then
-    rc=0
-    aws_w_soft "" iam create-instance-profile --instance-profile-name "$role" --tags "${IAM_TAGS[@]}" >/dev/null || rc=$?
-    if [ "$rc" = 3 ]; then
-      log "WARNING: creating the instance profile with tags was denied (iam:TagInstanceProfile); creating it without tags"
-      aws_w "" iam create-instance-profile --instance-profile-name "$role" >/dev/null
-    elif [ "$rc" != 0 ]; then
-      die "iam create-instance-profile failed"
+  iam_step attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+  iam_step attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  if [ "$profile_ok" = 1 ]; then
+    have=$(AWS_R_QUIET=1 aws_r "" iam get-instance-profile --instance-profile-name "$role" --query InstanceProfile.InstanceProfileName) || have=""
+    if [ -z "$have" ]; then
+      rc=0
+      aws_create_tagged "" "the instance profile" iam create-instance-profile --instance-profile-name "$role" --tags "${IAM_TAGS[@]}" \
+        -- iam create-instance-profile --instance-profile-name "$role" >/dev/null || rc=$?
+      if [ "$rc" = 0 ]; then
+        made_any=1
+        state_add_resource iam-instance-profile "$role" network "$role"
+        iam_step add-role-to-instance-profile --instance-profile-name "$role" --role-name "$role"
+        is_dry || sleep 10 # IAM is eventually consistent
+        log "created instance profile $role"
+      else
+        log "WARNING: iam create-instance-profile failed (exit $rc; 3 means the role is denied it)"
+        profile_ok=0
+      fi
+    else
+      state_add_resource iam-instance-profile "$role" network "$role"
     fi
-    aws_w "" iam add-role-to-instance-profile --instance-profile-name "$role" --role-name "$role"
-    is_dry || sleep 10 # IAM is eventually consistent
-    log "created instance profile $role"
   fi
-  state_set '.network.instance_profile' "$role"
-  state_set_json '.network.created_profile' true
-  state_add_resource iam-role "$role" network "$role"
-  state_add_resource iam-instance-profile "$role" network "$role"
+  # Teardown removes what this run created, by name; a profile that could not be completed is not used.
+  if [ "$made_any" = 1 ] || [ "$(state_get '.network.created_profile')" = true ]; then
+    state_set_json '.network.created_profile' true
+  else
+    state_set_json '.network.created_profile' false
+  fi
+  if [ "$profile_ok" = 1 ]; then
+    state_set '.network.instance_profile' "$role"
+  else
+    state_set '.network.instance_profile' ""
+    log "WARNING: launching WITHOUT an instance profile. $([ "$IMAGE_REGISTRY_KIND" = ecr ] && echo "The boxes cannot pull from ECR without one: use IMAGE_REGISTRY_KIND=ghcr, or set INSTANCE_PROFILE_NAME to an existing profile." || echo "SSM Session Manager will not work; SSH does.")"
+  fi
 fi
 
 resolve_ami >/dev/null
-log_line 10-network "network ready: default VPC, one zone ($AZ), security group, instance profile; placement group '$(state_get '.network.placement_group')' (empty: none); SSH by key in user-data" "20-postgres.sh"
+log_line 10-network "network ready: default VPC, one zone ($AZ), security group, instance profile '$(state_get '.network.instance_profile')' (empty: none); placement group '$(state_get '.network.placement_group')' (empty: none); SSH by key in user-data" "20-postgres.sh"
 log "network complete"

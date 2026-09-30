@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 25-pgdriver: one driver box for run 0a (pgbench against the Postgres box). It needs
-# only Docker; pgbench runs from the postgres image. Create or reuse.
+# only Docker; pgbench runs from the postgres image (from BASE_IMAGE_REGISTRY). No image
+# registry of ours is involved. Create or reuse.
 #
 #   bench/aws/25-pgdriver.sh
 SCRIPT_NAME=25-pgdriver
@@ -17,7 +18,7 @@ require_network_state
 spend_gate
 init_work_dir
 ud="$BENCH_WORK_DIR/userdata-pgdriver.sh"
-ECR_LOGIN_REGISTRY='' render_userdata "$ud" pgdriver "PGBENCH_IMAGE=$PGBENCH_IMAGE"
+render_userdata "$ud" pgdriver "PGBENCH_IMAGE=$PGBENCH_IMAGE"
 name=$(iname pgdriver 1)
 id=$(launch_instance "$name" pgdriver "$PGDRIVER_INSTANCE_TYPE" "$ud")
 wait_instances_running "$id"

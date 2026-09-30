@@ -4,7 +4,10 @@
 # on-demand list prices (lib.sh price_of; override with PRICE_<type>, scale
 # with PRICE_FACTOR). The real bill is in AWS Billing, which this role cannot
 # read (no Cost Explorer, no ViewBudget): this estimate is the primary spend
-# guard, with FLEET_MAX_UPTIME_H. It asks EC2 which boxes still exist first.
+# guard, with FLEET_MAX_UPTIME_H. It asks EC2 which boxes still exist first, then
+# lists what carries the project tag (the tagging API, or service by service when
+# tag:GetResources is denied) and warns about instances and volumes STATE does not
+# know, because their cost is not in the estimate.
 #
 #   bench/aws/cost-estimate.sh           table
 #   bench/aws/cost-estimate.sh --json    one JSON object
@@ -15,8 +18,36 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need_cmd jq
 state_init
 # Learn what still exists (the dead-man switch terminates boxes behind our back).
+untracked=()
 if ! is_dry && [ "${NO_AWS:-0}" != 1 ] && command -v aws >/dev/null 2>&1; then
   refresh_instances || true
+  known=" $(state_get '[.instances[]?.id, (.resources[]?.id)] | join(" ")') "
+  if project_inventory; then
+    for line in "${INVENTORY_LINES[@]}"; do
+      case "${line%% *}" in
+        instance | volume)
+          case "$known" in *" ${line#* } "*) ;; *) untracked+=("$line") ;; esac
+          ;;
+        arn)
+          # the tagging API lists ARNs: pick out instances and volumes
+          case "$line" in
+            *:instance/* | *:volume/*)
+              arn_id=${line##*/}
+              case "$known" in *" $arn_id "*) ;; *) untracked+=("${line#arn }") ;; esac
+              ;;
+          esac
+          ;;
+      esac
+    done
+    if [ "${#untracked[@]}" -gt 0 ]; then
+      log "WARNING: ${#untracked[@]} instance(s) or volume(s) tagged Project=$PROJECT_TAG are not in STATE, so their cost is not in this estimate: ${untracked[*]}"
+    fi
+    if [ "${#INVENTORY_UNVERIFIED[@]}" -gt 0 ]; then
+      log "could not list (denied): ${INVENTORY_UNVERIFIED[*]}"
+    fi
+  else
+    log "WARNING: could not list the project's resources in the account; the estimate covers only what STATE knows"
+  fi
 fi
 cost_checkpoint
 rate=$(state_get '.budget.rate_usd_h')

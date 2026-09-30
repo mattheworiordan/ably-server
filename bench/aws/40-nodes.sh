@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 40-nodes: NODE_COUNT ably-server nodes (in the placement group when there is one). Boot installs
-# Docker and chrony, raises fd limits and the port range, pulls the image from
-# ECR and starts it with --mode=cluster. /metrics is on the debug listener.
+# Docker and chrony, raises fd limits and the port range, pulls the image from the image
+# registry (IMAGE_REGISTRY; stops when IMAGE_REGISTRY_KIND=none) and starts it with --mode=cluster.
+# /metrics is on the debug listener.
 # Create or reuse; RECONFIGURE=1 re-applies image, bus and flags to live nodes;
 # SCALE_DOWN=1 terminates nodes above NODE_COUNT (run 7).
 #
@@ -25,8 +26,10 @@ require_network_state
 : "${NODE_GOMEMLIMIT:=13GiB}"
 : "${ABLY_SERVER_EXTRA_FLAGS:=}"
 
+require_registry
 tag=$(image_tag ably-server "${SERVER_TAG:-}")
-image="${ECR_REGISTRY}/${ECR_REPO_SERVER}:${tag}"
+image=$(image_ref ably-server "$tag")
+check_image_pullable ably-server "$tag"
 dsns=$(postgres_dsns)
 api_key=$(ensure_api_key)
 

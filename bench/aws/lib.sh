@@ -36,8 +36,6 @@ _default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
 : "${STATE_FILE:=$_default_workshop/STATE.json}"
 : "${DRY_STATE_FILE:=${TMPDIR:-/tmp}/${PROJECT_TAG}-dryrun-STATE.json}"
 
-: "${ECR_REPO_SERVER:=${PROJECT_TAG}/ably-server}"
-: "${ECR_REPO_LOADGEN:=${PROJECT_TAG}/ably-loadgen}"
 : "${BILLING_REGION:=us-east-1}" # the only region that has billing metrics
 : "${FLEET_MAX_UPTIME_H:=10}"    # dead-man switch: every box terminates itself after this long
 : "${USE_PLACEMENT_GROUP:=0}"    # the Operator role may not create one; 1 tries it and falls back
@@ -95,6 +93,31 @@ if [ -n "${RDS_ENGINE_VERSION:-}" ] && [ -z "${PG_IMAGE:-}" ]; then PG_IMAGE="po
 : "${PGBENCH_IMAGE:=postgres:17-alpine}"
 : "${DOCKER_COMPOSE_VERSION:=v2.29.7}"
 
+# BASE_IMAGE_REGISTRY: where the third party images above are pulled from.
+# The default, docker.io, leaves every name as written (Docker Hub, and quay.io
+# for the postgres exporter). Any other value is a mirror with a flat layout
+# (<registry>/<name>:<tag>, no owner in the path): "build-push.sh mirror" makes
+# one under IMAGE_REGISTRY. Docker Hub limits anonymous pulls per source address.
+: "${BASE_IMAGE_REGISTRY:=docker.io}"
+BASE_IMAGE_REGISTRY=${BASE_IMAGE_REGISTRY%/}
+# base_image <ref>: the ref to pull, under BASE_IMAGE_REGISTRY. Idempotent.
+base_image() {
+  if [ "$BASE_IMAGE_REGISTRY" = docker.io ]; then
+    printf '%s' "$1"
+  else
+    printf '%s/%s' "$BASE_IMAGE_REGISTRY" "${1##*/}"
+  fi
+}
+# The refs as written, for "build-push.sh mirror" (which must read Docker Hub),
+# then every *_IMAGE variable rewritten so every use site pulls from the mirror.
+BASE_IMAGE_VARS=(PG_IMAGE PGBENCH_IMAGE NATS_IMAGE NATS_EXPORTER_IMAGE NODE_EXPORTER_IMAGE PROMETHEUS_IMAGE GRAFANA_IMAGE POSTGRES_EXPORTER_IMAGE)
+BASE_IMAGE_SOURCES=()
+for _v in "${BASE_IMAGE_VARS[@]}"; do
+  BASE_IMAGE_SOURCES+=("${!_v}")
+  printf -v "$_v" '%s' "$(base_image "${!_v}")"
+done
+unset _v
+
 is_dry() { [ "$DRY_RUN" = 1 ]; }
 
 # Containers use host networking, so the ports of one box must differ.
@@ -124,7 +147,6 @@ fi
 SSH_PRIVATE_KEY_PATH="${SSH_PRIVATE_KEY_PATH%.pub}"
 : "${BUDGET_ALARM_USD:=750}"
 : "${BUDGET_CAP_USD:=1500}"
-: "${ECR_REGISTRY:=${AWS_ACCOUNT_ID:-}.dkr.ecr.${AWS_REGION:-}.amazonaws.com}"
 export ACTIVE_STATE
 _check_ports node "$SERVER_PORT" "$SERVER_DEBUG_PORT" "$NODE_EXPORTER_PORT"
 _check_ports nats "$NATS_CLIENT_PORT" "$NATS_ROUTE_PORT" "$NATS_MONITOR_PORT" "$NATS_EXPORTER_PORT" "$NODE_EXPORTER_PORT"
@@ -158,7 +180,158 @@ log_line() {
 _mask() {
   local s=$1
   if [ -n "${RDS_PASSWORD:-}" ]; then s=${s//"$RDS_PASSWORD"/***}; fi
+  if [ -n "${GHCR_PULL_TOKEN:-}" ]; then s=${s//"$GHCR_PULL_TOKEN"/***}; fi
   printf '%s' "$s"
+}
+
+# ------------------------------------------------------- image registry
+# Where the ably-server and ably-loadgen images live. The boxes pull from here.
+#   IMAGE_REGISTRY       ghcr.io/<github-owner> or
+#                        <account>.dkr.ecr.<region>.amazonaws.com[/<prefix>]
+#   IMAGE_REGISTRY_KIND  ghcr | ecr | none. Default ghcr (inferred from IMAGE_REGISTRY when that
+#                        is set). none: no registry at all; enough for run 0a, which runs only
+#                        third party images.
+# ghcr with no IMAGE_REGISTRY takes ghcr.io/<your GitHub login> (gh api user) when an image
+# reference is first needed (require_registry); run 0a never needs one. No owner is written
+# in a script. ECR with no IMAGE_REGISTRY uses <account>.dkr.ecr.<region>.amazonaws.com/$PROJECT_TAG
+# (the repositories the earlier version of these scripts created).
+: "${IMAGE_REGISTRY:=}"
+IMAGE_REGISTRY=${IMAGE_REGISTRY%/}
+if [ -z "${IMAGE_REGISTRY_KIND:-}" ]; then
+  case "$IMAGE_REGISTRY" in
+    '' | ghcr.io | ghcr.io/*) IMAGE_REGISTRY_KIND=ghcr ;;
+    *.dkr.ecr.*.amazonaws.com | *.dkr.ecr.*.amazonaws.com/*) IMAGE_REGISTRY_KIND=ecr ;;
+    *) die "cannot tell the registry kind of IMAGE_REGISTRY: set IMAGE_REGISTRY_KIND to ghcr, ecr or none" ;;
+  esac
+fi
+case "$IMAGE_REGISTRY_KIND" in
+  ghcr)
+    if [ -n "$IMAGE_REGISTRY" ]; then
+      case "$IMAGE_REGISTRY" in
+        ghcr.io/?*) ;;
+        *) die "IMAGE_REGISTRY_KIND=ghcr needs IMAGE_REGISTRY=ghcr.io/<github-owner>" ;;
+      esac
+      case "$IMAGE_REGISTRY" in
+        *[A-Z]*) die "IMAGE_REGISTRY=$IMAGE_REGISTRY: ghcr.io wants lower case names; use ${IMAGE_REGISTRY,,}" ;;
+      esac
+    fi
+    ;;
+  ecr)
+    if [ -z "$IMAGE_REGISTRY" ]; then
+      [ -n "${AWS_ACCOUNT_ID:-}" ] && [ -n "${AWS_REGION:-}" ] ||
+        die "IMAGE_REGISTRY_KIND=ecr needs IMAGE_REGISTRY, or AWS_ACCOUNT_ID and AWS_REGION to derive it"
+      IMAGE_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_TAG}"
+    fi
+    ;;
+  none) ;;
+  *) die "IMAGE_REGISTRY_KIND must be ghcr, ecr or none (got $IMAGE_REGISTRY_KIND)" ;;
+esac
+REGISTRY_HOST=${IMAGE_REGISTRY%%/*}
+if [ "$IMAGE_REGISTRY_KIND" = ghcr ]; then REGISTRY_HOST=ghcr.io; fi
+REGISTRY_PATH=""
+case "$IMAGE_REGISTRY" in */*) REGISTRY_PATH=${IMAGE_REGISTRY#*/} ;; esac
+: "${ECR_REPO_SERVER:=${REGISTRY_PATH:+$REGISTRY_PATH/}ably-server}"
+: "${ECR_REPO_LOADGEN:=${REGISTRY_PATH:+$REGISTRY_PATH/}ably-loadgen}"
+: "${GHCR_PULL_USER:=${GHCR_USER:-token}}"
+export IMAGE_REGISTRY IMAGE_REGISTRY_KIND REGISTRY_HOST REGISTRY_PATH
+# The instance profile (an IAM role) exists so boxes can pull from ECR and use SSM. It is optional
+# everywhere: only ecr wants one, ghcr and none skip the IAM calls unless CREATE_INSTANCE_PROFILE=1
+# (SSM Session Manager), and a role that may not create one gets a warning and boxes without.
+if [ -z "${CREATE_INSTANCE_PROFILE:-}" ]; then
+  if [ "$IMAGE_REGISTRY_KIND" = ecr ]; then CREATE_INSTANCE_PROFILE=1; else CREATE_INSTANCE_PROFILE=0; fi
+fi
+
+# require_registry: the fleet scripts need images somewhere the boxes can pull from. Call it in
+# the main shell (not in $( )) so that a registry taken from the GitHub login is kept.
+require_registry() {
+  [ "$IMAGE_REGISTRY_KIND" != none ] ||
+    die "IMAGE_REGISTRY_KIND is none: there is no registry to pull ably-server or ably-loadgen from. Set IMAGE_REGISTRY (ghcr.io/<github-owner> or an ECR registry), unset IMAGE_REGISTRY_KIND and run build-push.sh. Run 0a does not need images."
+  if [ "$IMAGE_REGISTRY_KIND" = ghcr ] && [ -z "$IMAGE_REGISTRY" ]; then
+    local owner=${GHCR_USER:-}
+    if [ -z "$owner" ] && ! is_dry && command -v gh >/dev/null 2>&1; then owner=$(gh api user --jq .login 2>/dev/null || true); fi
+    if is_dry; then owner=${owner:-github-login}; fi
+    [ -n "$owner" ] ||
+      die "IMAGE_REGISTRY is not set and the GitHub login could not be read (gh api user). Set IMAGE_REGISTRY=ghcr.io/<github-owner> (lower case), or IMAGE_REGISTRY_KIND=none for run 0a."
+    IMAGE_REGISTRY="ghcr.io/${owner,,}"
+    REGISTRY_PATH=${owner,,}
+    export IMAGE_REGISTRY REGISTRY_PATH
+    log "IMAGE_REGISTRY is not set: using $IMAGE_REGISTRY (your GitHub login)"
+  fi
+}
+
+# image_ref <ably-server|ably-loadgen> <tag>: the full reference the boxes pull.
+image_ref() {
+  local name=$1 tag=$2 repo
+  require_registry
+  case "$IMAGE_REGISTRY_KIND" in
+    ecr)
+      case "$name" in
+        ably-server) repo=$ECR_REPO_SERVER ;;
+        ably-loadgen) repo=$ECR_REPO_LOADGEN ;;
+        *) die "image_ref: unknown image $name" ;;
+      esac
+      printf '%s/%s:%s' "$REGISTRY_HOST" "$repo" "$tag"
+      ;;
+    *) printf '%s/%s:%s' "$IMAGE_REGISTRY" "$name" "$tag" ;;
+  esac
+}
+
+# registry_repo_path <ably-server|ably-loadgen>: the path below the host (owner/name on ghcr,
+# the repository name on ECR).
+registry_repo_path() {
+  local ref
+  ref=$(image_ref "$1" x)
+  ref=${ref#*/}
+  printf '%s' "${ref%:x}"
+}
+
+# ghcr_is_public <owner/name> <tag>: 0 when a client with no credentials can read the
+# manifest, which is what a box without GHCR_PULL_TOKEN is. curl only; nothing is changed.
+ghcr_is_public() {
+  local path=$1 tag=$2 tok code
+  tok=$(curl -fsS --max-time 20 "https://ghcr.io/token?scope=repository:${path}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null) || return 1
+  [ -n "$tok" ] || return 1
+  code=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+    "https://ghcr.io/v2/${path}/manifests/${tag}" 2>/dev/null) || return 1
+  [ "$code" = 200 ]
+}
+
+# check_image_pullable <ably-server|ably-loadgen> <tag>: stop before launching boxes that
+# cannot pull. ghcr without GHCR_PULL_TOKEN needs a public package; SKIP_REGISTRY_CHECK=1
+# skips the test (no network from here, or a package you know is readable).
+check_image_pullable() {
+  local name=$1 tag=$2 path
+  if is_dry || [ "${SKIP_REGISTRY_CHECK:-0}" = 1 ]; then return 0; fi
+  [ "$IMAGE_REGISTRY_KIND" = ghcr ] || return 0
+  if [ -n "${GHCR_PULL_TOKEN:-}" ]; then return 0; fi
+  path=$(registry_repo_path "$name")
+  ghcr_is_public "$path" "$tag" ||
+    die "the boxes cannot pull ghcr.io/$path:$tag anonymously: it is missing or private. After the first push set the package to public (https://github.com/users/${path%%/*}/packages, open the package, Package settings, Change visibility), or export GHCR_PULL_TOKEN (a token with read:packages; RUNBOOK section 3). SKIP_REGISTRY_CHECK=1 skips this test."
+}
+
+# ecr_ensure_repo <repository name>: 0 when the repository exists or was created; 3 when
+# creating it is denied (the reason is logged); 1 on another failure. Looks first with
+# describe-repositories and creates only a missing one. A denied tag on create falls back
+# to an untagged repository. There is no probe: ECR answers InvalidParameter before it
+# checks permission, so a deliberately invalid create says nothing about the permission.
+ecr_ensure_repo() {
+  local repo=$1 have rc=0
+  have=$(aws_r_soft "" ecr describe-repositories --repository-names "$repo" --query 'repositories[0].repositoryName') || rc=$?
+  if [ "$rc" = 3 ]; then log "WARNING: ecr:DescribeRepositories is denied; trying to create $repo"; fi
+  if [ "$rc" = 0 ] && [ -n "$have" ]; then
+    log "ECR repository $repo exists"
+    return 0
+  fi
+  rc=0
+  aws_create_tagged "" "the ECR repository $repo" ecr create-repository --repository-name "$repo" \
+    --tags "Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$repo" -- ecr create-repository --repository-name "$repo" >/dev/null || rc=$?
+  case "$rc" in
+    0) log "created ECR repository $repo" ;;
+    3) log "ecr:CreateRepository is DENIED for $repo in this account: the repository does not exist and this role cannot create it. Ask for the repositories to be created with push rights, or use IMAGE_REGISTRY_KIND=ghcr (or none for run 0a)." ;;
+    *) log "ecr create-repository failed for $repo" ;;
+  esac
+  return "$rc"
 }
 
 need_cmd() {
@@ -265,11 +438,14 @@ aws_r() {
 }
 
 # aws_probe <allowed-regex> <args...>: a harmless call used to learn whether
-# an action is permitted. Prints ALLOWED, DENIED or UNKNOWN. A call that
-# succeeds, or fails with a message matching <allowed-regex> (a dry-run
-# marker or a parameter validation error, which AWS reports only after the
-# authorisation check passed), counts as ALLOWED. In a dry run it prints the
-# call and reports ALLOWED.
+# an action is permitted. Prints "ALLOWED <basis>", "DENIED" or "UNKNOWN". A call
+# that succeeds, or fails with a message matching <allowed-regex>, counts as ALLOWED.
+# The basis says how firm that is: "dryrun" (EC2 --dry-run answered DryRunOperation,
+# which is given only after the authorisation check: sound), "success", or
+# "validation" (a deliberately invalid parameter was rejected: NOT sound, because a
+# service may validate parameters before it checks permission; ECR does, and a role
+# denied ecr:CreateRepository got "ok" from such a probe). In a dry run it prints the
+# call and reports "ALLOWED dryrun".
 aws_probe() {
   local ok=$1 out rc=0
   shift
@@ -277,16 +453,16 @@ aws_probe() {
   mapfile -t reg < <(_region_args "$@")
   if is_dry; then
     _ext "" aws "$@" "${reg[@]}"
-    echo ALLOWED
+    echo "ALLOWED dryrun"
     return 0
   fi
   out=$(aws "$@" "${reg[@]}" 2>&1) || rc=$?
   if [ "$rc" = 0 ]; then
-    echo ALLOWED
+    echo "ALLOWED success"
   elif printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|AuthorizationError|explicit deny|is not permitted'; then
     echo DENIED
   elif printf '%s' "$out" | grep -Eq "$ok"; then
-    echo ALLOWED
+    if printf '%s' "$out" | grep -q 'DryRunOperation'; then echo "ALLOWED dryrun"; else echo "ALLOWED validation"; fi
   else
     printf '%s\n' "$out" | head -3 >&2
     echo UNKNOWN
@@ -314,6 +490,31 @@ aws_w_tolerate() {
     return 1
   fi
   if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+}
+
+# aws_create_tagged <fake> <what> <tagged aws args...> -- <untagged aws args...>: create a
+# resource with tags, and without them when the role may not tag on create (a missing
+# tagging permission, such as ecr:TagResource, iam:TagRole or sns:TagResource, must not
+# stop a create that is otherwise allowed). Output of the successful call goes to stdout.
+# Returns 0 created, 3 denied even without tags (the create itself is not allowed),
+# 1 on another failure.
+aws_create_tagged() {
+  local fake=$1 what=$2 rc=0
+  shift 2
+  local -a targs=() pargs=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    targs+=("$1")
+    shift
+  done
+  if [ "${1:-}" = -- ]; then shift; fi
+  pargs=("$@")
+  aws_w_soft "$fake" "${targs[@]}" || rc=$?
+  if [ "$rc" = 3 ]; then
+    log "WARNING: creating $what with tags was denied (a tagging permission is missing); creating it without tags"
+    rc=0
+    aws_w_soft "$fake" "${pargs[@]}" || rc=$?
+  fi
+  return "$rc"
 }
 
 # aws_w_soft <fake> args...: a write the caller can live without. Returns 0 on
@@ -345,7 +546,8 @@ aws_w_soft() {
 }
 
 # aws_r_soft <fake> args...: a read whose denial is not fatal. Prints the
-# text output; returns 0 (ok, output may be empty), 3 (not authorised) or 1.
+# text output; returns 0 (ok, output may be empty), 3 (not authorised), 4 (the error
+# matches AWS_R_NOTFOUND, a regex such as NoSuchEntity: the thing is not there) or 1.
 aws_r_soft() {
   local fake=$1 out
   shift
@@ -366,6 +568,9 @@ aws_r_soft() {
   if printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|explicit deny|is not permitted'; then
     return 3
   fi
+  if [ -n "${AWS_R_NOTFOUND:-}" ] && printf '%s' "$out" | grep -Eq "$AWS_R_NOTFOUND"; then
+    return 4
+  fi
   return 1
 }
 
@@ -383,6 +588,110 @@ tag_spec() { # <resource-type> <name> [role]
 iam_tags() { IAM_TAGS=("Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$1"); }
 
 project_filter() { printf 'Name=tag:Project,Values=%s' "$PROJECT_TAG"; }
+
+# project_inventory: fills INVENTORY_LINES with one "<type> <id>" line for everything the
+# project may have left in the account (call it in the main shell, not in $( )).
+# First attempt: the tagging API (lines "arn <arn>"; it lists only tagged resources).
+# When that is denied (tag:GetResources is not in the Operator role), or TAGGING_API=off,
+# it asks each service: instances, volumes, security groups, network interfaces (by tag, and
+# by the project security group) and placement groups by tag; the IAM role and instance
+# profile by exact name (get-role, get-instance-profile: never list-instance-profiles, which
+# the scoped IAM grant lacks); CloudWatch billing alarms, SNS topics and ECR repositories by
+# the project's name prefix (they are created untagged when the role may not tag). A service
+# whose call is denied is named in INVENTORY_UNVERIFIED (and logged) instead of failing.
+# Returns 1 when a call fails for any other reason. INVENTORY_SOURCE is tagging-api or per-service.
+# shellcheck disable=SC2034  # INVENTORY_SOURCE and INVENTORY_UNVERIFIED are read by the callers
+INVENTORY_SOURCE=""
+INVENTORY_LINES=()
+INVENTORY_UNVERIFIED=()
+
+# _inv_add <type> <aws args...>: one list call; adds "<type> <id>" per word to INVENTORY_LINES.
+_inv_add() {
+  local type=$1 o rc=0 id l dup
+  shift
+  o=$(aws_r_soft "" "$@") || rc=$?
+  if [ "$rc" = 3 ]; then
+    log "WARNING: cannot list $type (denied); not verified"
+    INVENTORY_UNVERIFIED+=("$type")
+    return 0
+  elif [ "$rc" != 0 ]; then
+    return 1
+  fi
+  for id in $o; do
+    dup=0
+    for l in "${INVENTORY_LINES[@]:-}"; do
+      if [ "$l" = "$type $id" ]; then dup=1; fi
+    done
+    if [ "$dup" = 0 ]; then INVENTORY_LINES+=("$type $id"); fi
+  done
+}
+
+# _inv_get <type> <aws args...>: a get-by-name call; "not found" (NoSuchEntity) is an empty result.
+_inv_get() {
+  local type=$1 o rc=0
+  shift
+  o=$(AWS_R_NOTFOUND='NoSuchEntity' aws_r_soft "" "$@") || rc=$?
+  case "$rc" in
+    0) if [ -n "$o" ]; then INVENTORY_LINES+=("$type $o"); fi ;;
+    4) ;;
+    3)
+      log "WARNING: cannot look up $type (denied); not verified"
+      INVENTORY_UNVERIFIED+=("$type")
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# shellcheck disable=SC2034
+project_inventory() {
+  local out rc=0 id live="pending,running,stopping,stopped,shutting-down"
+  INVENTORY_SOURCE=""
+  INVENTORY_LINES=()
+  INVENTORY_UNVERIFIED=()
+  if [ "${TAGGING_API:-on}" != off ]; then
+    out=$(aws_r_soft "" resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=$PROJECT_TAG" \
+      --query 'ResourceTagMappingList[].ResourceARN') || rc=$?
+    if [ "$rc" = 0 ]; then
+      INVENTORY_SOURCE=tagging-api
+      for id in $out; do INVENTORY_LINES+=("arn $id"); done
+      return 0
+    elif [ "$rc" = 3 ]; then
+      log "tag:GetResources is denied; listing the project's resources service by service"
+    else
+      return 1
+    fi
+  fi
+  INVENTORY_SOURCE=per-service
+  _inv_add instance ec2 describe-instances --filters "$(project_filter)" "Name=instance-state-name,Values=$live" \
+    --query 'Reservations[].Instances[].InstanceId' || return 1
+  _inv_add volume ec2 describe-volumes --filters "$(project_filter)" --query 'Volumes[].VolumeId' || return 1
+  _inv_add security-group ec2 describe-security-groups --filters "$(project_filter)" --query 'SecurityGroups[].GroupId' || return 1
+  _inv_add network-interface ec2 describe-network-interfaces --filters "$(project_filter)" --query 'NetworkInterfaces[].NetworkInterfaceId' || return 1
+  local sgs=""
+  for id in "${INVENTORY_LINES[@]}"; do
+    case "$id" in "security-group "*) sgs+="${sgs:+,}${id#security-group }" ;; esac
+  done
+  if [ -n "$sgs" ]; then
+    # an interface that still uses the project security group blocks its deletion, tagged or not
+    _inv_add network-interface ec2 describe-network-interfaces --filters "Name=group-id,Values=$sgs" \
+      --query 'NetworkInterfaces[].NetworkInterfaceId' || return 1
+  fi
+  _inv_add placement-group ec2 describe-placement-groups --filters "$(project_filter)" --query 'PlacementGroups[].GroupName' || return 1
+  # IAM by exact name: the role the scripts create is ${PROJECT_TAG}-instance, and its profile has the
+  # same name. get-role and get-instance-profile are in the scoped IAM grant; list-instance-profiles is not.
+  _inv_get iam-role iam get-role --role-name "${PROJECT_TAG}-instance" --query Role.RoleName || return 1
+  _inv_get iam-instance-profile iam get-instance-profile --instance-profile-name "${PROJECT_TAG}-instance" \
+    --query InstanceProfile.InstanceProfileName || return 1
+  _inv_add cloudwatch-alarm cloudwatch describe-alarms --alarm-name-prefix "${PROJECT_TAG}-" \
+    --query 'MetricAlarms[].AlarmName' --region "$BILLING_REGION" || return 1
+  _inv_add sns-topic sns list-topics --query "Topics[?contains(TopicArn, ':${PROJECT_TAG}-')].TopicArn" --region "$BILLING_REGION" || return 1
+  if [ "$IMAGE_REGISTRY_KIND" = ecr ]; then
+    _inv_add ecr-repository ecr describe-repositories \
+      --query "repositories[?starts_with(repositoryName, '${REGISTRY_PATH:-ably-}')].repositoryName" || return 1
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------- state
 
@@ -779,13 +1088,19 @@ wait_boot() {
 }
 
 # render_userdata <outfile> <role-template> KEY=VALUE...
-# Output is templates/common.sh plus templates/<role-template>.sh.
+# Output is templates/common.sh plus templates/<role-template>.sh. The common part
+# logs in to the image registry: ecr with the instance profile; ghcr only when
+# GHCR_PULL_TOKEN is set (public packages need no login; the token then sits in the
+# user-data, RUNBOOK section 3); none not at all.
 render_userdata() {
   local out=$1 role=$2
   shift 2
+  case "${GHCR_PULL_TOKEN:-}" in *[!A-Za-z0-9_]*) die "GHCR_PULL_TOKEN may contain only letters, digits and _ (it is written into user-data)" ;; esac
+  case "$GHCR_PULL_USER" in *[!A-Za-z0-9-]*) die "GHCR_PULL_USER may contain only letters, digits and - (it is written into user-data)" ;; esac
   {
     render_template "$BENCH_AWS_DIR/templates/common.sh" \
-      "REGION=$AWS_REGION" "ECR_REGISTRY=${ECR_LOGIN_REGISTRY-$ECR_REGISTRY}" \
+      "REGION=${AWS_REGION:-}" "REGISTRY_KIND=$IMAGE_REGISTRY_KIND" "REGISTRY_HOST=$REGISTRY_HOST" \
+      "GHCR_PULL_USER=$GHCR_PULL_USER" "GHCR_PULL_TOKEN=${GHCR_PULL_TOKEN:-}" \
       "NODE_EXPORTER_IMAGE=$NODE_EXPORTER_IMAGE" "NODE_EXPORTER_PORT=$NODE_EXPORTER_PORT" \
       "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}" \
       "MAX_UPTIME_MIN=$((FLEET_MAX_UPTIME_H * 60))" "SSH_PUBKEY=$(ssh_pubkey)"
@@ -810,7 +1125,7 @@ apply_role_script() {
 # iname <role> <index>: the Name tag of an instance.
 iname() { printf '%s-%s-%s' "$PROJECT_TAG" "$1" "$2"; }
 
-# image_tag <ECR repo key in STATE.images> <override>: a tag from the
+# image_tag <key in STATE.images> <override>: a tag from the
 # environment, else the one build-push.sh recorded.
 image_tag() {
   local key=$1 override=${2:-} t

@@ -23,8 +23,10 @@ require_network_state
 : "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=generator}"
 : "${PUBLISHER_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=publisher}"
 
+require_registry
 tag=$(image_tag ably-loadgen "${LOADGEN_TAG:-}")
-image="${ECR_REGISTRY}/${ECR_REPO_LOADGEN}:${tag}"
+image=$(image_ref ably-loadgen "$tag")
+check_image_pullable ably-loadgen "$tag"
 dsns=$(postgres_dsns)
 
 spend_gate

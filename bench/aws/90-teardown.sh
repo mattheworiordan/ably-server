@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # 90-teardown: delete everything tagged Project=$PROJECT_TAG (and what STATE
 # lists, when it carries that tag), then verify nothing is left. Run it at the
-# end of every working day. The billing alarm and the ECR repositories stay
-# (they cost almost nothing and the alarm must outlive the fleet) unless
-# TEARDOWN_ALL=1. Terminating the instances also deletes their EBS volumes, so
+# end of every working day. The billing alarm and the ECR repositories (when
+# there are any) stay (they cost almost nothing and the alarm must outlive the
+# fleet) unless TEARDOWN_ALL=1. Terminating the instances also deletes their EBS volumes, so
 # the Postgres data goes with its instance: collect results first.
 #
 #   bench/aws/90-teardown.sh --yes
 #
 # Every read it relies on must succeed: an expired sign-in or a denied call
-# stops the script instead of looking like "nothing remains". STATE is cleared
-# only after the verification passes.
+# stops the script instead of looking like "nothing remains". The one read that may
+# be denied is the tagging API (tag:GetResources): the final listing then asks each
+# service instead (lib.sh project_inventory). STATE is cleared only after the
+# verification passes.
 #
-# Optional: TEARDOWN_ALL=1 (also delete the ECR repositories and the billing alarms).
+# Optional: TEARDOWN_ALL=1 (also delete the ECR repositories, the billing alarms and their SNS topic).
 SCRIPT_NAME=90-teardown
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -111,12 +113,18 @@ fi
 # ---- 4. IAM role and instance profile, only when 10-network.sh created them
 if [ "$(state_get '.network.created_profile')" = true ]; then
   role="${PROJECT_TAG}-instance"
-  # A role that may not delete IAM entities leaves them behind: they cost nothing, so warn and go on.
+  # A role that may not delete IAM entities, or may not detach what blocks the delete (the scoped
+  # grant has DeleteRole and DeleteInstanceProfile but neither DetachRolePolicy nor
+  # RemoveRoleFromInstanceProfile), leaves them behind: they cost nothing and the next
+  # 10-network.sh reuses them by name, so warn and go on.
   iam_del() {
-    local rc=0
-    AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam "$@" || rc=$?
+    local rc=0 out
+    out=$(AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam "$@" 2>&1) || rc=$?
+    if [ -n "$out" ]; then printf '%s\n' "$out" >&2; fi
     if [ "$rc" = 3 ]; then
       log "WARNING: iam $1 is denied; delete the role and instance profile $role by hand (they cost nothing)"
+    elif [ "$rc" = 1 ] && grep -q 'DeleteConflict' <<<"$out"; then
+      log "WARNING: iam $1 could not finish: the entity still has a policy or role attached and detaching is not allowed here. Left in place; it costs nothing and 10-network.sh reuses it."
     elif [ "$rc" != 0 ]; then
       die "iam $1 failed"
     fi
@@ -128,21 +136,27 @@ if [ "$(state_get '.network.created_profile')" = true ]; then
   iam_del delete-role --role-name "$role"
 fi
 
-# ---- 5. Optional: ECR repositories (only ones tagged for the project) and the budget
+# ---- 5. Optional: ECR repositories (only when the registry is ECR, and only ones tagged for the
+# project), the budget, the billing alarms and their SNS topic
 if [ "${TEARDOWN_ALL:-0}" = 1 ]; then
-  for repo in "$ECR_REPO_SERVER" "$ECR_REPO_LOADGEN"; do
-    arn=$(AWS_R_QUIET=1 aws_r "arn:dryrun:$repo" ecr describe-repositories --repository-names "$repo" --query 'repositories[0].repositoryArn') || continue
-    [ -n "$arn" ] || continue
-    if has_project_tag "$PROJECT_TAG" ecr list-tags-for-resource --resource-arn "$arn" --query "tags[?Key=='Project'].Value | [0]"; then
-      aws_w_tolerate 'RepositoryNotFoundException' "" ecr delete-repository --repository-name "$repo" --force >/dev/null
-    else
-      log "WARNING: ECR repository $repo has no Project tag; leaving it alone"
-    fi
-  done
+  if [ "$IMAGE_REGISTRY_KIND" = ecr ]; then
+    for repo in "$ECR_REPO_SERVER" "$ECR_REPO_LOADGEN"; do
+      arn=$(AWS_R_QUIET=1 aws_r "arn:dryrun:$repo" ecr describe-repositories --repository-names "$repo" --query 'repositories[0].repositoryArn') || continue
+      [ -n "$arn" ] || continue
+      if has_project_tag "$PROJECT_TAG" ecr list-tags-for-resource --resource-arn "$arn" --query "tags[?Key=='Project'].Value | [0]"; then
+        aws_w_tolerate 'RepositoryNotFoundException' "" ecr delete-repository --repository-name "$repo" --force >/dev/null
+      else
+        log "WARNING: ECR repository $repo has no Project tag; leaving it alone"
+      fi
+    done
+  fi
   aws_w_tolerate 'NotFoundException' "" budgets delete-budget --account-id "$AWS_ACCOUNT_ID" --budget-name "${BUDGET_NAME:-${PROJECT_TAG}-cap}"
   for usd in "$BUDGET_ALARM_USD" "$BUDGET_CAP_USD"; do
     aws_w_tolerate 'ResourceNotFound' "" cloudwatch delete-alarms --alarm-names "${PROJECT_TAG}-billing-${usd}usd" --region "$BILLING_REGION"
   done
+  rc=0
+  AWS_SOFT_OK='NotFound' aws_w_soft "" sns delete-topic --topic-arn "arn:aws:sns:$BILLING_REGION:$AWS_ACCOUNT_ID:${PROJECT_TAG}-billing" --region "$BILLING_REGION" >/dev/null || rc=$?
+  if [ "$rc" = 3 ]; then log "WARNING: sns:DeleteTopic is denied; delete the topic ${PROJECT_TAG}-billing by hand"; elif [ "$rc" != 0 ]; then die "sns delete-topic failed"; fi
 fi
 
 # ---- 6. Verify nothing tagged remains (every read must succeed)
@@ -161,10 +175,37 @@ chk instances "$v_inst"
 chk volumes "$v_vol"
 chk security-groups "$v_sg"
 chk placement-groups "$v_pg"
-# Any other tagged resource (the ECR repositories, for one) shows here on purpose.
-other=$(rd "" resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=$PROJECT_TAG" --query 'ResourceTagMappingList[].ResourceARN')
-if [ -n "$(words "$other")" ]; then
-  log "tagged resources the tagging API still lists (terminated instances can linger for an hour; ECR repositories and snapshots stay by design): $(words "$other" | tr '\n' ' ')"
+# Everything else the project may have left: the tagging API first, and each service when
+# that API is denied to the role (tag:GetResources is not in the Operator role).
+inv_rc=0
+project_inventory || inv_rc=$?
+[ "$inv_rc" = 0 ] || die "could not list the project's resources: a list call failed for a reason other than permission. Nothing more was deleted; fix it and re-run."
+log "final listing by: $INVENTORY_SOURCE"
+v_eni="" v_arn="" v_iam="" v_keep="" v_all=""
+for line in "${INVENTORY_LINES[@]}"; do
+  id=${line#* }
+  case "${line%% *}" in
+    arn) v_arn+="$id " ;;
+    network-interface) v_eni+="$id " ;;
+    iam-role | iam-instance-profile) v_iam+="$id " ;;
+    cloudwatch-alarm | sns-topic | ecr-repository)
+      if [ "${TEARDOWN_ALL:-0}" = 1 ]; then v_all+="$id "; else v_keep+="$id "; fi
+      ;;
+  esac
+done
+chk network-interfaces "$v_eni"
+chk "alarms, topics and repositories that TEARDOWN_ALL=1 removes" "$v_all"
+if [ -n "$(words "$v_arn")" ]; then
+  log "tagged resources the tagging API still lists (terminated instances can linger for an hour; ECR repositories and snapshots stay by design): $(words "$v_arn" | tr '\n' ' ')"
+fi
+if [ -n "$(words "$v_iam")" ]; then
+  log "IAM entities named for the project (they cost nothing; an IAM delete the role may not do leaves them): $(words "$v_iam" | tr '\n' ' ')"
+fi
+if [ -n "$(words "$v_keep")" ]; then
+  log "left in place on purpose (billing alarms, their SNS topic and any ECR repositories; TEARDOWN_ALL=1 removes them): $(words "$v_keep" | tr '\n' ' ')"
+fi
+if [ "${#INVENTORY_UNVERIFIED[@]}" -gt 0 ]; then
+  log "WARNING: could not verify (list call denied): ${INVENTORY_UNVERIFIED[*]}"
 fi
 
 # ---- 7. State and log (STATE is cleared only when the verification passed)

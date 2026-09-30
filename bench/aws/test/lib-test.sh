@@ -91,8 +91,12 @@ check "price factor scales list prices" 1.166 "$(PRICE_FACTOR=1.1 price_of r7i.4
 check "price override" 9 "$(PRICE_c7i_2xlarge=9 price_of c7i.2xlarge)"
 check "vcpus" 32 "$(vcpus_of c7i.8xlarge)"
 # accrual: pretend the interval opened an hour ago at $2/h
-_state_update '.budget = {since_epoch: ($n - 3600), rate_usd_h: 2, accrued_usd: 1}' --argjson n "$(date +%s)"
+# A fixed clock (the date stub answers only +%s), so the test cannot straddle a second boundary.
+fixed_now=$(date +%s)
+_state_update '.budget = {since_epoch: ($n - 3600), rate_usd_h: 2, accrued_usd: 1}' --argjson n "$fixed_now"
+date() { if [ "${1:-}" = +%s ]; then echo "$fixed_now"; else command date "$@"; fi; }
 cost_checkpoint
+unset -f date
 check "accrual adds one hour" 3.0000 "$(state_get '.budget.accrued_usd' | awk '{printf "%.4f", $1}')"
 check "checkpoint sets new rate" 3.3200 "$(state_get '.budget.rate_usd_h' | awk '{printf "%.4f", $1}')"
 
@@ -202,6 +206,198 @@ check "soft write: other failure is 1" 1 "$(FAKE_IAM=other soft 'aws_w_soft "" i
 check "soft write: other failure is 1 even when an unrelated pattern is ok" 1 "$(FAKE_IAM=other soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
 check "soft write: a tolerated error is success" 0 "$(FAKE_IAM=gone soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
 check "soft write: denied beats a tolerated pattern" 3 "$(FAKE_IAM=deny soft 'AWS_SOFT_OK=NoSuchEntity aws_w_soft "" iam delete-role --role-name r')"
+
+# ---- image registry kinds, base images, the tagging-API fallback ----------------------------
+reg() { # <KEY=VALUE...> -- <bash snippet>: lib in a clean environment (dry run), then the snippet
+  local -a envs=()
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/reg-state.json" PROJECT_TAG=test-scale AWS_REGION=test-region-1 AWS_ACCOUNT_ID=111111111111 \
+    "${envs[@]}" bash -c 'source "$0"; '"$1" "$HERE/../lib.sh" 2>/dev/null
+}
+check "no registry configured means kind ghcr" "ghcr" "$(reg -- 'echo $IMAGE_REGISTRY_KIND')"
+check "kind none is explicit" "none" "$(reg IMAGE_REGISTRY_KIND=none -- 'echo $IMAGE_REGISTRY_KIND')"
+check "ghcr with no IMAGE_REGISTRY: the owner is resolved when an image is needed (dry run placeholder)" "ghcr.io/github-login" "$(reg -- 'require_registry; echo $IMAGE_REGISTRY')"
+check "ghcr owner from GHCR_USER, lower cased" "ghcr.io/some-user/ably-server:t" "$(reg GHCR_USER=Some-User -- 'require_registry; image_ref ably-server t')"
+check "an explicit IMAGE_REGISTRY is never replaced" "ghcr.io/o" "$(reg IMAGE_REGISTRY=ghcr.io/o GHCR_USER=other -- 'require_registry; echo $IMAGE_REGISTRY')"
+check "ghcr.io host infers ghcr" "ghcr" "$(reg IMAGE_REGISTRY=ghcr.io/some-owner -- 'echo $IMAGE_REGISTRY_KIND')"
+check "an ECR host infers ecr" "ecr" "$(reg IMAGE_REGISTRY=111111111111.dkr.ecr.test-region-1.amazonaws.com/pfx -- 'echo $IMAGE_REGISTRY_KIND')"
+check "an unknown host needs an explicit kind" bad "$(reg IMAGE_REGISTRY=registry.example.invalid/x -- 'echo $IMAGE_REGISTRY_KIND' || echo bad)"
+check "a bad kind is refused" "" "$(reg IMAGE_REGISTRY_KIND=quay -- 'echo $IMAGE_REGISTRY_KIND')"
+check "ghcr needs an owner" "" "$(reg IMAGE_REGISTRY=ghcr.io IMAGE_REGISTRY_KIND=ghcr -- 'echo ok')"
+check "ghcr owner must be lower case" "" "$(reg IMAGE_REGISTRY=ghcr.io/SomeOwner -- 'echo ok')"
+check "ghcr image ref" "ghcr.io/some-owner/ably-server:abc1234" "$(reg IMAGE_REGISTRY=ghcr.io/some-owner -- 'image_ref ably-server abc1234')"
+check "ghcr repo path" "some-owner/ably-loadgen" "$(reg IMAGE_REGISTRY=ghcr.io/some-owner -- 'registry_repo_path ably-loadgen')"
+check "trailing slash is dropped" "ghcr.io/some-owner/ably-server:t" "$(reg IMAGE_REGISTRY=ghcr.io/some-owner/ -- 'image_ref ably-server t')"
+check "ecr default registry is derived from the account and region" "111111111111.dkr.ecr.test-region-1.amazonaws.com/test-scale/ably-server:t" \
+  "$(reg IMAGE_REGISTRY_KIND=ecr -- 'image_ref ably-server t')"
+check "ecr repository name follows the prefix" "test-scale/ably-server test-scale/ably-loadgen" \
+  "$(reg IMAGE_REGISTRY_KIND=ecr -- 'echo $ECR_REPO_SERVER $ECR_REPO_LOADGEN')"
+check "ecr registry with a prefix" "111111111111.dkr.ecr.test-region-1.amazonaws.com/pfx/ably-server:t" \
+  "$(reg IMAGE_REGISTRY=111111111111.dkr.ecr.test-region-1.amazonaws.com/pfx -- 'image_ref ably-server t')"
+check "ecr kind without account or region and without IMAGE_REGISTRY is refused" "" \
+  "$(env -i PATH="$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/reg2.json" PROJECT_TAG=t AWS_REGION=r IMAGE_REGISTRY_KIND=ecr bash -c 'source "$0"; echo ok' "$HERE/../lib.sh" 2>/dev/null || true)"
+check "kind none: image_ref stops and names IMAGE_REGISTRY" bad "$(reg IMAGE_REGISTRY_KIND=none -- 'image_ref ably-server t' || echo bad)"
+check "kind none: require_registry stops" bad "$(reg IMAGE_REGISTRY_KIND=none -- 'require_registry' || echo bad)"
+check "the instance profile is skipped for ghcr" 0 "$(reg IMAGE_REGISTRY=ghcr.io/o -- 'echo $CREATE_INSTANCE_PROFILE')"
+check "the instance profile is skipped by default (ghcr)" 0 "$(reg -- 'echo $CREATE_INSTANCE_PROFILE')"
+check "the instance profile is made for ecr" 1 "$(reg IMAGE_REGISTRY_KIND=ecr -- 'echo $CREATE_INSTANCE_PROFILE')"
+check "CREATE_INSTANCE_PROFILE=1 forces it for ghcr" 1 "$(reg IMAGE_REGISTRY=ghcr.io/o CREATE_INSTANCE_PROFILE=1 -- 'echo $CREATE_INSTANCE_PROFILE')"
+
+# base images
+check "docker.io leaves the image names as written" "postgres:17 nats:2.11 prom/prometheus:v2.55.1 quay.io/prometheuscommunity/postgres-exporter:v0.15.0" \
+  "$(reg -- 'echo $PG_IMAGE $NATS_IMAGE $PROMETHEUS_IMAGE $POSTGRES_EXPORTER_IMAGE')"
+check "a mirror replaces the registry and drops the owner" "ghcr.io/o/postgres:17 ghcr.io/o/nats:2.11 ghcr.io/o/prometheus:v2.55.1 ghcr.io/o/postgres-exporter:v0.15.0" \
+  "$(reg BASE_IMAGE_REGISTRY=ghcr.io/o -- 'echo $PG_IMAGE $NATS_IMAGE $PROMETHEUS_IMAGE $POSTGRES_EXPORTER_IMAGE')"
+check "the pgbench image follows the mirror" "ghcr.io/o/postgres:17-alpine" "$(reg BASE_IMAGE_REGISTRY=ghcr.io/o -- 'echo $PGBENCH_IMAGE')"
+check "the mirror list keeps the refs as written, once each" "8 postgres:17 prom/prometheus:v2.55.1" \
+  "$(reg BASE_IMAGE_REGISTRY=ghcr.io/o -- 'echo ${#BASE_IMAGE_SOURCES[@]} ${BASE_IMAGE_SOURCES[0]} ${BASE_IMAGE_SOURCES[4]:+} ${BASE_IMAGE_SOURCES[5]}' | tr -s ' ')"
+check "a custom image variable goes through the mirror too" "ghcr.io/o/postgres:16" "$(reg BASE_IMAGE_REGISTRY=ghcr.io/o PG_IMAGE=docker.io/library/postgres:16 -- 'echo $PG_IMAGE')"
+check "base_image is idempotent" "ghcr.io/o/nats:2.11" "$(reg BASE_IMAGE_REGISTRY=ghcr.io/o -- 'base_image "$(base_image nats:2.11)"')"
+
+# fake aws for the fallback tests (logs every call to $FAKE_LOG)
+mkdir -p "$tmp/fakeaws2"
+cat >"$tmp/fakeaws2/aws" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"${FAKE_LOG:-/dev/null}"
+deny() { echo "An error occurred (AccessDeniedException) when calling the $1 operation: User: x is not authorized to perform: $2 because no identity-based policy allows it" >&2; exit 254; }
+case "$*" in
+  *resourcegroupstaggingapi*)
+    case "$FAKE_TAGAPI" in deny) deny GetResources tag:GetResources ;; fail) echo "Throttling: rate exceeded" >&2; exit 254 ;; esac
+    printf 'arn:aws:ec2:r:1:instance/i-1\tarn:aws:ec2:r:1:volume/vol-1\n' ;;
+  *"ec2 describe-instances"*) [ "$FAKE_CLEAN" = 1 ] || echo i-aaa ;;
+  *"ec2 describe-volumes"*) [ "$FAKE_CLEAN" = 1 ] || echo vol-bbb ;;
+  *"ec2 describe-security-groups"*) [ "$FAKE_CLEAN" = 1 ] || echo sg-ccc ;;
+  *"ec2 describe-network-interfaces"*) [ "$FAKE_CLEAN" = 1 ] || echo eni-ddd ;;
+  *"ec2 describe-placement-groups"*) ;;
+  *"iam get-role"*)
+    [ "$FAKE_IAM" = deny ] && deny GetRole iam:GetRole
+    [ "$FAKE_CLEAN" = 1 ] && { echo "An error occurred (NoSuchEntity) when calling the GetRole operation: not found" >&2; exit 254; }
+    echo test-scale-instance ;;
+  *"iam get-instance-profile"*)
+    [ "$FAKE_IAM" = deny ] && deny GetInstanceProfile iam:GetInstanceProfile
+    [ "$FAKE_CLEAN" = 1 ] && { echo "An error occurred (NoSuchEntity) when calling the GetInstanceProfile operation: not found" >&2; exit 254; }
+    echo test-scale-instance ;;
+  *"iam list-instance-profiles"*) echo "list-instance-profiles must never be called" >&2; exit 99 ;;
+  *"iam list-roles"*) echo "list-roles is not needed" >&2; exit 99 ;;
+  *"cloudwatch describe-alarms"*) [ "$FAKE_CLEAN" = 1 ] || echo test-scale-billing-750usd ;;
+  *"sns list-topics"*) [ "$FAKE_CLEAN" = 1 ] || echo arn:aws:sns:us-east-1:1:test-scale-billing ;;
+  *"ecr describe-repositories"*)
+    case "$FAKE_ECR" in
+      exists) echo test-scale/ably-server ;;
+      *) echo "An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: not found" >&2; exit 254 ;;
+    esac ;;
+  *"ecr create-repository"*)
+    case "$FAKE_ECR" in
+      create-ok) echo '{}' ;;
+      tag-denied) case "$*" in *--tags*) deny CreateRepository ecr:TagResource ;; *) echo '{}' ;; esac ;;
+      create-denied) deny CreateRepository ecr:CreateRepository ;;
+      *) echo "unexpected create" >&2; exit 97 ;;
+    esac ;;
+  *"iam create-role"*)
+    case "$FAKE_IAM" in
+      tag-denied) case "$*" in *--tags*) deny CreateRole iam:TagRole ;; *) echo '{}' ;; esac ;;
+      create-denied) deny CreateRole iam:CreateRole ;;
+      other) echo "An error occurred (Throttling)" >&2; exit 254 ;;
+      *) echo '{}' ;;
+    esac ;;
+  *) echo "fake aws: unexpected call: $*" >&2; exit 97 ;;
+esac
+FAKE
+chmod +x "$tmp/fakeaws2/aws"
+cat >"$tmp/fakeaws2/gh" <<'FAKE'
+#!/bin/sh
+[ -n "$FAKE_GH_LOGIN" ] || exit 1
+echo "$FAKE_GH_LOGIN"
+FAKE
+chmod +x "$tmp/fakeaws2/gh"
+freal() { # <KEY=VALUE...> -- <bash snippet>: real mode (DRY_RUN=0) against the fake aws; calls go to $tmp/fake.log
+  local -a envs=()
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  : >"$tmp/fake.log"
+  env -i PATH="$tmp/fakeaws2:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/freal-state.json" PROJECT_TAG=test-scale AWS_REGION=test-region-1 \
+    AWS_ACCOUNT_ID=111111111111 FAKE_LOG="$tmp/fake.log" IMAGE_REGISTRY_KIND=none "${envs[@]}" bash -c 'source "$0"; '"$1" "$HERE/../lib.sh" 2>/dev/null
+}
+
+check "ghcr owner from gh api user (real mode), lower cased" "ghcr.io/fake-login/ably-loadgen:t" "$(freal IMAGE_REGISTRY_KIND=ghcr FAKE_GH_LOGIN=Fake-Login -- 'require_registry; image_ref ably-loadgen t')"
+check "ghcr with no owner and no gh login stops" "" "$(freal IMAGE_REGISTRY_KIND=ghcr FAKE_GH_LOGIN= -- 'require_registry; echo resolved')"
+
+# project_inventory: the tagging API first, each service when it is denied
+check "inventory: the tagging API is the first attempt" "tagging-api arn:aws:ec2:r:1:instance/i-1 arn:aws:ec2:r:1:volume/vol-1" \
+  "$(freal FAKE_TAGAPI=ok -- 'project_inventory; echo $INVENTORY_SOURCE ${INVENTORY_LINES[@]#arn }' | sed 's/ arn / /g')"
+check "inventory: an allowed tagging API means no per-service call" 0 "$(freal FAKE_TAGAPI=ok -- 'project_inventory' >/dev/null; grep -c 'ec2 describe\|iam list\|sns list' "$tmp/fake.log" || true)"
+check "inventory: a denied tagging API falls back per service" "per-service 8" \
+  "$(freal FAKE_TAGAPI=deny -- 'project_inventory; echo $INVENTORY_SOURCE ${#INVENTORY_LINES[@]}')"
+inv=$(freal FAKE_TAGAPI=deny -- 'project_inventory; printf "%s\n" "${INVENTORY_LINES[@]}" | sort -u | tr "\n" ";"')
+check "inventory: the fallback lists each kind of resource" "cloudwatch-alarm test-scale-billing-750usd;iam-instance-profile test-scale-instance;iam-role test-scale-instance;instance i-aaa;network-interface eni-ddd;security-group sg-ccc;sns-topic arn:aws:sns:us-east-1:1:test-scale-billing;volume vol-bbb;" "$inv"
+check "inventory: interfaces are also found by the project security group" 1 "$(freal FAKE_TAGAPI=deny -- 'project_inventory >/dev/null'; grep -c 'describe-network-interfaces --filters Name=group-id,Values=sg-ccc' "$tmp/fake.log")"
+check "inventory: the billing alarms and topics are read in the billing region" 2 "$(freal FAKE_TAGAPI=deny -- 'project_inventory >/dev/null'; grep -c 'us-east-1' "$tmp/fake.log")"
+check "inventory: a clean account is an empty list" "per-service 0" "$(freal FAKE_TAGAPI=deny FAKE_CLEAN=1 -- 'project_inventory; echo $INVENTORY_SOURCE ${#INVENTORY_LINES[@]}')"
+check "inventory: a denied call is named, not fatal" "iam-role,iam-instance-profile|6" "$(freal FAKE_TAGAPI=deny FAKE_IAM=deny -- 'project_inventory; echo "${INVENTORY_UNVERIFIED[*]}|${#INVENTORY_LINES[@]}"' | sed 's/ /,/g;s/,|/|/')"
+check "inventory: IAM is looked up by exact name, never listed" "1 1 0" "$(freal FAKE_TAGAPI=deny -- 'project_inventory >/dev/null'; echo "$(grep -c 'iam get-role --role-name test-scale-instance' "$tmp/fake.log") $(grep -c 'iam get-instance-profile --instance-profile-name test-scale-instance' "$tmp/fake.log") $(grep -c 'iam list-' "$tmp/fake.log" || true)")"
+check "inventory: a missing role is an empty result, not an error" "0 0" "$(freal FAKE_TAGAPI=deny FAKE_CLEAN=1 -- 'project_inventory; echo ${#INVENTORY_LINES[@]} $?')"
+check "inventory: another failure of the tagging API is an error" bad "$(freal FAKE_TAGAPI=fail -- 'project_inventory || echo bad')"
+check "inventory: TAGGING_API=off skips the first attempt" 0 "$(freal TAGGING_API=off -- 'project_inventory >/dev/null'; grep -c resourcegroupstaggingapi "$tmp/fake.log" || true)"
+check "inventory: ECR repositories are listed only for the ecr kind" 0 "$(freal TAGGING_API=off -- 'project_inventory >/dev/null'; grep -c 'ecr describe' "$tmp/fake.log" || true)"
+
+# tag-on-create fallbacks
+check "create: tags allowed, one call" "0 1" "$(freal -- 'rc=0; aws_create_tagged "" role iam create-role --tags k=v -- iam create-role >/dev/null || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+check "create: a denied tag falls back to an untagged create" "0 2" "$(freal FAKE_IAM=tag-denied -- 'rc=0; aws_create_tagged "" role iam create-role --tags k=v -- iam create-role >/dev/null || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+check "create: denied even untagged is 3" "3" "$(freal FAKE_IAM=create-denied -- 'rc=0; aws_create_tagged "" role iam create-role --tags k=v -- iam create-role >/dev/null || rc=$?; echo $rc')"
+check "create: another failure is 1 and is not retried" "1 1" "$(freal FAKE_IAM=other -- 'rc=0; aws_create_tagged "" role iam create-role --tags k=v -- iam create-role >/dev/null || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+
+# ecr_ensure_repo: look first, create only a missing one, report a denial
+check "ecr: an existing repository is left alone" "0 1" "$(freal FAKE_ECR=exists -- 'rc=0; ecr_ensure_repo test-scale/ably-server || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+check "ecr: a missing repository is created" "0 2" "$(freal FAKE_ECR=create-ok -- 'rc=0; ecr_ensure_repo test-scale/ably-server || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+check "ecr: a denied tag creates it untagged" "0 3" "$(freal FAKE_ECR=tag-denied -- 'rc=0; ecr_ensure_repo test-scale/ably-server || rc=$?; echo $rc $(wc -l <"$FAKE_LOG")' | tr -s ' ')"
+check "ecr: a denied create is 3" "3" "$(freal FAKE_ECR=create-denied -- 'rc=0; ecr_ensure_repo test-scale/ably-server || rc=$?; echo $rc')"
+msg=$(env -i PATH="$tmp/fakeaws2:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/freal-state.json" PROJECT_TAG=test-scale AWS_REGION=test-region-1 \
+  IMAGE_REGISTRY_KIND=none FAKE_ECR=create-denied bash -c 'source "$0"; ecr_ensure_repo test-scale/ably-server' "$HERE/../lib.sh" 2>&1 || true)
+case "$msg" in *"ecr:CreateRepository is DENIED"*"IMAGE_REGISTRY_KIND=ghcr"*) echo "ok   ecr: the denial is reported plainly and names the way out" ;; *) echo "FAIL ecr denial message: $msg"; fails=$((fails + 1)) ;; esac
+
+# probe basis: a dry-run answer is sound, a validation answer is not
+mkdir -p "$tmp/fakeprobe"
+cat >"$tmp/fakeprobe/aws" <<'FAKE'
+#!/bin/sh
+case "$FAKE_PROBE" in
+  dryrun) echo "An error occurred (DryRunOperation) when calling the RunInstances operation: Request would have succeeded, but DryRun flag is set." >&2; exit 254 ;;
+  validation) echo "An error occurred (InvalidParameterException) when calling the CreateRepository operation: bad name" >&2; exit 254 ;;
+  denied) echo "An error occurred (AccessDeniedException): User is not authorized to perform: ecr:CreateRepository" >&2; exit 254 ;;
+  *) echo "something else" >&2; exit 254 ;;
+esac
+FAKE
+chmod +x "$tmp/fakeprobe/aws"
+probe() { env -i PATH="$tmp/fakeprobe:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/freal-state.json" PROJECT_TAG=t AWS_REGION=r FAKE_PROBE="$1" \
+  bash -c 'source "$0"; aws_probe "DryRunOperation|Invalid" x y' "$HERE/../lib.sh" 2>/dev/null; }
+check "probe: DryRunOperation is a sound yes" "ALLOWED dryrun" "$(probe dryrun)"
+check "probe: a validation error is a yes marked unproven" "ALLOWED validation" "$(probe validation)"
+check "probe: AccessDenied is a no" "DENIED" "$(probe denied)"
+check "probe: anything else is unknown" "UNKNOWN" "$(probe other)"
+
+# ghcr public check (a fake curl, never the network)
+mkdir -p "$tmp/fakecurl"
+cat >"$tmp/fakecurl/curl" <<'FAKE'
+#!/bin/sh
+case "$*" in
+  *ghcr.io/token*) [ "$FAKE_TOKEN" = none ] && exit 22; echo '{"token":"anon"}' ;;
+  *-w*) echo "$FAKE_CODE" ;;
+esac
+FAKE
+chmod +x "$tmp/fakecurl/curl"
+pub() { env -i PATH="$tmp/fakecurl:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=1 DRY_STATE_FILE="$tmp/pub.json" PROJECT_TAG=t AWS_REGION=r FAKE_CODE="$1" FAKE_TOKEN="${2:-ok}" \
+  bash -c 'source "$0"; ghcr_is_public o/ably-server t && echo public || echo private' "$HERE/../lib.sh" 2>/dev/null; }
+check "ghcr: a readable manifest is public" public "$(pub 200)"
+check "ghcr: 401 is private" private "$(pub 401)"
+check "ghcr: 404 is private" private "$(pub 404)"
+check "ghcr: no anonymous token is private" private "$(pub 200 none)"
+pullable() { env -i PATH="$tmp/fakecurl:$PATH" HOME="$HOME" NO_AWS=1 DRY_RUN=0 STATE_FILE="$tmp/pub-state.json" PROJECT_TAG=t AWS_REGION=r IMAGE_REGISTRY=ghcr.io/o FAKE_CODE="$1" "${@:2}" \
+  bash -c 'source "$0"; check_image_pullable ably-server t; echo ok' "$HERE/../lib.sh" 2>/dev/null || echo stop; }
+check "pull check: public package passes" ok "$(pullable 200)"
+check "pull check: private package stops the launch" stop "$(pullable 401)"
+check "pull check: a pull token replaces the public requirement" ok "$(pullable 401 GHCR_PULL_TOKEN=ghp_abc123)"
+check "pull check: SKIP_REGISTRY_CHECK=1 skips it" ok "$(pullable 401 SKIP_REGISTRY_CHECK=1)"
+check "the pull token is masked in logs" "x *** y" "$(reg GHCR_PULL_TOKEN=ghp_secret123 -- '_mask "x ghp_secret123 y"')"
 
 if [ "$fails" -gt 0 ]; then
   echo "$fails check(s) failed" >&2

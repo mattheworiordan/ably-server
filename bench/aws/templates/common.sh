@@ -1,7 +1,7 @@
 #!/bin/bash
 # bench/aws user-data, common part (Amazon Linux 2023). Rendered by
 # lib.sh render_userdata; the role part follows it.
-# shellcheck disable=SC2050,SC2157  # template markers are replaced before the script runs
+# shellcheck disable=SC2050,SC2157,SC2194  # template markers are replaced before the script runs
 set -euxo pipefail
 install -m 600 /dev/null /var/log/bench-userdata.log
 exec > >(tee -a /var/log/bench-userdata.log) 2>&1
@@ -71,17 +71,27 @@ if [ "@@INSTALL_COMPOSE@@" = 1 ]; then
   chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 fi
 
+# Image registry login. ecr: the instance profile (it can take a minute to become
+# usable, so retry). ghcr: public packages need no login; a pull token is used only
+# when one was given (it is in this user-data: RUNBOOK section 3). none: nothing.
+case "@@REGISTRY_KIND@@" in
+  ecr)
+    for _ in $(seq 1 12); do
+      if aws ecr get-login-password --region @@REGION@@ |
+        docker login --username AWS --password-stdin @@REGISTRY_HOST@@; then break; fi
+      sleep 10
+    done
+    ;;
+  ghcr)
+    if [ -n "@@GHCR_PULL_TOKEN@@" ]; then
+      set +x # keep the token out of the boot log
+      printf '%s' '@@GHCR_PULL_TOKEN@@' | docker login ghcr.io -u '@@GHCR_PULL_USER@@' --password-stdin
+      set -x
+    fi
+    ;;
+esac
+
 # Host metrics for Prometheus.
 docker run -d --name node-exporter --restart unless-stopped --network host --pid host \
   -v /:/host:ro,rslave @@NODE_EXPORTER_IMAGE@@ \
   --path.rootfs=/host --web.listen-address=:@@NODE_EXPORTER_PORT@@
-
-# Pull from ECR with the instance profile (skipped when no registry is given).
-# The instance profile can take a minute to become usable, so retry.
-if [ -n "@@ECR_REGISTRY@@" ]; then
-  for _ in $(seq 1 12); do
-    if aws ecr get-login-password --region @@REGION@@ |
-      docker login --username AWS --password-stdin @@ECR_REGISTRY@@; then break; fi
-    sleep 10
-  done
-fi

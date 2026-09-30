@@ -14,8 +14,10 @@
 #
 # ablyctl detects agents (CLAUDECODE, CODEX_CI, CODEX_SANDBOX, CURSOR_AGENT,
 # GEMINI_CLI): it then ignores --aws-role and chains into the AgentOperator
-# role of the account, which the dev account does not have. This helper does
-# not touch those variables and never tries to get around the detection.
+# role of the account (the dev account now has one, and minting works from an
+# agent session). This helper does not touch those variables and never tries to
+# get around the detection. It runs in every script that is not a dry run and has
+# no AWS_ACCESS_KEY_ID or AWS_PROFILE, so credentials need not be kept in a file.
 # If ablyctl cannot mint credentials the script exits and names both supported
 # paths.
 
@@ -29,8 +31,8 @@ ensure_credentials() {
   out=$("${tlimit[@]}" ablyctl aws env --account "$account" "${role_args[@]}" 2>/dev/null) || rc=$?
   if [ "$rc" != 0 ] || [ -z "$out" ]; then
     {
-      echo "ablyctl could not mint credentials for '$account'. Either the sign-in expired, or an AI agent is running this:"
-      echo "ablyctl then chains into the AgentOperator role, which is not provisioned in that account (STS AccessDenied)."
+      echo "ablyctl could not mint credentials for '$account'. Either the SSO sign-in expired, or an AI agent is running this"
+      echo "and ablyctl's chain into the AgentOperator role failed (STS AccessDenied: the role is missing in that account)."
       echo "Supported paths: (a) infrastructure provisions AgentOperator in the account; (b) mint the credentials in your"
       echo "own terminal ('eval \"\$(ablyctl aws env --account $account)\"', finish the browser login) and export"
       echo "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN in the shell that runs these scripts."
