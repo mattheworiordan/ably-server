@@ -733,21 +733,62 @@ closed once the next entry is linked; parked attachment goroutines wake
 on that close. The list is grow-only — older entries become eligible
 for GC once no attachment retains a reference (see Memory below).
 
-The first `ATTACH` to a name (or the first publish) creates the Channel.
-The Channel is removed from the manager only when **both** are true:
+The first `ATTACH` to a name (or the first publish, or any REST read)
+creates the Channel and binds it: `storage.Channel(name, channel)`
+registers the Channel as the Appender and Initializes it from the store's
+watermark.
 
-- it has no attachments, and
-- every entry on its linked list has aged past the retention window (§6).
+**Idle-channel eviction.** A node that serves hundreds of thousands of
+channels an hour cannot hold every channel it has ever touched. With
+`--channel-idle-timeout` set (default 60 s, `0` disables), the Manager
+evicts a Channel once all of these hold:
 
-Removing a Channel calls `storage.Release(name)`, which drops the
-storage binding and, in cluster mode, the bus subscription (§7.2); the
-next `ATTACH` or publish re-binds through `storage.Channel`. (The
-storage hook exists; the eviction policy that calls it is being built.)
+- it has no attachments (no open `Stream`),
+- no storage operation on it is in flight (publish, presence, mutation,
+  annotation, history, members),
+- it has no presence members that this node has seen enter and not yet
+  leave (fed by the Appender, so it covers members held in the presence
+  grace window after an abrupt disconnect, §12.5, fixture members, and
+  members on other nodes whose ENTER reached this node), and
+- it has been in that state for the idle timeout.
 
-Holding the Channel for the retention window after the last detach keeps the
-in-process list available to serve a fresh `ATTACH` that arrives soon
-after with a `channelSerial` covering still-live messages, without having
-to re-materialise the list from storage.
+Eviction drops the Channel (its live list and the storage facet pointer)
+and calls `Storage.Release(ctx, name)`, which unbinds the Appender and
+frees the backend's per-channel state in this process while keeping all
+durable state (§6). The next attach, publish or read binds the channel
+afresh: the new Channel is Initialized from the store's current
+watermark, so a fresh attach starts at the latest committed serial, and a
+resume from an older serial gap-fills from the log (§4.3), including
+every message committed while the channel was unbound on this node.
+
+The Manager enforces this without holding a lock across I/O:
+
+- Channel operations and `Attach` pin the Channel (an in-flight count or
+  an attachment count) for their duration, so a pinned Channel is never
+  evicted. A caller holding a `*Channel` that was evicted after it was
+  obtained is redirected: the pin fails, the operation rebinds through
+  the Manager, and runs on the fresh Channel. `Attach` on a stale Channel
+  returns a Stream on the fresh one (`Stream.Channel()`).
+- The sweeper (every `timeout/10`, clamped to 5 ms to 5 s) marks idle
+  Channels evicted under the shard lock, then calls `Release` outside
+  it. A `GetChannel` for a name being evicted waits until `Release`
+  returns and then binds afresh, so a bind never overlaps the `Release`
+  of the Channel it replaces. A `GetChannel` for a name that is still
+  binding waits for the bind, so no caller sees a half-bound Channel.
+- The channel map is split into 64 shards by name hash, so neither
+  `GetChannel` (once per publish, attach and REST request) nor a sweep
+  holds one lock across all channels.
+
+Three series track it (§10): `ably_channels_bound`,
+`ably_channel_evictions_total` and `ably_channel_binds_total`. A bind is
+either a first use or a rebind after eviction; the node does not
+remember evicted names (that memory is the leak eviction removes), so
+the rebind rate is read as the bind rate once the working set is steady.
+Go maps keep their buckets after deletes, so each shard map holds about
+one slot per peak channel after a churn; everything else a Channel holds
+is freed.
+
+With eviction disabled a Channel is held for the life of the process.
 
 **Memory.** Go's GC reclaims entries once no attachment retains a
 reference. A slow attachment retains the prefix of the list between its
@@ -852,6 +893,20 @@ exposing two operations:
   latest version of each message positioned at its create serial; a
   by-serial version scan returns every version of one message ordered by
   `version` (§13.4).
+
+`Storage.Release(ctx, name)` is the storage half of idle-channel
+eviction (§5.1). It unbinds the channel's Appender (once it returns, the
+old Appender is never called again) and frees the per-channel state the
+backend holds in this process, keeping every durable thing: log,
+serials, idempotency keys, presence set, projections. A later
+`Channel(name, appender)` binds a fresh Appender and Initializes it from
+the store's watermark. Per backend: memory keeps its channelStore (it is
+the only copy of the data) and drops only the binding; bbolt drops the
+channelStore unless it still holds presence members (its presence set is
+in memory only), in which case it keeps it unbound; Postgres drops the
+channelStore and its LISTEN dispatch entry (the shared LISTEN connection
+listens on one broker channel, so there is nothing to UNLISTEN per Ably
+channel).
 
 Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
@@ -1512,6 +1567,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --config ably-server.toml     optional TOML file, see below
 --addr-file                   path to write the bound listener address to once listening
 --enable-stats-stub           register the GET/POST /stats compatibility stub (§1); default: false (404)
+--channel-idle-timeout 60s    evict a channel idle this long and release its storage binding (§5.1); 0 disables
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -1526,8 +1582,9 @@ Configuration may also be supplied via an optional TOML config file
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
 `postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
-`log-level`, `log-format`, `debug-listen`, `enable-stats-stub` —
-`shutdown-grace`, `postgres-notify-window` and `bus-sweep-interval` as
+`log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
+`channel-idle-timeout` — `shutdown-grace`, `postgres-notify-window`,
+`bus-sweep-interval` and `channel-idle-timeout` as
 duration strings, e.g. `"10s"`). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
@@ -1611,6 +1668,13 @@ name = "persisted:presence_fixtures"
     storage-commit/ACK.
   - `ably_http_requests_total{route,method,status}` (counter) — REST requests
     by matched route pattern, method, and response status.
+  - `ably_channels_bound` (gauge) — channels currently bound on this node
+    (§5.1).
+  - `ably_channel_binds_total` (counter) — channel binds: first use, or a
+    rebind after eviction.
+  - `ably_channel_evictions_total` (counter) — idle channels evicted.
+  - `ably_channel_release_errors_total` (counter) — storage `Release` calls
+    that failed during eviction.
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres

@@ -4,7 +4,10 @@ package core
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
@@ -51,6 +54,32 @@ type Channel struct {
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
+	// members is the set of presence members this Channel has seen
+	// enter and not yet leave, keyed by storage.MemberKey. It is fed by
+	// Append, so it counts every member whose ENTER reached this node
+	// since the channel was bound, whichever node owns the member. A
+	// channel with members is not evicted (DESIGN.md §5.1). Nil when
+	// empty. Guarded by mu.
+	members map[string]struct{}
+
+	// Lifecycle state for idle-channel eviction (DESIGN.md §5.1), guarded
+	// by life. Kept apart from mu so that pinning a channel for an
+	// operation never contends with the append path.
+	mgr      *Manager // nil for channels built outside a Manager (tests)
+	life     sync.Mutex
+	evicted  bool  // set once, by the Manager's sweeper; the Channel is then dropped
+	refs     int   // open Streams (attachments)
+	inflight int   // storage operations in progress
+	lastUsed int64 // Manager clock reading when refs or inflight last fell, or at bind
+
+	// bound is closed by the Manager once the storage binding is done
+	// (store set, or bindErr recorded); released is closed once an
+	// evicted channel's storage Release has returned. GetChannel waits
+	// on them so that a caller never sees a half-bound channel, and a
+	// rebind never overlaps the Release of the channel it replaces.
+	bound    chan struct{}
+	bindErr  error
+	released chan struct{}
 }
 
 // newChannel constructs a Channel in the not-ready state. The list
@@ -58,10 +87,95 @@ type Channel struct {
 // populate with the watermark serial.
 func newChannel(name string) *Channel {
 	return &Channel{
-		name:  name,
-		ready: make(chan struct{}),
-		tail:  &entry{notify: make(chan struct{})},
+		name:     name,
+		ready:    make(chan struct{}),
+		tail:     &entry{notify: make(chan struct{})},
+		bound:    make(chan struct{}),
+		released: make(chan struct{}),
 	}
+}
+
+// errNoManager is returned when an evicted Channel that was built
+// outside a Manager is asked to redirect; only the Manager evicts, so
+// this indicates a programming error.
+var errNoManager = errors.New("core: evicted channel has no manager to rebind through")
+
+// pin reserves the live Channel for name for one operation (attach
+// false) or one Stream (attach true), and returns it. It is c itself
+// unless c has been evicted since the caller obtained it; then pin
+// rebinds through the Manager and pins the fresh Channel instead, so a
+// caller holding a stale *Channel never operates on released storage
+// (DESIGN.md §5.1). A pinned Channel is not evicted until unpin.
+func (c *Channel) pin(ctx context.Context, attach bool) (*Channel, error) {
+	ch := c
+	for {
+		ch.life.Lock()
+		if !ch.evicted {
+			if attach {
+				ch.refs++
+			} else {
+				ch.inflight++
+			}
+			ch.life.Unlock()
+			return ch, nil
+		}
+		ch.life.Unlock()
+		if ch.mgr == nil {
+			return nil, errNoManager
+		}
+		next, err := ch.mgr.GetChannel(ctx, ch.name)
+		if err != nil {
+			return nil, err
+		}
+		ch = next
+	}
+}
+
+// unpin releases a reservation taken by pin, restarting the idle clock.
+func (c *Channel) unpin(attach bool) {
+	c.life.Lock()
+	if attach {
+		c.refs--
+	} else {
+		c.inflight--
+	}
+	if c.mgr != nil {
+		c.lastUsed = c.mgr.now()
+	}
+	c.life.Unlock()
+}
+
+// begin pins the live Channel for one storage operation; the caller
+// must defer end on the returned Channel.
+func (c *Channel) begin(ctx context.Context) (*Channel, error) {
+	return c.pin(ctx, false)
+}
+
+// end releases a reservation taken by begin.
+func (c *Channel) end() {
+	c.unpin(false)
+}
+
+// idle reports whether the channel may be evicted at time now: bound,
+// not already evicted, no open Streams, no operation in flight, no
+// presence members, and unused for at least timeout. Called with life
+// held.
+func (c *Channel) idle(now int64, timeout time.Duration) bool {
+	select {
+	case <-c.bound:
+	default:
+		return false // still binding
+	}
+	if c.evicted || c.bindErr != nil || c.refs > 0 || c.inflight > 0 {
+		return false
+	}
+	if now-c.lastUsed < int64(timeout) {
+		return false
+	}
+	c.mu.Lock()
+	hasMembers := len(c.members) > 0
+	c.mu.Unlock()
+	return !hasMembers
 }
 
 // Name returns the channel name.
@@ -77,7 +191,12 @@ func (c *Channel) Name() string {
 // asynchronously via the LISTEN goroutine in cluster mode. The
 // (cm, idempotent, err) tuple is forwarded verbatim from storage.
 func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
-	return c.store.Store(ctx, msgs)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer ch.end()
+	return ch.store.Store(ctx, msgs)
 }
 
 // PublishPresence runs the presence-publish sequence: hand the presence
@@ -87,7 +206,12 @@ func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*proto
 // message publish (DESIGN.md §12.2). The (cm, idempotent, err) tuple is
 // forwarded verbatim from storage.
 func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
-	return c.store.StorePresence(ctx, presence)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer ch.end()
+	return ch.store.StorePresence(ctx, presence)
 }
 
 // PublishAnnotation runs the annotation-publish sequence: hand the
@@ -99,13 +223,23 @@ func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.Pres
 // (cm, idempotent, err) tuple is forwarded verbatim — notably
 // storage.ErrTargetNotFound when a target message does not exist.
 func (c *Channel) PublishAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
-	return c.store.StoreAnnotation(ctx, annotations)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer ch.end()
+	return ch.store.StoreAnnotation(ctx, annotations)
 }
 
 // Annotations returns the annotations attached to the message identified
 // by messageSerial, paginated per q (DESIGN.md §14.4).
 func (c *Channel) Annotations(ctx context.Context, messageSerial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
-	return c.store.Annotations(ctx, messageSerial, q)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return storage.HistoryPage{}, err
+	}
+	defer ch.end()
+	return ch.store.Annotations(ctx, messageSerial, q)
 }
 
 // Mutate applies an update/delete/append to an existing message,
@@ -116,19 +250,34 @@ func (c *Channel) Annotations(ctx context.Context, messageSerial string, q stora
 // order (DESIGN.md §13.2). The (cm, idempotent, err) tuple is forwarded
 // verbatim — notably storage.ErrTargetNotFound for an unknown target.
 func (c *Channel) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
-	return c.store.Mutate(ctx, mut)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer ch.end()
+	return ch.store.Mutate(ctx, mut)
 }
 
 // LatestVersion returns the current latest version of the message
 // identified by serial, or storage.ErrTargetNotFound (DESIGN.md §13.4).
 func (c *Channel) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
-	return c.store.LatestVersion(ctx, serial)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer ch.end()
+	return ch.store.LatestVersion(ctx, serial)
 }
 
 // Versions returns every version of the message identified by serial,
 // paginated per q (DESIGN.md §13.4).
 func (c *Channel) Versions(ctx context.Context, serial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
-	return c.store.Versions(ctx, serial, q)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return storage.HistoryPage{}, err
+	}
+	defer ch.end()
+	return ch.store.Versions(ctx, serial, q)
 }
 
 // History delegates to the underlying ChannelStore. Backends return
@@ -136,14 +285,24 @@ func (c *Channel) Versions(ctx context.Context, serial string, q storage.History
 // storage.HistoryQuery); the REST and resume paths flatten the page
 // without further reordering.
 func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
-	return c.store.History(ctx, q)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return storage.HistoryPage{}, err
+	}
+	defer ch.end()
+	return ch.store.History(ctx, q)
 }
 
 // Members returns the channel's current presence set plus the
 // channelSerial the set is current as-of, delegating to the storage
 // backend. Backs presence sync on attach (DESIGN.md §12.4).
 func (c *Channel) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
-	return c.store.Members(ctx)
+	ch, err := c.begin(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer ch.end()
+	return ch.store.Members(ctx)
 }
 
 // Initialize seeds the sentinel with the channel's current watermark
@@ -199,26 +358,59 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if len(cm.Presence) > 0 {
+		c.trackMembers(cm.Presence)
+	}
 	e := &entry{cm: cm, notify: make(chan struct{})}
 	c.tail.next = e
 	close(c.tail.notify)
 	c.tail = e
 }
 
+// trackMembers folds a presence cm into the local member set that
+// holds off eviction (DESIGN.md §5.1): ENTER/UPDATE/PRESENT add the
+// member, LEAVE/ABSENT remove it. Called with mu held.
+func (c *Channel) trackMembers(presence []*protocol.PresenceMessage) {
+	for _, p := range presence {
+		key := storage.MemberKey(p.ConnectionID, p.ClientID)
+		switch p.Action {
+		case protocol.PresenceEnter, protocol.PresenceUpdate, protocol.PresencePresent:
+			if c.members == nil {
+				c.members = make(map[string]struct{})
+			}
+			c.members[key] = struct{}{}
+		case protocol.PresenceLeave, protocol.PresenceAbsent:
+			delete(c.members, key)
+		}
+	}
+	if len(c.members) == 0 {
+		c.members = nil
+	}
+}
+
 // Attach blocks until the channel is ready (Initialize has run), then
 // returns a Stream positioned at the current tail. The Stream's first
 // Next call blocks until the next ChannelMessage is appended.
 //
+// The Stream holds the channel against eviction until Close. If c was
+// evicted after the caller obtained it, the Stream is opened on the
+// freshly bound Channel for the same name (see Stream.Channel).
+//
 // Returns ctx.Err() if the context cancels before the channel readies.
 func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
+	ch, err := c.pin(ctx, true)
+	if err != nil {
+		return nil, err
+	}
 	select {
-	case <-c.ready:
+	case <-ch.ready:
 	case <-ctx.Done():
+		ch.unpin(true)
 		return nil, ctx.Err()
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return &Stream{cursor: c.tail}, nil
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return &Stream{cursor: ch.tail, ch: ch}, nil
 }
 
 // Stream is an attachment's per-channel view of the linked list. Its
@@ -226,6 +418,23 @@ func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
 // to drive a single Stream from one goroutine.
 type Stream struct {
 	cursor *entry
+	ch     *Channel
+	closed atomic.Bool
+}
+
+// Channel returns the Channel this Stream is attached to. It differs
+// from the Channel Attach was called on only when that one had been
+// evicted in the meantime.
+func (s *Stream) Channel() *Channel {
+	return s.ch
+}
+
+// Close releases the Stream's hold on its Channel, so the channel can
+// be evicted once idle (DESIGN.md §5.1). Idempotent.
+func (s *Stream) Close() {
+	if s.closed.CompareAndSwap(false, true) {
+		s.ch.unpin(true)
+	}
 }
 
 // ChannelSerial returns the cursor's current position — the

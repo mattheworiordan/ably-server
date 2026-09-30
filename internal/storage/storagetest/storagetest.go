@@ -142,6 +142,56 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("ReleaseKeepsDurableState", func(t *testing.T) {
+		// Release keeps every durable thing (DESIGN.md §5.1): idempotency
+		// keys, the presence set and history survive a release and rebind.
+		s := f(t)
+		ctx := context.Background()
+		a := newCapturingAppender()
+		cs, err := s.Channel(ctx, "durable", a)
+		if err != nil {
+			t.Fatalf("Channel: %v", err)
+		}
+		orig, _, err := cs.Store(ctx, []*protocol.Message{{ID: "idem-1", Name: "m"}})
+		if err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+		enter := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "c1", ConnectionID: "conn1"}
+		if _, _, err := cs.StorePresence(ctx, []*protocol.PresenceMessage{enter}); err != nil {
+			t.Fatalf("StorePresence: %v", err)
+		}
+		waitAppends(t, a, 2)
+		if err := s.Release(ctx, "durable"); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+
+		cs2, err := s.Channel(ctx, "durable", newCapturingAppender())
+		if err != nil {
+			t.Fatalf("rebind Channel: %v", err)
+		}
+		dup, idempotent, err := cs2.Store(ctx, []*protocol.Message{{ID: "idem-1", Name: "m"}})
+		if err != nil {
+			t.Fatalf("Store duplicate: %v", err)
+		}
+		if !idempotent || dup.ChannelSerial != orig.ChannelSerial {
+			t.Errorf("duplicate after rebind: idempotent=%v serial=%q, want true and %q", idempotent, dup.ChannelSerial, orig.ChannelSerial)
+		}
+		members, _, err := cs2.Members(ctx)
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 1 || members[0].ClientID != "c1" {
+			t.Errorf("members after rebind = %v, want the one entered member", members)
+		}
+		page, err := cs2.History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		if len(page.ChannelMessages) != 1 || page.ChannelMessages[0].ChannelSerial != orig.ChannelSerial {
+			t.Errorf("history after rebind = %v, want the original publish", channelSerialsOf(page))
+		}
+	})
+
 	t.Run("AppendStampsChannelSerialAndMessageSerials", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")

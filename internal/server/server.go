@@ -60,6 +60,7 @@ const (
 	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
 	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
 	busSweepEnv        = "ABLY_SERVER_BUS_SWEEP_INTERVAL"
+	channelIdleEnv     = "ABLY_SERVER_CHANNEL_IDLE_TIMEOUT"
 )
 
 // Opts bundles Run's inputs so the production main() and tests
@@ -116,6 +117,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	channelIdleDefault, err := config.DefaultDuration(opts.Getenv(channelIdleEnv), file.ChannelIdleTimeout, core.DefaultChannelIdleTimeout)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -166,7 +172,12 @@ func Run(ctx context.Context, opts Opts) int {
 	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
 	addrFile := fs.String("addr-file", opts.Getenv(addrFileEnv), "path to write the bound listener address to once listening; used by a parent process to discover an ephemeral (--listen :0) port (env: "+addrFileEnv+")")
 	enableStatsStub := fs.Bool("enable-stats-stub", enableStatsStubDefault, "register the GET/POST /stats compatibility stub used by SDK test flows; unregistered (404) by default (env: "+enableStatsStubEnv+")")
+	channelIdleTimeout := fs.Duration("channel-idle-timeout", channelIdleDefault, "evict a channel with no attachments, no operation in flight and no presence members after this long idle, releasing its storage binding; 0 disables eviction (DESIGN.md §5.1) (env: "+channelIdleEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
+		return 2
+	}
+	if *channelIdleTimeout < 0 {
+		fmt.Fprintln(opts.Out, "--channel-idle-timeout must not be negative")
 		return 2
 	}
 
@@ -259,7 +270,14 @@ func Run(ctx context.Context, opts Opts) int {
 		logger.Info("storage ready", "mode", *mode)
 	}
 
-	manager := core.NewManager(store)
+	manager := core.NewManagerWithOptions(store, core.Options{
+		IdleTimeout: *channelIdleTimeout,
+		Metrics:     m,
+		Logger:      logger,
+	})
+	// Deferred after the storage close, so it runs first: the eviction
+	// sweeper stops before the storage it releases into is closed.
+	defer manager.Close()
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a

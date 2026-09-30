@@ -30,6 +30,11 @@ type Metrics struct {
 	messagesDelivered  prometheus.Counter
 	publishLatency     prometheus.Histogram
 	httpRequests       *prometheus.CounterVec
+
+	channelsBound        prometheus.Gauge
+	channelBinds         prometheus.Counter
+	channelEvictions     prometheus.Counter
+	channelReleaseErrors prometheus.Counter
 }
 
 // New builds a Metrics with its own registry (so instances are isolated
@@ -74,6 +79,22 @@ func New() *Metrics {
 			Name: "ably_http_requests_total",
 			Help: "Total HTTP requests, labelled by matched route pattern, method, and response status.",
 		}, []string{"route", "method", "status"}),
+		channelsBound: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ably_channels_bound",
+			Help: "Channels currently bound on this node (live list plus storage binding).",
+		}),
+		channelBinds: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_channel_binds_total",
+			Help: "Total channel binds on this node: first use of a channel, or a rebind after eviction.",
+		}),
+		channelEvictions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_channel_evictions_total",
+			Help: "Total idle channels evicted on this node.",
+		}),
+		channelReleaseErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_channel_release_errors_total",
+			Help: "Total storage Release calls that returned an error during eviction.",
+		}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -86,6 +107,10 @@ func New() *Metrics {
 		m.messagesDelivered,
 		m.publishLatency,
 		m.httpRequests,
+		m.channelsBound,
+		m.channelBinds,
+		m.channelEvictions,
+		m.channelReleaseErrors,
 	)
 	return m
 }
@@ -162,4 +187,32 @@ func (m *Metrics) HTTPRequest(route, method string, status int) {
 		return
 	}
 	m.httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+}
+
+// ChannelBound records a channel bind (first use or rebind after
+// eviction): it bumps the binds counter and the bound gauge.
+func (m *Metrics) ChannelBound() {
+	if m == nil {
+		return
+	}
+	m.channelBinds.Inc()
+	m.channelsBound.Inc()
+}
+
+// ChannelEvicted records an idle channel eviction: it bumps the
+// evictions counter and decrements the bound gauge.
+func (m *Metrics) ChannelEvicted() {
+	if m == nil {
+		return
+	}
+	m.channelEvictions.Inc()
+	m.channelsBound.Dec()
+}
+
+// ChannelReleaseError records a storage Release failure during eviction.
+func (m *Metrics) ChannelReleaseError() {
+	if m == nil {
+		return
+	}
+	m.channelReleaseErrors.Inc()
 }

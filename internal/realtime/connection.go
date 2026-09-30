@@ -488,7 +488,10 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		})
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
+	// The stream's Channel, not ch: if ch was evicted between GetChannel
+	// and Attach, the stream is on the freshly bound Channel (DESIGN.md
+	// §5.1).
+	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)

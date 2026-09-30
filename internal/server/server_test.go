@@ -407,3 +407,34 @@ key = "app.key:secret"
 		t.Fatal("server did not shut down within 5s")
 	}
 }
+
+func TestRunChannelIdleTimeoutValidation(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		env      map[string]string
+		file     string
+		wantCode int
+		wantOut  string
+	}{
+		{"negative flag", []string{"--keys=app.key:secret", "--channel-idle-timeout=-1s"}, nil, "", 2, "must not be negative"},
+		{"malformed env", []string{"--keys=app.key:secret"}, map[string]string{channelIdleEnv: "soon"}, "", 1, "invalid duration"},
+		{"malformed file", []string{"--keys=app.key:secret"}, nil, `channel-idle-timeout = "soon"`, 1, "invalid duration"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := tc.args
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != tc.wantCode {
+				t.Errorf("exit code = %d, want %d (out %q)", code, tc.wantCode, out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantOut) {
+				t.Errorf("output = %q, want substring %q", out.String(), tc.wantOut)
+			}
+		})
+	}
+}

@@ -56,6 +56,10 @@ type File struct {
 	// unregistered, matching the fallback default, so the usual
 	// "zero value means absent" convention costs nothing here.
 	EnableStatsStub bool `toml:"enable-stats-stub"`
+	// ChannelIdleTimeout is the raw duration string for
+	// --channel-idle-timeout (DESIGN.md §5.1, §9), parsed like
+	// ShutdownGrace.
+	ChannelIdleTimeout string `toml:"channel-idle-timeout"`
 	// Namespaces are [[namespaces]] entries mirroring the test-app-setup
 	// post_apps shape (DESIGN.md §9, §12.5). They are parsed and retained
 	// but behaviourally inert: the feature flags are recorded, not acted

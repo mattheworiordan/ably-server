@@ -60,6 +60,15 @@ func startServer(t *testing.T) string {
 // bound "host:port"; tears down on t.Cleanup.
 func startServerOnDSN(t *testing.T, dsn string) string {
 	t.Helper()
+	addr, _ := startNode(t, dsn)
+	return addr
+}
+
+// startNode is startServerOnDSN with extra CLI args appended, and a
+// debug listener (pprof + /metrics) on a free port. It returns the
+// bound listener and debug "host:port".
+func startNode(t *testing.T, dsn string, extraArgs ...string) (addr, debugAddr string) {
+	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -68,28 +77,35 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 		"--mode=cluster",
 		"--postgres-dsn=" + dsn,
 		"--listen=127.0.0.1:0",
+		"--debug-listen=127.0.0.1:0",
 		"--log-level=error",
 	}, busArgs(t)...)
+	args = append(args, extraArgs...)
 
 	ready := make(chan net.Addr, 1)
+	debugReady := make(chan net.Addr, 1)
 	done := make(chan int, 1)
 	go func() {
 		done <- server.Run(ctx, server.Opts{
-			Args:   args,
-			Getenv: func(string) string { return "" },
-			Out:    io.Discard,
-			Ready:  ready,
+			Args:       args,
+			Getenv:     func(string) string { return "" },
+			Out:        io.Discard,
+			Ready:      ready,
+			DebugReady: debugReady,
 		})
 	}()
 
-	var addr net.Addr
-	select {
-	case addr = <-ready:
-	case code := <-done:
-		t.Fatalf("server exited before ready (code=%d)", code)
-	case <-time.After(30 * time.Second):
-		cancel()
-		t.Fatal("server did not become ready within 30s")
+	var bound, debug net.Addr
+	for bound == nil || debug == nil {
+		select {
+		case bound = <-ready:
+		case debug = <-debugReady:
+		case code := <-done:
+			t.Fatalf("server exited before ready (code=%d)", code)
+		case <-time.After(30 * time.Second):
+			cancel()
+			t.Fatal("server did not become ready within 30s")
+		}
 	}
 
 	t.Cleanup(func() {
@@ -101,7 +117,7 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 		}
 	})
 
-	return addr.String()
+	return bound.String(), debug.String()
 }
 
 // busArgs returns the --bus flags for the cluster bus under test, chosen

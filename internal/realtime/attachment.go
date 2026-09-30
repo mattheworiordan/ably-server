@@ -321,6 +321,9 @@ func (a *attachment) echoParams() map[string]string {
 // attachment's context is cancelled. done is closed on exit.
 func (a *attachment) run() {
 	defer close(a.done)
+	// Closing the stream releases the attachment's hold on the channel,
+	// so it can be evicted once idle (DESIGN.md §5.1).
+	defer a.stream.Close()
 
 	anchor := a.stream.ChannelSerial()
 	replay, attachPoint, resumed, errInfo := a.computeReplay(anchor)

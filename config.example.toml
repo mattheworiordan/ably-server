@@ -88,6 +88,12 @@
 # enable this so compat suites' stats round-trip doesn't wedge.
 # enable-stats-stub = false
 
+# Evict a channel that has had no attachments, no operation in flight
+# and no presence members for this long, releasing its storage binding
+# (DESIGN.md §5.1). "0s" disables eviction (env:
+# ABLY_SERVER_CHANNEL_IDLE_TIMEOUT).
+# channel-idle-timeout = "60s"
+
 # [[keys]] entries are the only file-tier source of API keys, and the
 # only one that can carry a narrowing capability. Each entry is an
 # Ably-format key spec plus an optional `capability` — an
