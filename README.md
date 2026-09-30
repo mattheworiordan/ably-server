@@ -110,8 +110,12 @@ ably-server --mode cluster --bus postgres
 ably-server --mode cluster --bus nats --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
 ```
 
-`bench/docker-compose.nats.yml` runs three `--bus=nats` nodes with
-Postgres and NATS (nodes on host ports 8181-8183).
+`bench/` has a three-node compose stack per bus, each on its own ports
+so they can run side by side: `docker-compose.pgnotify.yml` (nodes on
+8381-8383), `docker-compose.postgres.yml` (8281-8283) and
+`docker-compose.nats.yml` (8181-8183, with a three-server NATS
+cluster). `bench/compose-smoke.sh <bus>` brings one up, publishes on
+node 1, reads it back from node 3 and tears it down.
 
 Run `ably-server --help` for the full flag list. Every option can also be
 set in a TOML config file passed via `--config`; see
