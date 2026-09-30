@@ -694,7 +694,8 @@ internal/realtime/      # WebSocket upgrade, connection loop, attachment cursor,
 internal/rest/          # HTTP handlers + router
 internal/core/          # Channel + ChannelManager (live entry list)
 internal/storage/       # Storage interface + memory / bbolt / postgres backends
-                        #   (the postgres backend carries the cluster LISTEN/NOTIFY broker)
+                        #   (the postgres backend carries the cluster bus: LISTEN/NOTIFY
+                        #   by default, or NATS, §7.3)
 internal/serial/        # channelSerial minting + global ordering
 internal/id/            # connection IDs, message IDs
 internal/compatgate/    # known-failures diff logic behind cmd/compat-gate
@@ -1150,6 +1151,60 @@ ably-server targets developer-loop, CI, and modest single-region
 self-host deployments. Operators who need cloud-scale throughput
 should use Ably or fork.
 
+### 7.3 Cluster mode with a NATS bus
+
+`--bus=nats` (with `--nats-url`) keeps Postgres as the store and moves
+only cross-node delivery onto NATS core pub/sub. Delivery sits behind a
+small `Bus` seam in the postgres backend (`internal/storage/postgres/bus.go`);
+the LISTEN/NOTIFY broker of §7.2 is the default `Bus` and is unchanged.
+A publish is:
+
+1. `store.Store` mints the serial and writes the rows as in §7.2, and in
+   the same round trip reads the channel's previous serial under the
+   channels-row lock. It emits **no NOTIFY**. Postgres serialises every
+   transaction that has issued a NOTIFY on a database-wide lock held
+   until after its commit record is flushed, so NOTIFYing publishes
+   cannot group-commit; without the NOTIFY they can.
+2. After commit, the publishing node publishes one message to the
+   channel's subject: `ably.cm.` plus the unpadded URL-safe base64 of the
+   channel name (`ably.cm.h.<sha256 hex>` for a name too long to encode).
+   The body is a msgpack envelope of channel, serial, previous serial and
+   the cm as stored, with annotation summary snapshots. A cm whose
+   encoding exceeds `--nats-inline-max-bytes` (default 256 KiB) goes as a
+   pointer, and receivers fetch it by serial, like the LISTEN path.
+3. **Publisher fast path.** The publishing node gives the cm to its own
+   delivery point straight after commit. Local subscribers do not wait
+   for a bus round trip; the bus echo that follows is a duplicate that
+   the high-water mark drops.
+4. A node subscribes to a channel's subject when `Storage.Channel` first
+   binds the channel, before it reads the watermark (a flush confirms the
+   SUB is registered). So a node receives only the channels it holds and
+   misses nothing committed after the watermark read. Each subscription
+   has its own delivery goroutine, and an inline cm needs no read-back.
+
+**Ordering.** NATS orders messages per publishing connection, not across
+nodes. Every bus message therefore names its predecessor serial, and the
+per-channel delivery point (the §7.2 high-water mark) appends a cm only
+when its predecessor is the last serial delivered. A cm that arrives
+early is held. If its predecessor has not arrived within 100 ms, the
+missing range is read from the log (all kinds, serial order) and
+delivered. Order and exactly-once delivery are as on the LISTEN bus.
+
+**Reconcile.** NATS core is at-most-once. After a reconnect the client
+re-sends every SUB; a flush confirms the server has them, and then each
+bound channel is replayed from its mark (the §7.2 re-LISTEN-then-reconcile
+order). A bus message can also be lost with no later publish to show the
+gap (the publisher dies between commit and publish, a slow consumer
+drops it). So every 5 s each node reads the watermarks of its bound
+channels in one query and catches up any channel still behind the
+watermark of the previous sweep. Such a cm arrives late, not never.
+
+**Gaps.** Subscriptions last for the process lifetime: the Manager never
+releases a channel (§5.1), so there is no hook to unsubscribe on.
+Reconcile reads the log once per bound channel. `/readyz` checks
+Postgres only. There are no NATS auth or TLS options beyond the URL, and
+no bus metrics. JetStream is not used.
+
 ## 8. Identifiers & ordering
 
 - **connectionId**: 12-char base64 of random 9 bytes, generated on `CONNECTED`.
@@ -1329,6 +1384,9 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only
+--bus {postgres|nats}         cluster mode cross-node bus (§7.2, §7.3); default: postgres
+--nats-url nats://…           --bus=nats only
+--nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -1347,7 +1405,8 @@ reader polling the path never sees a partial address.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
-(`mode`, `listen`, `data-dir`, `postgres-dsn`, `shutdown-grace`,
+(`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
+`nats-inline-max-bytes`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub` —
 `shutdown-grace` as a duration string, e.g. `"10s"`). API keys are
 declared as structured

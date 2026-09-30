@@ -32,6 +32,7 @@ One Go binary, three storage modes selected by `--mode`:
 | `memory`  | in-process     | in-process   | tests, local dev, ephemeral       |
 | `disk`    | embedded KV    | in-process   | single-node with persistence      |
 | `cluster` | Postgres       | `LISTEN/NOTIFY` | N stateless nodes, shared DB   |
+| `cluster` + `--bus=nats` | Postgres | NATS core pub/sub | N stateless nodes, shared DB, NATS carries cross-node delivery ([DESIGN.md §7.3](DESIGN.md#73-cluster-mode-with-a-nats-bus)) |
 
 Server processes are stateless: any node can serve any connection.
 There's no peer-to-peer membership or gossip — in `cluster` mode, the
@@ -96,7 +97,13 @@ ably-server --mode disk --data-dir ./data
 # Clustered against Postgres
 export ABLY_SERVER_POSTGRES_DSN='postgres://user:pw@host:5432/db?sslmode=disable'
 ably-server --mode cluster
+
+# Clustered, with NATS as the cross-node bus (Postgres stays the store)
+ably-server --mode cluster --bus nats --nats-url nats://host:4222
 ```
+
+`bench/docker-compose.nats.yml` runs three `--bus=nats` nodes with
+Postgres and NATS (nodes on host ports 8181-8183).
 
 Run `ably-server --help` for the full flag list. Every option can also be
 set in a TOML config file passed via `--config`; see
