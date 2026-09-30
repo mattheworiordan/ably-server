@@ -469,7 +469,7 @@ func writeAddrFile(path, addr string) error {
 //   - cluster: postgres at postgresDSN (auto-migrates schema on Open;
 //     spawns the LISTEN/NOTIFY broker — see DESIGN.md §7.2).
 //   - jetstream: NATS JetStream at natsURL (experimental; creates its
-//     streams and KV buckets on Open — see DESIGN.md §6.4).
+//     streams and KV buckets on Open; see DESIGN.md §6.4).
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
