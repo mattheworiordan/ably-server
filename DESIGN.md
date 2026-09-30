@@ -1162,9 +1162,10 @@ A publish is:
 1. `store.Store` mints the serial and writes the rows as in §7.2, and in
    the same round trip reads the channel's previous serial under the
    channels-row lock. It emits **no NOTIFY**. Postgres serialises every
-   transaction that has issued a NOTIFY on a database-wide lock held
-   until after its commit record is flushed, so NOTIFYing publishes
-   cannot group-commit; without the NOTIFY they can.
+   transaction that has issued a NOTIFY on one exclusive lock, shared by
+   every database in the Postgres cluster and held until after the
+   commit record is flushed, so NOTIFYing publishes commit one at a time
+   and cannot group-commit; without the NOTIFY they can.
 2. After commit, the publishing node publishes one message to the
    channel's subject: `ably.cm.` plus the unpadded URL-safe base64 of the
    channel name (`ably.cm.h.<sha256 hex>` for a name too long to encode).
