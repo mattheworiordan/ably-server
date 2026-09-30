@@ -132,6 +132,12 @@ type Storage struct {
 
 	stats busCounters
 
+	// workersMu guards workersClosed, which stops new per-channel workers
+	// starting once Close has begun; workerWG tracks the running ones.
+	workersMu     sync.Mutex
+	workersClosed bool
+	workerWG      sync.WaitGroup
+
 	initialListenConn *pgx.Conn // first LISTEN conn, dialed by Open; owned by listenLoop thereafter
 	loopCtx           context.Context
 	cancel            context.CancelFunc
@@ -277,7 +283,7 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 // newChannelStore builds the per-channel facet for name. Only a store
 // with an appender joins the bound (LISTEN) set; see Channel.
 func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
-	return &channelStore{
+	cs := &channelStore{
 		s:        s,
 		pool:     s.pool,
 		series:   s.series,
@@ -287,6 +293,10 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		appender: appender,
 		ready:    make(chan struct{}),
 	}
+	if appender != nil {
+		cs.q.slots = make(chan struct{}, channelQueueDepth)
+	}
+	return cs
 }
 
 // Close stops the background goroutines (LISTEN broker and, in cluster
@@ -298,6 +308,7 @@ func (s *Storage) Close() error {
 		if s.cancel != nil {
 			s.cancel()
 			s.wg.Wait()
+			s.stopWorkers()
 		}
 		s.pool.Close()
 	})
@@ -644,30 +655,35 @@ type channelStore struct {
 	ready     chan struct{}
 	abandoned atomic.Bool
 
+	// q is the bound channel's ordered delivery queue (bus.go).
+	q busQueue
+
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
-	// appender. It is the per-channel de-dup high-water mark that makes
-	// post-reconnect history replay (reconcileFromHistory) idempotent
-	// against the normal NOTIFY dispatch (DESIGN.md §7.2). Only the
-	// LISTEN goroutine writes it, via deliver.
+	// appender (seeded with the bind-time watermark). It is the
+	// per-channel de-dup high-water mark that makes post-reconnect
+	// history replay (reconcileFromHistory) idempotent against the normal
+	// NOTIFY dispatch (DESIGN.md §7.2). deliver holds it across
+	// appender.Append, so appends on one channel are serialised in serial
+	// order whichever goroutine delivers.
 	hwmMu    sync.Mutex
 	lastSeen string
 }
 
 // deliver hands cm to the appender exactly once and in order, advancing
-// the per-channel high-water mark. A cm whose serial is not strictly
-// greater than the last delivered serial is dropped — the case where a
-// reconnect's history replay and a subsequently-buffered NOTIFY both
-// carry it. All appends (steady-state NOTIFY dispatch and reconcile)
-// funnel through here, from the single LISTEN goroutine.
-func (cs *channelStore) deliver(cm *protocol.ChannelMessage) {
+// the per-channel high-water mark, and reports whether it did. A cm whose
+// serial is not strictly greater than the last delivered serial is
+// dropped: the case where a reconnect's history replay and a
+// subsequently-buffered NOTIFY both carry it. All appends funnel through
+// here.
+func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
 	cs.hwmMu.Lock()
+	defer cs.hwmMu.Unlock()
 	if cm.ChannelSerial <= cs.lastSeen {
-		cs.hwmMu.Unlock()
-		return
+		return false
 	}
 	cs.lastSeen = cm.ChannelSerial
-	cs.hwmMu.Unlock()
 	cs.appender.Append(cm)
+	return true
 }
 
 // reconcileFromHistory replays every cm minted after the channel's

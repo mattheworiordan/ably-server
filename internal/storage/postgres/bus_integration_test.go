@@ -252,3 +252,82 @@ func TestBusInlineAndPointerPayloadsDeliverOnce(t *testing.T) {
 		t.Fatalf("B received %d notifications, want 2", st.Notifications)
 	}
 }
+
+// slowAppender records serials like recorder but sleeps in every Append,
+// standing in for a slow subscriber-side append.
+type slowAppender struct {
+	recorder
+	delay time.Duration
+}
+
+func (a *slowAppender) Append(cm *protocol.ChannelMessage) {
+	time.Sleep(a.delay)
+	a.recorder.Append(cm)
+}
+
+// TestBusSlowChannelDoesNotDelayOthers is test (c): node B holds two
+// channels, one with an artificially slow appender. A backlog on the slow
+// channel must not delay the other channel's deliveries, because each
+// bound channel is drained by its own ordered worker. With one consume
+// loop per node (the previous design), the fast channel's cm waited
+// behind the whole slow backlog.
+func TestBusSlowChannelDoesNotDelayOthers(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	a := openNode(t, dsn)
+	b := openNode(t, dsn)
+
+	const backlog = 6
+	const delay = 250 * time.Millisecond
+	slow := &slowAppender{delay: delay}
+	if _, err := b.Channel(ctx, "slow", slow); err != nil {
+		t.Fatalf("B binds slow: %v", err)
+	}
+	fast := &recorder{}
+	if _, err := b.Channel(ctx, "fast", fast); err != nil {
+		t.Fatalf("B binds fast: %v", err)
+	}
+	slowPub, err := a.Channel(ctx, "slow", nil)
+	if err != nil {
+		t.Fatalf("A opens slow: %v", err)
+	}
+	fastPub, err := a.Channel(ctx, "fast", nil)
+	if err != nil {
+		t.Fatalf("A opens fast: %v", err)
+	}
+
+	var want []string
+	for i := range backlog {
+		want = append(want, publish(t, ctx, slowPub, fmt.Sprintf("slow-%d", i)))
+	}
+	published := time.Now()
+	fastSerial := publish(t, ctx, fastPub, "fast-0")
+
+	waitForCount(t, fast, 1, 10*time.Second)
+	latency := time.Since(published)
+	slowDone := slow.count()
+	if latency > time.Duration(backlog)*delay/2 {
+		t.Fatalf("fast channel delivery took %s behind a %s slow backlog: channels are not consumed in parallel", latency, time.Duration(backlog)*delay)
+	}
+	if slowDone >= backlog {
+		t.Fatalf("slow channel had already delivered all %d cms when fast delivered; the test did not overlap them", backlog)
+	}
+	if got := fast.serials(); len(got) != 1 || got[0] != fastSerial {
+		t.Fatalf("fast appender = %v, want [%s]", got, fastSerial)
+	}
+
+	// The slow channel still gets its whole backlog, in order, once each.
+	waitForCount(t, &slow.recorder, backlog, 10*time.Second)
+	got := slow.serials()
+	if len(got) != backlog {
+		t.Fatalf("slow appender saw %d cms, want %d", len(got), backlog)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("slow cm[%d] = %s, want %s (order broken)\n got=%v\nwant=%v", i, got[i], want[i], got, want)
+		}
+	}
+	t.Logf("fast channel delivered in %s while the slow channel had delivered %d of %d", latency, slowDone, backlog)
+}

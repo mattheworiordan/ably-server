@@ -6,7 +6,10 @@ package postgres
 // (Storage.Channel with an appender), so a node receives notifications
 // only for channels it holds. A cm small enough to fit in a NOTIFY
 // travels inline, so receivers skip the SELECT read-back; bigger cms
-// send a pointer.
+// send a pointer. The LISTEN goroutine only receives and dispatches: each
+// notification goes to its channel's bounded, ordered delivery queue, and
+// a worker per busy channel does the parsing, reads and appends, so a
+// slow read or a slow appender on one channel never stalls another.
 
 import (
 	"context"
@@ -16,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +47,11 @@ const (
 	// listenBatchSize caps the LISTEN statements sent in one round trip
 	// (bind bursts, and the re-LISTEN after a reconnect).
 	listenBatchSize = 500
+
+	// channelQueueDepth bounds each bound channel's delivery queue. When
+	// a queue is full the LISTEN goroutine blocks on it, so backpressure
+	// is explicit instead of an unbounded buffer.
+	channelQueueDepth = 1024
 )
 
 // errStorageClosed is returned by Channel when the storage is closed
@@ -336,9 +345,9 @@ func (s *Storage) runPendingListens(ctx context.Context, conn *pgx.Conn) error {
 // listenLoop owns the LISTEN connection (DESIGN.md §7.2). It runs
 // consume() until the connection fails; unless the storage is closing it
 // then re-dials with capped exponential backoff, re-LISTENs every bound
-// channel and reconciles each bound channel before it resumes, so every
-// cm whose NOTIFY was lost in the gap is replayed exactly once. It exits
-// only when the storage is Close()d.
+// channel and queues a reconcile on each bound channel before it resumes,
+// so every cm whose NOTIFY was lost in the gap is replayed exactly once.
+// It exits only when the storage is Close()d.
 func (s *Storage) listenLoop(ctx context.Context) {
 	defer s.wg.Done()
 
@@ -355,11 +364,12 @@ func (s *Storage) listenLoop(ctx context.Context) {
 		if conn == nil {
 			return // ctx cancelled during backoff
 		}
-		// Re-LISTEN is done by redial; reconcile before resuming so any
-		// cm minted during the gap is replayed exactly once (deliver()
-		// dedups against a subsequent buffered NOTIFY).
+		// Re-LISTEN is done by redial. Queue a reconcile on every bound
+		// channel before resuming: it sits ahead of any notification the
+		// new connection delivers on that channel's queue, and deliver()
+		// drops the overlap.
 		s.reconcile(ctx)
-		s.logger.Info("storage/postgres: LISTEN reconnected and reconciled")
+		s.logger.Info("storage/postgres: LISTEN reconnected; reconcile queued")
 	}
 }
 
@@ -405,11 +415,10 @@ func (s *Storage) consume(ctx context.Context, conn *pgx.Conn) error {
 	}
 }
 
-// dispatch routes one notification to the channel store bound to its
-// Postgres channel and delivers the cm: decoded from an inline payload,
-// or read back by (channel, serial) for a pointer. It waits for a bind
-// still in progress: the LISTEN is active before the bind reads its
-// watermark, so a cm committed in between must not be dropped.
+// dispatch hands one notification to its channel's ordered queue. It does
+// no parsing, decoding or I/O (the channel's worker does that), so the
+// LISTEN goroutine only receives and dispatches. It blocks while the
+// channel's queue is full: explicit backpressure.
 func (s *Storage) dispatch(ctx context.Context, n *pgconn.Notification) {
 	s.stats.notifications.Add(1)
 	s.mu.RLock()
@@ -419,39 +428,7 @@ func (s *Storage) dispatch(ctx context.Context, n *pgconn.Notification) {
 		s.stats.unrouted.Add(1)
 		return
 	}
-	select {
-	case <-cs.ready:
-	case <-ctx.Done():
-		return
-	}
-	if cs.abandoned.Load() {
-		return
-	}
-
-	var p busNotification
-	if err := json.Unmarshal([]byte(n.Payload), &p); err != nil || p.Serial == "" {
-		s.stats.malformed.Add(1)
-		return
-	}
-	if p.Serial <= cs.watermark() {
-		s.stats.duplicates.Add(1)
-		return
-	}
-	cm, err := p.inlineCM()
-	if err != nil {
-		s.logger.Warn("storage/postgres: bad inline payload; reading the cm instead", "channel", cs.name, "serial", p.Serial, "err", err)
-	}
-	if cm != nil {
-		s.stats.inline.Add(1)
-		cs.deliver(cm)
-		return
-	}
-	if cm, err = s.loadChannelMessage(ctx, cs.name, p.Serial); err != nil {
-		s.stats.fetchErrors.Add(1)
-		return // best-effort; nothing we can do without the cm
-	}
-	s.stats.fetched.Add(1)
-	cs.deliver(cm)
+	cs.enqueue(ctx, busItem{payload: n.Payload})
 }
 
 // redial re-establishes the LISTEN connection with capped exponential
@@ -480,11 +457,11 @@ func (s *Storage) redial(ctx context.Context) *pgx.Conn {
 	}
 }
 
-// reconcile replays, per bound and initialised channel, every cm minted
-// past the channel's last-delivered serial: the cms whose NOTIFY was lost
-// while the LISTEN connection was down (DESIGN.md §7.2). Each is
-// delivered through cs.deliver, whose high-water mark makes replay
-// idempotent against the normal NOTIFY path.
+// reconcile queues, on every bound and initialised channel, a replay of
+// every cm minted past the channel's last delivered serial: the cms whose
+// NOTIFY was lost while the LISTEN connection was down (DESIGN.md §7.2).
+// Each channel reconciles on its own worker, so channels catch up in
+// parallel and each stays ordered behind its reconcile.
 func (s *Storage) reconcile(ctx context.Context) {
 	s.mu.RLock()
 	stores := make([]*channelStore, 0, len(s.bound))
@@ -492,14 +469,147 @@ func (s *Storage) reconcile(ctx context.Context) {
 		stores = append(stores, cs)
 	}
 	s.mu.RUnlock()
-
 	for _, cs := range stores {
-		if !cs.isReady() {
-			continue // bind in progress: it reads its watermark after its LISTEN
+		if cs.isReady() { // a bind in progress reads its watermark after its LISTEN
+			cs.enqueue(ctx, busItem{reconcile: true})
 		}
-		if err := cs.reconcileFromHistory(ctx); err != nil {
-			s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
+	}
+}
+
+// startWorker runs fn on a tracked goroutine unless the storage is
+// closing. Workers are started lazily, one per channel with queued work,
+// and exit when their queue drains, so idle channels cost no goroutine.
+func (s *Storage) startWorker(fn func()) bool {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+	if s.workersClosed {
+		return false
+	}
+	s.workerWG.Add(1)
+	go func() {
+		defer s.workerWG.Done()
+		fn()
+	}()
+	return true
+}
+
+// stopWorkers stops new workers starting and waits for running ones to
+// finish. Called by Close after the loop context is cancelled, so
+// running workers discard what is left in their queues.
+func (s *Storage) stopWorkers() {
+	s.workersMu.Lock()
+	s.workersClosed = true
+	s.workersMu.Unlock()
+	s.workerWG.Wait()
+}
+
+// busItem is one unit of work on a channel's delivery queue: a raw NOTIFY
+// payload, or a reconcile request.
+type busItem struct {
+	payload   string
+	reconcile bool
+}
+
+// busQueue is a bound channel's ordered delivery queue. slots holds one
+// token per queued item, so a full queue blocks the producer. A worker
+// goroutine starts when the queue becomes non-empty and exits when it
+// drains, so there is at most one worker per channel and the channel's
+// items are handled strictly in order.
+type busQueue struct {
+	slots   chan struct{}
+	mu      sync.Mutex
+	items   []busItem
+	running bool
+}
+
+// enqueue appends it to the channel's queue, blocking while the queue is
+// full, and starts the channel's worker if none is running. It returns
+// false if ctx ends first.
+func (cs *channelStore) enqueue(ctx context.Context, it busItem) bool {
+	select {
+	case cs.q.slots <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	cs.q.mu.Lock()
+	cs.q.items = append(cs.q.items, it)
+	start := !cs.q.running
+	cs.q.running = true
+	cs.q.mu.Unlock()
+	if start && !cs.s.startWorker(cs.drain) {
+		cs.q.mu.Lock()
+		cs.q.running = false // closing: nothing will drain this queue
+		cs.q.mu.Unlock()
+	}
+	return true
+}
+
+// drain is the channel's worker: it waits until the channel's bind has
+// finished, then handles queued items in order until the queue is empty.
+func (cs *channelStore) drain() {
+	ctx := cs.s.loopCtx
+	select {
+	case <-cs.ready:
+	case <-ctx.Done():
+		return
+	}
+	for {
+		cs.q.mu.Lock()
+		if len(cs.q.items) == 0 {
+			cs.q.items = nil
+			cs.q.running = false
+			cs.q.mu.Unlock()
+			return
 		}
+		it := cs.q.items[0]
+		cs.q.items[0] = busItem{}
+		cs.q.items = cs.q.items[1:]
+		cs.q.mu.Unlock()
+		<-cs.q.slots
+
+		if ctx.Err() != nil || cs.abandoned.Load() {
+			continue // closing, or the bind failed: discard
+		}
+		cs.process(ctx, it)
+	}
+}
+
+// process handles one queued item on the channel's worker: a reconcile,
+// or a notification whose cm it decodes inline or reads back by serial.
+func (cs *channelStore) process(ctx context.Context, it busItem) {
+	st := &cs.s.stats
+	if it.reconcile {
+		if err := cs.reconcileFromHistory(ctx); err != nil && ctx.Err() == nil {
+			cs.s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
+		}
+		return
+	}
+
+	var n busNotification
+	if err := json.Unmarshal([]byte(it.payload), &n); err != nil || n.Serial == "" {
+		st.malformed.Add(1)
+		return
+	}
+	if n.Serial <= cs.watermark() {
+		st.duplicates.Add(1) // already delivered: no read needed
+		return
+	}
+
+	cm, err := n.inlineCM()
+	if err != nil {
+		cs.s.logger.Warn("storage/postgres: bad inline payload; reading the cm instead", "channel", cs.name, "serial", n.Serial, "err", err)
+	}
+	if cm != nil {
+		st.inline.Add(1)
+	} else {
+		if cm, err = cs.s.loadChannelMessage(ctx, cs.name, n.Serial); err != nil {
+			st.fetchErrors.Add(1)
+			return // best-effort; nothing we can do without the cm
+		}
+		st.fetched.Add(1)
+	}
+	if !cs.deliver(cm) {
+		st.duplicates.Add(1)
 	}
 }
 
