@@ -43,7 +43,8 @@ curl -fsS -u app.key:secret -H 'Content-Type: application/json' \
 
 found=
 for _ in $(seq 1 50); do
-  if curl -fsS -u app.key:secret "$(node 3)/channels/$channel/messages" | grep -q "$payload"; then
+  history="$(curl -fsS -u app.key:secret "$(node 3)/channels/$channel/messages" || true)"
+  if grep -q "$payload" <<<"$history"; then
     found=1
     break
   fi
@@ -54,7 +55,11 @@ if [[ -z $found ]]; then
   exit 1
 fi
 
-if ! curl -fsS "$(debug 1)/metrics" | grep -q "ably_bus_info{bus=\"$bus\""; then
+# Read the whole body first: with pipefail, grep -q exiting at the first
+# match makes curl fail writing the rest (exit 23) once /metrics outgrows
+# the pipe buffer.
+metrics_body="$(curl -fsS "$(debug 1)/metrics")"
+if ! grep -q "ably_bus_info{bus=\"$bus\"" <<<"$metrics_body"; then
   echo "FAIL: node 1 /metrics does not report ably_bus_info{bus=\"$bus\"}" >&2
   exit 1
 fi
