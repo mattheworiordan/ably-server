@@ -46,6 +46,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/logging"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
@@ -107,7 +108,8 @@ func TestSoakConnections(t *testing.T) {
 	}
 	manager := core.NewManagerWithOptions(memory.New(memory.Options{}), core.Options{IdleTimeout: core.DefaultChannelIdleTimeout})
 	defer manager.Close()
-	rt := NewServer([]auth.APIKey{parsed}, manager, DefaultHeartbeatInterval, logging.New(slog.DiscardHandler), nil, nil)
+	m := metrics.New()
+	rt := NewServer([]auth.APIKey{parsed}, manager, DefaultHeartbeatInterval, logging.New(slog.DiscardHandler), m, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -159,7 +161,14 @@ func TestSoakConnections(t *testing.T) {
 	rampTime := time.Since(rampStart)
 	go func() { _, _ = io.Copy(io.Discard, stdout) }()
 
-	if got := rt.connCount(); got != nConns {
+	// A client dial that timed out after the server accepted it leaves a
+	// server connection that closes once the client drops the socket:
+	// let the count settle before measuring.
+	settle := time.Now().Add(30 * time.Second)
+	for rt.connCount() != nConns && time.Now().Before(settle) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := rt.connCount(); got < nConns || got > nConns+nConns/1000 {
 		t.Fatalf("server holds %d connections, want %d", got, nConns)
 	}
 	ramped := sample("after-ramp", nConns)
@@ -172,9 +181,10 @@ func TestSoakConnections(t *testing.T) {
 	}
 
 	// Hold with light traffic: one publish per channel every
-	// SOAK_PUBLISH_EVERY. (At one per second per channel, 50k deliveries/s,
-	// a laptop running both processes stalled in socket writes until the Go
-	// runtime hit its 10,000-thread limit; see STATUS.)
+	// SOAK_PUBLISH_EVERY, spread evenly. (Publishing every channel in one
+	// burst, 50k deliveries at once, made the laptop running both processes
+	// stall in loopback socket writes until the Go runtime hit its
+	// 10,000-thread limit; see .working/STATUS.md.)
 	ctx := context.Background()
 	chans := make([]*core.Channel, nChannels)
 	for i := range chans {
@@ -189,17 +199,19 @@ func TestSoakConnections(t *testing.T) {
 	pubWG.Add(1)
 	go func() {
 		defer pubWG.Done()
-		tick := time.NewTicker(publishEvery)
+		// Spread the publishes over the interval, one channel per tick,
+		// rather than one burst per interval: a burst wakes every
+		// subscriber's writer at once (see the comment above).
+		tick := time.NewTicker(max(publishEvery/time.Duration(nChannels), time.Millisecond))
 		defer tick.Stop()
-		for {
+		for i := 0; ; i++ {
 			select {
 			case <-stop:
 				return
 			case <-tick.C:
-				for _, ch := range chans {
-					if _, _, err := ch.Publish(ctx, []*protocol.Message{{Name: "tick", Data: "0123456789abcdef0123456789abcdef"}}); err == nil {
-						published.Add(1)
-					}
+				ch := chans[i%len(chans)]
+				if _, _, err := ch.Publish(ctx, []*protocol.Message{{Name: "tick", Data: "0123456789abcdef0123456789abcdef"}}); err == nil {
+					published.Add(1)
 				}
 			}
 		}
@@ -222,7 +234,12 @@ func TestSoakConnections(t *testing.T) {
 	perConnG := float64(ramped.Goroutines-base.Goroutines) / float64(nConns)
 	t.Logf("per connection: heap %.0f B, stack %.0f B, goroutines %.2f (1 attachment each)", perConnHeap, perConnStack, perConnG)
 
-	if held.Conns != nConns {
+	for _, line := range strings.Split(scrape(t, m), "\n") {
+		if strings.HasPrefix(line, "ably_slow_consumer_disconnects_total{") {
+			t.Logf("%s", line)
+		}
+	}
+	if held.Conns < nConns {
 		t.Errorf("connections dropped during the hold: %d of %d", held.Conns, nConns)
 	}
 	if held.Goroutines > ramped.Goroutines+nChannels/10+50 {
@@ -297,7 +314,7 @@ func TestSoakClientProcess(t *testing.T) {
 	}
 	var failed atomic.Int64
 	conns := make([]*websocket.Conn, nConns)
-	sem := make(chan struct{}, 256)
+	sem := make(chan struct{}, 96) // below the listeners' accept backlog, so SYNs are not dropped
 	var wg sync.WaitGroup
 	for i := range nConns {
 		wg.Add(1)
