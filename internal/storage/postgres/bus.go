@@ -118,7 +118,7 @@ type busStats struct {
 	inline, fetched, fastPath, filled                  atomic.Uint64
 	duplicates, held, gapFills, fetchErrors            atomic.Uint64
 	reconcileRuns, reconciles, reconcileNanos          atomic.Uint64
-	sweeps, sweepCatchUps, sweepNanos                  atomic.Uint64
+	sweeps, sweepChannels, sweepCatchUps, sweepNanos   atomic.Uint64
 	drops, listens, unlistens                          atomic.Uint64
 	wakeupsSent, wakeupsReceived, flushes, flushErrors atomic.Uint64
 	overflow, flushNanos                               atomic.Uint64
@@ -166,6 +166,7 @@ func (s *Storage) BusStats() storage.BusStats {
 		Reconciles:        c.reconciles.Load(),
 		ReconcileSeconds:  time.Duration(c.reconcileNanos.Load()).Seconds(),
 		Sweeps:            c.sweeps.Load(),
+		SweepChannels:     c.sweepChannels.Load(),
 		SweepCatchUps:     c.sweepCatchUps.Load(),
 		SweepSeconds:      time.Duration(c.sweepNanos.Load()).Seconds(),
 		Drops:             c.drops.Load(),

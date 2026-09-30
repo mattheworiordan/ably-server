@@ -97,6 +97,17 @@ type Appender interface {
 	Append(cm *protocol.ChannelMessage)
 }
 
+// SubscriberReporter is implemented by an Appender that can say whether
+// anything in this process receives what it is handed: core.Channel,
+// which has subscribers while it has an open Stream (an attachment) or a
+// tracked presence member. A backend may use it to skip work that only
+// matters to a local subscriber, such as the cluster bus's watermark
+// sweep (DESIGN.md §7.2). An Appender that does not implement it is
+// treated as always subscribed.
+type SubscriberReporter interface {
+	HasSubscribers() bool
+}
+
 // Storage is the per-process persistence root. It hands out
 // per-channel stores and owns any shared resources (e.g. a bolt DB
 // handle or a pgxpool).
@@ -211,10 +222,11 @@ type BusStats struct {
 	ReconcileRuns, Reconciles uint64
 	ReconcileSeconds          float64
 
-	// Sweeps counts watermark sweeps; SweepCatchUps the channels they
-	// found behind and caught up; SweepSeconds their total duration.
-	Sweeps, SweepCatchUps uint64
-	SweepSeconds          float64
+	// Sweeps counts watermark sweeps; SweepChannels the channels whose
+	// watermark they read; SweepCatchUps the channels they found behind
+	// and caught up; SweepSeconds their total duration.
+	Sweeps, SweepChannels, SweepCatchUps uint64
+	SweepSeconds                         float64
 
 	// Drops counts bus messages dropped before delivery: a NATS slow
 	// consumer episode (a full dispatch shard), or a full per-channel

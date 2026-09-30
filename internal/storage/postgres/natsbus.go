@@ -74,7 +74,7 @@ var (
 
 // DefaultNATSSweepInterval is the nats bus's default watermark sweep
 // interval (DESIGN.md §7.2).
-const DefaultNATSSweepInterval = 5 * time.Second
+const DefaultNATSSweepInterval = 30 * time.Second
 
 // natsNamespacePrefix is the subject prefix for every channel of one
 // schema: "ably.cm.<ns>.".

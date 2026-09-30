@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // Chained delivery (DESIGN.md §7.2). The two buses that deliver a
@@ -54,6 +56,34 @@ const reconcileChunk = 500
 
 // sweepChunk caps the channel names in one watermark sweep query.
 const sweepChunk = 1000
+
+// Watermark sweep scopes accepted by Options.SweepScope (DESIGN.md
+// §7.2).
+const (
+	// SweepSubscribed sweeps only the bound channels with a subscriber on
+	// this node: an attachment or a tracked presence member
+	// (storage.SubscriberReporter). The default.
+	SweepSubscribed = "subscribed"
+	// SweepBound sweeps every bound channel, the behaviour before sweep
+	// scopes existed.
+	SweepBound = "bound"
+)
+
+// ParseSweepScope validates a sweep scope. The empty string is the
+// default, SweepSubscribed.
+func ParseSweepScope(s string) (string, error) {
+	switch s {
+	case "", SweepSubscribed:
+		return SweepSubscribed, nil
+	case SweepBound:
+		return SweepBound, nil
+	}
+	return "", fmt.Errorf("unknown bus sweep scope %q (valid: %s, %s)", s, SweepSubscribed, SweepBound)
+}
+
+// sweepNamesHook, when set, receives the channel names of each watermark
+// sweep query (tests count what the sweep reads). Nil in production.
+var sweepNamesHook atomic.Pointer[func(names []string)]
 
 // chainTiming is the snapshot of the gap-fill tuning a Storage (and each
 // of its channelStores) runs with.
@@ -632,13 +662,40 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 	return firstErr
 }
 
-// sweepWatermarks is the chained buses' safety net (DESIGN.md §7.2). It
-// reads the current serial of every bound channel, sweepChunk names per
-// query, and catches up each channel whose delivery mark is still behind
-// the watermark this node read on the previous sweep: a cm that old
-// whose bus message has not arrived is treated as lost, not late.
-func (s *Storage) sweepWatermarks(ctx context.Context) error {
+// sweepStores returns the bound channels the watermark sweep reads: every
+// one under SweepBound; under SweepSubscribed only those whose appender
+// has a subscriber on this node (an appender that cannot say counts as
+// subscribed). A channel with no local subscriber has nobody a lost cm
+// could be late for: its binding goes on receiving the bus, a later
+// subscriber sees whatever the delivery point appends from then on, and
+// a lost tail is caught up within two sweeps of the channel gaining a
+// subscriber (DESIGN.md §7.2).
+func (s *Storage) sweepStores() []*channelStore {
 	stores := s.boundStores()
+	if s.sweepAll {
+		return stores
+	}
+	kept := stores[:0]
+	for _, cs := range stores {
+		if r, ok := cs.appender.(storage.SubscriberReporter); ok && !r.HasSubscribers() {
+			continue
+		}
+		kept = append(kept, cs)
+	}
+	clear(stores[len(kept):])
+	return kept
+}
+
+// sweepWatermarks is the chained buses' safety net (DESIGN.md §7.2). It
+// reads the current serial of the channels sweepStores selects,
+// sweepChunk names per query, and catches up each channel whose delivery
+// mark is still behind the watermark this node read on the previous
+// sweep: a cm that old whose bus message has not arrived is treated as
+// lost, not late. Each shard of a shard list is its own Storage, so the
+// queries go to the shard that holds the channels.
+func (s *Storage) sweepWatermarks(ctx context.Context) error {
+	stores := s.sweepStores()
+	s.stats.sweepChannels.Add(uint64(len(stores)))
 	var behind []*channelStore
 	for start := 0; start < len(stores); start += sweepChunk {
 		chunk := stores[start:min(start+sweepChunk, len(stores))]
@@ -647,6 +704,9 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		for _, cs := range chunk {
 			byName[cs.name] = cs
 			names = append(names, cs.name)
+		}
+		if hook := sweepNamesHook.Load(); hook != nil {
+			(*hook)(names)
 		}
 		rows, err := s.pool.Query(ctx, `SELECT name, channel_serial FROM channels WHERE name = ANY($1)`, names)
 		if err != nil {

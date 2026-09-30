@@ -206,6 +206,7 @@ func addBusStats(a, b storage.BusStats) storage.BusStats {
 	a.Reconciles += b.Reconciles
 	a.ReconcileSeconds += b.ReconcileSeconds
 	a.Sweeps += b.Sweeps
+	a.SweepChannels += b.SweepChannels
 	a.SweepCatchUps += b.SweepCatchUps
 	a.SweepSeconds += b.SweepSeconds
 	a.Drops += b.Drops

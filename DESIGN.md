@@ -1624,11 +1624,33 @@ The `postgres` and `nats` buses share one delivery point
   delivered it.
 - **Reconcile.** After the bus connection comes back, every bound channel
   is caught up from its mark, 500 channels per query.
-- **Sweep.** Every sweep interval (`--bus-sweep-interval`; defaults 2 s for
-  `postgres`, 5 s for `nats`) each node reads the committed serial of its
-  bound channels, 1,000 per query, and catches up any channel still
-  behind the serial the previous sweep saw. A cm that old whose bus
-  message has not arrived is treated as lost, not late.
+- **Sweep.** Every sweep interval (`--bus-sweep-interval`, default 30 s
+  for both buses) each node reads the committed serial of the channels
+  in its sweep scope, 1,000 per query and one query per shard's
+  database, and catches up any channel still behind the serial the
+  previous sweep saw. A cm that old whose bus message has not arrived is
+  treated as lost, not late.
+- **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
+  only bound channels with a subscriber on this node: an open
+  attachment, or a presence member the node has seen enter and not leave
+  (whose LEAVE eviction waits for). `bound` sweeps every bound channel,
+  the behaviour before the scope existed. A channel bound only by a REST
+  request, or kept bound after its last detach until eviction, has
+  nobody on this node a lost cm could be late for, so reading it is
+  waste: in a 15-minute shape-D run the full sweep was about a quarter of
+  Postgres's time. The bound: a lost bus message on a subscribed channel
+  with no later cm is delivered up to two intervals late (60 s at the
+  default). On a channel with no local subscriber nothing is waiting for
+  it. The binding goes on receiving the bus, so a later cm's predecessor
+  still reveals the gap; if none comes, the lost tail is delivered
+  within two intervals of the channel gaining a subscriber, and a channel
+  evicted meanwhile re-seeds from the watermark on its next bind, which
+  covers the tail. Nothing is lost. (A receiver cannot tell which
+  channels it missed a message on, so there is no cheaper "dirty set" to
+  sweep instead.) The postgres bus's coalesced overflow (below) is
+  delivered by the same sweep, so an overflowed write is also up to two
+  intervals late; lower the interval if that matters more than the
+  sweep's cost.
 
 #### postgres
 
@@ -1802,7 +1824,9 @@ that the log has moved, and every loss below is recovered from the log.
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 
-Worst case for the chained buses is about two sweep intervals late. The
+Worst case for the chained buses is about two sweep intervals late,
+counted from the moment the channel has a subscriber on the receiving
+node (the sweep scope above). The
 load tests check this rather than assume it: the serial-continuity
 check fails on any gap or duplicate.
 
@@ -2001,7 +2025,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
 --postgres-notify-window 50ms   coalescing window (coalesced mode)
 --postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
---bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (postgres 2s, nats 5s)
+--bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (30s) (§7.2)
+--bus-sweep-scope subscribed  channels that sweep reads: subscribed (an attachment or presence member here) or bound (all)
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -2034,7 +2059,7 @@ Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
-`postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
+`postgres-notify-max-pending`, `bus-sweep-interval`, `bus-sweep-scope`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
@@ -2171,7 +2196,9 @@ name = "persisted:presence_fixtures"
     `ably_bus_gap_fills_total`, `ably_bus_fetch_errors_total`,
     `ably_bus_drops_total`, `ably_bus_reconciles_total`,
     `ably_bus_reconciled_channels_total`, `ably_bus_reconcile_seconds_total`,
-    `ably_bus_sweeps_total`, `ably_bus_sweep_catch_ups_total`,
+    `ably_bus_sweeps_total`, `ably_bus_sweep_channels_total` (channels
+    whose watermark a sweep read, summed over sweeps: the sweep scope's
+    size), `ably_bus_sweep_catch_ups_total`,
     `ably_bus_sweep_seconds_total`.
   - `ably_bus_delivery_lag_seconds{path}` (histogram, buckets 1 ms to
     30 s): for each cm a node appends that came from another node, the

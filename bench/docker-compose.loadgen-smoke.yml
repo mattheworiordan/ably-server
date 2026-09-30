@@ -63,7 +63,10 @@ services:
       POSTGRES_USER: ably
       POSTGRES_PASSWORD: ably
       POSTGRES_DB: ably
-    command: ["postgres", "-c", "max_connections=300"]
+    # pg_stat_statements is preloaded so a smoke can report which
+    # statements the database spent its time on (CREATE EXTENSION
+    # pg_stat_statements, then read the view).
+    command: ["postgres", "-c", "max_connections=300", "-c", "shared_preload_libraries=pg_stat_statements"]
     ports:
       - "5443:5432"
     healthcheck:

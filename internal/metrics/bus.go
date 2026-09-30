@@ -73,6 +73,7 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 	add("reconciled_channels_total", "Channels caught up by reconciles.", false, u(func(s storage.BusStats) uint64 { return s.Reconciles }))
 	add("reconcile_seconds_total", "Total time spent in reconciles.", false, func(s storage.BusStats) float64 { return s.ReconcileSeconds })
 	add("sweeps_total", "Watermark sweeps.", false, u(func(s storage.BusStats) uint64 { return s.Sweeps }))
+	add("sweep_channels_total", "Channels whose watermark a sweep read (the sweep scope's channels, summed over sweeps).", false, u(func(s storage.BusStats) uint64 { return s.SweepChannels }))
 	add("sweep_catch_ups_total", "Channels a sweep found behind and caught up.", false, u(func(s storage.BusStats) uint64 { return s.SweepCatchUps }))
 	add("sweep_seconds_total", "Total time spent in watermark sweeps.", false, func(s storage.BusStats) float64 { return s.SweepSeconds })
 	add("listens_total", "LISTEN statements issued by the postgres bus.", false, u(func(s storage.BusStats) uint64 { return s.Listens }))

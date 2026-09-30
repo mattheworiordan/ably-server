@@ -124,7 +124,7 @@ const fixtureNodeID = "__fixtures__"
 // DefaultPostgresSweepInterval is the postgres bus's default watermark
 // sweep interval: the safety net that delivers a write whose coalesced
 // wake-up was lost (DESIGN.md §7.2).
-const DefaultPostgresSweepInterval = 2 * time.Second
+const DefaultPostgresSweepInterval = 30 * time.Second
 
 // postgresSweepDefault and natsSweepDefault are the sweep intervals Open
 // uses when Options.SweepInterval is zero. Package vars so integration
@@ -189,6 +189,12 @@ type Options struct {
 	// DefaultNATSSweepInterval.
 	SweepInterval time.Duration
 
+	// SweepScope selects the bound channels the watermark sweep reads
+	// (DESIGN.md §7.2): SweepSubscribed, only those whose appender reports
+	// a subscriber on this node (storage.SubscriberReporter), or
+	// SweepBound, every bound channel. Empty means SweepSubscribed.
+	SweepScope string
+
 	// Retention configures how long the message log keeps each class of
 	// channel (DESIGN.md §6.3). The zero value applies the defaults.
 	Retention Retention
@@ -237,6 +243,7 @@ type Storage struct {
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
+	sweepAll                    bool          // sweep every bound channel, not only subscribed ones
 	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
 
 	mu       sync.RWMutex
@@ -272,6 +279,10 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		if mode, err = ParseNotifyMode(string(opts.NotifyMode)); err != nil {
 			return nil, fmt.Errorf("storage/postgres: %w", err)
 		}
+	}
+	sweepScope, err := ParseSweepScope(opts.SweepScope)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	if busKind == BusNATS && opts.NATSURL == "" {
 		return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
@@ -341,6 +352,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		reconnectBase: listenReconnectBaseDelay,
 		reconnectMax:  listenReconnectMaxDelay,
 		sweepInterval: opts.SweepInterval,
+		sweepAll:      sweepScope == SweepBound,
 		timing:        currentChainTiming(),
 		retention:     opts.Retention.resolve(),
 		persisted:     persisted,

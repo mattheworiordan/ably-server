@@ -178,6 +178,25 @@ func (c *Channel) idle(now int64, timeout time.Duration) bool {
 	return !hasMembers
 }
 
+// HasSubscribers reports whether anything in this process receives the
+// channel's cms: an open Stream (an attachment) or a presence member
+// this node has seen enter and not leave, whose LEAVE must still arrive
+// for eviction to proceed. A channel bound only for a REST operation or
+// kept bound after its last detach has none. Implements
+// storage.SubscriberReporter; the cluster bus's watermark sweep reads
+// only channels that have subscribers (DESIGN.md §7.2).
+func (c *Channel) HasSubscribers() bool {
+	c.life.Lock()
+	refs := c.refs
+	c.life.Unlock()
+	if refs > 0 {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.members) > 0
+}
+
 // Name returns the channel name.
 func (c *Channel) Name() string {
 	return c.name
