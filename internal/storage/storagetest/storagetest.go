@@ -62,6 +62,86 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("ReleaseThenRebindSeesNoGap", func(t *testing.T) {
+		// Release drops the binding (DESIGN.md §7.2); a re-bind is
+		// initialised at the watermark, which covers every cm committed
+		// while released, and then receives every later cm exactly once,
+		// in order. The released appender receives nothing more.
+		s := f(t)
+		ctx := context.Background()
+		if err := s.Release(ctx, "never-bound"); err != nil {
+			t.Fatalf("Release of an unbound channel: %v", err)
+		}
+
+		a1 := newCapturingAppender()
+		ch1, err := s.Channel(ctx, "rel", a1)
+		if err != nil {
+			t.Fatalf("Channel: %v", err)
+		}
+		var pre []string
+		for i := range 3 {
+			pre = append(pre, mustStore(t, ch1, fmt.Sprintf("pre-%d", i)))
+		}
+		waitAppends(t, a1, 3)
+
+		if err := s.Release(ctx, "rel"); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		if err := s.Release(ctx, "rel"); err != nil {
+			t.Fatalf("second Release: %v", err)
+		}
+		// The old handle still stores; it just delivers to nobody.
+		var mid []string
+		for i := range 2 {
+			mid = append(mid, mustStore(t, ch1, fmt.Sprintf("mid-%d", i)))
+		}
+
+		a2 := newCapturingAppender()
+		ch2, err := s.Channel(ctx, "rel", a2)
+		if err != nil {
+			t.Fatalf("re-bind Channel: %v", err)
+		}
+		if got := a2.initializeCount(); got != 1 {
+			t.Fatalf("re-bound appender Initialize count = %d, want 1", got)
+		}
+		if got, want := a2.initialized(), mid[len(mid)-1]; got != want {
+			t.Fatalf("re-bound appender initialised at %q, want the watermark %q (the last cm committed while released)", got, want)
+		}
+		a1.mu.Lock()
+		wantInitial := a1.initInitial
+		a1.mu.Unlock()
+		a2.mu.Lock()
+		gotInitial := a2.initInitial
+		a2.mu.Unlock()
+		if gotInitial != wantInitial {
+			t.Errorf("re-bound appender initial = %q, want the channel's initial %q", gotInitial, wantInitial)
+		}
+
+		var post []string
+		for i := range 3 {
+			post = append(post, mustStore(t, ch2, fmt.Sprintf("post-%d", i)))
+		}
+		post = append(post, mustStore(t, ch1, "post-via-old-handle"))
+		waitAppends(t, a2, len(post))
+		time.Sleep(200 * time.Millisecond) // room for a (wrong) late or duplicate delivery
+
+		if got := serialsOf(a2.appended()); !equalStrings(got, post) {
+			t.Fatalf("re-bound appender saw %v, want exactly %v (nothing at or below the watermark, nothing twice)", got, post)
+		}
+		if got := serialsOf(a1.appended()); !equalStrings(got, pre) {
+			t.Fatalf("released appender saw %v, want only the pre-release %v", got, pre)
+		}
+
+		page, err := ch2.History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		all := append(append(append([]string(nil), pre...), mid...), post...)
+		if got := channelSerialsOf(page); !equalStrings(got, all) {
+			t.Fatalf("history = %v, want %v", got, all)
+		}
+	})
+
 	t.Run("AppendStampsChannelSerialAndMessageSerials", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")
@@ -2087,6 +2167,47 @@ func (a *capturingAppender) initializeCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.initCount
+}
+
+func (a *capturingAppender) appended() []*protocol.ChannelMessage {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]*protocol.ChannelMessage(nil), a.appends...)
+}
+
+// waitAppends waits until a has received at least n appends. Cluster
+// backends deliver asynchronously, so contract tests that assert on
+// appends poll rather than check once.
+func waitAppends(t *testing.T, a *capturingAppender, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(a.appended()) >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d appends; have %d", n, len(a.appended()))
+}
+
+// mustStore publishes one message named name and returns its
+// channelSerial.
+func mustStore(t *testing.T, ch storage.ChannelStore, name string) string {
+	t.Helper()
+	cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: name}})
+	if err != nil {
+		t.Fatalf("Store %q: %v", name, err)
+	}
+	return cm.ChannelSerial
+}
+
+// serialsOf lists the channelSerials of cms in order.
+func serialsOf(cms []*protocol.ChannelMessage) []string {
+	out := make([]string, len(cms))
+	for i, cm := range cms {
+		out[i] = cm.ChannelSerial
+	}
+	return out
 }
 
 // mustChannel materialises a ChannelStore for name, failing the test

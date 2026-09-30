@@ -1,0 +1,91 @@
+# Three ably-server nodes on one Postgres with the rebuilt Postgres bus,
+# --bus=postgres (DESIGN.md §7.2): per-channel LISTEN, inline payloads,
+# one ordered worker per channel, a publisher fast path, and coalesced
+# wake-ups by default. This is the "small" deployment size: Postgres is
+# the only dependency.
+#
+#   docker compose -f bench/docker-compose.postgres.yml up -d --build --wait
+#   docker compose -f bench/docker-compose.postgres.yml down -v
+#
+# Host ports: nodes 8281, 8282, 8283; each node's debug listener (pprof
+# and Prometheus /metrics, including the ably_bus_* series) 8291, 8292,
+# 8293; Postgres 5434 (user, password and database "ably"). All nodes
+# share the key app.key:secret.
+#
+# The notify mode is chosen per run with environment variables (compose
+# recreates the nodes when they change):
+#
+#   PGBUS_NOTIFY_MODE=coalesced      writes commit without NOTIFY; each
+#                                    node sends at most one wake-up per
+#                                    channel per PGBUS_NOTIFY_WINDOW
+#                                    (the default)
+#   PGBUS_NOTIFY_MODE=transactional  one NOTIFY per write, inside its
+#                                    transaction
+#   PGBUS_NOTIFY_WINDOW=50ms         coalescing window
+#   POOL_MAX_CONNS=16                pgxpool size per node
+#
+# Ports, project name and image tag differ from the root
+# docker-compose.yml and the other bench stacks, so they can all run side
+# by side.
+
+name: ablypostgres
+
+x-ably-node: &ably-node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: ably-server:bench-postgres
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    ABLY_SERVER_KEYS: app.key:secret
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable&pool_max_conns=${POOL_MAX_CONNS:-16}
+    ABLY_SERVER_BUS: postgres
+    ABLY_SERVER_POSTGRES_NOTIFY_MODE: ${PGBUS_NOTIFY_MODE:-coalesced}
+    ABLY_SERVER_POSTGRES_NOTIFY_WINDOW: ${PGBUS_NOTIFY_WINDOW:-50ms}
+  command:
+    - --mode=cluster
+    - --listen=:8080
+    - --debug-listen=:6060
+    - --log-level=info
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  node1:
+    <<: *ably-node
+    ports:
+      - "8281:8080"
+      - "8291:6060"
+
+  node2:
+    <<: *ably-node
+    ports:
+      - "8282:8080"
+      - "8292:6060"
+
+  node3:
+    <<: *ably-node
+    ports:
+      - "8283:8080"
+      - "8293:6060"

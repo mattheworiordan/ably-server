@@ -38,6 +38,10 @@ func (s *controlStorage) Channel(ctx context.Context, name string, ap storage.Ap
 	return &controlStore{parent: s, ChannelStore: cs}, nil
 }
 
+func (s *controlStorage) Release(ctx context.Context, name string) error {
+	return s.inner.Release(ctx, name)
+}
+
 func (s *controlStorage) Close() error { return s.inner.Close() }
 
 func (s *controlStorage) setGate(g chan struct{}) {

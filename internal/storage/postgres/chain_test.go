@@ -9,7 +9,7 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 )
 
-// Unit tests for the chained delivery point (DESIGN.md §7.3). Every
+// Unit tests for the chained delivery point (DESIGN.md §7.2). Every
 // event here carries its body inline, so no database is involved; the
 // gap-fill timer is parked an hour out so only the chain itself acts.
 

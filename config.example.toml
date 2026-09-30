@@ -29,19 +29,45 @@
 # when --mode=cluster and not supplied by a flag or env var.
 # postgres-dsn = "postgres://user:pw@host:5432/db?sslmode=disable"
 
-# Cluster-mode cross-node bus: postgres (LISTEN/NOTIFY on the store) or
-# nats (NATS core pub/sub; Postgres stays the store) (env:
-# ABLY_SERVER_BUS). See DESIGN.md §7.2 and §7.3.
-# bus = "postgres"
+# Cluster-mode cross-node bus (env: ABLY_SERVER_BUS). Postgres stays the
+# store with every bus; the bus only decides how a committed message
+# reaches the other nodes. See DESIGN.md §7.2.
+#   pgnotify  the shipped LISTEN/NOTIFY broker (the default)
+#   postgres  per-channel LISTEN; see postgres-notify-mode
+#   nats      NATS core pub/sub; needs nats-url
+# bus = "pgnotify"
 
-# NATS server URL for bus = "nats"; a comma-separated list is accepted
-# (env: ABLY_SERVER_NATS_URL). Required when bus = "nats".
-# nats-url = "nats://127.0.0.1:4222"
+# NATS server URL for bus = "nats"; a comma-separated list of the servers
+# of one NATS cluster is accepted (env: ABLY_SERVER_NATS_URL).
+# nats-url = "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
 
 # Largest encoded message the NATS bus carries inline, in bytes; larger
 # ones travel as a pointer that receivers read from Postgres (env:
 # ABLY_SERVER_NATS_INLINE_MAX_BYTES).
 # nats-inline-max-bytes = 262144
+
+# Notify mode for bus = "postgres" (env:
+# ABLY_SERVER_POSTGRES_NOTIFY_MODE): "coalesced" (the default; writes
+# commit without NOTIFY and each node sends at most one wake-up per
+# channel per window) or "transactional" (one NOTIFY per write, inside
+# its transaction).
+# postgres-notify-mode = "coalesced"
+
+# Coalescing window for postgres-notify-mode = "coalesced", as a duration
+# string: the extra delivery latency a remote subscriber pays in that
+# mode (env: ABLY_SERVER_POSTGRES_NOTIFY_WINDOW).
+# postgres-notify-window = "50ms"
+
+# Cap on channels pending a coalesced wake-up on one node. A write to a
+# further channel is not announced; receivers deliver it on their next
+# sweep instead (env: ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING).
+# postgres-notify-max-pending = 65536
+
+# How often bus = "postgres" or "nats" checks every bound channel against
+# its committed serial and catches up one that fell behind, as a
+# duration string; "0s" means the bus default, 2s for postgres and 5s
+# for nats (env: ABLY_SERVER_BUS_SWEEP_INTERVAL).
+# bus-sweep-interval = "0s"
 
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).

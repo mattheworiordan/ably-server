@@ -31,8 +31,13 @@ One Go binary, three storage modes selected by `--mode`:
 |-----------|----------------|--------------|-----------------------------------|
 | `memory`  | in-process     | in-process   | tests, local dev, ephemeral       |
 | `disk`    | embedded KV    | in-process   | single-node with persistence      |
-| `cluster` | Postgres       | `LISTEN/NOTIFY` | N stateless nodes, shared DB   |
-| `cluster` + `--bus=nats` | Postgres | NATS core pub/sub | N stateless nodes, shared DB, NATS carries cross-node delivery ([DESIGN.md §7.3](DESIGN.md#73-cluster-mode-with-a-nats-bus)) |
+| `cluster` | Postgres       | `LISTEN/NOTIFY` on one channel (`--bus=pgnotify`, the default) | N stateless nodes, shared DB   |
+| `cluster` + `--bus=postgres` | Postgres | per-channel `LISTEN`, coalesced wake-ups by default | N stateless nodes, shared DB, no other dependency |
+| `cluster` + `--bus=nats` | Postgres | NATS core pub/sub | N stateless nodes, shared DB, a NATS server or cluster carries cross-node delivery |
+
+In every cluster mode Postgres is the store and orders each channel;
+`--bus` only chooses how a committed message reaches the other nodes
+([DESIGN.md §7.2](DESIGN.md#72-cluster-bus)).
 
 Server processes are stateless: any node can serve any connection.
 There's no peer-to-peer membership or gossip — in `cluster` mode, the
@@ -98,8 +103,11 @@ ably-server --mode disk --data-dir ./data
 export ABLY_SERVER_POSTGRES_DSN='postgres://user:pw@host:5432/db?sslmode=disable'
 ably-server --mode cluster
 
+# Clustered, with the rebuilt Postgres bus (no extra dependency)
+ably-server --mode cluster --bus postgres
+
 # Clustered, with NATS as the cross-node bus (Postgres stays the store)
-ably-server --mode cluster --bus nats --nats-url nats://host:4222
+ably-server --mode cluster --bus nats --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
 ```
 
 `bench/docker-compose.nats.yml` runs three `--bus=nats` nodes with

@@ -56,6 +56,10 @@ const (
 	busEnv             = "ABLY_SERVER_BUS"
 	natsURLEnv         = "ABLY_SERVER_NATS_URL"
 	natsInlineMaxEnv   = "ABLY_SERVER_NATS_INLINE_MAX_BYTES"
+	pgNotifyModeEnv    = "ABLY_SERVER_POSTGRES_NOTIFY_MODE"
+	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
+	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
+	busSweepEnv        = "ABLY_SERVER_BUS_SWEEP_INTERVAL"
 )
 
 // Opts bundles Run's inputs so the production main() and tests
@@ -122,6 +126,21 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	pgNotifyWindowDefault, err := config.DefaultDuration(opts.Getenv(pgNotifyWindowEnv), file.PostgresNotifyWindow, postgres.DefaultNotifyWindow)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	pgNotifyMaxPendingDefault, err := config.DefaultInt(opts.Getenv(pgNotifyMaxPendEnv), file.PostgresNotifyMaxPending, postgres.DefaultNotifyMaxPending)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	busSweepDefault, err := config.DefaultDuration(opts.Getenv(busSweepEnv), file.BusSweepInterval, 0)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
 	fs.SetOutput(opts.Out)
@@ -132,9 +151,13 @@ func Run(ctx context.Context, opts Opts) int {
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
-	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPostgres), "cluster-mode cross-node bus: postgres (LISTEN/NOTIFY) or nats; Postgres stays the store either way (env: "+busEnv+")")
-	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222 (env: "+natsURLEnv+")")
+	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPGNotify), "cluster-mode cross-node bus: pgnotify (the shipped LISTEN/NOTIFY broker), postgres (per-channel LISTEN, see --postgres-notify-mode) or nats; Postgres stays the store in every case (DESIGN.md §7.2) (env: "+busEnv+")")
+	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted (env: "+natsURLEnv+")")
 	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
+	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), file.PostgresNotifyMode, string(postgres.NotifyCoalesced)), "--bus=postgres notify mode: coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) or transactional (one NOTIFY per write, inside its transaction) (env: "+pgNotifyModeEnv+")")
+	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced (env: "+pgNotifyWindowEnv+")")
+	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
+	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks every bound channel against its committed serial and catches up one that fell behind; 0 means the bus default (postgres 2s, nats 5s) (env: "+busSweepEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -204,11 +227,15 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	store, err := openStorage(ctx, *mode, *dataDir, clusterOptions{
-		dsn:           *postgresDSN,
-		bus:           *bus,
-		natsURL:       *natsURL,
-		natsInlineMax: *natsInlineMax,
-		logger:        logger,
+		dsn:              *postgresDSN,
+		bus:              *bus,
+		natsURL:          *natsURL,
+		natsInlineMax:    *natsInlineMax,
+		notifyMode:       *pgNotifyMode,
+		notifyWindow:     *pgNotifyWindow,
+		notifyMaxPending: *pgNotifyMaxPending,
+		sweepInterval:    *busSweep,
+		logger:           logger,
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -223,13 +250,15 @@ func Run(ctx context.Context, opts Opts) int {
 			logger.Error("close storage", "err", err)
 		}
 	}()
-	if *mode == "cluster" {
-		logger.Info("storage ready", "mode", *mode, "bus", *bus)
+	m := metrics.New()
+	if bs, ok := store.(storage.BusStatser); ok {
+		st := bs.BusStats()
+		logger.Info("storage ready", "mode", *mode, "bus", st.Bus, "postgresNotifyMode", st.Mode)
+		m.RegisterBus(bs) // ably_bus_* series (DESIGN.md §7.2, §10)
 	} else {
 		logger.Info("storage ready", "mode", *mode)
 	}
 
-	m := metrics.New()
 	manager := core.NewManager(store)
 
 	// Pre-seed presence fixtures declared in the config file before
@@ -485,8 +514,9 @@ func writeAddrFile(path, addr string) error {
 //   - memory: in-process, no persistence.
 //   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
 //   - cluster: postgres at cluster.dsn (auto-migrates schema on Open),
-//     with cluster.bus as the cross-node bus: the LISTEN/NOTIFY broker
-//     by default (DESIGN.md §7.2) or NATS (§7.3).
+//     with cluster.bus as the cross-node bus: pgnotify (the shipped
+//     LISTEN/NOTIFY broker, the default), postgres or nats (DESIGN.md
+//     §7.2).
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
@@ -612,13 +642,17 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 }
 
 // clusterOptions carries the cluster-mode storage settings: the Postgres
-// DSN and the cross-node bus (DESIGN.md §7.2, §7.3).
+// DSN and the cross-node bus (DESIGN.md §7.2).
 type clusterOptions struct {
-	dsn           string
-	bus           string
-	natsURL       string
-	natsInlineMax int
-	logger        *logging.Logger
+	dsn              string
+	bus              string
+	natsURL          string
+	natsInlineMax    int
+	notifyMode       string
+	notifyWindow     time.Duration
+	notifyMaxPending int
+	sweepInterval    time.Duration
+	logger           *logging.Logger
 }
 
 func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptions) (storage.Storage, error) {
@@ -638,10 +672,24 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
 		}
 		switch cluster.bus {
-		case postgres.BusPostgres:
-			// The default: no NATS settings apply. The logger is passed only
-			// for the NATS bus so the default path is exactly as before.
+		case postgres.BusPGNotify:
+			// The default, opened exactly as before the bus seam: no bus
+			// settings apply.
 			return postgres.Open(ctx, postgres.Options{DSN: cluster.dsn})
+		case postgres.BusPostgres:
+			mode, err := postgres.ParseNotifyMode(cluster.notifyMode)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --postgres-notify-mode: %w", err)
+			}
+			return postgres.Open(ctx, postgres.Options{
+				DSN:              cluster.dsn,
+				Bus:              postgres.BusPostgres,
+				NotifyMode:       mode,
+				NotifyWindow:     cluster.notifyWindow,
+				NotifyMaxPending: cluster.notifyMaxPending,
+				SweepInterval:    cluster.sweepInterval,
+				Logger:           cluster.logger,
+			})
 		case postgres.BusNATS:
 			if cluster.natsURL == "" {
 				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
@@ -651,10 +699,11 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 				Bus:                postgres.BusNATS,
 				NATSURL:            cluster.natsURL,
 				NATSInlineMaxBytes: cluster.natsInlineMax,
+				SweepInterval:      cluster.sweepInterval,
 				Logger:             cluster.logger,
 			})
 		default:
-			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s)", cluster.bus, postgres.BusPostgres, postgres.BusNATS)
+			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s, %s)", cluster.bus, postgres.BusPGNotify, postgres.BusPostgres, postgres.BusNATS)
 		}
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)

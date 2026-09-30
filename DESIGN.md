@@ -132,7 +132,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable, and also while the bus connection is down with `--bus=nats` (NATS) or `--bus=postgres` (LISTEN) (§7.2) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -694,8 +694,8 @@ internal/realtime/      # WebSocket upgrade, connection loop, attachment cursor,
 internal/rest/          # HTTP handlers + router
 internal/core/          # Channel + ChannelManager (live entry list)
 internal/storage/       # Storage interface + memory / bbolt / postgres backends
-                        #   (the postgres backend carries the cluster bus: LISTEN/NOTIFY
-                        #   by default, or NATS, §7.3)
+                        #   (the postgres backend carries the cluster bus: pgnotify
+                        #   by default, the rebuilt postgres bus, or NATS, §7.2)
 internal/serial/        # channelSerial minting + global ordering
 internal/id/            # connection IDs, message IDs
 internal/compatgate/    # known-failures diff logic behind cmd/compat-gate
@@ -718,7 +718,7 @@ exposes two methods:
   `store.Store(ctx, msgs)`, which mints the channelSerial and
   persists. The link onto the live list arrives via the Appender
   callback — synchronously after commit in memory/bbolt;
-  asynchronously via the LISTEN goroutine in Postgres (§7).
+  asynchronously via the cluster bus in Postgres (§7.2).
 - `Append(cm)` — satisfies the `storage.Appender` contract. It is
   the **only** writer to the linked list, and it is called only by
   the storage backend (never directly by publish-path callers, in
@@ -738,6 +738,11 @@ The Channel is removed from the manager only when **both** are true:
 
 - it has no attachments, and
 - every entry on its linked list has aged past the retention window (§6).
+
+Removing a Channel calls `storage.Release(name)`, which drops the
+storage binding and, in cluster mode, the bus subscription (§7.2); the
+next `ATTACH` or publish re-binds through `storage.Channel`. (The
+storage hook exists; the eviction policy that calls it is being built.)
 
 Holding the Channel for the retention window after the last detach keeps the
 in-process list available to serve a fresh `ATTACH` that arrives soon
@@ -854,9 +859,11 @@ single delivery path for committed cms: the backend invokes
 `appender.Append(cm)` on every fresh publish (skipped on idempotent
 returns, where the original was delivered when first persisted).
 Memory and bbolt fire it synchronously after commit. Postgres fires
-it asynchronously from the LISTEN goroutine after the NOTIFY emitted
-inside the commit tx round-trips — including for the publisher's own
-publish, so there is no separate path for self-publishes (§7).
+it asynchronously through the cluster bus (§7.2): with `pgnotify` from
+the LISTEN goroutine after the NOTIFY emitted inside the commit tx
+round-trips, including for the publisher's own publish; with `postgres`
+or `nats` the publishing node's own cm takes a fast path straight after
+commit and other nodes' cms arrive over the bus.
 
 Serial minting and idempotency live behind this interface so persistent
 backends (bbolt, Postgres) can restore monotonic generator state across
@@ -920,9 +927,10 @@ live tail is a bounded history range scan.
 
 ### 6.3 Database backend (cluster mode)
 
-Postgres only. LISTEN/NOTIFY gives us pub/sub and the same connection
-serves as the durable store, so cluster mode needs nothing beyond a
-single Postgres.
+Postgres only. With the `pgnotify` or `postgres` bus (§7.2), LISTEN/NOTIFY
+gives us pub/sub and the same database serves as the durable store, so
+cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
+a NATS server or cluster for delivery; Postgres stays the store.
 
 Schema sketch:
 
@@ -1063,7 +1071,7 @@ writer to the linked list in every mode.
 Presence enter/update/leave ride this exact path: a presence operation
 is a cm like any other (carrying `Presence` rather than `Messages`) and
 reaches subscribers through the identical `storage → Append` mechanism,
-including the cross-node NOTIFY round-trip in cluster mode (§12.2).
+including cross-node delivery over the cluster bus (§7.2, §12.2).
 
 ### 7.1 Single-process modes (`memory`, `disk`)
 
@@ -1086,125 +1094,222 @@ Local subscribers parked on the previous tail's `notify` wake up and
 observe the new entry. ACK/201 fires once `Publish` returns; the
 linked-list update has already happened by then.
 
-### 7.2 Cluster mode (Postgres broker)
+### 7.2 Cluster bus
 
-Same `channel.Publish` API; the Appender fires from a dedicated
-LISTEN goroutine running inside `postgres.Storage`. A publish is:
+In cluster mode Postgres is always the store: it mints each channel's
+serials under the `channels` row lock, holds the log that serves resume
+and history, and commits every publish before the ACK. The **bus** is
+only how a committed cm reaches the other nodes that hold its channel.
+`--bus` selects it; the rest of the server does not change. The bus sits
+behind a small seam inside the postgres backend
+(`internal/storage/postgres/bus.go`).
 
-1. The publishing node's `store.Store(ctx, msgs)` mints the serial,
-   `INSERT`s the rows, and emits
-   `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`
-   inside the same transaction. PG buffers the NOTIFY until commit,
-   so listeners only see it if the publish committed.
-2. **Every** node's LISTEN goroutine — including the publisher's
-   — receives the NOTIFY, parses the JSON payload, looks up the
-   local `ChannelStore` for that channel name, fetches the canonical
-   cm by `(channel, channel_serial)`, and calls
-   `appender.Append(cm)`. The publisher's local subscribers see the
-   publish via this same round-trip — there is no fast-path direct
-   Append; no self-vs-foreign dedup.
+| `--bus` | How a committed cm reaches other nodes | Extra infrastructure | What bounds it |
+|---|---|---|---|
+| `pgnotify` (default) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
+| `postgres` | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
+| `nats` | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel | a NATS core server or cluster | One primary's commit rate |
 
-This means the publisher's local-visibility latency is one NOTIFY
-round-trip (typically ~1–5ms against a same-region Postgres). The
-trade-off is a single, symmetric delivery path: any cm reaches its
-Channel via exactly one mechanism (the Appender callback), regardless
-of which node minted it.
+`pgnotify` is the default so the shipped behaviour stays the default
+until the deployment sizes are written from measured numbers.
 
-Notifications for channels that have never been opened on this node
-(no `Channel(name, appender)` call yet) are silently dropped. The
-canonical cm remains in storage and is picked up by the eventual
-`ATTACH` via the history-replay path (§4.3).
+**The publish path, common to every bus.** The publish transaction mints
+the serial under the channels-row lock and writes the rows. The bus then
+runs a hook inside the transaction (`pgnotify` and transactional
+`postgres` NOTIFY here, so listeners see the cm only if it commits), the
+transaction commits, and the bus runs a hook after commit (the NATS
+publish, the coalesced wake-up mark, the publisher fast path). The ACK is
+sent after the commit in every mode.
 
-The serial's format is itself the global ordering: the `<seriesId>`
-suffix disambiguates serials minted in the same millisecond by
-different processes, so storage's `ORDER BY channel_serial` reflects
-a single global publish order without a central sequence. Local
-linked-list arrival order on a given node approximates this but may
-have small inversions under cross-node interleavings — canonical
-order is the storage scan.
+#### pgnotify
 
-NOTIFY's 8KB payload limit is why we send pointers `(channel,
-serial)` rather than full payloads. PG delivers notifications
-at-most-once: a NOTIFY emitted while the LISTEN conn is down is not
-redelivered when it reconnects. The broker therefore survives dropped
-LISTEN connections rather than treating a `WaitForNotification` error
-as fatal. When the conn drops, the LISTEN goroutine re-dials a fresh
-`pgx.Conn` with capped exponential backoff, re-`LISTEN`s, and — before
-resuming the notification loop — **reconciles** each registered
-channel: it reads `History(AfterChannelSerial: lastSeen)` (both the
-message and presence streams, merged in serial order) and delivers each
-missed cm. Re-`LISTEN` precedes the reconcile scan, so any cm committed
-during reconciliation is also buffered as a NOTIFY and observed once the
-loop resumes — never lost in a gap between the snapshot and resubscribe.
-It retries until the storage is `Close()`d.
+The bus as shipped. The publish transaction emits
+`pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`. Every
+node's LISTEN goroutine, including the publisher's, receives every
+notification, looks up the local `ChannelStore` for that channel, reads
+the cm back by `(channel, channel_serial)` and calls `appender.Append(cm)`.
+The publisher's own subscribers see the publish through this same round
+trip; there is no fast path. Notifications for channels not bound on the
+node are dropped; the cm stays in the log for a later `ATTACH` (§4.3).
 
-Delivery is idempotent across the two paths. Every append — steady-state
-NOTIFY dispatch and reconcile replay alike — funnels through a single
-per-channel delivery point that tracks the highest `channel_serial`
-handed to the appender and drops any cm whose serial is not strictly
-greater. So a cm that arrives via both the reconnect history replay and
-a subsequently-buffered NOTIFY reaches the Channel exactly once, in
-order.
+Postgres delivers notifications at most once. When the LISTEN connection
+drops, the goroutine re-dials with capped exponential backoff,
+re-`LISTEN`s, and then reconciles each bound channel from
+`History(AfterChannelSerial: lastSeen)` (messages and presence, merged in
+serial order) before it resumes. A per-channel high-water mark drops any
+cm at or below the last one delivered, so the reconcile and a buffered
+notification never deliver a cm twice. The mark is seeded with the
+channel's watermark at bind, so a notification for a cm already covered
+by the watermark is dropped too.
 
-LISTEN/NOTIFY's well-known throughput ceiling is not a concern here:
-ably-server targets developer-loop, CI, and modest single-region
-self-host deployments. Operators who need cloud-scale throughput
-should use Ably or fork.
+Two ceilings limit this bus. Postgres serialises every transaction that
+issued a NOTIFY on one lock, shared by every database in the Postgres
+cluster and held until the commit record is flushed, so NOTIFYing
+publishes commit one at a time and cannot group-commit. And every node
+receives the whole cluster's notifications on one goroutine that runs a
+SELECT before it takes the next one. Adding nodes raises neither.
 
-### 7.3 Cluster mode with a NATS bus
+#### Chained delivery (postgres and nats)
 
-`--bus=nats` (with `--nats-url`) keeps Postgres as the store and moves
-only cross-node delivery onto NATS core pub/sub. Delivery sits behind a
-small `Bus` seam in the postgres backend (`internal/storage/postgres/bus.go`);
-the LISTEN/NOTIFY broker of §7.2 is the default `Bus` and is unchanged.
-A publish is:
+The `postgres` and `nats` buses share one delivery point
+(`internal/storage/postgres/chain.go`):
 
-1. `store.Store` mints the serial and writes the rows as in §7.2, and in
-   the same round trip reads the channel's previous serial under the
-   channels-row lock. It emits **no NOTIFY**. Postgres serialises every
-   transaction that has issued a NOTIFY on one exclusive lock, shared by
-   every database in the Postgres cluster and held until after the
-   commit record is flushed, so NOTIFYing publishes commit one at a time
-   and cannot group-commit; without the NOTIFY they can.
-2. After commit, the publishing node publishes one message to the
-   channel's subject: `ably.cm.` plus the unpadded URL-safe base64 of the
-   channel name (`ably.cm.h.<sha256 hex>` for a name too long to encode).
-   The body is a msgpack envelope of channel, serial, previous serial and
-   the cm as stored, with annotation summary snapshots. A cm whose
-   encoding exceeds `--nats-inline-max-bytes` (default 256 KiB) goes as a
-   pointer, and receivers fetch it by serial, like the LISTEN path.
-3. **Publisher fast path.** The publishing node gives the cm to its own
-   delivery point straight after commit. Local subscribers do not wait
-   for a bus round trip; the bus echo that follows is a duplicate that
-   the high-water mark drops.
-4. A node subscribes to a channel's subject when `Storage.Channel` first
-   binds the channel, before it reads the watermark (a flush confirms the
-   SUB is registered). So a node receives only the channels it holds and
-   misses nothing committed after the watermark read. Each subscription
-   has its own delivery goroutine, and an inline cm needs no read-back.
+- **Predecessor.** The publish transaction reads the channel's previous
+  serial under the same channels-row lock, in the same round trip as the
+  serial advance. Every bus message names that predecessor.
+- **Bind order.** `Storage.Channel(name, appender)` puts the bus
+  subscription in place (a LISTEN, or a NATS SUB confirmed by a flush)
+  before it reads the channel's watermark. A cm committed after the read
+  therefore reaches the node; one committed before it sorts at or below
+  the watermark, which seeds the delivery point's mark. Messages that
+  arrive while the bind is in flight are held until the seed.
+- **Publisher fast path.** Straight after commit the publishing node
+  offers the cm to its own delivery point for the channel. Local
+  subscribers do not wait for the bus; the bus echo is a duplicate the
+  mark drops.
+- **Order.** A cm whose predecessor is the last delivered serial is
+  appended at once. A cm that arrives ahead of its predecessor is held.
+  If the predecessor has not arrived within 100 ms, the missing range is
+  read from the log (all kinds, serial order, a page at a time) and
+  delivered. The mark's lock is held across `Appender.Append`, so a
+  Channel sees every cm once and in serial order whichever path
+  delivered it.
+- **Reconcile.** After the bus connection comes back, every bound channel
+  is caught up from its mark, 500 channels per query.
+- **Sweep.** Every sweep interval (`--bus-sweep-interval`; defaults 2 s for
+  `postgres`, 5 s for `nats`) each node reads the committed serial of its
+  bound channels, 1,000 per query, and catches up any channel still
+  behind the serial the previous sweep saw. A cm that old whose bus
+  message has not arrived is treated as lost, not late.
 
-**Ordering.** NATS orders messages per publishing connection, not across
-nodes. Every bus message therefore names its predecessor serial, and the
-per-channel delivery point (the §7.2 high-water mark) appends a cm only
-when its predecessor is the last serial delivered. A cm that arrives
-early is held. If its predecessor has not arrived within 100 ms, the
-missing range is read from the log (all kinds, serial order) and
-delivered. Order and exactly-once delivery are as on the LISTEN bus.
+#### postgres
 
-**Reconcile.** NATS core is at-most-once. After a reconnect the client
-re-sends every SUB; a flush confirms the server has them, and then each
-bound channel is replayed from its mark (the §7.2 re-LISTEN-then-reconcile
-order). A bus message can also be lost with no later publish to show the
-gap (the publisher dies between commit and publish, a slow consumer
-drops it). So every 5 s each node reads the watermarks of its bound
-channels in one query and catches up any channel still behind the
-watermark of the previous sweep. Such a cm arrives late, not never.
+Each Ably channel has its own Postgres notification channel: `ably_c_`
+plus the hex of the first 16 bytes of SHA-256(schema, NUL, channel name),
+a short lower-case identifier whatever the name. The schema
+(`current_schema()`) is in the hash because NOTIFY is scoped per database,
+not per schema. A node LISTENs on a channel when it binds it and
+UNLISTENs when it releases it, so it receives notifications only for the
+channels it holds.
 
-**Gaps.** Subscriptions last for the process lifetime: the Manager never
-releases a channel (§5.1), so there is no hook to unsubscribe on.
-Reconcile reads the log once per bound channel. `/readyz` checks
-Postgres only. There are no NATS auth or TLS options beyond the URL, and
-no bus metrics. JetStream is not used.
+In **transactional** mode the transaction NOTIFYs the channel's own
+notification channel with `{channel, serial, prev}` and, when the payload
+stays under 7,900 bytes, the cm's rows exactly as stored (one msgpack
+payload per row plus the annotation summary column), so receivers skip
+the read-back. `pg_notify` rejects payloads of 8,000 bytes or more, so a
+bigger cm sends the pointer only. This mode removes the per-node ceilings
+of `pgnotify` but keeps the notify commit lock.
+
+In **coalesced** mode (the default) writes commit without NOTIFY. A
+per-node notifier sends at most one wake-up per channel per window
+(`--postgres-notify-window`, default 50 ms), in statements outside any
+transaction, each naming the latest serial the node wrote on the channel.
+A receiver answers a wake-up with one range read after its mark, or no
+read if it is already past that serial. Remote subscribers pay up to one
+window of extra latency; the publisher's fast path is unchanged.
+
+The LISTEN goroutine only receives and dispatches. Each payload goes to
+the bound channel's queue; a channel with queued work has one worker,
+started on demand and gone when the queue drains, so channels are
+consumed in parallel and each stays in order. A worker waits until its
+channel's bind has seeded before it handles anything.
+
+**Overflow policy.**
+
+- *Receive side.* A channel's queue holds at most 1,024 notifications.
+  One that finds it full is dropped and the channel is marked; its worker
+  then discards what is queued and catches the channel up from the log in
+  one range read, which delivers everything the dropped notifications
+  announced. The LISTEN goroutine never blocks, so a slow channel cannot
+  stall another. Each drop counts in `ably_bus_drops_total`.
+- *Coalesced send side.* A wake-up is at most the notification channel
+  name plus `{"serial":...,"wake":true}`, whatever the Ably channel name,
+  so it can never exceed the payload limit. The pending set holds one
+  entry per channel written in the window, so a hot channel costs one
+  entry however often it is written. It is capped at
+  `--postgres-notify-max-pending` channels (default 65,536): a write to a
+  channel not already pending when the set is full is not announced, is
+  counted in `ably_bus_coalesced_overflow_total`, and is delivered by the
+  receivers' next sweeps. A flush sends 1,000 wake-ups per statement; a
+  statement that fails (a Postgres error, or a full NOTIFY queue) puts its
+  wake-ups back into the pending set for the next window, within the same
+  cap. The notifier flushes one window at a time: when a flush takes
+  longer than the window, marks arriving meanwhile coalesce into the next
+  flush, so falling behind costs latency and never grows the set beyond
+  one entry per channel.
+
+The LISTEN connection re-dials with capped exponential backoff,
+re-LISTENs every bound channel in batches of 500 statements, and requests
+a reconcile. Postgres still wakes every listening backend on each
+notifying commit, and each backend filters the notification against its
+own LISTEN list, so per-channel LISTEN moves that filtering from the
+nodes into Postgres. Coalescing bounds the notification count for hot
+channels.
+
+#### nats
+
+After commit the publishing node publishes one message to the channel's
+subject, `ably.cm.` plus the unpadded URL-safe base64 of the channel name
+(`ably.cm.h.<sha256 hex>` for a name too long to encode). The body is a
+msgpack envelope of channel, serial, predecessor and the cm as stored,
+with annotation summary snapshots. A cm whose encoding exceeds
+`--nats-inline-max-bytes` (default 256 KiB) goes as a pointer, and
+receivers read it by serial. The publish transaction emits no NOTIFY.
+Each subscription has its own delivery goroutine.
+
+`--nats-url` may list the servers of one NATS cluster, comma-separated.
+The client connects to one, learns the others from the cluster, and on a
+disconnect moves to another (a silent server is detected by pings within
+about 15 s). Every reconnect re-sends the node's subscriptions; a flush
+confirms the server has them, and then every bound channel is reconciled.
+In a cluster the bind's flush confirms only that the node's own server
+has the SUB: a publish through another server in the moment before the
+interest reaches it over the route can miss the node. That cm is late,
+not lost: the next message's predecessor or the sweep recovers it. A slow
+consumer that NATS drops messages for counts in `ably_bus_drops_total`
+and is repaired the same way.
+
+**Readiness.** In `nats` mode `/readyz` returns 503 while the node has no
+NATS connection, and in `postgres` mode while its LISTEN connection is
+down: the node cannot receive cross-node deliveries, so it leaves
+rotation until it reconnects and reconciles. `pgnotify` reports ready
+while the pool pings, as before.
+
+#### Release and re-bind
+
+`Storage.Release(name)` (the hook idle-channel eviction calls, §5.1)
+stops delivery to the channel's appender, removes the bus subscription
+(UNLISTEN or NATS unsubscribe; `pgnotify` has none) and forgets the
+`ChannelStore`. A later `Storage.Channel(name, appender)` binds afresh:
+subscription first, then the watermark read that initialises the new
+appender and seeds its mark. Every cm committed after that watermark,
+including one committed while the channel was released, reaches the new
+appender once and in order; nothing at or below it is delivered. A
+`ChannelStore` handed out before the release still stores and reads;
+its publishes reach whichever appender is bound at the time. A release
+and a re-bind of the same channel queue their UNLISTEN and LISTEN in the
+order they happened, so the re-bind's LISTEN stays in effect. The caller
+serialises `Channel` and `Release` for one name; if they overlap, the
+outcome is as if the release came second.
+
+#### Can a delivery be lost when the bus send is not transactional?
+
+No; it can be late. On the `postgres` coalesced and `nats` buses the
+message is committed before the bus is told, so the bus message is a hint
+that the log has moved, and every loss below is recovered from the log.
+
+| Failure | pgnotify | postgres, transactional | postgres, coalesced | nats |
+|---|---|---|---|---|
+| Publisher dies between commit and bus send | cannot happen (NOTIFY commits with the write) | cannot happen | wake-up never sent: next sweeps (at most about two intervals) | message never sent: next cm's predecessor (100 ms hold) or next sweeps |
+| Receiver's bus connection drops | reconcile from history on reconnect (messages and presence) | reconcile from the log on reconnect | same | same, after a flush confirms the re-sent SUBs |
+| A NATS server in the cluster dies | n/a | n/a | n/a | client moves to another server, then reconciles |
+| Receiver falls behind | the node's one read-back loop lags; nothing is dropped | full queue: drop, then one catch-up read | same | NATS slow-consumer drop: predecessor gap or sweep |
+| Read of a pointer or gap fails | that cm is not delivered to that node until a reconnect reconcile | retried from the log with backoff | same | same |
+| Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
+
+Worst case for the chained buses is about two sweep intervals late. The
+load tests check this rather than assume it: the serial-continuity
+check fails on any gap or duplicate.
 
 ## 8. Identifiers & ordering
 
@@ -1385,9 +1490,13 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only
---bus {postgres|nats}         cluster mode cross-node bus (§7.2, §7.3); default: postgres
---nats-url nats://…           --bus=nats only
+--bus {pgnotify|postgres|nats}  cluster mode cross-node bus (§7.2); default: pgnotify
+--nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
+--postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
+--postgres-notify-window 50ms   coalescing window (coalesced mode)
+--postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
+--bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (postgres 2s, nats 5s)
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -1407,9 +1516,11 @@ reader polling the path never sees a partial address.
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
-`nats-inline-max-bytes`, `shutdown-grace`,
+`nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
+`postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub` —
-`shutdown-grace` as a duration string, e.g. `"10s"`). API keys are
+`shutdown-grace`, `postgres-notify-window` and `bus-sweep-interval` as
+duration strings, e.g. `"10s"`). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
@@ -1492,6 +1603,31 @@ name = "persisted:presence_fixtures"
     storage-commit/ACK.
   - `ably_http_requests_total{route,method,status}` (counter) — REST requests
     by matched route pattern, method, and response status.
+
+  In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
+  - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
+    bus notify mode; `ably_bus_connected` and `ably_bus_bound_channels`
+    (gauges).
+  - Traffic: `ably_bus_published_total`, `ably_bus_publish_errors_total`,
+    `ably_bus_pointers_total`, `ably_bus_received_total`,
+    `ably_bus_unrouted_total`, `ably_bus_malformed_total`.
+  - Delivery paths, one count per cm appended:
+    `ably_bus_inline_deliveries_total`, `ably_bus_fetched_deliveries_total`,
+    `ably_bus_fast_path_deliveries_total`,
+    `ably_bus_filled_deliveries_total` (log range reads).
+  - Recovery: `ably_bus_duplicates_total`, `ably_bus_holds_total`,
+    `ably_bus_gap_fills_total`, `ably_bus_fetch_errors_total`,
+    `ably_bus_drops_total`, `ably_bus_reconciles_total`,
+    `ably_bus_reconciled_channels_total`, `ably_bus_reconcile_seconds_total`,
+    `ably_bus_sweeps_total`, `ably_bus_sweep_catch_ups_total`,
+    `ably_bus_sweep_seconds_total`.
+  - Postgres bus: `ably_bus_listens_total`, `ably_bus_unlistens_total`, and
+    in coalesced mode `ably_bus_coalesced_wakeups_sent_total`,
+    `ably_bus_coalesced_wakeups_received_total`,
+    `ably_bus_coalesced_flushes_total`,
+    `ably_bus_coalesced_flush_errors_total`,
+    `ably_bus_coalesced_flush_seconds_total` and
+    `ably_bus_coalesced_overflow_total`.
 
   Standard Go runtime and process collectors are also registered.
 - **Tracing**: OpenTelemetry, off by default and configured entirely through

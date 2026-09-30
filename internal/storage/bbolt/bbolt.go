@@ -150,6 +150,11 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
+		if appender != nil {
+			if err := s.rebind(cs, appender); err != nil {
+				return nil, err
+			}
+		}
 		return cs, nil
 	}
 	cs := &channelStore{
@@ -171,6 +176,56 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 	}
 	appender.Initialize(current, initial)
 	return cs, nil
+}
+
+// Release unbinds the channel's appender (storage.Storage.Release). The
+// channel's data stays in the bolt file; a later Channel call binds a new
+// appender at the channel's current serial.
+func (s *Storage) Release(_ context.Context, name string) error {
+	s.mu.Lock()
+	cs, ok := s.channels[name]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	cs.bindMu.Lock()
+	defer cs.bindMu.Unlock()
+	if cs.appender != nil {
+		cs.appender = nil
+		cs.released = true
+	}
+	return nil
+}
+
+// rebind binds appender to a channel whose previous appender was
+// released. The watermark is read under bindMu held for writing, so a
+// publish committed before the read is either delivered to nobody or
+// dropped by boundAt, and every publish committed after it reaches the
+// new appender. A channel that was never released keeps its binding.
+func (s *Storage) rebind(cs *channelStore, appender storage.Appender) error {
+	cs.bindMu.Lock()
+	defer cs.bindMu.Unlock()
+	if !cs.released {
+		return nil
+	}
+	current, initial, err := s.loadOrMintInitial(cs.name)
+	if err != nil {
+		return err
+	}
+	cs.appender = appender
+	cs.released = false
+	cs.boundAt = current
+	appender.Initialize(current, initial)
+	return nil
+}
+
+// deliver hands a freshly committed cm to the bound appender, if any.
+func (cs *channelStore) deliver(cm *protocol.ChannelMessage) {
+	cs.bindMu.RLock()
+	defer cs.bindMu.RUnlock()
+	if cs.appender != nil && cm.ChannelSerial > cs.boundAt {
+		cs.appender.Append(cm)
+	}
 }
 
 // loadOrMintInitial returns the channel's (current, initial) serials.
@@ -286,10 +341,20 @@ func putVersion(tx *bolt.Tx, channel string, m *protocol.Message) error {
 // bolt (one writer at a time per DB) and by the shared generator's
 // internal mutex.
 type channelStore struct {
-	db       *bolt.DB
-	gen      *serial.Generator
-	name     string
+	db   *bolt.DB
+	gen  *serial.Generator
+	name string
+
+	// bindMu guards the appender binding: appender, released (set by
+	// Release, so the next Channel call binds a new appender) and
+	// boundAt (the watermark a rebound appender was initialised at; cms
+	// at or below it are not delivered to it). deliver holds it for
+	// reading across Append, so Release returns only once no Append to
+	// the old appender is in flight.
+	bindMu   sync.RWMutex
 	appender storage.Appender
+	released bool
+	boundAt  string
 
 	// members is the in-memory presence set, guarded by mu. Not
 	// persisted — empty on Open (DESIGN.md §12.5). Lazily allocated.
@@ -386,8 +451,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	// mu, and we want the bolt write lock released ASAP. Idempotent
 	// returns do not re-fire (the original was delivered on its
 	// first persist).
-	if !idempotent && cs.appender != nil {
-		cs.appender.Append(resultCM)
+	if !idempotent {
+		cs.deliver(resultCM)
 	}
 	return resultCM, idempotent, nil
 }
@@ -469,8 +534,8 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, err
 	}
 
-	if !idempotent && cs.appender != nil {
-		cs.appender.Append(resultCM)
+	if !idempotent {
+		cs.deliver(resultCM)
 	}
 	return resultCM, idempotent, nil
 }
@@ -641,8 +706,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		return nil, false, err
 	}
 
-	if !idempotent && cs.appender != nil {
-		cs.appender.Append(resultCM)
+	if !idempotent {
+		cs.deliver(resultCM)
 	}
 	return resultCM, idempotent, nil
 }
@@ -789,8 +854,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	}
 	cs.mu.Unlock()
 
-	if !idempotent && cs.appender != nil {
-		cs.appender.Append(resultCM)
+	if !idempotent {
+		cs.deliver(resultCM)
 	}
 	return resultCM, idempotent, nil
 }

@@ -1,0 +1,77 @@
+# Three ably-server nodes on one Postgres with the shipped cluster bus,
+# --bus=pgnotify (DESIGN.md §7.2): one global LISTEN channel and a NOTIFY
+# inside every publish transaction. This is the "before" stack for the
+# scale runs.
+#
+#   docker compose -f bench/docker-compose.pgnotify.yml up -d --build --wait
+#   docker compose -f bench/docker-compose.pgnotify.yml down -v
+#
+# Host ports: nodes 8381, 8382, 8383; each node's debug listener (pprof
+# and Prometheus /metrics, including the ably_bus_* series) 8391, 8392,
+# 8393; Postgres 5435 (user, password and database "ably"). All nodes
+# share the key app.key:secret. POOL_MAX_CONNS sets the pgxpool size per
+# node (default 16).
+#
+# Ports, project name and image tag differ from the root
+# docker-compose.yml and the other bench stacks, so they can all run side
+# by side.
+
+name: ablypgnotify
+
+x-ably-node: &ably-node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: ably-server:bench-pgnotify
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    ABLY_SERVER_KEYS: app.key:secret
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable&pool_max_conns=${POOL_MAX_CONNS:-16}
+    ABLY_SERVER_BUS: pgnotify
+  command:
+    - --mode=cluster
+    - --listen=:8080
+    - --debug-listen=:6060
+    - --log-level=info
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  node1:
+    <<: *ably-node
+    ports:
+      - "8381:8080"
+      - "8391:6060"
+
+  node2:
+    <<: *ably-node
+    ports:
+      - "8382:8080"
+      - "8392:6060"
+
+  node3:
+    <<: *ably-node
+    ports:
+      - "8383:8080"
+      - "8393:6060"

@@ -93,6 +93,21 @@ type Storage interface {
 	// called.
 	Channel(ctx context.Context, name string, appender Appender) (ChannelStore, error)
 
+	// Release drops this process's binding of the channel (DESIGN.md
+	// §5.1, §7.2): the backend stops delivering to the appender that
+	// Channel bound, frees what it holds per bound channel (in cluster
+	// mode the bus subscription: an UNLISTEN or a NATS unsubscribe) and
+	// forgets the binding. Persisted state is untouched. A later
+	// Channel(name, appender) binds afresh: it calls Initialize with the
+	// channel's watermark at that moment and then delivers every cm
+	// committed after it, including cms committed while the channel was
+	// released, exactly once and in order. A ChannelStore handed out
+	// before Release still stores and reads (its publishes reach
+	// whichever appender is bound at the time); it never delivers to the
+	// released appender. Releasing a channel that is not bound is a
+	// no-op. This is the hook idle-channel eviction calls.
+	Release(ctx context.Context, name string) error
+
 	// Close releases any resources held by the storage backend. After
 	// Close, behaviour of ChannelStores previously handed out is
 	// undefined.
@@ -109,6 +124,76 @@ type Pinger interface {
 	// should be cheap and side-effect-free — callers may invoke it on
 	// every readiness probe.
 	Ping(ctx context.Context) error
+}
+
+// BusStatser is implemented by the cluster-mode backend
+// (postgres.Storage), whose cross-node bus keeps its own counters
+// (DESIGN.md §7.2, §10). internal/metrics exports them as ably_bus_*.
+type BusStatser interface {
+	BusStats() BusStats
+}
+
+// BusStats is a point-in-time copy of a node's cluster bus counters
+// (DESIGN.md §7.2). Counters are cumulative since the process started.
+// A field a bus has no use for stays zero.
+type BusStats struct {
+	// Bus is the bus kind ("pgnotify", "postgres" or "nats"); Mode is the
+	// postgres bus's notify mode ("transactional" or "coalesced"), empty
+	// for the other buses.
+	Bus, Mode string
+	// Connected reports whether the bus connection is up (NATS, or the
+	// LISTEN connection for the Postgres buses).
+	Connected bool
+	// BoundChannels is the number of channels bound on this node.
+	BoundChannels int
+
+	// Published counts bus messages sent for committed cms (NATS
+	// publishes, or NOTIFYs inside publish transactions); PublishErrors
+	// the NATS publishes that failed after commit; Pointers the cms sent
+	// as a (channel, serial) pointer because they were too big to inline.
+	Published, PublishErrors, Pointers uint64
+
+	// Received counts bus messages received; Unrouted those for a
+	// channel with no bound store; Malformed those that did not decode.
+	Received, Unrouted, Malformed uint64
+
+	// Delivery paths, one count per cm appended: Inline (body carried by
+	// the bus message), Fetched (read back by serial: a pointer, or every
+	// pgnotify delivery), FastPath (the publishing node's own commit) and
+	// Filled (log range reads: gap fills, reconciles, sweeps, wake-ups).
+	Inline, Fetched, FastPath, Filled uint64
+
+	// Duplicates counts offers dropped because the cm was already
+	// delivered; Held the cms that arrived ahead of their predecessor;
+	// GapFills the log reads that filled a gap; FetchErrors the failed
+	// log reads on the delivery path.
+	Duplicates, Held, GapFills, FetchErrors uint64
+
+	// ReconcileRuns counts reconciles after a bus reconnect; Reconciles
+	// the channels they caught up; ReconcileSeconds their total duration.
+	ReconcileRuns, Reconciles uint64
+	ReconcileSeconds          float64
+
+	// Sweeps counts watermark sweeps; SweepCatchUps the channels they
+	// found behind and caught up; SweepSeconds their total duration.
+	Sweeps, SweepCatchUps uint64
+	SweepSeconds          float64
+
+	// Drops counts bus messages dropped before delivery: a NATS slow
+	// consumer, or a full per-channel queue on the postgres bus. Each is
+	// recovered from the log.
+	Drops uint64
+
+	// Listens and Unlistens count LISTEN and UNLISTEN statements (the
+	// postgres bus, including re-LISTENs after a reconnect).
+	Listens, Unlistens uint64
+
+	// Coalesced mode: WakeupsSent and WakeupsReceived count wake-ups;
+	// Flushes the notifier's flush statements and FlushSeconds their
+	// total duration; FlushErrors the flushes that failed; Overflow the
+	// wake-ups dropped by the overflow policy (DESIGN.md §7.2).
+	WakeupsSent, WakeupsReceived, Flushes, FlushErrors, Overflow uint64
+	FlushSeconds                                                 float64
 }
 
 // ChannelStore is the per-channel persistence facet. All methods are

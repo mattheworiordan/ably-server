@@ -66,15 +66,57 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
+		if appender != nil {
+			cs.rebind(appender)
+		}
 		return cs, nil
 	}
 	cs := newChannelStore(s.gen, appender)
 	s.channels[name] = cs
 	if appender != nil {
 		seed := s.gen.Mint()
+		cs.initial = seed
 		appender.Initialize(seed, seed)
 	}
 	return cs, nil
+}
+
+// Release unbinds the channel's appender (storage.Storage.Release). The
+// channel's state stays in memory, because in this backend the state is
+// the store; a later Channel call binds a new appender to it.
+func (s *Storage) Release(_ context.Context, name string) error {
+	s.mu.Lock()
+	cs, ok := s.channels[name]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.appender != nil {
+		cs.appender = nil
+		cs.released = true
+	}
+	return nil
+}
+
+// rebind binds appender to a channel whose previous appender was
+// released, initialising it at the channel's current serial. Under the
+// channel mutex, so no publish can fall between the Initialize and the
+// first Append. A channel that was never released keeps its binding.
+func (cs *channelStore) rebind(appender storage.Appender) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if !cs.released {
+		return
+	}
+	current := cs.initial
+	if n := len(cs.order); n > 0 {
+		current = cs.order[n-1]
+	}
+	cs.appender = appender
+	cs.released = false
+	appender.Initialize(current, cs.initial)
 }
 
 // Close is a no-op for the memory backend.
@@ -86,10 +128,17 @@ func (s *Storage) Close() error {
 // channelSerials, a map for O(1) lookup, an idempotency index, and
 // the Appender that will receive freshly-stored ChannelMessages.
 // The channel's initial watermark is handed to the Appender via
-// Initialize at construction time; storage does not retain it.
+// Initialize at construction time and retained for a rebind after
+// Release.
 type channelStore struct {
 	gen      *serial.Generator
-	appender storage.Appender
+	appender storage.Appender // guarded by mu once the store is shared
+
+	// initial is the seed serial handed to the first appender; released
+	// marks a store whose appender Release dropped, so the next Channel
+	// call binds a new one (rebind). Both guarded by mu.
+	initial  string
+	released bool
 
 	mu      sync.Mutex
 	order   []string // append-only, sorted (serials are monotonic): both kinds

@@ -1,37 +1,61 @@
-# Cluster-mode topology with the NATS bus (DESIGN.md §7.3): one
-# PostgreSQL instance as the store, one NATS server as the cross-node
-# bus, and three stateless ably-server nodes running --bus=nats.
+# Three ably-server nodes on one Postgres with the NATS bus, --bus=nats
+# (DESIGN.md §7.2), against a three-server NATS core cluster. Postgres is
+# the store; NATS carries cross-node delivery. This is the "large"
+# deployment size.
 #
-#   docker compose -f bench/docker-compose.nats.yml up --build -d
-#   docker compose -f bench/docker-compose.nats.yml down
+#   docker compose -f bench/docker-compose.nats.yml up -d --build --wait
+#   docker compose -f bench/docker-compose.nats.yml down -v
 #
-# Host ports are offset from the root docker-compose.yml so both stacks
-# can run side by side: nodes on 8181/8182/8183, Postgres on 5433 and
-# NATS on 4223 (NATS monitoring stays inside the network). The image
-# tag is distinct too, so building this stack never replaces the
-# ably-server:local image the root stack uses.
+# Host ports: nodes 8181, 8182, 8183; each node's debug listener (pprof
+# and Prometheus /metrics, including the ably_bus_* series) 8191, 8192,
+# 8193; Postgres 5433 (user, password and database "ably"); NATS client
+# ports 4223, 4224, 4225 and monitoring 8223, 8224, 8225. All nodes share
+# the key app.key:secret. POOL_MAX_CONNS sets the pgxpool size per node
+# (default 16).
+#
+# Every node is given all three NATS servers; each connects to one and
+# moves to another if it dies. To see that, stop one server:
+#
+#   docker compose -f bench/docker-compose.nats.yml kill nats1
+#
+# Ports, project name and image tag differ from the root
+# docker-compose.yml and the other bench stacks, so they can all run side
+# by side.
 
 name: ablynats
+
+x-nats: &nats
+  image: nats:2.11-alpine
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
 
 x-ably-node: &ably-node
   build:
     context: ..
     dockerfile: Dockerfile
-  image: ably-server:nats-bus
+  image: ably-server:bench-nats
   restart: unless-stopped
   depends_on:
     postgres:
       condition: service_healthy
-    nats:
+    nats1:
+      condition: service_healthy
+    nats2:
+      condition: service_healthy
+    nats3:
       condition: service_healthy
   environment:
     ABLY_SERVER_KEYS: app.key:secret
-    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable&pool_max_conns=${POOL_MAX_CONNS:-16}
+    ABLY_SERVER_BUS: nats
+    ABLY_SERVER_NATS_URL: nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
   command:
     - --mode=cluster
-    - --bus=nats
-    - --nats-url=nats://nats:4222
     - --listen=:8080
+    - --debug-listen=:6060
     - --log-level=info
   healthcheck:
     test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
@@ -41,11 +65,12 @@ x-ably-node: &ably-node
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: ably
       POSTGRES_PASSWORD: ably
       POSTGRES_DB: ably
+    command: ["postgres", "-c", "max_connections=300"]
     ports:
       - "5433:5432"
     healthcheck:
@@ -54,29 +79,43 @@ services:
       timeout: 3s
       retries: 30
 
-  nats:
-    image: nats:2.11-alpine
-    # Core NATS only (no JetStream); -m serves /healthz for the check.
-    command: ["-m", "8222"]
+  # Core NATS only (no JetStream), fully meshed by routes; -m serves
+  # /healthz for the check.
+  nats1:
+    <<: *nats
+    command: ["-m", "8222", "--name", "nats1", "--cluster_name", "ably", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats1:6222,nats://nats2:6222,nats://nats3:6222"]
     ports:
       - "4223:4222"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+      - "8223:8222"
+
+  nats2:
+    <<: *nats
+    command: ["-m", "8222", "--name", "nats2", "--cluster_name", "ably", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats1:6222,nats://nats2:6222,nats://nats3:6222"]
+    ports:
+      - "4224:4222"
+      - "8224:8222"
+
+  nats3:
+    <<: *nats
+    command: ["-m", "8222", "--name", "nats3", "--cluster_name", "ably", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats1:6222,nats://nats2:6222,nats://nats3:6222"]
+    ports:
+      - "4225:4222"
+      - "8225:8222"
 
   node1:
     <<: *ably-node
     ports:
       - "8181:8080"
+      - "8191:6060"
 
   node2:
     <<: *ably-node
     ports:
       - "8182:8080"
+      - "8192:6060"
 
   node3:
     <<: *ably-node
     ports:
       - "8183:8080"
+      - "8193:6060"

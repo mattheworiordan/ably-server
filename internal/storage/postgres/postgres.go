@@ -8,41 +8,35 @@
 // empty database serialise on the lock and only one applies the
 // pending migrations.
 //
-// The publish path:
+// The publish path: ChannelStore.Store (and Mutate, StorePresence,
+// StoreAnnotation) persists the cm in one transaction. Concurrent
+// writers serialise per channel on the channels-row lock taken by
+// advance_channel_serial, so each channel's serials are minted in
+// commit order, cluster-wide.
 //
-//   - ChannelStore.Store persists the cm and emits a NOTIFY on
-//     channel "ably_channel" inside the same transaction (PG buffers
-//     NOTIFYs until commit, so listeners only see it if the publish
-//     committed).
-//   - A LISTEN goroutine inside Storage, running on a dedicated
-//     pgx.Conn, receives every NOTIFY (including the publisher's
-//     own), fetches the canonical cm by (channel, channel_serial),
-//     looks up the channelStore that was registered for that channel
-//     via Channel(name, appender), and calls appender.Append(cm).
+// Cross-node delivery sits behind a Bus (bus.go, DESIGN.md §7.2),
+// selected by Options.Bus:
 //
-// There is no self-dedup at the broker level: the publish path does
-// not call the appender directly; the appender is the sole writer to
-// the live linked list, always via the LISTEN round-trip. NOTIFYs for
-// channels that no one on this node has opened (no Channel(name,…)
-// call yet) are silently dropped — local subscribers materialise the
-// channel via ATTACH, which calls core.Manager.GetChannel(name) and
-// in turn registers an appender here.
+//   - pgnotify (the default, pgnotify.go): the publish transaction
+//     NOTIFYs the one global channel "ably_channel"; a LISTEN goroutine
+//     on every node reads each cm back by (channel, serial) and delivers
+//     it to the channel's appender.
+//   - postgres (pgbus.go): per-channel LISTEN, cms inline in the
+//     payload, one ordered worker per channel; the NOTIFY is either in
+//     the transaction (transactional) or replaced by a per-channel
+//     wake-up sent outside it once per window (coalesced, the default).
+//   - nats (natsbus.go): after commit the publishing node sends the cm to
+//     the channel's NATS subject; nodes subscribe per bound channel.
 //
-// Concurrent writers serialise per channel via a per-channel
-// pg_advisory_xact_lock inside Store's transaction, so the row
-// stream remains ordered by channelSerial without cross-channel
-// contention.
-//
-// Cross-node delivery sits behind a Bus (bus.go). The LISTEN/NOTIFY
-// broker described above is the default Bus; Options.Bus = BusNATS
-// swaps in NATS core pub/sub on per-channel subjects (natsbus.go,
-// DESIGN.md §7.3) while Postgres stays the store.
+// The postgres and nats buses share the chained delivery point in
+// chain.go: each cm carries its predecessor serial, the publishing node
+// delivers its own cm straight after commit, and gaps are filled from
+// the log.
 package postgres
 
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -71,15 +65,13 @@ var migrationsFS embed.FS
 // someone else's code also picked this exact key on the same DB.
 const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
 
-// notifyChannelName is the LISTEN channel used by the publish/subscribe
-// broker — distinct concept from an Ably channel.
-const notifyChannelName = "ably_channel"
-
 // listenReconnectBaseDelay / listenReconnectMaxDelay bound the capped
-// exponential backoff the LISTEN goroutine applies between re-dial
+// exponential backoff a LISTEN goroutine applies between re-dial
 // attempts after its connection drops (DESIGN.md §7.2). They are
 // package vars, not consts, so integration tests can shrink them; in
-// production they are effectively constant.
+// production they are effectively constant. Open copies them into the
+// Storage, so a test that restores them never races a reconnect still
+// in flight.
 var (
 	listenReconnectBaseDelay = 200 * time.Millisecond
 	listenReconnectMaxDelay  = 5 * time.Second
@@ -106,13 +98,18 @@ var (
 // with an 'infinity' lease they are never reaped.
 const fixtureNodeID = "__fixtures__"
 
-// notifyPayload is the JSON-encoded NOTIFY body. Keeping it JSON
-// avoids ambiguity in the face of Ably channel names that contain
-// arbitrary characters (including ':' and '@').
-type notifyPayload struct {
-	Channel string `json:"channel"`
-	Serial  string `json:"serial"`
-}
+// DefaultPostgresSweepInterval is the postgres bus's default watermark
+// sweep interval: the safety net that delivers a write whose coalesced
+// wake-up was lost (DESIGN.md §7.2).
+const DefaultPostgresSweepInterval = 2 * time.Second
+
+// postgresSweepDefault and natsSweepDefault are the sweep intervals Open
+// uses when Options.SweepInterval is zero. Package vars so integration
+// tests can shrink them; in production they are the exported defaults.
+var (
+	postgresSweepDefault = DefaultPostgresSweepInterval
+	natsSweepDefault     = DefaultNATSSweepInterval
+)
 
 // Options configures the Postgres backend.
 type Options struct {
@@ -124,19 +121,21 @@ type Options struct {
 	// time.Now().UnixMilli — overridden by tests for determinism.
 	Now func() int64
 
-	// Logger receives operational events — currently the LISTEN
-	// broker's reconnect/reconcile lifecycle (DESIGN.md §7.2) and the
-	// presence reaper (§12.5). Nil means logging.Default().
+	// Logger receives operational events — the bus's reconnect and
+	// reconcile lifecycle (DESIGN.md §7.2) and the presence reaper
+	// (§12.5). Nil means logging.Default().
 	Logger *logging.Logger
 
-	// Bus selects the cross-node delivery mechanism: BusPostgres (the
-	// default; LISTEN/NOTIFY on this database, DESIGN.md §7.2) or
-	// BusNATS (NATS core pub/sub, DESIGN.md §7.3). Empty means
-	// BusPostgres. Postgres is the store either way.
+	// Bus selects the cross-node delivery mechanism (DESIGN.md §7.2):
+	// BusPGNotify (the default; the shipped LISTEN/NOTIFY broker),
+	// BusPostgres (per-channel LISTEN, transactional or coalesced) or
+	// BusNATS (NATS core pub/sub). Empty means BusPGNotify. Postgres is
+	// the store whichever bus is chosen.
 	Bus string
 
-	// NATSURL is the NATS server URL (a comma-separated list is
-	// accepted) for BusNATS. Required when Bus is BusNATS.
+	// NATSURL is the NATS server URL for BusNATS; a comma-separated list
+	// of the servers of one NATS cluster is accepted. Required when Bus
+	// is BusNATS.
 	NATSURL string
 
 	// NATSInlineMaxBytes caps the encoded size of a cm carried inline on
@@ -144,47 +143,82 @@ type Options struct {
 	// that receivers fetch from the log. Zero means
 	// DefaultNATSInlineMaxBytes.
 	NATSInlineMaxBytes int
+
+	// NotifyMode is the BusPostgres notify mode. Empty means
+	// NotifyCoalesced.
+	NotifyMode NotifyMode
+
+	// NotifyWindow is the coalescing window in NotifyCoalesced mode: a
+	// node sends at most one wake-up per channel per window. Zero means
+	// DefaultNotifyWindow. It is the extra latency a remote subscriber
+	// pays in that mode.
+	NotifyWindow time.Duration
+
+	// NotifyMaxPending caps the channels pending a wake-up on one node in
+	// NotifyCoalesced mode (the overflow policy, pgbus_coalesced.go).
+	// Zero means DefaultNotifyMaxPending.
+	NotifyMaxPending int
+
+	// SweepInterval is how often a chaining bus (BusPostgres, BusNATS)
+	// compares every bound channel's delivery mark with its committed
+	// serial and catches up a channel that has fallen behind. Zero means
+	// the bus's default: DefaultPostgresSweepInterval or
+	// DefaultNATSSweepInterval.
+	SweepInterval time.Duration
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
-	pool   *pgxpool.Pool
-	dsn    string // retained so the LISTEN goroutine can re-dial on drop
-	series string // per-process seriesId, embedded in every minted channelSerial
-	node   string // per-process node id, owning presence rows for the liveness lease (§12.5)
-	logger *logging.Logger
+	pool      *pgxpool.Pool
+	dsn       string // retained so a LISTEN goroutine can re-dial on drop
+	series    string // per-process seriesId, embedded in every minted channelSerial
+	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
+	namespace string // current_schema(), mixed into every postgres-bus notification channel name
+	logger    *logging.Logger
 
-	mu       sync.Mutex
-	channels map[string]*channelStore
+	busKind    string // BusPGNotify, BusPostgres or BusNATS
+	notifyMode string // the BusPostgres notify mode, "" for the other buses
 
-	bus               Bus         // cross-node delivery (bus.go); set by Open
-	timing            chainTiming // gap-fill tuning for a chaining bus, snapshotted by Open
-	initialListenConn *pgx.Conn   // first LISTEN conn, dialed by Open for the Postgres bus; owned by listenLoop thereafter
-	cancel            context.CancelFunc
-	done              <-chan struct{} // closed when Close cancels the background goroutines
-	wg                sync.WaitGroup
-	closeOnce         sync.Once
+	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
+	sweepInterval               time.Duration // chaining buses' watermark sweep
+	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
+
+	mu       sync.RWMutex
+	channels map[string]*channelStore // every store handed out, by Ably channel name
+
+	bus         Bus // cross-node delivery (bus.go); set by Open
+	stats       busStats
+	reconcileCh chan struct{} // chaining buses: reconcile requests (chain.go)
+
+	loopCtx   context.Context
+	cancel    context.CancelFunc
+	done      <-chan struct{} // closed when Close cancels the background goroutines
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // Open dials Postgres at opts.DSN, applies any pending migrations
 // (under a session-scoped advisory lock so concurrent Opens
-// serialise), opens a dedicated LISTEN connection for the cluster
-// pub/sub broker, and returns a Storage ready for use. The seriesId
-// is freshly generated per process — multi-node deployments rely on
-// distinct per-node seriesIds to disambiguate concurrent mints
-// (DESIGN.md §8).
+// serialise), connects the cross-node bus, and returns a Storage ready
+// for use. The seriesId is freshly generated per process — multi-node
+// deployments rely on distinct per-node seriesIds to disambiguate
+// concurrent mints (DESIGN.md §8).
 func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if opts.DSN == "" {
 		return nil, errors.New("storage/postgres: Open requires a DSN")
 	}
-	switch opts.Bus {
-	case "", BusPostgres:
-	case BusNATS:
-		if opts.NATSURL == "" {
-			return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
+	busKind, err := ParseBus(opts.Bus)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: %w", err)
+	}
+	var mode NotifyMode
+	if busKind == BusPostgres {
+		if mode, err = ParseNotifyMode(string(opts.NotifyMode)); err != nil {
+			return nil, fmt.Errorf("storage/postgres: %w", err)
 		}
-	default:
-		return nil, fmt.Errorf("storage/postgres: unknown bus %q (valid: %s, %s)", opts.Bus, BusPostgres, BusNATS)
+	}
+	if busKind == BusNATS && opts.NATSURL == "" {
+		return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
 	}
 	pool, err := pgxpool.New(ctx, opts.DSN)
 	if err != nil {
@@ -204,41 +238,73 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		logger = logging.Default()
 	}
 
+	loopCtx, cancel := context.WithCancel(context.Background())
 	s := &Storage{
-		pool:     pool,
-		dsn:      opts.DSN,
-		series:   serial.NewSeriesID(),
-		node:     serial.NewSeriesID(),
-		logger:   logger,
-		channels: make(map[string]*channelStore),
-		timing:   currentChainTiming(),
+		pool:          pool,
+		dsn:           opts.DSN,
+		series:        serial.NewSeriesID(),
+		node:          serial.NewSeriesID(),
+		logger:        logger,
+		busKind:       busKind,
+		notifyMode:    string(mode),
+		reconnectBase: listenReconnectBaseDelay,
+		reconnectMax:  listenReconnectMaxDelay,
+		sweepInterval: opts.SweepInterval,
+		timing:        currentChainTiming(),
+		channels:      make(map[string]*channelStore),
+		reconcileCh:   make(chan struct{}, 1),
+		loopCtx:       loopCtx,
+		cancel:        cancel,
+		done:          loopCtx.Done(),
+	}
+	fail := func(err error) (*Storage, error) {
+		cancel()
+		pool.Close()
+		return nil, err
 	}
 
-	if opts.Bus == BusNATS {
+	switch busKind {
+	case BusNATS:
+		if s.sweepInterval <= 0 {
+			s.sweepInterval = natsSweepDefault
+		}
 		b, err := dialNATSBus(s, opts)
 		if err != nil {
-			pool.Close()
-			return nil, err
+			return fail(err)
 		}
 		s.bus = b
-	} else {
+	case BusPostgres:
+		if s.sweepInterval <= 0 {
+			s.sweepInterval = postgresSweepDefault
+		}
+		// The schema this Storage works in namespaces its notification
+		// channels: NOTIFY is per database, not per schema (see
+		// pgChannelName).
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&s.namespace); err != nil {
+			return fail(fmt.Errorf("storage/postgres: current_schema: %w", err))
+		}
+		// Dedicated LISTEN connection. It LISTENs on nothing yet: each
+		// channel is LISTENed when this node first binds it (Channel).
+		conn, err := dialListenConn(ctx, opts.DSN)
+		if err != nil {
+			return fail(err)
+		}
+		s.bus = newPGBus(s, mode, conn, opts.NotifyWindow, opts.NotifyMaxPending)
+	default:
 		// Dedicated LISTEN connection. pgxpool doesn't expose the long-
 		// lived single-conn semantics LISTEN needs, so we acquire a
 		// separate raw conn for the broker goroutine. Dialing it here lets
 		// Open fail fast on a bad DSN; the goroutine re-dials fresh conns
 		// itself when this one drops.
-		listenConn, err := dialAndListen(ctx, opts.DSN)
+		conn, err := dialAndListen(ctx, opts.DSN)
 		if err != nil {
-			pool.Close()
-			return nil, err
+			return fail(err)
 		}
-		s.initialListenConn = listenConn
-		s.bus = &pgNotifyBus{s: s}
+		b := &pgNotifyBus{s: s, initialConn: conn}
+		b.connected.Store(true)
+		s.bus = b
 	}
 
-	loopCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	s.done = loopCtx.Done()
 	s.wg.Add(2)
 	go s.presenceLeaseBumpLoop(loopCtx)
 	go s.presenceReaperLoop(loopCtx)
@@ -246,30 +312,20 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	return s, nil
 }
 
-// dialAndListen opens a fresh raw pgx.Conn and issues the broker LISTEN
-// on it. Used both for the initial conn in Open and for every
-// post-drop re-dial in the LISTEN goroutine.
-func dialAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: dial LISTEN conn: %w", err)
-	}
-	if _, err := conn.Exec(ctx, `LISTEN `+pgx.Identifier{notifyChannelName}.Sanitize()); err != nil {
-		_ = conn.Close(context.Background())
-		return nil, fmt.Errorf("storage/postgres: LISTEN: %w", err)
-	}
-	return conn, nil
-}
-
 // Channel returns the ChannelStore for name, binding it to appender on
 // first access. Subsequent calls with the same name return the same
-// instance and ignore the new appender. The internal LISTEN goroutine
-// looks up channelStores in this map by name to dispatch notifications.
+// instance and ignore the new appender (until Release drops the
+// binding).
 //
-// On first creation the channels row is upserted via ensure_channel
-// (creating it with a fresh seed serial if absent), and the resulting
-// channelSerial — the watermark — is handed to appender.Initialize
-// before this call returns.
+// Binding with a non-nil appender first puts the bus subscription in
+// place (Bus.bind: a no-op for pgnotify, whose one LISTEN covers every
+// channel; a LISTEN or a NATS subscription otherwise), then upserts the
+// channels row via ensure_channel (creating it with a fresh seed serial
+// if absent) and hands the resulting channelSerial — the watermark — to
+// appender.Initialize before this call returns. Because the
+// subscription is in effect before the read, a cm committed after it
+// always reaches this node, and one committed before it sorts at or
+// below the watermark, which seeds the delivery point's de-dup mark.
 func (s *Storage) Channel(ctx context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	if cs, ok := s.channels[name]; ok {
@@ -283,37 +339,69 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if appender == nil {
 		return cs, nil
 	}
-	// A bus that routes per channel subscribes before the watermark is
-	// read, so every cm committed after the read is received (DESIGN.md
-	// §7.3). The Postgres bus's single LISTEN already covers every
-	// channel, so its bind is a no-op.
-	if err := s.bus.bind(ctx, cs); err != nil {
+
+	// fail unwinds a bind that never finished: drop the store so a retry
+	// can start again, and release anything waiting on it.
+	fail := func(err error) (storage.ChannelStore, error) {
 		s.mu.Lock()
-		delete(s.channels, name)
+		if s.channels[name] == cs {
+			delete(s.channels, name)
+		}
 		s.mu.Unlock()
+		cs.release()
+		s.bus.unbind(cs)
 		return nil, err
+	}
+
+	if err := s.bus.bind(ctx, cs); err != nil {
+		return fail(err)
 	}
 	var current, initial string
 	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
-		// Unwind: the channelStore exists in the map but was never
-		// Initialize'd. Remove it so a retry can re-attempt.
-		s.mu.Lock()
-		delete(s.channels, name)
-		s.mu.Unlock()
-		s.bus.unbind(cs)
-		return nil, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
+		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
 	}
 	appender.Initialize(current, initial)
-	if s.bus.chains() {
-		cs.seed(current)
+	cs.seed(current)
+	if cs.isReleased() {
+		// Release ran while this bind was in flight and may have missed
+		// the subscription bind put in place; drop it.
+		s.bus.unbind(cs)
 	}
 	return cs, nil
+}
+
+// Channel and Release for the same name are not meant to run
+// concurrently (the caller, core.Manager, serialises them per channel).
+// If they do, the outcome is as if Release ran after Channel: the store
+// Channel returns is released and delivers nothing, and the next Channel
+// call binds a new one.
+
+// Release drops this node's binding of the channel
+// (storage.Storage.Release, DESIGN.md §7.2): no further cm reaches the
+// appender, the bus subscription is removed (UNLISTEN, or a NATS
+// unsubscribe), and the channelStore is forgotten. A later Channel call
+// binds afresh; its watermark read seeds the new delivery point, so it
+// sees every cm committed while the channel was released that sorts
+// after the new watermark, and none twice.
+func (s *Storage) Release(_ context.Context, name string) error {
+	s.mu.Lock()
+	cs, ok := s.channels[name]
+	if ok {
+		delete(s.channels, name)
+	}
+	s.mu.Unlock()
+	if !ok || cs.appender == nil {
+		return nil
+	}
+	cs.release()
+	s.bus.unbind(cs)
+	return nil
 }
 
 // newChannelStore constructs a channelStore bound to appender (nil for a
 // storage-only or transient store).
 func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
-	return &channelStore{
+	cs := &channelStore{
 		pool:     s.pool,
 		series:   s.series,
 		node:     s.node,
@@ -323,14 +411,22 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		logger:   s.logger,
 		done:     s.done,
 		timing:   s.timing,
+		stats:    &s.stats,
 	}
+	if s.busKind == BusPostgres {
+		cs.pgChan = pgChannelName(s.namespace, name)
+	}
+	if appender != nil {
+		cs.ready = make(chan struct{})
+	}
+	return cs
 }
 
 // boundStore returns the channelStore bound to name with a live
 // appender, or nil if this node holds no such channel.
 func (s *Storage) boundStore(name string) *channelStore {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if cs, ok := s.channels[name]; ok && cs.appender != nil {
 		return cs
 	}
@@ -339,8 +435,8 @@ func (s *Storage) boundStore(name string) *channelStore {
 
 // boundStores snapshots every channelStore bound with a live appender.
 func (s *Storage) boundStores() []*channelStore {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	stores := make([]*channelStore, 0, len(s.channels))
 	for _, cs := range s.channels {
 		if cs.appender != nil {
@@ -350,194 +446,41 @@ func (s *Storage) boundStores() []*channelStore {
 	return stores
 }
 
-// sweepWatermarks is the chained bus's safety net (DESIGN.md §7.3). It
-// reads the current serial of every bound channel in one query and
-// catches up each channel whose delivery mark is still behind the
-// watermark this node read on the previous sweep: a cm that old whose
-// bus message has not arrived is treated as lost, not late.
-func (s *Storage) sweepWatermarks(ctx context.Context) error {
-	stores := s.boundStores()
-	if len(stores) == 0 {
-		return nil
-	}
-	byName := make(map[string]*channelStore, len(stores))
-	names := make([]string, 0, len(stores))
-	for _, cs := range stores {
-		byName[cs.name] = cs
-		names = append(names, cs.name)
-	}
-	rows, err := s.pool.Query(ctx, `SELECT name, channel_serial FROM channels WHERE name = ANY($1)`, names)
-	if err != nil {
-		return fmt.Errorf("storage/postgres: read watermarks: %w", err)
-	}
-	current := make(map[string]string, len(names))
-	for rows.Next() {
-		var name, watermark string
-		if err := rows.Scan(&name, &watermark); err != nil {
-			rows.Close()
-			return fmt.Errorf("storage/postgres: scan watermark: %w", err)
-		}
-		current[name] = watermark
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("storage/postgres: watermark rows: %w", err)
-	}
-
-	for name, watermark := range current {
-		cs := byName[name]
-		cs.hwmMu.Lock()
-		behind := cs.seeded && cs.sweptWatermark > cs.lastSeen
-		cs.sweptWatermark = watermark
-		cs.hwmMu.Unlock()
-		if !behind {
-			continue
-		}
-		if err := cs.catchUp(ctx); err != nil {
-			return fmt.Errorf("storage/postgres: sweep catch-up %q: %w", name, err)
-		}
-		cs.hwmMu.Lock()
-		cs.sweepCatchUps++
-		cs.hwmMu.Unlock()
-	}
-	return nil
-}
-
-// Close stops the background goroutines (LISTEN broker and, in cluster
-// presence, the lease-bump and reaper loops) and releases the pool. The
+// Close stops the background goroutines (the bus and the presence
+// lease-bump and reaper loops), closes the bus and releases the pool. A
 // LISTEN goroutine owns closing its own conn, so Close only cancels and
 // waits.
 func (s *Storage) Close() error {
 	s.closeOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-			s.wg.Wait()
-		}
+		s.cancel()
+		s.wg.Wait()
 		s.bus.close()
 		s.pool.Close()
 	})
 	return nil
 }
 
-// Ping reports whether the Postgres pool is reachable. It satisfies
-// storage.Pinger, backing the /readyz check in cluster mode
-// (DESIGN.md §2.2).
+// Ping reports whether the node can serve cluster traffic: the Postgres
+// pool is reachable and the bus is ready (the nats bus is not ready
+// while disconnected from NATS). It satisfies storage.Pinger, backing
+// the /readyz check in cluster mode (DESIGN.md §2.2, §7.2).
 func (s *Storage) Ping(ctx context.Context) error {
-	return s.pool.Ping(ctx)
+	if err := s.pool.Ping(ctx); err != nil {
+		return err
+	}
+	return s.bus.ready()
 }
 
-// listenLoop dispatches NOTIFY events to the registered channelStore
-// for each channel, surviving dropped LISTEN connections (DESIGN.md
-// §7.2). It runs consume() on the current conn until a
-// WaitForNotification error; unless that error is Close() cancelling
-// the context, it re-dials a fresh conn with capped-exponential
-// backoff, re-LISTENs, reconciles each channel's missed cms from
-// history, and resumes. It exits only when the storage is Close()d.
-//
-// A NOTIFY for an unregistered channel is dropped: local attachments
-// materialise the channelStore on demand via Storage.Channel, so
-// events that arrive before any local interest are intentionally lost
-// (the canonical cm is still in storage and picked up by a subsequent
-// ATTACH+resume via History).
-func (s *Storage) listenLoop(ctx context.Context) {
-	defer s.wg.Done()
-
-	conn := s.initialListenConn
-	for {
-		err := s.consume(ctx, conn)
-		_ = conn.Close(context.Background())
-		if ctx.Err() != nil {
-			return // Close(): expected shutdown
-		}
-		s.logger.Warn("storage/postgres: LISTEN connection lost; reconnecting", "err", err)
-
-		conn = s.redial(ctx)
-		if conn == nil {
-			return // ctx cancelled during backoff
-		}
-		// Re-LISTEN is already done by redial; reconcile before resuming
-		// so any cm minted during the gap is replayed exactly once
-		// (deliver() dedups against a subsequent buffered NOTIFY).
-		s.reconcile(ctx)
-		s.logger.Info("storage/postgres: LISTEN reconnected and reconciled")
-	}
-}
-
-// consume runs the steady-state WaitForNotification dispatch on conn,
-// returning the error that ended it (a dropped conn, or ctx
-// cancellation on Close).
-func (s *Storage) consume(ctx context.Context, conn *pgx.Conn) error {
-	for {
-		n, err := conn.WaitForNotification(ctx)
-		if err != nil {
-			return err
-		}
-
-		var p notifyPayload
-		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
-			continue // malformed; nothing actionable
-		}
-
-		s.mu.Lock()
-		cs, ok := s.channels[p.Channel]
-		s.mu.Unlock()
-		if !ok || cs.appender == nil {
-			continue
-		}
-
-		cm, err := s.loadChannelMessage(ctx, p.Channel, p.Serial)
-		if err != nil {
-			continue // best-effort; nothing we can do without the cm
-		}
-		cs.deliver(cm)
-	}
-}
-
-// redial re-establishes the LISTEN connection with capped exponential
-// backoff, retrying until it succeeds or ctx is cancelled (Close). A
-// nil return means ctx was cancelled.
-func (s *Storage) redial(ctx context.Context) *pgx.Conn {
-	delay := listenReconnectBaseDelay
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(delay):
-		}
-
-		conn, err := dialAndListen(ctx, s.dsn)
-		if err == nil {
-			return conn
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		s.logger.Warn("storage/postgres: LISTEN re-dial failed; backing off", "err", err, "delay", delay)
-		if delay *= 2; delay > listenReconnectMaxDelay {
-			delay = listenReconnectMaxDelay
-		}
-	}
-}
-
-// reconcile replays, per registered channel, every cm minted past the
-// channel's last-delivered serial — the cms whose NOTIFY was lost while
-// the LISTEN conn was down (DESIGN.md §7.2). Each is delivered through
-// cs.deliver, whose high-water mark makes replay idempotent against the
-// normal NOTIFY path.
-func (s *Storage) reconcile(ctx context.Context) {
-	s.mu.Lock()
-	stores := make([]*channelStore, 0, len(s.channels))
-	for _, cs := range s.channels {
-		if cs.appender != nil {
-			stores = append(stores, cs)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, cs := range stores {
-		if err := cs.reconcileFromHistory(ctx); err != nil {
-			s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
-		}
+// sleepCtx waits for d or until ctx is done, reporting whether the full
+// wait elapsed.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -652,50 +595,6 @@ func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial
 func loadChannelMessagePool(ctx context.Context, pool *pgxpool.Pool, channel, channelSerial string) (*protocol.ChannelMessage, error) {
 	rows, err := pool.Query(ctx, sqlLoadCM, channel, channelSerial)
 	return decodeChannelMessageRows(rows, err, channel, channelSerial)
-}
-
-const sqlLoadRange = `
-SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
-WHERE channel = $1 AND channel_serial > $2 AND ($3 = '' OR channel_serial <= $3)
-ORDER BY channel_serial, idx
-`
-
-// loadChannelMessagesAfter reads every cm on channel with a serial in
-// (after, upTo] (upTo "" means unbounded), of every kind, ascending,
-// with annotation summary snapshots. The chained bus's gap fill and
-// reconcile read the log through it (DESIGN.md §7.3); unlike the
-// History-based reconcile of the LISTEN broker it includes annotation
-// cms, which a chain must see to stay unbroken.
-func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo string) ([]*protocol.ChannelMessage, error) {
-	rows, err := pool.Query(ctx, sqlLoadRange, channel, after, upTo)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: load range %s (%s, %s]: %w", channel, after, upTo, err)
-	}
-	defer rows.Close()
-
-	var out []*protocol.ChannelMessage
-	for rows.Next() {
-		var (
-			channelSerial string
-			idx           int
-			kind          string
-			payload       []byte
-			summary       []byte
-		)
-		if err := rows.Scan(&channelSerial, &idx, &kind, &payload, &summary); err != nil {
-			return nil, fmt.Errorf("storage/postgres: scan range %s: %w", channel, err)
-		}
-		if n := len(out); n == 0 || out[n-1].ChannelSerial != channelSerial {
-			out = append(out, &protocol.ChannelMessage{ChannelSerial: channelSerial})
-		}
-		if err := decodeRowInto(out[len(out)-1], channel, idx, kind, payload, summary); err != nil {
-			return nil, err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("storage/postgres: range rows %s: %w", channel, err)
-	}
-	return out, nil
 }
 
 const sqlLoadCM = `
@@ -920,100 +819,73 @@ type channelStore struct {
 	logger   *logging.Logger
 	done     <-chan struct{} // the owning Storage's shutdown signal
 	timing   chainTiming
+	stats    *busStats // the owning Storage's bus counters (nil in unit tests)
+	pgChan   string    // the postgres bus's notification channel (pgChannelName)
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
-	// appender. It is the per-channel de-dup high-water mark that makes
-	// post-reconnect history replay (reconcileFromHistory) idempotent
-	// against the normal NOTIFY dispatch (DESIGN.md §7.2). On the
-	// Postgres bus only the LISTEN goroutine writes it, via deliver; on
-	// the NATS bus every writer goes through deliverChained (chain.go),
-	// which also guards the fields below.
+	// appender (seeded with the bind-time watermark). It is the
+	// per-channel de-dup high-water mark that makes the publisher fast
+	// path, gap fills and reconciles idempotent against bus delivery
+	// (DESIGN.md §7.2). On the pgnotify bus the LISTEN goroutine writes
+	// it via deliver (pgnotify.go); on the chaining buses every writer
+	// goes through deliverChained (chain.go). Both hold it across
+	// appender.Append, so appends on one channel stay in serial order and
+	// Release cannot return while an append to the old appender is in
+	// flight. It also guards the fields below.
 	hwmMu    sync.Mutex
 	lastSeen string
 
+	// released is set by Storage.Release (or a failed bind): nothing is
+	// delivered to the appender after it. ready is closed once the bind
+	// has seeded (or failed); a postgres-bus worker waits on it.
+	released    bool
+	ready       chan struct{}
+	readyClosed bool
+	preSeed     []*protocol.ChannelMessage // pgnotify: deliveries received before the seed
+
 	// Chained-delivery state, used only by a bus whose chains() is true
-	// (DESIGN.md §7.3). seeded is set once Storage.Channel has read the
+	// (DESIGN.md §7.2). seeded is set once Storage.Channel has read the
 	// channel's watermark into lastSeen; pending holds cms that arrived
 	// ahead of their predecessor, keyed by predecessor serial; gapTimer
 	// fires the log read that fills a gap the bus did not.
 	seeded         bool
 	pending        map[string]busEvent
 	gapTimer       *time.Timer
+	filling        bool // a gap fill is reading the log
 	gapBackoff     time.Duration
 	sweptWatermark string // the channel's watermark at the previous sweep
-	sub            *nats.Subscription
 
 	// Delivery counters for tests (guarded by hwmMu).
 	delivered, duplicates, held, gapFills, sweepCatchUps int
+
+	// Bus-specific state: the nats bus's subscription (guarded by subMu)
+	// and the postgres bus's delivery queue.
+	subMu sync.Mutex
+	sub   *nats.Subscription
+	q     busQueue
 }
 
-// deliver hands cm to the appender exactly once and in order, advancing
-// the per-channel high-water mark. A cm whose serial is not strictly
-// greater than the last delivered serial is dropped — the case where a
-// reconnect's history replay and a subsequently-buffered NOTIFY both
-// carry it. All appends (steady-state NOTIFY dispatch and reconcile)
-// funnel through here, from the single LISTEN goroutine.
-func (cs *channelStore) deliver(cm *protocol.ChannelMessage) {
-	cs.hwmMu.Lock()
-	if cm.ChannelSerial <= cs.lastSeen {
-		cs.hwmMu.Unlock()
-		return
+// commitWrite finishes a publish transaction: the bus's in-transaction
+// hook (the pgnotify and transactional postgres buses NOTIFY here, so
+// listeners see the cm only if it commits), COMMIT, then the bus's
+// post-commit hook (the publisher fast path, the NATS publish, the
+// coalesced wake-up mark). w carries the cm's serial, predecessor and
+// stored rows.
+func (cs *channelStore) commitWrite(ctx context.Context, tx pgx.Tx, cm *protocol.ChannelMessage, w *busWrite) error {
+	if err := cs.bus.beforeCommit(ctx, tx, cs, w); err != nil {
+		return err
 	}
-	cs.lastSeen = cm.ChannelSerial
-	cs.hwmMu.Unlock()
-	cs.appender.Append(cm)
-}
-
-// reconcileFromHistory replays every cm minted after the channel's
-// last-delivered serial — both message and presence kinds, merged in
-// channelSerial order — through deliver (DESIGN.md §7.2). Called after
-// a LISTEN reconnect to recover cms whose NOTIFY was lost in the gap.
-func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
-	cs.hwmMu.Lock()
-	after := cs.lastSeen
-	cs.hwmMu.Unlock()
-
-	messages, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindMessage,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return fmt.Errorf("reconcile messages: %w", err)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage/postgres: commit: %w", err)
 	}
-	presence, err := cs.History(ctx, storage.HistoryQuery{
-		Kind:               storage.KindPresence,
-		Direction:          storage.DirectionForwards,
-		AfterChannelSerial: after,
-	})
-	if err != nil {
-		return fmt.Errorf("reconcile presence: %w", err)
+	if w.notified {
+		cs.st().published.Add(1)
 	}
-
-	for _, cm := range mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages) {
-		cs.deliver(cm)
+	if w.pointer {
+		cs.st().pointers.Add(1)
 	}
+	cs.bus.afterCommit(cs, cm, w.prev)
 	return nil
-}
-
-// mergeByChannelSerial merges two channelSerial-ascending cm slices
-// (the message and presence streams share one channelSerial namespace
-// but never collide on a serial) into a single ascending slice.
-func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMessage {
-	out := make([]*protocol.ChannelMessage, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i].ChannelSerial <= b[j].ChannelSerial {
-			out = append(out, a[i])
-			i++
-		} else {
-			out = append(out, b[j])
-			j++
-		}
-	}
-	out = append(out, a[i:]...)
-	out = append(out, b[j:]...)
-	return out
 }
 
 // advanceSerial mints the publish's channelSerial inside tx via
@@ -1123,11 +995,13 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	cm := &protocol.ChannelMessage{ID: batchID, ChannelSerial: channelSerial, Messages: msgs}
 
+	rows := make([][]byte, 0, len(msgs))
 	for i, m := range msgs {
 		payload, err := msgpack.Marshal(m)
 		if err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: encode message %d: %w", i, err)
 		}
+		rows = append(rows, payload)
 		// id is stored as NULL when empty so the partial UNIQUE
 		// idempotency index never matches a no-id publish. message_serial
 		// is the message identity (its own serial for a create) — the
@@ -1152,18 +1026,9 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		}
 	}
 
-	// Bus hook inside the tx: the Postgres bus NOTIFYs here (PG buffers
-	// the payload until commit, so listeners only see it if the publish
-	// actually lands; the LISTEN goroutine on every node, including this
-	// one, routes the cm to the channel's appender, DESIGN.md §7.2).
-	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindMessage, rows: rows}); err != nil {
 		return nil, false, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
-	}
-	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -1262,13 +1127,9 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
 	}
 
-	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindMessage, rows: [][]byte{payload}}); err != nil {
 		return nil, false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
-	}
-	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -1435,11 +1296,13 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
 
+	rows := make([][]byte, 0, len(presence))
 	for i, p := range presence {
 		payload, err := msgpack.Marshal(p)
 		if err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: encode presence %d: %w", i, err)
 		}
+		rows = append(rows, payload)
 		var idArg any
 		if p.ID != "" {
 			idArg = p.ID
@@ -1501,14 +1364,9 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		}
 	}
 
-	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindPresence, rows: rows}); err != nil {
 		return nil, false, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
-	}
-	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 
@@ -1583,6 +1441,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
 
+	rows := make([][]byte, 0, len(annotations))
+	sums := make([][]byte, 0, len(annotations))
 	for i, a := range annotations {
 		payload, err := msgpack.Marshal(a)
 		if err != nil {
@@ -1597,6 +1457,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		if err != nil {
 			return nil, false, err
 		}
+		rows = append(rows, payload)
+		sums = append(sums, summaryBlob)
 		var idArg any
 		if a.ID != "" {
 			idArg = a.ID
@@ -1613,14 +1475,9 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		}
 	}
 
-	if err := cs.bus.beforeCommit(ctx, tx, cs.name, channelSerial); err != nil {
+	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindAnnotation, rows: rows, sums: sums}); err != nil {
 		return nil, false, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
-	}
-	cs.bus.afterCommit(cs, cm, prev)
 	return cm, false, nil
 }
 

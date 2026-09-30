@@ -4,32 +4,54 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
-// Bus kinds accepted by Options.Bus (DESIGN.md §7.2, §7.3).
+// Bus kinds accepted by Options.Bus (DESIGN.md §7.2).
 const (
-	// BusPostgres is the default bus: LISTEN/NOTIFY on the store itself.
+	// BusPGNotify is the shipped bus and the default: one global
+	// LISTEN channel, a NOTIFY inside every publish transaction, and one
+	// read-back per notification on one goroutine per node.
+	BusPGNotify = "pgnotify"
+	// BusPostgres is the rebuilt Postgres bus: per-channel LISTEN,
+	// inline payloads, one ordered worker per channel, and (by default)
+	// coalesced wake-ups sent outside the publish transaction.
 	BusPostgres = "postgres"
 	// BusNATS is NATS core pub/sub on a per-channel subject. Postgres
 	// stays the store; only cross-node delivery moves.
 	BusNATS = "nats"
 )
 
+// ParseBus validates a bus name. The empty string is the default,
+// BusPGNotify.
+func ParseBus(s string) (string, error) {
+	switch s {
+	case "", BusPGNotify:
+		return BusPGNotify, nil
+	case BusPostgres, BusNATS:
+		return s, nil
+	}
+	return "", fmt.Errorf("unknown bus %q (valid: %s, %s, %s)", s, BusPGNotify, BusPostgres, BusNATS)
+}
+
 // Bus is the cross-node delivery mechanism of cluster mode: how a cm
 // committed on one node reaches the channelStore bound to that channel
-// on every node (DESIGN.md §7.2, §7.3). Postgres is the store under
-// every Bus; a Bus decides only how the existence of a committed cm
-// (and, for the NATS bus, its body) travels between nodes.
+// on every node (DESIGN.md §7.2). Postgres is the store under every Bus;
+// a Bus decides only how the existence of a committed cm (and, for the
+// postgres and nats buses, its body) travels between nodes.
 //
-// Two implementations live in this package: pgNotifyBus, the default
-// LISTEN/NOTIFY broker, and natsBus. The methods are unexported because
-// a Bus reaches into the per-channel delivery point (channelStore) and
-// the publish transaction; the abstraction is a seam inside the
-// backend, not a public plug-in API.
+// Three implementations live in this package: pgNotifyBus (the shipped
+// LISTEN/NOTIFY broker), pgBus (per-channel LISTEN, transactional or
+// coalesced) and natsBus. The methods are unexported because a Bus
+// reaches into the per-channel delivery point (channelStore) and the
+// publish transaction; the abstraction is a seam inside the backend,
+// not a public plug-in API.
 type Bus interface {
 	// start launches the bus's background goroutines. They are tracked
 	// by the Storage WaitGroup and stop when ctx is cancelled (Close).
@@ -38,45 +60,161 @@ type Bus interface {
 	// chains reports whether deliveries carry their predecessor serial.
 	// When true the publish transaction captures the channel's previous
 	// serial (channelStore.advanceSerial) and deliveries are ordered on
-	// it (channelStore.deliverChained); when false the delivery point
-	// relies on the bus delivering each channel's cms in commit order.
+	// it (channelStore.deliverChained, chain.go); when false the delivery
+	// point relies on the bus delivering each channel's cms in commit
+	// order.
 	chains() bool
 
 	// bind is called when Storage.Channel first binds a channel with a
 	// non-nil appender, before the channel's watermark is read, so a bus
-	// that routes per channel can subscribe without a gap.
+	// that routes per channel can subscribe without a gap. It returns
+	// once the subscription is in effect.
 	bind(ctx context.Context, cs *channelStore) error
 
-	// unbind reverses bind when the bind cannot complete.
+	// unbind reverses bind: when the bind cannot complete, and when
+	// Storage.Release drops the channel (UNLISTEN, NATS unsubscribe).
 	unbind(cs *channelStore)
 
 	// beforeCommit runs inside the publish transaction once the cm's
 	// rows are written, just before COMMIT.
-	beforeCommit(ctx context.Context, tx pgx.Tx, channel, channelSerial string) error
+	beforeCommit(ctx context.Context, tx pgx.Tx, cs *channelStore, w *busWrite) error
 
 	// afterCommit runs once the publish transaction has committed. prev
 	// is the channel's serial before this publish ("" when the bus does
 	// not chain, or the channel had no row).
 	afterCommit(cs *channelStore, cm *protocol.ChannelMessage, prev string)
 
+	// ready reports whether the bus can currently deliver: nil, or why
+	// not. Storage.Ping (the cluster /readyz check) includes it.
+	ready() error
+
 	// close releases the bus's connections. Called by Storage.Close
 	// after the background goroutines have stopped.
 	close()
 }
 
-// pgNotifyBus is the default Bus: every publish emits a NOTIFY on the
+// busWrite describes a publish about to commit, for Bus.beforeCommit:
+// its serial, the serial it follows (prev, set only for a chaining bus)
+// and its rows exactly as stored: one msgpack payload per
+// channel_messages row in idx order, plus that row's annotation summary
+// column (sums is nil unless the cm is annotations).
+type busWrite struct {
+	serial, prev string
+	kind         storage.Kind
+	rows, sums   [][]byte
+
+	// Set by beforeCommit: a NOTIFY went into the transaction, and it was
+	// the pointer form. commitWrite counts them once the commit succeeds.
+	notified, pointer bool
+}
+
+// busStats are this node's bus counters; see storage.BusStats for what
+// each means.
+type busStats struct {
+	published, publishErrors, pointers                 atomic.Uint64
+	received, unrouted, malformed                      atomic.Uint64
+	inline, fetched, fastPath, filled                  atomic.Uint64
+	duplicates, held, gapFills, fetchErrors            atomic.Uint64
+	reconcileRuns, reconciles, reconcileNanos          atomic.Uint64
+	sweeps, sweepCatchUps, sweepNanos                  atomic.Uint64
+	drops, listens, unlistens                          atomic.Uint64
+	wakeupsSent, wakeupsReceived, flushes, flushErrors atomic.Uint64
+	overflow, flushNanos                               atomic.Uint64
+}
+
+// discardStats absorbs the counts of a channelStore built without a
+// Storage (the chain unit tests).
+var discardStats busStats
+
+// st returns the node's bus counters.
+func (cs *channelStore) st() *busStats {
+	if cs.stats != nil {
+		return cs.stats
+	}
+	return &discardStats
+}
+
+// BusStats returns a snapshot of this node's bus counters (DESIGN.md
+// §7.2). It implements storage.BusStatser for the ably_bus_* metrics.
+func (s *Storage) BusStats() storage.BusStats {
+	c := &s.stats
+	out := storage.BusStats{
+		Bus:              s.busKind,
+		Mode:             s.notifyMode,
+		Connected:        s.busConnected(),
+		BoundChannels:    s.boundCount(),
+		Published:        c.published.Load(),
+		PublishErrors:    c.publishErrors.Load(),
+		Pointers:         c.pointers.Load(),
+		Received:         c.received.Load(),
+		Unrouted:         c.unrouted.Load(),
+		Malformed:        c.malformed.Load(),
+		Inline:           c.inline.Load(),
+		Fetched:          c.fetched.Load(),
+		FastPath:         c.fastPath.Load(),
+		Filled:           c.filled.Load(),
+		Duplicates:       c.duplicates.Load(),
+		Held:             c.held.Load(),
+		GapFills:         c.gapFills.Load(),
+		FetchErrors:      c.fetchErrors.Load(),
+		ReconcileRuns:    c.reconcileRuns.Load(),
+		Reconciles:       c.reconciles.Load(),
+		ReconcileSeconds: time.Duration(c.reconcileNanos.Load()).Seconds(),
+		Sweeps:           c.sweeps.Load(),
+		SweepCatchUps:    c.sweepCatchUps.Load(),
+		SweepSeconds:     time.Duration(c.sweepNanos.Load()).Seconds(),
+		Drops:            c.drops.Load(),
+		Listens:          c.listens.Load(),
+		Unlistens:        c.unlistens.Load(),
+		WakeupsSent:      c.wakeupsSent.Load(),
+		WakeupsReceived:  c.wakeupsReceived.Load(),
+		Flushes:          c.flushes.Load(),
+		FlushErrors:      c.flushErrors.Load(),
+		Overflow:         c.overflow.Load(),
+		FlushSeconds:     time.Duration(c.flushNanos.Load()).Seconds(),
+	}
+	return out
+}
+
+// boundCount counts the channels bound with a live appender, without
+// allocating.
+func (s *Storage) boundCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, cs := range s.channels {
+		if cs.appender != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// busConnected reports whether the bus's connection is up: NATS, or the
+// LISTEN connection of the Postgres buses.
+func (s *Storage) busConnected() bool {
+	if c, ok := s.bus.(interface{ isConnected() bool }); ok {
+		return c.isConnected()
+	}
+	return true
+}
+
+// pgNotifyBus is the shipped Bus: every publish emits a NOTIFY on the
 // single "ably_channel" LISTEN channel inside its transaction, and one
 // LISTEN goroutine per node dispatches every notification, reading the
 // cm back from the log (DESIGN.md §7.2). Its mechanics (listenLoop,
-// consume, redial, reconcile) stay on Storage, unchanged; this type is
-// only the adapter onto the Bus seam.
+// consume, redial, reconcile, deliver) live in pgnotify.go, unchanged
+// from before the bus seam; this type is the adapter onto the seam.
 type pgNotifyBus struct {
 	s *Storage
+
+	initialConn *pgx.Conn   // first LISTEN conn, dialed by Open; owned by listenLoop thereafter
+	connected   atomic.Bool // the LISTEN connection is up
 }
 
 func (b *pgNotifyBus) start(ctx context.Context) {
 	b.s.wg.Add(1)
-	go b.s.listenLoop(ctx)
+	go b.listenLoop(ctx)
 }
 
 func (b *pgNotifyBus) chains() bool { return false }
@@ -89,19 +227,24 @@ func (b *pgNotifyBus) unbind(*channelStore) {}
 // buffers the payload until commit, so listeners only see it if the
 // publish lands. The LISTEN goroutine on every node (including this
 // one) routes the cm to the channel's appender (DESIGN.md §7.2).
-func (b *pgNotifyBus) beforeCommit(ctx context.Context, tx pgx.Tx, channel, channelSerial string) error {
-	body, err := json.Marshal(notifyPayload{Channel: channel, Serial: channelSerial})
+func (b *pgNotifyBus) beforeCommit(ctx context.Context, tx pgx.Tx, cs *channelStore, w *busWrite) error {
+	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: w.serial})
 	if err != nil {
 		return fmt.Errorf("storage/postgres: encode notify: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
 		return fmt.Errorf("storage/postgres: notify: %w", err)
 	}
+	w.notified = true
 	return nil
 }
 
 // afterCommit is a no-op: delivery, including to the publisher's own
 // subscribers, arrives via the NOTIFY round-trip (DESIGN.md §7.2).
 func (b *pgNotifyBus) afterCommit(*channelStore, *protocol.ChannelMessage, string) {}
+
+// ready is always nil: as before the bus seam, readiness is the pool
+// ping alone (a dropped LISTEN connection redials in the background).
+func (b *pgNotifyBus) ready() error { return nil }
 
 func (b *pgNotifyBus) close() {}

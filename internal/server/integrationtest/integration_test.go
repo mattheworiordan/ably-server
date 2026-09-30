@@ -12,6 +12,11 @@
 // Run it with:
 //
 //	go test -tags=integration ./...
+//
+// Cluster mode runs on the default bus (pgnotify). Set
+// ABLY_INTEGRATION_BUS to postgres (coalesced), postgres-transactional
+// or nats to run the same suite on another bus (DESIGN.md §7.2); CI runs
+// it once per bus.
 package integrationtest
 
 import (
@@ -21,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,6 +35,7 @@ import (
 	"github.com/ably/ably-go/ably"
 
 	"github.com/ably/ably-server/internal/server"
+	"github.com/ably/ably-server/internal/storage/postgres/natstest"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
@@ -56,17 +63,19 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	args := append([]string{
+		"--keys=" + integrationAPIKey,
+		"--mode=cluster",
+		"--postgres-dsn=" + dsn,
+		"--listen=127.0.0.1:0",
+		"--log-level=error",
+	}, busArgs(t)...)
+
 	ready := make(chan net.Addr, 1)
 	done := make(chan int, 1)
 	go func() {
 		done <- server.Run(ctx, server.Opts{
-			Args: []string{
-				"--keys=" + integrationAPIKey,
-				"--mode=cluster",
-				"--postgres-dsn=" + dsn,
-				"--listen=127.0.0.1:0",
-				"--log-level=error",
-			},
+			Args:   args,
 			Getenv: func(string) string { return "" },
 			Out:    io.Discard,
 			Ready:  ready,
@@ -93,6 +102,25 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 	})
 
 	return addr.String()
+}
+
+// busArgs returns the --bus flags for the cluster bus under test, chosen
+// by ABLY_INTEGRATION_BUS (empty or pgnotify: the default bus, no flags).
+func busArgs(t *testing.T) []string {
+	t.Helper()
+	switch bus := os.Getenv("ABLY_INTEGRATION_BUS"); bus {
+	case "", "pgnotify":
+		return nil
+	case "postgres":
+		return []string{"--bus=postgres", "--postgres-notify-mode=coalesced"}
+	case "postgres-transactional":
+		return []string{"--bus=postgres", "--postgres-notify-mode=transactional"}
+	case "nats":
+		return []string{"--bus=nats", "--nats-url=" + natstest.Start(t).URL}
+	default:
+		t.Fatalf("ABLY_INTEGRATION_BUS=%q: want pgnotify, postgres, postgres-transactional or nats", bus)
+		return nil
+	}
 }
 
 // newClient builds an anonymous ably-go realtime client pointed at the

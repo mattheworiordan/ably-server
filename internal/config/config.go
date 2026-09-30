@@ -38,12 +38,19 @@ type File struct {
 	LogLevel      string     `toml:"log-level"`
 	LogFormat     string     `toml:"log-format"`
 	DebugListen   string     `toml:"debug-listen"`
-	// Bus selects cluster mode's cross-node bus, "postgres" or "nats"
-	// (DESIGN.md §7.2, §7.3); NATSURL and NATSInlineMaxBytes configure
-	// the NATS bus. A zero NATSInlineMaxBytes means absent.
-	Bus                string `toml:"bus"`
-	NATSURL            string `toml:"nats-url"`
-	NATSInlineMaxBytes int    `toml:"nats-inline-max-bytes"`
+	// Bus selects cluster mode's cross-node bus, "pgnotify", "postgres"
+	// or "nats" (DESIGN.md §7.2); NATSURL and NATSInlineMaxBytes
+	// configure the nats bus; the PostgresNotify* keys configure the
+	// postgres bus; BusSweepInterval the chaining buses' safety-net
+	// sweep. Durations are strings, like ShutdownGrace; a zero int means
+	// absent.
+	Bus                      string `toml:"bus"`
+	NATSURL                  string `toml:"nats-url"`
+	NATSInlineMaxBytes       int    `toml:"nats-inline-max-bytes"`
+	PostgresNotifyMode       string `toml:"postgres-notify-mode"`
+	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
+	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`
+	BusSweepInterval         string `toml:"bus-sweep-interval"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual

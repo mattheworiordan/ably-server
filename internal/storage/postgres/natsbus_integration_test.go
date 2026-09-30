@@ -22,7 +22,7 @@ import (
 
 // The NATS bus tests mirror TestPostgresClusterBrokerDeliversCrossNode:
 // two (or three) Storage instances share one Postgres schema, and, for
-// the NATS bus, one NATS server (DESIGN.md §7.3).
+// the NATS bus, one NATS server (DESIGN.md §7.2).
 
 // TestNATSBusChannelStoreContract runs the shared storage contract suite
 // against the Postgres backend with the NATS bus, so the bus swap is
@@ -77,7 +77,7 @@ func TestNATSBusDeliversCrossNodeInSerialOrder(t *testing.T) {
 			t.Fatalf("node2 cm[%d] lost its server stamps: %+v", i, cm.Messages[0])
 		}
 	}
-	if got := natsBusOf(t, s1).pointers.Load(); got != 0 {
+	if got := s1.BusStats().Pointers; got != 0 {
 		t.Errorf("pointers published = %d, want 0 (small cms travel inline)", got)
 	}
 
@@ -232,7 +232,7 @@ func TestNATSBusReconcilesAfterOutage(t *testing.T) {
 	waitFor(t, 5*time.Second, "node2 to notice the outage", func() bool {
 		return !bus2.nc.IsConnected()
 	})
-	reconcilesBefore := bus2.reconciles.Load()
+	reconcilesBefore := s2.BusStats().ReconcileRuns
 
 	for i := range 5 {
 		want = append(want, publish(t, ctx, ch1, fmt.Sprintf("gap-%d", i)))
@@ -244,7 +244,7 @@ func TestNATSBusReconcilesAfterOutage(t *testing.T) {
 
 	proxy.Restore()
 	a2.waitFor(t, len(want), 10*time.Second)
-	if got := bus2.reconciles.Load(); got <= reconcilesBefore {
+	if got := s2.BusStats().ReconcileRuns; got <= reconcilesBefore {
 		t.Errorf("reconciles = %d, want > %d: the gap was not delivered by the reconnect reconcile", got, reconcilesBefore)
 	}
 
@@ -397,7 +397,7 @@ func TestNATSBusLargeCMTravelsAsPointer(t *testing.T) {
 	if got := a2.cms()[0].Messages[0].Data; got != big {
 		t.Errorf("pointer cm body has %d bytes, want %d", len(fmt.Sprint(got)), len(big))
 	}
-	if got := natsBusOf(t, s1).pointers.Load(); got != 1 {
+	if got := s1.BusStats().Pointers; got != 1 {
 		t.Errorf("pointers published = %d, want 1 (only the large cm)", got)
 	}
 }
@@ -535,18 +535,19 @@ func storeCounters(cs *channelStore) deliveryCounters {
 	return deliveryCounters{cs.delivered, cs.duplicates, cs.held, cs.gapFills, cs.sweepCatchUps}
 }
 
-// swapNATSTimings shrinks the NATS reconnect wait and sets the sweep
-// interval for one test. The restore is a t.Cleanup registered before
-// any node opens, so it runs after every node has closed.
+// swapNATSTimings shrinks the NATS reconnect wait and the gap-fill
+// delay and sets the sweep interval for one test. The restore is a
+// t.Cleanup registered before any node opens, so it runs after every
+// node has closed.
 func swapNATSTimings(t *testing.T, reconnectWait, sweepInterval time.Duration) {
 	t.Helper()
-	origWait, origSweep, origRetry := natsReconnectWait, natsWatermarkInterval, natsReconcileRetryWait
-	origGap := natsGapFillDelay
-	natsReconnectWait, natsWatermarkInterval, natsReconcileRetryWait = reconnectWait, sweepInterval, reconnectWait
-	natsGapFillDelay = 50 * time.Millisecond
+	origWait, origSweep, origRetry := natsReconnectWait, natsSweepDefault, natsReconcileRetryWait
+	origGap := gapFillDelay
+	natsReconnectWait, natsSweepDefault, natsReconcileRetryWait = reconnectWait, sweepInterval, reconnectWait
+	gapFillDelay = 50 * time.Millisecond
 	t.Cleanup(func() {
-		natsReconnectWait, natsWatermarkInterval, natsReconcileRetryWait = origWait, origSweep, origRetry
-		natsGapFillDelay = origGap
+		natsReconnectWait, natsSweepDefault, natsReconcileRetryWait = origWait, origSweep, origRetry
+		gapFillDelay = origGap
 	})
 }
 
@@ -599,6 +600,8 @@ func (r *cmRecorder) cms() []*protocol.ChannelMessage {
 	return slices.Clone(r.got)
 }
 
+func (r *cmRecorder) all() []*protocol.ChannelMessage { return r.cms() }
+
 func (r *cmRecorder) serials() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -609,14 +612,15 @@ func (r *cmRecorder) serials() []string {
 	return out
 }
 
-func (r *cmRecorder) waitFor(t *testing.T, n int, timeout time.Duration) {
+func (r *cmRecorder) waitFor(t *testing.T, n int, timeout time.Duration) []*protocol.ChannelMessage {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if r.count() >= n {
-			return
+		if got := r.cms(); len(got) >= n {
+			return got
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d cms; have %d", n, r.count())
+	return nil
 }

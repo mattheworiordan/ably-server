@@ -11,6 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // Metrics holds the process-wide collectors and the registry they are
@@ -86,6 +88,16 @@ func New() *Metrics {
 		m.httpRequests,
 	)
 	return m
+}
+
+// RegisterBus exports a cluster bus's counters (DESIGN.md §7.2, §10) as
+// ably_bus_* series, read from src on every scrape. No-op on a nil
+// Metrics.
+func (m *Metrics) RegisterBus(src storage.BusStatser) {
+	if m == nil {
+		return
+	}
+	m.registry.MustRegister(newBusCollector(src))
 }
 
 // Handler returns the HTTP handler that serves the registry in the
