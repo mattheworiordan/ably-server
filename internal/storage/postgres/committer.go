@@ -34,7 +34,7 @@ func validText(s string) bool {
 // never seen it, so a batch never has to insert one.
 func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if !validText(cs.name) {
-		return nil, false, fmt.Errorf("storage/postgres: channel name is not valid UTF-8 text")
+		return nil, false, storage.ErrInvalidChannelName
 	}
 	clientIDs := len(nonEmptyIDs(msgs)) > 0
 	for _, m := range msgs {
@@ -47,8 +47,14 @@ func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs [
 		return nil, false, err
 	}
 	if !cs.rowEnsured.Load() {
-		if _, err := cs.pool.Exec(ctx, `SELECT ensure_channel($1, $2)`, cs.name, cs.series); err != nil {
-			return nil, false, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
+		// Create the row if absent, as ensure_channel would, but without
+		// its ON CONFLICT DO UPDATE: that takes the row lock, which would
+		// queue this publish behind a hot channel's in-flight batch.
+		if _, err := cs.pool.Exec(ctx, `
+			INSERT INTO channels (name, channel_serial, initial_channel_serial)
+			SELECT $1, s, s FROM (SELECT format_channel_serial((extract(epoch from clock_timestamp()) * 1000)::BIGINT, 0, $2) AS s) seed
+			ON CONFLICT (name) DO NOTHING`, cs.name, cs.series); err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: create channel row: %w", err)
 		}
 		cs.rowEnsured.Store(true)
 	}
@@ -68,7 +74,10 @@ type batchSlot struct {
 	prev      string // the channel's serial before this cm (earlier cms of the batch included)
 	dupSerial string
 
-	cm *protocol.ChannelMessage // an ok slot's cm
+	cm        *protocol.ChannelMessage // an ok slot's cm
+	item      *batchItem               // an ok slot's bus item
+	recovered bool                     // a duplicate that is this publish's own first attempt
+	original  *protocol.ChannelMessage // a duplicate's stored cm
 }
 
 // commitBatch implements committer: it commits a lane's batch of message
@@ -98,7 +107,7 @@ func (s *Storage) commitBatch(ctx context.Context, batch []*pending) ([]*pending
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: acquire for batch: %w", err)
 	}
-	items, err := s.commitBatchTx(ctx, conn, slots)
+	_, err = s.commitBatchTx(ctx, conn, slots)
 	conn.Release()
 	if err != nil {
 		return nil, err
@@ -111,20 +120,52 @@ func (s *Storage) commitBatch(ctx context.Context, batch []*pending) ([]*pending
 		}
 	}
 
-	for _, it := range items {
-		if it.w.notified {
-			s.stats.published.Add(1)
+	// Read the stored cm of every database duplicate now that the batch's
+	// connection is back in the pool. A duplicate stored under the serial
+	// this publish's own first attempt minted is that attempt's commit,
+	// whose reply was lost: it is recovered, not a duplicate.
+	for i := range slots {
+		sl := &slots[i]
+		if sl.dupOf >= 0 || sl.status != "duplicate" {
+			continue
 		}
-		if it.w.pointer {
-			s.stats.pointers.Add(1)
+		original, err := s.loadChannelMessage(ctx, sl.p.channel, sl.dupSerial)
+		if err != nil {
+			// Stored, but not readable now: retriable, and a retry with
+			// the same id finds it.
+			sl.p.res = pendingResult{err: fmt.Errorf("%w: read back the stored publish: %w", storage.ErrUnavailable, err)}
+			continue
 		}
-		s.bus.afterCommit(it.cs, it.cm, it.w.prev)
+		sl.original = original
+		sl.recovered = sl.p.minted != "" && sl.dupSerial == sl.p.minted
 	}
 
-	// Results. A publish the database recognised as a duplicate returns
-	// the original cm, read now that the batch's connection is back in
-	// the pool; one that repeats an id of an earlier publish in this
-	// batch shares that publish's result.
+	// The bus's post-commit hook, per cm in batch order (so each channel's
+	// cms in serial order): the fresh ones, and recovered ones whose hook
+	// the lost first attempt never ran.
+	chains := s.bus.chains()
+	for i := range slots {
+		sl := &slots[i]
+		switch {
+		case sl.item != nil:
+			if sl.item.w.notified {
+				s.stats.published.Add(1)
+			}
+			if sl.item.w.pointer {
+				s.stats.pointers.Add(1)
+			}
+			s.bus.afterCommit(sl.item.cs, sl.item.cm, sl.item.w.prev)
+		case sl.recovered:
+			prev := ""
+			if chains {
+				prev = sl.p.mintedPrev
+			}
+			s.bus.afterCommit(sl.p.cs, sl.original, prev)
+		}
+	}
+
+	// Results. A publish that repeats an id of an earlier publish in
+	// this batch shares that publish's result.
 	var deferred []*pending
 	for i := range slots {
 		sl := &slots[i]
@@ -139,8 +180,9 @@ func (s *Storage) commitBatch(ctx context.Context, batch []*pending) ([]*pending
 			if sl.dupOf >= 0 {
 				continue // filled from its primary below
 			}
-			original, err := s.loadChannelMessage(ctx, sl.p.channel, sl.dupSerial)
-			sl.p.res = pendingResult{cm: original, idempotent: err == nil, err: err}
+			if sl.original != nil {
+				sl.p.res = pendingResult{cm: sl.original, idempotent: !sl.recovered}
+			}
 		case "ok":
 			sl.p.res = pendingResult{cm: primary.cm, idempotent: sl.dupOf >= 0}
 		default:
@@ -150,7 +192,9 @@ func (s *Storage) commitBatch(ctx context.Context, batch []*pending) ([]*pending
 	for i := range slots {
 		sl := &slots[i]
 		if sl.dupOf >= 0 && slots[sl.dupOf].status == "duplicate" {
-			sl.p.res = slots[sl.dupOf].p.res
+			res := slots[sl.dupOf].p.res
+			res.idempotent = res.err == nil
+			sl.p.res = res
 		}
 	}
 	return deferred, nil
@@ -286,6 +330,15 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 		}
 		sl.cm = &protocol.ChannelMessage{ID: p.batchID, ChannelSerial: sl.serial, Messages: p.msgs}
 		items = append(items, batchItem{cs: p.cs, cm: sl.cm, w: w})
+		if p.minted == "" && !p.retried {
+			p.minted, p.mintedPrev = sl.serial, sl.prev
+		}
+	}
+	for i, j := 0, 0; i < len(slots); i++ {
+		if slots[i].dupOf < 0 && slots[i].status == "ok" {
+			slots[i].item = &items[j]
+			j++
+		}
 	}
 
 	// Round trip 2: rows, the bus hook, COMMIT.

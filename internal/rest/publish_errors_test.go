@@ -53,6 +53,7 @@ func TestPublishBatchingFailuresMapToRetriableCodes(t *testing.T) {
 	}{
 		{storage.ErrOverloaded, http.StatusTooManyRequests, 42910},
 		{storage.ErrUnavailable, http.StatusServiceUnavailable, 50003},
+		{storage.ErrInvalidChannelName, http.StatusBadRequest, 40010},
 	} {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			manager := core.NewManager(failingStorage{Storage: memory.New(memory.Options{}), err: tc.err})

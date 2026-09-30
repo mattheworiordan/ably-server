@@ -350,8 +350,16 @@ func (t connTx) Begin(context.Context) (pgx.Tx, error) {
 	return nil, errors.New("storage/postgres: nested transaction in a batched publish")
 }
 func (t connTx) Commit(ctx context.Context) error {
-	_, err := t.conn.Exec(ctx, "COMMIT")
-	return err
+	tag, err := t.conn.Exec(ctx, "COMMIT")
+	if err != nil {
+		return err
+	}
+	if tag.String() != "COMMIT" {
+		// An aborted transaction answers COMMIT with ROLLBACK, which
+		// pgx.Tx reports as ErrTxCommitRollback.
+		return pgx.ErrTxCommitRollback
+	}
+	return nil
 }
 func (t connTx) Rollback(ctx context.Context) error {
 	_, err := t.conn.Exec(ctx, "ROLLBACK")

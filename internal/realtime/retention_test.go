@@ -160,7 +160,7 @@ func TestPublishBatchingFailuresNACKWithRetriableCodes(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		code int
-	}{{storage.ErrOverloaded, 42910}, {storage.ErrUnavailable, 50003}} {
+	}{{storage.ErrOverloaded, 42910}, {storage.ErrUnavailable, 50003}, {storage.ErrInvalidChannelName, 40010}} {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			parsed, err := auth.ParseAPIKey(testKey)
 			if err != nil {

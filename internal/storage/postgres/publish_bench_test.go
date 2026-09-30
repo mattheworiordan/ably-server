@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"testing"
 	"time"
 
@@ -26,7 +27,8 @@ func (nopAppender) Append(*protocol.ChannelMessage) {}
 // 16 x GOMAXPROCS concurrent publishers, each publishing one 500-byte
 // message at a time to a random one of 1,000 channels, with the shipped
 // LISTEN bus running. It reports publishes/s and Postgres commits/s,
-// unbatched and batched. A laptop number, not a cloud one:
+// unbatched and batched, on the pgnotify bus or, with BENCH_BUS=postgres,
+// the coalesced postgres bus. A laptop number, not a cloud one:
 //
 //	go test -tags=integration -run '^$' -bench PublishThroughput -benchtime 10s ./internal/storage/postgres/
 func BenchmarkPublishThroughput(b *testing.B) {
@@ -42,7 +44,12 @@ func BenchmarkPublishThroughput(b *testing.B) {
 		b.Run(mode.name, func(b *testing.B) {
 			ctx := context.Background()
 			dsn := c.FreshSchemaDSN(b)
-			s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Batching: mode.batching})
+			o := postgres.Options{DSN: dsn, Batching: mode.batching}
+			switch os.Getenv("BENCH_BUS") {
+			case "postgres":
+				o.Bus, o.NotifyMode, o.NotifyWindow = postgres.BusPostgres, postgres.NotifyCoalesced, 0
+			}
+			s, err := postgres.Open(ctx, o)
 			if err != nil {
 				b.Fatalf("Open: %v", err)
 			}

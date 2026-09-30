@@ -41,6 +41,11 @@ var ErrTargetNotFound = errors.New("storage: target message not found")
 // map it to a 400 (REST) or a NACK (WS).
 var ErrIncompatibleAppend = errors.New("storage: append data type is incompatible with the target's current data")
 
+// ErrInvalidChannelName is returned by a backend that cannot store the
+// channel's name as text (the Postgres backend: not valid UTF-8, or a NUL
+// byte). Callers map it to a 400 (REST) or a NACK (WS), Ably 40010.
+var ErrInvalidChannelName = errors.New("storage: channel name cannot be stored (invalid UTF-8 or NUL)")
+
 // ErrOverloaded is returned by Store when the backend's bounded publish
 // queue is full (the Postgres backend's per-lane queue, DESIGN.md §6.3).
 // Nothing was stored; the publish may be retried after a back-off.

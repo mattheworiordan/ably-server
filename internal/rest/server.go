@@ -196,6 +196,10 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorInfo(w, r, http.StatusBadRequest, 40031, err.Error())
 		return
 	}
+	if errors.Is(err, storage.ErrInvalidChannelName) {
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40010, err.Error())
+		return
+	}
 	if errors.Is(err, storage.ErrOverloaded) {
 		// The backend's bounded publish queue is full (DESIGN.md §6.3):
 		// nothing was stored; the client should back off and retry.

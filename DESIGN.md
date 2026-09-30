@@ -1363,20 +1363,26 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   each cm names the serial before it on its channel, counting earlier cms
   of the same batch, so the chaining buses (§7.2) see exactly the
   predecessor chain a single publish would give them.
-- Everything that can reject a single publish (the id format, an id or
+- Everything that can reject a single publish (the id format; an id or
   channel name that is not valid UTF-8 or contains NUL, which Postgres
-  cannot store) is checked before it is queued, and a channel's row is
-  created before its first publish is queued, so one bad publish cannot
-  fail a batch. A publish that repeats a client id of an earlier publish
+  cannot store, refused with 40031 or 40010) is checked before it is
+  queued, and a channel's row is created (without taking its lock) before
+  its first publish is queued, so one bad publish cannot fail a batch. A publish that repeats a client id of an earlier publish
   of the same channel in the batch takes that publish's result,
   idempotently. Server-generated ids are unique by construction and skip
   the lookup on a first attempt.
-- A batch that fails is retried once. The first attempt's `COMMIT` may
-  have reached the database with only its reply lost, so the retry looks
-  up every publish's id, server-generated ones included, and returns the
-  original of any already stored. If the retry fails too, every publish
-  in the batch is refused with Ably error **50003** (HTTP 503, or a NACK)
-  and may be retried by the client with the same id. Publishes caught by
+- Each commit attempt is bounded (15 s), so a stuck connection cannot
+  wedge a lane. A batch that fails is retried once. The first attempt's
+  `COMMIT` may have reached the database with only its reply lost, so
+  the retry looks up every publish's id, server-generated ones included.
+  A publish found stored under the serial the first attempt gave it is
+  that attempt's own commit: it is returned as a fresh publish and the
+  bus's post-commit hook, which the lost attempt never ran, runs now, so
+  delivery is not left to the sweep. If the retry fails too, every
+  publish in the batch is refused with Ably error **50003** (HTTP 503, or
+  a NACK). A client retry with the same client-supplied id is then
+  deduplicated; a publish that carried no id may, rarely, be stored twice
+  if the client retries one whose COMMIT did land. Publishes caught by
   shutdown get the same error.
 - ACKs are per publish, sent when its batch commits.
 

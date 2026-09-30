@@ -94,6 +94,12 @@ type pending struct {
 	// lost, so the retry checks every publish's (stamped) ids, server-
 	// generated ones included, and returns the original on a hit.
 	retried bool
+	// minted and mintedPrev are the serial (and its predecessor) the
+	// first attempt gave this publish. A retry that finds the publish
+	// stored under minted knows the first attempt committed: the publish
+	// is this caller's own, not a duplicate, and its post-commit bus hook
+	// never ran, so the retry runs it.
+	minted, mintedPrev string
 
 	res  pendingResult
 	done chan struct{} // closed once res is final
@@ -179,10 +185,15 @@ const laneCloseGrace = 5 * time.Second
 // close stops accepting publishes, fails the queued ones, and waits for
 // the batches in flight, cancelling them after laneCloseGrace.
 func (ls *laneSet) close() {
+	// Stop every lane first, so none keeps accepting or starting
+	// batches while another drains; then wait for their batches.
+	for _, l := range ls.lanes {
+		l.stop()
+	}
 	done := make(chan struct{})
 	go func() {
 		for _, l := range ls.lanes {
-			l.close()
+			l.wg.Wait()
 		}
 		close(done)
 	}()
@@ -304,13 +315,13 @@ func (l *lane) takeLocked() []*pending {
 func (l *lane) run(batch []*pending) {
 	defer l.wg.Done()
 	start := time.Now()
-	deferred, err := l.c.commitBatch(l.ctx, batch)
+	deferred, err := l.attempt(batch)
 	if err != nil && l.ctx.Err() == nil {
 		l.metrics.retries.Inc()
 		for _, p := range batch {
 			p.retried = true
 		}
-		deferred, err = l.c.commitBatch(l.ctx, batch)
+		deferred, err = l.attempt(batch)
 	}
 	l.metrics.commitSeconds.Observe(time.Since(start).Seconds())
 
@@ -357,8 +368,28 @@ func (l *lane) run(batch []*pending) {
 	}
 }
 
+// commitAttemptTimeout bounds one commit attempt of a batch, so a stuck
+// connection or statement cannot keep the batch's channels busy, and its
+// lane stalled, indefinitely. The retry that follows finds anything the
+// timed-out attempt did commit. A var so tests can shrink it.
+var commitAttemptTimeout = 15 * time.Second
+
+// attempt runs one commit attempt of batch under commitAttemptTimeout.
+func (l *lane) attempt(batch []*pending) ([]*pending, error) {
+	ctx, cancel := context.WithTimeout(l.ctx, commitAttemptTimeout)
+	defer cancel()
+	return l.c.commitBatch(ctx, batch)
+}
+
 // close fails queued publishes and waits for in-flight batches.
 func (l *lane) close() {
+	l.stop()
+	l.wg.Wait()
+}
+
+// stop marks the lane closed and fails its queued publishes, without
+// waiting for the batches in flight.
+func (l *lane) stop() {
 	l.mu.Lock()
 	l.closed = true
 	if l.timer != nil {
@@ -371,7 +402,6 @@ func (l *lane) close() {
 	for _, p := range queued {
 		p.finish(pendingResult{err: errLanesClosed})
 	}
-	l.wg.Wait()
 }
 
 // writeMetrics are the ably_publish_* batching series (DESIGN.md §10).

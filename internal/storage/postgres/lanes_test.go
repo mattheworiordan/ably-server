@@ -470,3 +470,47 @@ func waitQueuedOrDone(ls *laneSet, channel string, n int, f *fakeCommitter) {
 		time.Sleep(50 * time.Microsecond)
 	}
 }
+
+// hangingCommitter blocks its first two attempts until their context
+// ends (a stuck connection), then commits normally.
+type hangingCommitter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (h *hangingCommitter) commitBatch(ctx context.Context, batch []*pending) ([]*pending, error) {
+	h.mu.Lock()
+	h.calls++
+	n := h.calls
+	h.mu.Unlock()
+	if n <= 2 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	for _, p := range batch {
+		p.res = pendingResult{cm: &protocol.ChannelMessage{ChannelSerial: "ok"}}
+	}
+	return nil, nil
+}
+
+// TestLaneStuckCommitIsBounded: an attempt that never returns on its own
+// is cut off by commitAttemptTimeout, so the batch fails retriably and
+// the lane goes on to commit the next one instead of wedging.
+func TestLaneStuckCommitIsBounded(t *testing.T) {
+	orig := commitAttemptTimeout
+	commitAttemptTimeout = 50 * time.Millisecond
+	defer func() { commitAttemptTimeout = orig }()
+	ls := testLanes(t, Batching{Lanes: 1}, &hangingCommitter{})
+
+	start := time.Now()
+	_, _, err := ls.publish(newPending(context.Background(), "a"))
+	if !errors.Is(err, storage.ErrUnavailable) {
+		t.Fatalf("publish whose batch hung twice: err = %v, want storage.ErrUnavailable", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("stuck batch took %v to fail, want about two attempt timeouts", took)
+	}
+	if _, _, err := ls.publish(newPending(context.Background(), "a")); err != nil {
+		t.Errorf("next publish on the same channel after the stuck batch: %v", err)
+	}
+}

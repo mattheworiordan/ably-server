@@ -776,6 +776,8 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 // NACKs without one, as before.
 func publishErrorInfo(err error) *protocol.ErrorInfo {
 	switch {
+	case errors.Is(err, storage.ErrInvalidChannelName):
+		return &protocol.ErrorInfo{Message: err.Error(), Code: 40010, StatusCode: 400}
 	case errors.Is(err, storage.ErrOverloaded):
 		return &protocol.ErrorInfo{Message: "publish rejected: server busy, retry later", Code: 42910, StatusCode: 429}
 	case errors.Is(err, storage.ErrUnavailable):
