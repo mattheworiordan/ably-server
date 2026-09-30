@@ -573,22 +573,16 @@ func TestRepeatAttachConcurrentForwardIsRaceFree(t *testing.T) {
 
 	// Drain outbound frames so the attachment's forward loop keeps running
 	// (and keeps reading the mode set) rather than parking on backpressure.
+	// The reads block until the test closes the socket: a read deadline
+	// would fail the connection for good the first time 20 ms passed
+	// without a frame (a slow runner), and gorilla panics on the
+	// thousandth read of a failed connection.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			_ = ws.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 			if _, _, err := ws.ReadMessage(); err != nil {
-				select {
-				case <-stop:
-					return
-				default:
-				}
+				return
 			}
 		}
 	}()
@@ -622,6 +616,7 @@ func TestRepeatAttachConcurrentForwardIsRaceFree(t *testing.T) {
 		})
 	}
 	close(stop)
+	_ = ws.Close() // ends the drain
 	wg.Wait()
 }
 
