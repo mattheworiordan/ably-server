@@ -1641,10 +1641,15 @@ dispatched in the order the connection read them. The goroutine count is
 fixed whatever the number of bound channels. A pointer's body is read off
 the worker (at most 32 reads in flight), so a slow log read stalls no
 other channel on its queue; the chain holds any later cm of that channel
-until the pointer's body is in. A full queue makes NATS drop the message
-(a slow consumer, counted once per episode in `ably_bus_drops_total`),
-which the chain repairs from the log. `ably_bus_receive_queue_depth` is
-the number of messages waiting across the queues.
+until the pointer's body is in. A pointer that finds 32 reads in flight
+goes to the delivery point without a body, and the gap fill reads it
+after the hold. A full queue makes NATS drop the message (a slow
+consumer, counted once per episode in `ably_bus_drops_total`), which the
+chain repairs from the log. `ably_bus_receive_queue_depth` is the number
+of messages waiting across the queues. The queues bound messages, not
+bytes: at most 16 × 8,192 messages are buffered, each no larger than
+`--nats-inline-max-bytes` (a pointer is small), against nats.go's
+default of 64 MiB per subscription before the fan-in.
 
 `--nats-url` may list the servers of one NATS cluster, comma-separated.
 The client connects to one, learns the others from the cluster, and on a

@@ -62,8 +62,10 @@ var (
 // chain recovers it from the log. natsPointerFetches bounds the pointer
 // reads in flight: they run off the shard worker so a slow log read
 // never stalls the other channels of its shard, and the chain holds any
-// later cm of that channel until the pointer's body is in. Package vars
-// so tests can shrink them; Open snapshots them.
+// later cm of that channel until the pointer's body is in. A pointer
+// that finds them all busy is handed to the delivery point without a
+// body, and the gap fill reads it after the hold. Package vars so tests
+// can shrink them; Open snapshots them.
 var (
 	natsDispatchShards   = 16
 	natsDispatchQueueLen = 8192
@@ -229,6 +231,14 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 			s.requestReconcile()
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			select {
+			case <-s.done:
+				// Closing: the dispatch workers have stopped and the shards
+				// fill until the connection closes. Nothing is lost that
+				// matters, and a warning per subscription is noise.
+				return
+			default:
+			}
 			if errors.Is(err, nats.ErrSlowConsumer) {
 				// A dispatch shard was full and NATS dropped messages for
 				// this subscription (reported once per slow-consumer
@@ -287,7 +297,7 @@ func (b *natsBus) dispatch(ctx context.Context, q <-chan *nats.Msg) {
 		case <-ctx.Done():
 			return
 		case m := <-q:
-			b.handle(ctx, m)
+			b.handle(m)
 		}
 	}
 }
@@ -297,8 +307,8 @@ func (b *natsBus) dispatch(ctx context.Context, q <-chan *nats.Msg) {
 // subject is not that channel's (a hashed-subject collision), or for a
 // channel no longer bound here (released while the message was queued),
 // is unrouted. A pointer's body is read off the shard worker, bounded by
-// natsPointerFetches.
-func (b *natsBus) handle(ctx context.Context, m *nats.Msg) {
+// natsPointerFetches; beyond that the gap fill reads it.
+func (b *natsBus) handle(m *nats.Msg) {
 	b.s.stats.received.Add(1)
 	ev, channel, err := decodeNATSEnvelope(m.Data)
 	if err != nil {
@@ -320,7 +330,12 @@ func (b *natsBus) handle(ctx context.Context, m *nats.Msg) {
 	}
 	select {
 	case b.fetches <- struct{}{}:
-	case <-ctx.Done():
+	default:
+		// natsPointerFetches reads are in flight already. Never block the
+		// shard on them: offer the pointer without a body, which the
+		// delivery point holds, and the gap fill reads it from the log
+		// after the hold.
+		cs.deliverChained(ev)
 		return
 	}
 	b.s.wg.Add(1)
