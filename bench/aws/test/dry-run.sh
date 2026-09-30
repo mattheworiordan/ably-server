@@ -62,6 +62,20 @@ for s in "${SEQUENCE[@]}"; do
   fi
 done
 
+# The CloudWatch billing-alarm path (used when the role cannot create a Budget)
+# must call us-east-1 only, once per call.
+cw_out="$tmp/cw.txt"
+BUDGET_METHOD=cloudwatch "$AWS_DIR/00-preflight.sh" 2>&1 >/dev/null | grep -E '^DRYRUN aws (sns|cloudwatch)' >"$cw_out" || true
+if [ "$(grep -c 'put-metric-alarm --alarm-name test-scale-billing-' "$cw_out")" != 2 ] ||
+  ! grep -q 'sns create-topic --name test-scale-billing .*--region us-east-1' "$cw_out" ||
+  grep -q 'test-region-1' <(grep -E 'test-scale-billing' "$cw_out"); then
+  echo "FAIL: the CloudWatch billing alarm path did not produce the expected us-east-1 calls:" >&2
+  cat "$cw_out" >&2
+  status=1
+else
+  echo "cloudwatch alarm path calls us-east-1 only"
+fi
+
 # Normalise volatile text.
 sed -E \
   -e "s#[^ ]*/bench-aws\.[A-Za-z0-9]+/#<work>/#g" \

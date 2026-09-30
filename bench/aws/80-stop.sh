@@ -43,7 +43,7 @@ if [ "$STOP_RDS" = 1 ]; then
     log "stopping RDS instance $id"
   done
   for id in $(state_get '.postgres.instances // {} | keys[]'); do
-    aws_w "" rds wait db-instance-stopped --db-instance-identifier "$id" 2>/dev/null || true
+    wait_until "RDS instance $id stopped" 2400 30 rds_status_is "$id" stopped
   done
   _state_update '.postgres.instances |= (. // {} | map_values(.running = false))'
 fi

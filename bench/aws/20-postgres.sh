@@ -68,6 +68,13 @@ aws_w "" rds modify-db-parameter-group --db-parameter-group-name "$pgroup" --par
   "ParameterName=max_connections,ParameterValue=$max_conn,ApplyMethod=pending-reboot" \
   "ParameterName=shared_preload_libraries,ParameterValue=pg_stat_statements,ApplyMethod=pending-reboot" >/dev/null
 
+# ---- Is this storage type offered for this instance class? (RDS rejects it late otherwise.)
+offered=$(aws_r "$RDS_STORAGE" rds describe-orderable-db-instance-options --engine postgres --db-instance-class "$RDS_INSTANCE_CLASS" \
+  --query "OrderableDBInstanceOptions[?StorageType=='$RDS_STORAGE'].StorageType | [0]") || offered=""
+if [ -z "$offered" ]; then
+  die "RDS does not offer $RDS_STORAGE storage for $RDS_INSTANCE_CLASS (postgres) in this region. Pick another RDS_INSTANCE_CLASS or RDS_STORAGE."
+fi
+
 # ---- Instances
 ids=()
 for shard in $(seq 1 "$SHARDS"); do

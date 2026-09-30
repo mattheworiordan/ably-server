@@ -63,7 +63,11 @@ docker run -d --name node-exporter --restart unless-stopped --network host --pid
   --path.rootfs=/host --web.listen-address=:@@NODE_EXPORTER_PORT@@
 
 # Pull from ECR with the instance profile (skipped when no registry is given).
+# The instance profile can take a minute to become usable, so retry.
 if [ -n "@@ECR_REGISTRY@@" ]; then
-  aws ecr get-login-password --region @@REGION@@ |
-    docker login --username AWS --password-stdin @@ECR_REGISTRY@@
+  for _ in $(seq 1 12); do
+    if aws ecr get-login-password --region @@REGION@@ |
+      docker login --username AWS --password-stdin @@ECR_REGISTRY@@; then break; fi
+    sleep 10
+  done
 fi

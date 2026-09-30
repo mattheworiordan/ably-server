@@ -19,6 +19,9 @@ test/userdata-lint.sh
 echo "== lib unit tests"
 test/lib-test.sh
 
+echo "== cost estimate"
+test/cost-test.sh
+
 echo "== pgbench summary tables"
 test/summarise-test.sh
 

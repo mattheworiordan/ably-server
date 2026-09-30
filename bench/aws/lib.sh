@@ -185,11 +185,23 @@ _ext() {
   "$tool" "$@"
 }
 
+# _region_args <args...>: prints "--region <AWS_REGION>" unless the caller
+# already passed --region (billing alarms must use one fixed region).
+_region_args() {
+  local a
+  for a in "$@"; do
+    if [ "$a" = --region ]; then return 0; fi
+  done
+  printf '%s\n' --region "$AWS_REGION"
+}
+
 # aws_w <fake> args...: a write call.
 aws_w() {
   local fake=$1
   shift
-  _ext "$fake" aws "$@" --region "$AWS_REGION"
+  local -a reg
+  mapfile -t reg < <(_region_args "$@")
+  _ext "$fake" aws "$@" "${reg[@]}"
 }
 
 # aws_r <fake> args...: a read call. Text output unless --output is given;
@@ -199,7 +211,8 @@ aws_r() {
   local fake=$1
   shift
   local a have_out=0
-  local -a extra=(--region "$AWS_REGION")
+  local -a extra
+  mapfile -t extra < <(_region_args "$@")
   for a in "$@"; do
     if [ "$a" = --output ]; then have_out=1; fi
   done
@@ -227,12 +240,14 @@ aws_r() {
 aws_probe() {
   local ok=$1 out rc=0
   shift
+  local -a reg
+  mapfile -t reg < <(_region_args "$@")
   if is_dry; then
-    _ext "" aws "$@" --region "$AWS_REGION"
+    _ext "" aws "$@" "${reg[@]}"
     echo ALLOWED
     return 0
   fi
-  out=$(aws "$@" --region "$AWS_REGION" 2>&1) || rc=$?
+  out=$(aws "$@" "${reg[@]}" 2>&1) || rc=$?
   if [ "$rc" = 0 ]; then
     echo ALLOWED
   elif printf '%s' "$out" | grep -Eqi 'UnauthorizedOperation|AccessDenied|not authorized|AuthorizationError|explicit deny|is not permitted'; then
@@ -255,7 +270,9 @@ aws_w_tolerate() {
     return 0
   fi
   local out
-  if ! out=$(aws "$@" --region "$AWS_REGION" 2>&1); then
+  local -a reg
+  mapfile -t reg < <(_region_args "$@")
+  if ! out=$(aws "$@" "${reg[@]}" 2>&1); then
     if printf '%s' "$out" | grep -q -- "$pattern"; then
       log "already in place ($pattern): aws $1 $2"
       return 0
@@ -264,6 +281,11 @@ aws_w_tolerate() {
     return 1
   fi
   if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+}
+
+# rds_status_is <instance-id> <status>: true when RDS reports that status.
+rds_status_is() {
+  [ "$(AWS_R_QUIET=1 aws_r "" rds describe-db-instances --db-instance-identifier "$1" --query 'DBInstances[0].DBInstanceStatus')" = "$2" ]
 }
 
 # ----------------------------------------------------------------- tags
