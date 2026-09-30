@@ -383,10 +383,14 @@ func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMe
 }
 
 // repair replays cs's log from its high-water mark and clears the dirty
-// flag on success. On failure the channel stays dirty, so its next
-// notification (or the next reconnect's reconcile) retries.
+// flag on success. On failure the channel is marked dirty (a reconnect
+// reconcile may not have marked it), so its next notification repairs
+// from the mark instead of delivering that cm alone, which would move
+// the mark past the cms the failed read did not deliver; the next
+// notification or reconnect retries.
 func (b *pgNotifyBus) repair(ctx context.Context, cs *channelStore) {
 	if err := cs.reconcileFromHistory(ctx); err != nil {
+		cs.setDirty(true)
 		if ctx.Err() == nil {
 			b.s.logger.Warn("storage/postgres: repair from history failed; will retry", "channel", cs.name, "err", err)
 		}

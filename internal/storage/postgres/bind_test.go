@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
+	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
@@ -176,5 +178,38 @@ func TestReleasedStoreDeliversNothing(t *testing.T) {
 	_ = cs2.initialize(context.Background(), "004", "000")
 	if got := b.got(); len(got) != 0 {
 		t.Fatalf("released-while-binding appender events = %v, want none", got)
+	}
+}
+
+// TestFailedRepairMarksChannelDirty: a reconnect reconcile whose log read
+// fails leaves the channel dirty, so the next notification repairs from
+// the mark instead of delivering its own cm alone past the cms the
+// failed read never delivered.
+func TestFailedRepairMarksChannelDirty(t *testing.T) {
+	a := &recordingAppender{}
+	cs := &channelStore{name: "c", appender: a}
+	if err := cs.initialize(context.Background(), "010", "000"); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	b := &pgNotifyBus{s: &Storage{logger: logging.Default()}}
+	fail := true
+	cs.loadAfterFn = func(_ context.Context, after string) ([]*protocol.ChannelMessage, error) {
+		if fail {
+			return nil, errors.New("injected: log read failed")
+		}
+		return []*protocol.ChannelMessage{cmAt("011"), cmAt("012")}, nil
+	}
+
+	b.repair(context.Background(), cs) // the reconnect's reconcile, failing
+	if !cs.isDirty() {
+		t.Fatal("a failed repair left the channel clean: the next NOTIFY would skip the missed cms")
+	}
+	fail = false
+	b.repair(context.Background(), cs) // the next notification repairs
+	if cs.isDirty() {
+		t.Error("a successful repair left the channel dirty")
+	}
+	if want := []string{"init:010", "011", "012"}; !equal(a.got(), want) {
+		t.Fatalf("appender events = %v, want %v", a.got(), want)
 	}
 }
