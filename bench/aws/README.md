@@ -8,9 +8,9 @@ Anonymised results go in [RESULTS.md](RESULTS.md).
 |---|---|
 | `env.example` | Every environment variable, with placeholders. Copy it outside the repository. |
 | `lib.sh` | Shared helpers: dry-run wrapper, tags, state file (jq), log, waits, cost estimate. |
-| `00-preflight.sh` | Credentials, account, permission probes, vCPU quota, ECR repositories, billing alarm. |
-| `10-network.sh` | Default VPC, one zone, security group, instance profile (a placement group only on request; no key pair: the SSH key goes in user-data). |
-| `build-push.sh`, `Dockerfile.loadgen` | Build `ably-server` and `ably-loadgen` for linux/amd64, push to ECR, record tags. |
+| `00-preflight.sh` | Credentials, account, permission probes, vCPU quota, billing alarm, image registry (ECR repositories only for `IMAGE_REGISTRY_KIND=ecr`). |
+| `10-network.sh` | Default VPC, one zone, security group, instance profile (ecr only; a placement group only on request; no key pair: the SSH key goes in user-data). |
+| `build-push.sh`, `Dockerfile.loadgen` | Build `ably-server` and `ably-loadgen` for linux/amd64, push to `IMAGE_REGISTRY` (ghcr or ECR; none builds only), record tags. `mirror` copies the third party images to the same registry. |
 | `20-postgres.sh` | PostgreSQL 17 in Docker on an r7i.4xlarge with an EBS data volume (io2 or gp3), not RDS (see RUNBOOK section 1); optionally several instances for run 8. |
 | `25-pgdriver.sh`, `65-run-0a.sh`, `pgbench/` | Run 0a: pgbench against Postgres alone. |
 | `30-nats.sh` | Three-server NATS core cluster. |
@@ -20,7 +20,7 @@ Anonymised results go in [RESULTS.md](RESULTS.md).
 | `70-collect.sh` | Gather metrics, logs and database statistics for a run. |
 | `80-terminate.sh` | Between runs: terminate every instance and its disks (there is no stop and start) and keep the network. |
 | `90-teardown.sh` | Delete everything tagged for the project and verify. |
-| `cost-estimate.sh` | Hourly rate of what is running and an estimate of the spend so far. |
+| `cost-estimate.sh` | Hourly rate of what is running, an estimate of the spend so far, and a warning about tagged instances and volumes STATE does not know. |
 | `templates/` | The user-data that boots each kind of box. |
 | `test/` | Tests that need no AWS account: `test/run-all.sh`. |
 
