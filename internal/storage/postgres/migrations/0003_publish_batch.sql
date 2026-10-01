@@ -74,11 +74,9 @@ BEGIN
   -- Channels with no row yet are created here, as ensure_channel would,
   -- and then locked without waiting, in sorted order. This is the normal
   -- path for a publish on a channel no bind has created the row for (a
-  -- write-only REST publish, a presence operation on a cold channel); only
-  -- under --publish-bind-on-write does a bind or an earlier statement
-  -- create the row first, making this a fallback. A row another
-  -- transaction holds locked defers its cms like any busy channel, so the
-  -- lock step never waits while holding locks. The INSERT itself can wait:
+  -- write-only REST publish, a presence operation on a cold channel). A
+  -- row another transaction holds locked defers its cms like any busy
+  -- channel, so the lock step never waits while holding locks. The INSERT itself can wait:
   -- ON CONFLICT DO NOTHING does not wait on a committed row, but it waits
   -- for another transaction's uncommitted insert of the same new name (two
   -- nodes' first publishes to one channel at the same instant). That wait

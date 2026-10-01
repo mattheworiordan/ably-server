@@ -33,9 +33,7 @@ func validText(s string) bool {
 // waits for the batch that commits it (DESIGN.md §6.3). Everything that
 // can reject one publish on its own (the id format, text Postgres would
 // refuse) is checked here, before it is queued, so one bad publish cannot
-// fail a batch. Under Options.BindOnWrite the channel's row is created
-// here if this store has never seen it, so a batch never has to insert
-// one; otherwise a missing row is created by the batch's
+// fail a batch. A missing channel row is created by the batch's
 // publish_batch_lock, in the same round trip that locks the rows. That
 // insert can wait for another transaction's uncommitted insert of the same
 // new name, and never deadlocks (DESIGN.md §6.3 "Channel rows").
@@ -51,9 +49,6 @@ func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs [
 	}
 	batchID, err := storage.StampMessageIDs(msgs)
 	if err != nil {
-		return nil, false, err
-	}
-	if err := cs.ensureRow(ctx); err != nil {
 		return nil, false, err
 	}
 	p := newPending(ctx, cs.name)
@@ -75,9 +70,6 @@ func (cs *channelStore) storePresenceBatched(ctx context.Context, lanes *laneSet
 		if !validText(pm.ID) || !validText(pm.ClientID) || !validText(pm.ConnectionID) {
 			return nil, false, storage.ErrInvalidMessageID
 		}
-	}
-	if err := cs.ensureRow(ctx); err != nil {
-		return nil, false, err
 	}
 	if storage.IsPresenceReentry(ctx) {
 		// A lease-lapse re-entry skips members still present, which a
@@ -144,29 +136,6 @@ func (cs *channelStore) storePresenceAround(ctx context.Context, presence []*pro
 		}
 	}
 	return cs.storePresenceTx(ctx, presence, onlyAbsent)
-}
-
-// ensureRow creates the channel's row before a message or presence
-// publish is queued, under Options.BindOnWrite only, if this store has
-// never seen it, so a batch never has to insert one. Otherwise (the
-// default) it does nothing: the batch's publish_batch_lock creates a
-// missing row in the round trip that locks the rows, for presence
-// operations exactly as for messages (DESIGN.md §6.3 "Channel rows").
-func (cs *channelStore) ensureRow(ctx context.Context) error {
-	if !cs.preInsertRow || cs.rowEnsured.Load() {
-		return nil
-	}
-	// Create the row if absent, as ensure_channel would, but without its
-	// ON CONFLICT DO UPDATE: that takes the row lock, which would queue
-	// this publish behind a hot channel's in-flight batch.
-	if _, err := cs.pool.Exec(ctx, `
-		INSERT INTO channels (name, channel_serial, initial_channel_serial)
-		SELECT $1, s, s FROM (SELECT format_channel_serial((extract(epoch from clock_timestamp()) * 1000)::BIGINT, 0, $2) AS s) seed
-		ON CONFLICT (name) DO NOTHING`, cs.name, cs.series); err != nil {
-		return fmt.Errorf("storage/postgres: create channel row: %w", err)
-	}
-	cs.rowEnsured.Store(true)
-	return nil
 }
 
 // batchSlot is one publish's place in a batch transaction.

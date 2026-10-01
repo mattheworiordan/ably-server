@@ -46,13 +46,6 @@ type Options struct {
 	// Logger receives Release failures. Nil means logging.Default().
 	Logger *logging.Logger
 
-	// WriteOnlyPublish enables the write-only publish path (DESIGN.md
-	// §5.1): when the storage implements storage.UnboundPublisher,
-	// WriteOnlyStore hands out an unbound store for a channel with no
-	// Channel on this node, so a publish to it does not bind it. False
-	// keeps every publish on GetChannel (--publish-bind-on-write).
-	WriteOnlyPublish bool
-
 	// PresenceSyncSource is where an attach's SYNC snapshot comes from:
 	// PresenceSyncLocal (the empty default) or PresenceSyncStore
 	// (DESIGN.md §12.4).
@@ -72,7 +65,7 @@ type Options struct {
 // pub/sub mechanics live in storage.
 type Manager struct {
 	store       storage.Storage
-	unbound     storage.UnboundPublisher // nil: the write-only path is off
+	unbound     storage.UnboundPublisher // nil: the storage has no write-only path
 	idleTimeout time.Duration
 	sweepEvery  time.Duration
 	metrics     *metrics.Metrics
@@ -135,7 +128,7 @@ func newManager(store storage.Storage, opts Options, now func() int64) *Manager 
 	if m.logger == nil {
 		m.logger = logging.Default()
 	}
-	if up, ok := store.(storage.UnboundPublisher); ok && opts.WriteOnlyPublish {
+	if up, ok := store.(storage.UnboundPublisher); ok {
 		m.unbound = up
 	}
 	if m.syncSource == "" {
@@ -265,8 +258,8 @@ func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error)
 
 // WriteOnlyStore returns a store through which a message publish on name
 // is stored without binding the channel (DESIGN.md §5.1), or nil when the
-// publish should go through GetChannel: the write-only path is off or the
-// storage has none, or this node has a Channel for name (bound, or still
+// publish should go through GetChannel: the storage has no write-only
+// path, or this node has a Channel for name (bound, or still
 // binding) that is not being evicted. A name with no Channel here has no
 // attachment and no presence member on this node, so the publish has no
 // local subscriber to reach; the storage still announces it to the other

@@ -647,3 +647,15 @@ func TestBusSettingsIgnored(t *testing.T) {
 		}
 	}
 }
+
+// TestRunWarnsAboutUnknownConfigKeys (DESIGN.md §9 "Removed settings"):
+// a config file key the server does not define, such as a removed
+// setting, is named in a startup warning rather than ignored silently.
+func TestRunWarnsAboutUnknownConfigKeys(t *testing.T) {
+	path := writeConfigFile(t, "publish-bind-on-write = true\n")
+	var out bytes.Buffer
+	Run(context.Background(), Opts{Args: []string{"--config=" + path}, Getenv: emptyEnv, Out: &out})
+	if !strings.Contains(out.String(), "config file key not recognised") || !strings.Contains(out.String(), "key=publish-bind-on-write") {
+		t.Errorf("output lacks a warning naming publish-bind-on-write: %q", out.String())
+	}
+}

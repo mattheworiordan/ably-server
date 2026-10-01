@@ -84,7 +84,6 @@ const (
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
 	publishLingerMinEnv = "ABLY_SERVER_PUBLISH_LINGER_MIN"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
-	publishBindEnv      = "ABLY_SERVER_PUBLISH_BIND_ON_WRITE"
 
 	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
 	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
@@ -222,11 +221,6 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
-	publishBindDefault, err := config.DefaultBool(opts.Getenv(publishBindEnv), file.PublishBindOnWrite, false)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
 	presenceBatchingDefault, err := config.DefaultBoolPtr(opts.Getenv(presenceBatchingEnv), file.PresenceBatching, true)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -291,7 +285,6 @@ func Run(ctx context.Context, opts Opts) int {
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishLingerMin := fs.Duration("publish-linger-min", publishLingerMinDefault, "cluster mode: how long an idle lane holds its first publish so others can join its commit; 0 commits at once (DESIGN.md §6.3) (env: "+publishLingerMinEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
 	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
 	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
 	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
@@ -365,6 +358,10 @@ func Run(ctx context.Context, opts Opts) int {
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
 		return 1
+	}
+
+	for _, k := range file.Unknown {
+		logger.Warn("config file key not recognised; ignored (DESIGN.md §9)", "key", k, "file", configPath)
 	}
 
 	keySpecs := resolveAPIKeys([]string(keysFlags), opts.Getenv(keysEnv), file)
@@ -443,7 +440,6 @@ func Run(ctx context.Context, opts Opts) int {
 		},
 		persisted:           persistedNamespaces(file.Namespaces),
 		persistedNamespaces: persistedNamespaceIDs(file.Namespaces),
-		bindOnWrite:         *publishBindOnWrite,
 		batching: postgres.Batching{
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
@@ -496,7 +492,6 @@ func Run(ctx context.Context, opts Opts) int {
 		IdleTimeout:        *channelIdleTimeout,
 		Metrics:            m,
 		Logger:             logger,
-		WriteOnlyPublish:   !*publishBindOnWrite,
 		PresenceSyncSource: syncSource,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
@@ -966,7 +961,6 @@ type clusterOptions struct {
 	batching            postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted           func(channel string) bool // persisted-namespace resolver
 	persistedNamespaces []string                  // the persisted namespace ids (cluster identity, DESIGN.md §11)
-	bindOnWrite         bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 
 	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
 	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
@@ -986,7 +980,6 @@ func (c clusterOptions) options() postgres.Options {
 		Batching:  c.batching,
 
 		PersistedNamespaces: c.persistedNamespaces,
-		BindOnWrite:         c.bindOnWrite,
 
 		PresenceMaxInflight:  c.presenceMaxInflight,
 		PresenceLeaseMode:    c.presenceLeaseMode,

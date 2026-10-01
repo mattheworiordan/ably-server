@@ -871,7 +871,6 @@ the nodes with members receive it on the bus like any other cm. A node
 that holds a Channel for the name (an attachment, a presence member, or
 a Channel not yet evicted) sends its REST publishes down the normal path,
 so its local member set sees them in order with the presence cms.
-`--publish-bind-on-write=true` restores binding on every publish.
 `ably_channel_unbound_publishes_total` counts the publishes that take
 this path.
 
@@ -1591,10 +1590,7 @@ writes a new row version and waits for the row lock of a channel another
 node is publishing on. A known name whose row has since been pruned (see
 below) reads no row, and the bind falls back to `ensure_channel`, which
 creates it. Either read comes after
-the bus subscription, so the bind misses nothing (§7.2). With
-`--publish-bind-on-write=true` the earlier behaviour returns: every bind
-runs `ensure_channel`, and a batched publish (message or presence)
-creates a missing row in a statement of its own before it is queued.
+the bus subscription, so the bind misses nothing (§7.2).
 
 **Pruning `channels` rows.** One row per channel name ever used is
 unbounded: a workload that touches millions of distinct names an hour
@@ -2458,7 +2454,6 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-linger-min 0s       cluster mode: how long an idle lane holds its first publish; 0 = leading edge (§6.3)
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
---publish-bind-on-write false cluster mode: true binds a channel on every REST publish (§5.1, §6.3)
 --presence-sync-source local  where an attach's presence SYNC comes from: local (the node's member set) or store (§12.4)
 --presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
 --presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
@@ -2483,7 +2478,7 @@ Configuration may also be supplied via an optional TOML config file
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
-`publish-queue-max`, `publish-bind-on-write`, `presence-sync-source`,
+`publish-queue-max`, `presence-sync-source`,
 `presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
@@ -2514,6 +2509,17 @@ or `nats`, `--bus-sweep-*` under `pgnotify`), given by flag, env or file,
 is named in a warning at startup rather than dropped silently. The bus,
 the retentions and the persisted namespaces must be the same on every
 node of a cluster, which the database enforces at startup (§11).
+
+**Removed settings.** The settings below existed to switch a fix off for
+an A/B comparison in the scale proof; each was removed once the fix was
+measured, and the behaviour it selected by default is now the only one.
+A flag from this list is now a startup error; its env var is ignored; a
+TOML key from it, like any key the file format does not define, is named
+in a warning at startup.
+
+- `--publish-bind-on-write` (`publish-bind-on-write`): replaced by the
+  write-only publish path (§5.1) and in-batch channel row creation (§6.3,
+  "Channel rows"), which were its `false` default.
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably

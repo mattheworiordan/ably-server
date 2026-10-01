@@ -132,14 +132,6 @@
 # publish-linger-min = "0s"
 # publish-queue-max = 10000
 
-# Cluster mode: bind a channel on every REST publish, as before the
-# write-only path (env: ABLY_SERVER_PUBLISH_BIND_ON_WRITE). By default a
-# REST publish to a channel with no attachment and no presence member on
-# the receiving node is stored and announced to the other nodes without
-# binding the channel there, and a channel's first publish creates its
-# row inside the batch transaction. See DESIGN.md §6.3.
-# publish-bind-on-write = false
-
 # The presence path (DESIGN.md §12.4, §12.5). presence-sync-source picks
 # where an attach's SYNC comes from: "local" (this node's member set,
 # seeded from the store once per channel bind and kept current from the

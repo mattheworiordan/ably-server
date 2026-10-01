@@ -225,16 +225,6 @@ type Options struct {
 	// transaction; the server enables 4 lanes by default.
 	Batching Batching
 
-	// BindOnWrite restores how channel rows were made before the
-	// write-only publish path (the server's --publish-bind-on-write,
-	// DESIGN.md §6.3): every bind runs ensure_channel, and a batched
-	// publish through a store that has not seen its row creates the row
-	// in a statement of its own before it is queued. False (the default)
-	// leaves a missing row to the batch transaction's publish_batch_lock
-	// and lets a bind read a row this node knows exists (rowCache)
-	// without ensure_channel.
-	BindOnWrite bool
-
 	// PresenceMaxInflight bounds the presence writes this Storage runs
 	// in their own transaction at once (those not batched, DESIGN.md
 	// §12.5), so a convoy on one room's row lock cannot hold the whole
@@ -324,11 +314,9 @@ type Storage struct {
 	metrics   *retentionMetrics
 	lanes     *laneSet // publish batching; nil when off (§6.3)
 	wmetrics  *writeMetrics
-	// bindOnWrite is Options.BindOnWrite; rows remembers channels known to
-	// have a row (nil when bindOnWrite). ensureCalls and rowReads count the
-	// binds that ran ensure_channel and those that read a known row
-	// (ably_storage_channel_binds_total{source}).
-	bindOnWrite           bool
+	// rows remembers channels known to have a row. ensureCalls and
+	// rowReads count the binds that ran ensure_channel and those that read
+	// a known row (ably_storage_channel_binds_total{source}).
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
 
@@ -509,7 +497,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		metrics:         newRetentionMetrics(),
 		wmetrics:        newWriteMetrics(),
 		lmetrics:        newLeaseMetrics(),
-		bindOnWrite:     opts.BindOnWrite,
+		rows:            newRowCache(rowCacheSize),
 		channels:        make(map[string]*channelStore),
 		reconcileCh:     make(chan struct{}, 1),
 		loopCtx:         loopCtx,
@@ -605,9 +593,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if n := presenceMaxInflight(opts.PresenceMaxInflight, batching); n > 0 {
 		s.presenceSlots = make(chan struct{}, n)
 	}
-	if !s.bindOnWrite {
-		s.rows = newRowCache(rowCacheSize)
-	}
 
 	s.wg.Add(3)
 	go s.presenceLeaseBumpLoop(loopCtx)
@@ -674,7 +659,6 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if err != nil {
 		return fail(unavailable(err))
 	}
-	cs.rowEnsured.Store(true)
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("ensured")
 	}
@@ -789,7 +773,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		timing:    s.timing,
 		stats:     &s.stats,
 	}
-	cs.preInsertRow, cs.rows = s.bindOnWrite, s.rows
+	cs.rows = s.rows
 	if s.busKind == BusPostgres {
 		cs.pgChan = pgChannelName(s.namespace, name)
 	}
@@ -1273,18 +1257,14 @@ type channelStore struct {
 	// feed RetainedSince and the idempotency window.
 	persisted bool
 	// lanes is the storage's publish batcher, nil when batching is off
-	// (DESIGN.md §6.3); rowEnsured records that this channel's channels
-	// row is known to exist. preInsertRow (Options.BindOnWrite) makes a
-	// batched publish create a missing row in its own statement before it
-	// is queued, so the batch never has to; otherwise publish_batch_lock
-	// creates it inside the batch.
-	lanes        *laneSet
-	rowEnsured   atomic.Bool
-	preInsertRow bool
-	rows         *rowCache // the storage's known-row cache (nil under BindOnWrite)
-	retention    time.Duration
-	clock        *atomic.Int64
-	floorMin     string
+	// (DESIGN.md §6.3); a batched publish on a channel with no row yet
+	// creates it inside its batch (publish_batch_lock). rows is the
+	// storage's known-row cache.
+	lanes     *laneSet
+	rows      *rowCache
+	retention time.Duration
+	clock     *atomic.Int64
+	floorMin  string
 
 	// presenceLanes is lanes when presence operations are batched too
 	// (nil otherwise); presenceSlots bounds the presence operations this

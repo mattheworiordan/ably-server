@@ -71,9 +71,6 @@ type File struct {
 	PublishLingerMax string `toml:"publish-linger-max"`
 	PublishLingerMin string `toml:"publish-linger-min"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
-	// PublishBindOnWrite restores binding a channel on every REST publish
-	// (DESIGN.md §6.3); absent/false keeps the write-only path.
-	PublishBindOnWrite bool `toml:"publish-bind-on-write"`
 	// The presence path (DESIGN.md §12.4, §12.5, §9): the SYNC source
 	// ("local" or "store"), whether presence writes join the publish
 	// batches (a pointer, since its default is true and a file must be
@@ -114,6 +111,12 @@ type File struct {
 	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
 	// replacing the retired --fixtures JSON path.
 	Channels []Channel `toml:"channels"`
+
+	// Unknown lists the keys in the file that File does not define, such
+	// as a setting that has been removed (DESIGN.md §9 "Removed
+	// settings"), so the server can name each in a startup warning
+	// rather than ignore it silently. Set by Load, never by the file.
+	Unknown []string `toml:"-"`
 }
 
 // KeyEntry is one structured [[keys]] entry (DESIGN.md §3.1, §9): an
@@ -155,11 +158,16 @@ type PresenceMember struct {
 	Encoding string `toml:"encoding"`
 }
 
-// Load parses the TOML file at path into a File.
+// Load parses the TOML file at path into a File. Keys File does not
+// define are not an error; they are listed in File.Unknown.
 func Load(path string) (*File, error) {
 	var f File
-	if _, err := toml.DecodeFile(path, &f); err != nil {
+	md, err := toml.DecodeFile(path, &f)
+	if err != nil {
 		return nil, fmt.Errorf("config: parse %q: %w", path, err)
+	}
+	for _, k := range md.Undecoded() {
+		f.Unknown = append(f.Unknown, k.String())
 	}
 	return &f, nil
 }

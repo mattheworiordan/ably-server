@@ -376,8 +376,7 @@ func TestBatchedLostCommitReplyStillDelivers(t *testing.T) {
 }
 
 // TestPublishBatchLockCreatesMissingRow drives the function's path for a
-// channel with no row (the default Go path's first publish on a cold
-// channel; under BindOnWrite the row is made before queueing instead):
+// channel with no row (the Go path's first publish on a cold channel):
 // the row is created, locked and advanced, and the cm's prev is the new
 // row's seed serial.
 func TestPublishBatchLockCreatesMissingRow(t *testing.T) {
