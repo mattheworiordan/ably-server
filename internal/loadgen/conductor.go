@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,10 @@ type ConductorConfig struct {
 	// Zero takes the scenario's; negative measures growth from hold
 	// start.
 	ServerIdleTimeout time.Duration
+	// AllowUnmeasured waives the node-metrics coverage and box-CPU gates
+	// (a local run on a laptop, say). The record says so, and the run is
+	// not fit to quote.
+	AllowUnmeasured bool
 	// Out receives progress lines.
 	Out io.Writer
 	// HTTP is the client for agents and node metrics (default: 10s timeout).
@@ -249,11 +254,38 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 	}
 	clocks := make([]ClockRecord, 0, len(jobs))
 	clockIdx := map[string]int{}
+	agentRoleSet := map[string]map[string]bool{} // agent URL to the roles of the jobs it runs
 	for _, j := range jobs {
 		if _, ok := clockIdx[j.agent.URL]; !ok {
 			clockIdx[j.agent.URL] = len(clocks)
 			clocks = append(clocks, ClockRecord{Agent: j.agent.Name})
+			agentRoleSet[j.agent.URL] = map[string]bool{}
 		}
+		agentRoleSet[j.agent.URL][j.spec.Role] = true
+	}
+	// Each agent box's CPU, read at the start and end of the hold.
+	type hostPair struct{ start, end *HostCPU }
+	hostReads := make([]hostPair, len(clocks))
+	hostErrs := make([]string, len(clocks))
+	hostScrape := func(end bool) {
+		var wg sync.WaitGroup
+		for url, i := range clockIdx {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var h HostCPU
+				if _, err := agentCall(runCtx, cfg.HTTP, http.MethodGet, strings.TrimRight(url, "/")+"/v1/host", nil, &h); err != nil {
+					hostErrs[i] = err.Error()
+					return
+				}
+				if end {
+					hostReads[i].end = &h
+				} else {
+					hostReads[i].start = &h
+				}
+			}()
+		}
+		wg.Wait()
 	}
 	measureClocks := func(ctx context.Context, end bool) {
 		var wg sync.WaitGroup
@@ -320,8 +352,11 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 			return "drain"
 		}
 	}
-	scrape := func() {
+	scrape := func(fixed string) {
 		ph := phase(time.Now())
+		if fixed != "" {
+			ph = fixed
+		}
 		var wg sync.WaitGroup
 		for _, n := range cfg.Inventory.Nodes {
 			if n.Metrics == "" {
@@ -382,17 +417,19 @@ loop:
 			timedOut = ctx.Err() == nil
 			break loop
 		case <-tick.C:
-			scrape()
+			scrape("")
 			progress()
 			if time.Now().After(end) {
 				break loop
 			}
 		case <-holdStart:
-			scrape()
+			scrape(PhaseHoldStart)
+			hostScrape(false)
 		case <-baselineScrape:
-			scrape()
+			scrape(PhaseBaseline)
 		case <-holdEnd:
-			scrape()
+			scrape(PhaseHoldEnd)
+			hostScrape(true)
 		case <-faultTimer:
 			at := time.Now()
 			cfg.logf("fault: running %q", cfg.FaultHook)
@@ -453,8 +490,24 @@ loop:
 		Bus: cfg.Scenario.Bus, Nodes: len(cfg.Inventory.Nodes), Shards: cfg.Scenario.Shards,
 		Environment: cfg.Inventory.Environment,
 		StartUS:     startAt.UnixMicro(), MeasureStartUS: measureStart.UnixMicro(), MeasureEndUS: measureEnd.UnixMicro(), EndUS: time.Now().UnixMicro(),
-		Plan: totals, Fault: fault, Jobs: refs, Clocks: clocks,
+		Plan: totals, Fault: fault, Jobs: refs, Clocks: clocks, UnmeasuredWaived: cfg.AllowUnmeasured,
 	}
+	if cfg.FaultHook != "" && fault == nil {
+		// The scenario said a fault would be injected and the run ended
+		// first: that must not read as a fault-free pass or a relaxed one.
+		rec.Fault = &FaultRecord{Command: cfg.FaultHook, ExitCode: -1, Output: "the fault hook did not run before the end of the run"}
+	}
+	for url, i := range clockIdx {
+		c := AgentCPU{Agent: clocks[i].Agent, Kind: "generator", Error: hostErrs[i]}
+		if roles := agentRoleSet[url]; len(roles) > 0 && !roles[RoleSubscriber] && !roles[RoleRealtime] && !roles[RolePresence] {
+			c.Kind = "publisher"
+		}
+		if h := hostReads[i]; h.start != nil && h.end != nil && h.end.Total > h.start.Total {
+			c.Measured, c.CPUs, c.BusyFraction = true, h.end.CPUs, BusyFraction(*h.start, *h.end)
+		}
+		rec.AgentCPU = append(rec.AgentCPU, c)
+	}
+	sort.Slice(rec.AgentCPU, func(a, b int) bool { return rec.AgentCPU[a].Agent < rec.AgentCPU[b].Agent })
 	if b := cfg.Inventory.Environment["bus"]; b != "" {
 		rec.Bus = b
 	}
@@ -464,6 +517,7 @@ loop:
 	rec.Result = MergeSummaries(sums, plan.Pass.TailMargin.Duration)
 	rec.GrowthBaselineUS = growthBaseline.UnixMicro()
 	rec.NodeStats = ComputeNodeStats(allSamples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
+	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(cfg.Inventory, allSamples, rec.MeasureEndUS, rec.GrowthBaselineUS)
 	if ns := rec.NodeStats; ns.Measured {
 		cfg.logf("server channels bound (sum of nodes): hold start %.0f, baseline (hold start + %s) %.0f, end %.0f",
 			ns.ChannelsBoundAtStart, idle, ns.ChannelsBoundAtBaseline, ns.ChannelsBoundAtEnd)
@@ -587,6 +641,7 @@ func EvaluateRunDir(runDir string, inv *Inventory) (*RunRecord, error) {
 	}
 	rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
 	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
+	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
 	rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
 	Evaluate(&rec, spec)
 	return &rec, nil

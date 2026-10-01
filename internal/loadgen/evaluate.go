@@ -49,6 +49,13 @@ type RunRecord struct {
 	// Clocks is each generator box's clock offset from NTP at the start
 	// and end of the run (one-way latency is only as good as these).
 	Clocks []ClockRecord `json:"clocks,omitempty"`
+	// AgentCPU is each generator and publisher box's busy CPU fraction
+	// over the hold.
+	AgentCPU []AgentCPU `json:"agent_cpu,omitempty"`
+	// UnmeasuredWaived records that the run was started with
+	// --allow-unmeasured: node metrics and box CPU coverage are then
+	// reported, not gated, and the run is not fit to quote.
+	UnmeasuredWaived bool `json:"unmeasured_waived,omitempty"`
 	// UnsampledNote says what covers the channels outside the sample.
 	UnsampledNote string   `json:"unsampled_note,omitempty"`
 	Pass          bool     `json:"pass"`
@@ -65,6 +72,37 @@ type ClockRecord struct {
 	Start *ClockOffset `json:"start,omitempty"`
 	End   *ClockOffset `json:"end,omitempty"`
 	Error string       `json:"error,omitempty"`
+}
+
+// AgentCPU is one agent box's busy CPU fraction between the start and the
+// end of the hold, from its GET /v1/host. Kind is "generator" or
+// "publisher" (an agent that takes only REST publish jobs).
+type AgentCPU struct {
+	Agent        string  `json:"agent"`
+	Kind         string  `json:"kind"`
+	CPUs         int     `json:"cpus,omitempty"`
+	BusyFraction float64 `json:"busy_fraction"`
+	Measured     bool    `json:"measured"`
+	Error        string  `json:"error,omitempty"`
+}
+
+// NodeCoverage is how well one inventory node was sampled: scrapes taken
+// and failed, and whether it has a good sample at hold start, at the
+// growth baseline and at hold end.
+type NodeCoverage struct {
+	Node       string `json:"node"`
+	HasURL     bool   `json:"has_metrics_url"`
+	Samples    int    `json:"samples"`
+	Errors     int    `json:"errors"`
+	AtStart    bool   `json:"at_hold_start"`
+	AtBaseline bool   `json:"at_baseline"`
+	AtEnd      bool   `json:"at_hold_end"`
+}
+
+// Sampled reports whether the node has a good sample at hold start and
+// end, and at the baseline when one was due.
+func (c NodeCoverage) Sampled(baselineDue bool) bool {
+	return c.AtStart && c.AtEnd && (c.AtBaseline || !baselineDue)
 }
 
 // JobRef names one generator job of the run.
@@ -125,6 +163,11 @@ type NodeStats struct {
 	RSSBytesAtBaseline      float64 `json:"rss_bytes_at_baseline"`
 	GoroutinesAtBaseline    float64 `json:"goroutines_at_baseline"`
 	GoroutinesAtEnd         float64 `json:"goroutines_at_end"`
+	// Coverage is per inventory node (ComputeNodeCoverage);
+	// BaselineDue says the growth baseline scrape was due before the hold
+	// ended.
+	Coverage    []NodeCoverage `json:"coverage,omitempty"`
+	BaselineDue bool           `json:"baseline_due,omitempty"`
 }
 
 // Footprint is plan §8's footprint: provisioned and used resources per
@@ -351,6 +394,51 @@ func ComputeNodeStats(samples []NodeSample, measureStartUS, measureEndUS, baseli
 		ns.ChannelsBoundAtEnd += last.Values["ably_channels_bound"]
 	}
 	return ns
+}
+
+// Phases of the three scrapes the conductor takes at fixed points of the
+// hold, in NodeSample.Phase.
+const (
+	PhaseHoldStart = "hold-start"
+	PhaseBaseline  = "baseline"
+	PhaseHoldEnd   = "hold-end"
+)
+
+// ComputeNodeCoverage counts, for every node of the inventory, the
+// scrapes taken and failed and whether it was sampled at the three fixed
+// points. A node with no metrics URL is listed with HasURL false.
+func ComputeNodeCoverage(inv *Inventory, samples []NodeSample, measureEndUS, baselineUS int64) (cov []NodeCoverage, baselineDue bool) {
+	baselineDue = baselineUS+int64(time.Second/time.Microsecond) <= measureEndUS
+	if inv == nil {
+		return nil, baselineDue
+	}
+	byNode := map[string]*NodeCoverage{}
+	for _, n := range inv.Nodes {
+		byNode[n.Name] = &NodeCoverage{Node: n.Name, HasURL: n.Metrics != ""}
+	}
+	for _, s := range samples {
+		c := byNode[s.Node]
+		if c == nil {
+			continue
+		}
+		c.Samples++
+		if s.Error != "" || s.Values == nil {
+			c.Errors++
+			continue
+		}
+		switch s.Phase {
+		case PhaseHoldStart:
+			c.AtStart = true
+		case PhaseBaseline:
+			c.AtBaseline = true
+		case PhaseHoldEnd:
+			c.AtEnd = true
+		}
+	}
+	for _, n := range inv.Nodes {
+		cov = append(cov, *byNode[n.Name])
+	}
+	return cov, baselineDue
 }
 
 // ComputeFootprint derives plan §8's footprint figures.
@@ -636,13 +724,73 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if c, a := res.Connections, res.Attachments; c.OpenAtMeasureStart > 0 {
 		dc := relChange(c.OpenAtMeasureStart, c.OpenAtMeasureEnd)
 		da := relChange(a.AttachedAtMeasureStart, a.AttachedAtMeasureEnd)
-		gate := rec.Fault == nil
+		gate := !faultRelaxed(rec)
 		add(Check{Name: "generator load steady over hold",
 			Value: fmt.Sprintf("connections %d to %d (%+.1f%%), attachments %d to %d (%+.1f%%)", c.OpenAtMeasureStart, c.OpenAtMeasureEnd, dc*100,
 				a.AttachedAtMeasureStart, a.AttachedAtMeasureEnd, da*100),
 			Limit: fmt.Sprintf("within ±%.0f%%", spec.MaxLoadDrift*100), Pass: abs(dc) <= spec.MaxLoadDrift && abs(da) <= spec.MaxLoadDrift, Gating: gate})
 	}
 	ns := rec.NodeStats
+	if f := rec.Fault; f != nil {
+		// A fault that did not run, or whose hook failed, relaxes nothing
+		// (faultRelaxed) and fails the run: the scenario said it would
+		// inject one.
+		add(Check{Name: "fault injection", Value: fmt.Sprintf("hook exited %d", f.ExitCode), Limit: "exit 0", Pass: f.ExitCode == 0, Gating: true,
+			Note: strings.TrimSpace(f.Output)})
+	}
+	if len(ns.Coverage) > 0 {
+		sampled, errs, scrapes := 0, 0, 0
+		for _, c := range ns.Coverage {
+			if c.Sampled(ns.BaselineDue) {
+				sampled++
+			}
+			errs += c.Errors
+			scrapes += c.Samples
+		}
+		note := fmt.Sprintf("%d scrape errors in %d scrapes", errs, scrapes)
+		if !ns.BaselineDue {
+			note += "; no baseline scrape was due in a hold this short"
+		}
+		gate := !faultRelaxed(rec) && !rec.UnmeasuredWaived
+		if rec.UnmeasuredWaived {
+			note += "; waived with --allow-unmeasured"
+		}
+		add(Check{Name: "node metrics coverage", Value: fmt.Sprintf("%d of %d nodes sampled", sampled, len(ns.Coverage)),
+			Limit: "every node at hold start, baseline and end", Pass: sampled == len(ns.Coverage), Gating: gate, Note: note})
+	}
+	cpuCheck := func(kind string) {
+		var n, unmeasured int
+		var sum, worst float64
+		var worstAgent string
+		for _, c := range rec.AgentCPU {
+			if c.Kind != kind {
+				continue
+			}
+			if !c.Measured {
+				unmeasured++
+				continue
+			}
+			n++
+			sum += c.BusyFraction
+			if c.BusyFraction >= worst {
+				worst, worstAgent = c.BusyFraction, c.Agent
+			}
+		}
+		if n+unmeasured == 0 {
+			return
+		}
+		gate := !faultRelaxed(rec) && !rec.UnmeasuredWaived
+		if n == 0 {
+			add(Check{Name: kind + " CPU", Value: "not measured", Limit: "< " + pctOf(spec.MaxGeneratorCPU), Pass: false, Gating: gate,
+				Note: fmt.Sprintf("%d boxes could not be read (GET /v1/host)", unmeasured)})
+			return
+		}
+		add(Check{Name: kind + " CPU", Value: fmt.Sprintf("worst %.0f%% (%s), mean %.0f%% over %d boxes", worst*100, worstAgent, sum/float64(n)*100, n),
+			Limit: "< " + pctOf(spec.MaxGeneratorCPU), Pass: worst < spec.MaxGeneratorCPU && unmeasured == 0, Gating: gate,
+			Note: fmt.Sprintf("busy fraction of the whole box over the hold; %d boxes unmeasured; a saturated box measures itself", unmeasured)})
+	}
+	cpuCheck("generator")
+	cpuCheck("publisher")
 	switch {
 	case ns.Measured && !ns.GrowthMeasured:
 		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
@@ -650,7 +798,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	case ns.Measured:
 		// A killed node moves its connections to the survivors, so growth
 		// across the hold is expected in a fault run: reported, not gated.
-		gate, note := rec.Fault == nil, ""
+		gate, note := !faultRelaxed(rec), ""
 		if !gate {
 			note = "fault run: surviving nodes take the killed node's load"
 		}
@@ -737,6 +885,16 @@ func (rec *RunRecord) Markdown() string {
 	if d := r.Deliveries; d.InWindow > 0 {
 		fmt.Fprintf(&b, "\nDeliveries in the hold: %d; %d with negative latency from the send (clock skew detector).\n", d.InWindow, d.NegativeLatency)
 	}
+	if len(rec.AgentCPU) > 0 {
+		b.WriteString("\n| Agent box | Kind | CPU busy over the hold |\n|---|---|---|\n")
+		for _, c := range rec.AgentCPU {
+			v := "not measured"
+			if c.Measured {
+				v = fmt.Sprintf("%.0f%% of %d CPUs", c.BusyFraction*100, c.CPUs)
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", c.Agent, c.Kind, v)
+		}
+	}
 	if len(rec.Clocks) > 0 {
 		b.WriteString("\n| Generator box | Clock offset from NTP at start | at end |\n|---|---|---|\n")
 		off := func(o *ClockOffset) string {
@@ -757,6 +915,15 @@ func (rec *RunRecord) Markdown() string {
 	b.WriteString("\n| Over the hold | Start | End |\n|---|---|---|\n")
 	fmt.Fprintf(&b, "| Generator connections | %d | %d |\n", r.Connections.OpenAtMeasureStart, r.Connections.OpenAtMeasureEnd)
 	fmt.Fprintf(&b, "| Generator attachments | %d | %d (plan %d + %d churn slots) |\n", r.Attachments.AttachedAtMeasureStart, r.Attachments.AttachedAtMeasureEnd, rec.Plan.Attachments, rec.Plan.ChurnSlots)
+	if len(ns.Coverage) > 0 {
+		sampled := 0
+		for _, c := range ns.Coverage {
+			if c.Sampled(ns.BaselineDue) {
+				sampled++
+			}
+		}
+		fmt.Fprintf(&b, "| Nodes sampled at hold start, baseline and end | %d of %d | |\n", sampled, len(ns.Coverage))
+	}
 	if ns.Measured {
 		fmt.Fprintf(&b, "| Server connections (sum of nodes) | %.0f | %.0f |\n", ns.ConnectionsAtStart, ns.ConnectionsOpen)
 		fmt.Fprintf(&b, "| Server channels bound (sum of nodes) | %.0f | %.0f |\n", ns.ChannelsBoundAtStart, ns.ChannelsBoundAtEnd)

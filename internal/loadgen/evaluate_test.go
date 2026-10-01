@@ -740,3 +740,152 @@ func TestEvaluatePublishRetriesAndUnresolved(t *testing.T) {
 		t.Fatalf("unresolved must be printed:\n%s", md)
 	}
 }
+
+func nodeCovRecord(t *testing.T, fault *FaultRecord, mutate func(*RunRecord)) *RunRecord {
+	t.Helper()
+	return evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.Fault = fault
+			r.NodeStats.Coverage = []NodeCoverage{
+				{Node: "n1", HasURL: true, Samples: 6, AtStart: true, AtBaseline: true, AtEnd: true},
+				{Node: "n2", HasURL: true, Samples: 6, AtStart: true, AtBaseline: true, AtEnd: true},
+			}
+			r.NodeStats.BaselineDue = true
+			if mutate != nil {
+				mutate(r)
+			}
+		}
+	})
+}
+
+func TestEvaluateNodeMetricsCoverage(t *testing.T) {
+	t.Run("every node sampled", func(t *testing.T) {
+		mustNotFail(t, nodeCovRecord(t, nil, nil), "node metrics coverage")
+	})
+	t.Run("a node without samples at the baseline fails", func(t *testing.T) {
+		rec := nodeCovRecord(t, nil, func(r *RunRecord) { r.NodeStats.Coverage[1].AtBaseline = false; r.NodeStats.Coverage[1].Errors = 3 })
+		mustFail(t, rec, "node metrics coverage")
+		for _, c := range rec.Checks {
+			if c.Name == "node metrics coverage" && !strings.Contains(c.Value, "1 of 2 nodes sampled") {
+				t.Fatalf("%q", c.Value)
+			}
+		}
+	})
+	t.Run("a node with no metrics URL fails", func(t *testing.T) {
+		mustFail(t, nodeCovRecord(t, nil, func(r *RunRecord) { r.NodeStats.Coverage[1] = NodeCoverage{Node: "n2"} }), "node metrics coverage")
+	})
+	t.Run("no baseline due in a short hold", func(t *testing.T) {
+		mustNotFail(t, nodeCovRecord(t, nil, func(r *RunRecord) {
+			r.NodeStats.BaselineDue = false
+			r.NodeStats.Coverage[1].AtBaseline = false
+		}), "node metrics coverage")
+	})
+	t.Run("a successful fault run does not gate it", func(t *testing.T) {
+		mustNotFail(t, nodeCovRecord(t, &FaultRecord{Command: "kill"}, func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false }), "node metrics coverage")
+	})
+	t.Run("a failed fault hook relaxes nothing and fails the run", func(t *testing.T) {
+		rec := nodeCovRecord(t, &FaultRecord{Command: "kill", ExitCode: 1, Output: "no such node"}, func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false })
+		mustFail(t, rec, "node metrics coverage")
+		mustFail(t, rec, "fault injection")
+	})
+	t.Run("waived", func(t *testing.T) {
+		rec := nodeCovRecord(t, nil, func(r *RunRecord) { r.NodeStats.Coverage[1] = NodeCoverage{Node: "n2"}; r.UnmeasuredWaived = true })
+		mustNotFail(t, rec, "node metrics coverage")
+		if !strings.Contains(rec.Markdown(), "waived with --allow-unmeasured") {
+			t.Fatal("a waiver must be visible in the summary")
+		}
+	})
+}
+
+func TestEvaluateFailedFaultHookDoesNotRelaxGrowthOrSteadiness(t *testing.T) {
+	growing := func(fault *FaultRecord) *RunRecord {
+		return evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Connections.OpenAtMeasureStart = 100
+				s[0].Attachments.AttachedAtMeasureStart = 150
+				s[0].Attachments.AttachedAtMeasureEnd = 180
+			} else {
+				r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, MemoryGrowth: 0.5}
+				r.Fault = fault
+			}
+		})
+	}
+	mustFail(t, growing(&FaultRecord{Command: "kill", ExitCode: 3}), "node memory growth over hold")
+	mustFail(t, growing(&FaultRecord{Command: "kill", ExitCode: 3}), "generator load steady over hold")
+	rec := growing(&FaultRecord{Command: "kill"})
+	mustNotFail(t, rec, "node memory growth over hold")
+	mustNotFail(t, rec, "generator load steady over hold")
+}
+
+func TestComputeNodeCoverage(t *testing.T) {
+	inv := &Inventory{Nodes: []InventoryNode{{Name: "n1", Metrics: "u1"}, {Name: "n2", Metrics: "u2"}, {Name: "n3"}}}
+	ok := func(node, phase string) NodeSample {
+		return NodeSample{Node: node, Phase: phase, Values: map[string]float64{"x": 1}}
+	}
+	samples := []NodeSample{
+		ok("n1", PhaseHoldStart), ok("n1", PhaseBaseline), ok("n1", PhaseHoldEnd), ok("n1", "hold"),
+		ok("n2", PhaseHoldStart), {Node: "n2", Phase: PhaseBaseline, Error: "timeout"}, ok("n2", PhaseHoldEnd),
+	}
+	cov, due := ComputeNodeCoverage(inv, samples, 10_000_000, 2_000_000)
+	if !due || len(cov) != 3 {
+		t.Fatalf("due %v cov %+v", due, cov)
+	}
+	if !cov[0].Sampled(due) || cov[0].Samples != 4 {
+		t.Errorf("n1 %+v", cov[0])
+	}
+	if cov[1].Sampled(due) || cov[1].Errors != 1 || !cov[1].Sampled(false) {
+		t.Errorf("n2 %+v: the failed baseline scrape must not count, and only matters when a baseline was due", cov[1])
+	}
+	if cov[2].HasURL || cov[2].Sampled(false) {
+		t.Errorf("n3 %+v", cov[2])
+	}
+	if _, due := ComputeNodeCoverage(inv, samples, 2_500_000, 2_000_000); due {
+		t.Error("a baseline less than a second before the end of the hold was not due")
+	}
+}
+
+func agentCPURecord(t *testing.T, mutate func(*RunRecord)) *RunRecord {
+	t.Helper()
+	return evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.AgentCPU = []AgentCPU{
+				{Agent: "gen-1", Kind: "generator", CPUs: 32, BusyFraction: 0.41, Measured: true},
+				{Agent: "gen-2", Kind: "generator", CPUs: 32, BusyFraction: 0.38, Measured: true},
+				{Agent: "pub-1", Kind: "publisher", CPUs: 16, BusyFraction: 0.55, Measured: true},
+			}
+			if mutate != nil {
+				mutate(r)
+			}
+		}
+	})
+}
+
+func TestEvaluateGeneratorCPU(t *testing.T) {
+	rec := agentCPURecord(t, nil)
+	mustNotFail(t, rec, "generator CPU")
+	mustNotFail(t, rec, "publisher CPU")
+	if md := rec.Markdown(); !strings.Contains(md, "| gen-1 | generator | 41% of 32 CPUs |") || !strings.Contains(md, "| pub-1 | publisher |") {
+		t.Fatalf("summary.md must print each box's CPU:\n%s", md)
+	}
+	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[1].BusyFraction = 0.85 }), "generator CPU")
+	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[2].BusyFraction = 0.71 }), "publisher CPU")
+	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[0].Measured = false }), "generator CPU") // one box unread: not a pass
+	mustNotFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[1].BusyFraction = 0.85; r.Fault = &FaultRecord{Command: "kill"} }), "generator CPU")
+	mustNotFail(t, agentCPURecord(t, func(r *RunRecord) {
+		for i := range r.AgentCPU {
+			r.AgentCPU[i].Measured = false
+		}
+		r.UnmeasuredWaived = true
+	}), "generator CPU")
+	rec = agentCPURecord(t, func(r *RunRecord) {
+		for i := range r.AgentCPU {
+			r.AgentCPU[i].Measured = false
+		}
+	})
+	mustFail(t, rec, "generator CPU")
+	for _, c := range rec.Checks {
+		if c.Name == "generator CPU" && c.Value != "not measured" {
+			t.Fatalf("%q", c.Value)
+		}
+	}
+}

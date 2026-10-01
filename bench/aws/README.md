@@ -167,6 +167,7 @@ node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | status (connections, attached, acked, received, violations) |
 | `GET /v1/jobs/{id}/summary` | the job's summary (202 while running) |
 | `GET /v1/clock` | this box's clock offset from `--ntp-server` (501 without one) |
+| `GET /v1/host` | this box's cumulative CPU time from `/proc/stat` (501 off Linux); the conductor reads it at the start and end of the hold |
 | `POST /v1/stop` | stop every running job (summaries are still written) |
 | `DELETE /v1/jobs` | forget finished jobs |
 | `GET /metrics` | Prometheus: `ably_loadgen_*` plus Go and process collectors |
@@ -251,6 +252,7 @@ is a run. `run` flags:
 | `--time-limit D` | planned length + 5m | hard limit: stops every agent, runs `--on-timeout`, verdict ABORTED |
 | `--on-timeout CMD` | | for instance `bench/aws/90-teardown.sh` |
 | `--env k=v` | | labels for the run record (bus, storage, instance types) |
+| `--allow-unmeasured` | off | waive the node-metrics coverage and box-CPU gates (a local run); the record says so and the run is not fit to quote |
 | `--format` | msgpack | realtime wire format |
 | `--server-idle-timeout D` | the scenario's `server_idle_timeout`, else 60s | the nodes' `--channel-idle-timeout`; node memory and goroutine growth are measured from hold start + D (0: from hold start) |
 
@@ -302,8 +304,9 @@ footprint.
 - `plan.json`: scenario, multiplier, scale, derived totals, inventory
   (key removed), phase times.
 - `agents/<job-id>.json`: every job's summary.
-- `summary.json`: the merged result, node samples and stats, footprint,
-  fault record, checks and verdict.
+- `summary.json`: the merged result, node samples and stats (with
+  per-node scrape counts and coverage), footprint, per-box clock offsets
+  and CPU, fault record, checks and verdict.
 - `summary.md`: the same as tables.
 
 Pass criteria (plan §8, overridable per scenario in `[pass]`): delivery
@@ -324,7 +327,17 @@ publishes sent (`max_retry_ratio`; both waived after a successful fault,
 and retries, 429s and unresolved are printed either way); negative
 latency under 0.1% of in-window deliveries and, where the agents can
 measure it, every generator box within 5 ms of NTP at the start and end
-of the run;
+of the run; every inventory node sampled at hold start, at the growth
+baseline (when one falls inside the hold) and at hold end
+("N of M nodes sampled" is printed, with scrape errors), and every
+generator and publisher box under 70% CPU averaged over the hold
+(`max_generator_cpu`; read from the box's `/proc/stat`), so a saturated
+harness cannot produce a quoted number. These coverage and CPU gates,
+the retry, unresolved and delivery-rate gates stand down only for a
+fault run whose hook ran and exited 0: a hook that failed, or never ran
+before the run ended, fails the run ("fault injection") and relaxes
+nothing. `--allow-unmeasured` waives the node-metrics and CPU gates for a
+local run and is recorded as `unmeasured_waived`;
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
 within ±3% from hold start to end (else node growth would measure the
@@ -511,6 +524,7 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_negative_latency = 0.001 # in-window deliveries with negative latency from the send (clock skew)
     max_clock_offset = "5ms"     # generator box clock vs NTP, start and end of run (when measured)
     max_retry_ratio = 0.01       # publish retries over first attempts (not in a fault run)
+    max_generator_cpu = 0.7      # busy CPU of any generator or publisher box over the hold (not in a fault run)
     tail_margin = "1s"
     min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
     min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded

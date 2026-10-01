@@ -24,6 +24,7 @@ import (
 //	GET  /v1/jobs/{id}/summary its summary (202 while running)
 //	POST /v1/stop              stop every running job
 //	GET  /v1/clock             this box's clock offset from NTP (501 without NTPServer)
+//	GET  /v1/host              this box's cumulative CPU time from /proc/stat (501 off Linux)
 //	DELETE /v1/jobs            forget finished jobs
 //	GET  /metrics, /healthz
 type Agent struct {
@@ -64,6 +65,7 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{id}/summary", a.handleSummary)
 	mux.HandleFunc("POST /v1/stop", a.handleStop)
 	mux.HandleFunc("GET /v1/clock", a.handleClock)
+	mux.HandleFunc("GET /v1/host", a.handleHost)
 	return mux
 }
 
@@ -185,6 +187,15 @@ func (a *Agent) handleClock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, off)
+}
+
+func (a *Agent) handleHost(w http.ResponseWriter, _ *http.Request) {
+	h, err := ReadHostCPU()
+	if err != nil {
+		writeErr(w, http.StatusNotImplemented, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (a *Agent) handleStop(w http.ResponseWriter, _ *http.Request) {

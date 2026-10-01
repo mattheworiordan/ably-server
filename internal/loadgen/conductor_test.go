@@ -157,6 +157,15 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	if rec.Footprint.VCPU != 4 {
 		t.Errorf("footprint %+v", rec.Footprint)
 	}
+	// Node coverage: n1 has a metrics URL and was scraped at the fixed
+	// points; n2 has none and so counts as not sampled. (A fault run does
+	// not gate on it.)
+	if cov := rec.NodeStats.Coverage; len(cov) != 2 || !cov[0].Sampled(rec.NodeStats.BaselineDue) || cov[1].HasURL || cov[1].Sampled(false) {
+		t.Errorf("node coverage %+v", rec.NodeStats.Coverage)
+	}
+	if len(rec.AgentCPU) != 2 || rec.AgentCPU[0].Kind != "generator" {
+		t.Errorf("agent CPU records %+v", rec.AgentCPU)
+	}
 	if len(rec.Clocks) != 2 {
 		t.Fatalf("clock records %+v", rec.Clocks)
 	}
@@ -252,5 +261,44 @@ func TestConductorTimeLimitStopsAgents(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Error("on-timeout hook did not run")
+	}
+}
+
+// A fault hook that is configured but never runs (the run ends first) is
+// recorded as a failed fault and fails the run: it must not read as a
+// fault-free pass.
+func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
+	addr, metricsURL := startServerWithMetrics(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := loadgen.NewAgent(ctx, nil)
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+	inv := &loadgen.Inventory{
+		Key:    testKey,
+		Nodes:  []loadgen.InventoryNode{{Name: "n1", Endpoint: addr, Metrics: metricsURL}},
+		Agents: []loadgen.InventoryAgent{{Name: "a1", URL: srv.URL, Roles: []string{loadgen.RoleSubscriber, loadgen.RoleREST}, Workers: 8}},
+	}
+	sc, err := loadgen.ParseScenario([]byte(strings.Replace(conductorScenario, `hold = "4s"`, `hold = "2s"`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
+		Scenario: sc, RunID: "nf", RunTag: "nf", Inventory: inv, ResultsDir: t.TempDir(),
+		StartDelay: time.Second, Poll: 500 * time.Millisecond,
+		FaultHook: "echo never", FaultAt: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 {
+		t.Fatalf("pass=%v fault=%+v\n%s", rec.Pass, rec.Fault, rec.Markdown())
+	}
+	found := false
+	for _, c := range rec.Checks {
+		found = found || (c.Name == "fault injection" && !c.Pass && c.Gating)
+	}
+	if !found {
+		t.Fatalf("no failing fault injection check:\n%s", rec.Markdown())
 	}
 }

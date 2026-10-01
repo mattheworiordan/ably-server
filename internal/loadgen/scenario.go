@@ -218,6 +218,10 @@ type PassSpec struct {
 	// MaxRetryRatio: publish retries over first attempts (default 0.01),
 	// outside a fault run.
 	MaxRetryRatio float64 `toml:"max_retry_ratio" json:"max_retry_ratio"`
+	// MaxGeneratorCPU: the busy CPU fraction of any generator or
+	// publisher box averaged over the hold (default 0.7), outside a fault
+	// run: above it the box, not the server, may be what the run measured.
+	MaxGeneratorCPU float64 `toml:"max_generator_cpu" json:"max_generator_cpu"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -242,6 +246,7 @@ func DefaultPass() PassSpec {
 		MaxNegativeLatency:    0.001,
 		MaxClockOffset:        Duration{5 * time.Millisecond},
 		MaxRetryRatio:         0.01,
+		MaxGeneratorCPU:       0.7,
 	}
 }
 
@@ -304,6 +309,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MaxRetryRatio == 0 {
 		p.MaxRetryRatio = d.MaxRetryRatio
+	}
+	if p.MaxGeneratorCPU == 0 {
+		p.MaxGeneratorCPU = d.MaxGeneratorCPU
 	}
 	return p
 }
