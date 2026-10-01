@@ -1728,9 +1728,12 @@ The `postgres` and `nats` buses share one delivery point
   neither also drops its local presence member set (§12.4): that set is
   folded from the delivered cms, so a presence cm lost while nothing was
   attached would stay missing from it, unswept, and be served to the
-  next attach. The next attach seeds the set again from the store
-  instead (one `Members` read, the cost of a channel coming back from no
-  subscribers). An attach with the default modes includes
+  next attach. The first sweep that finds the channel so drops the set,
+  and the next attach seeds it again from the store (one `Members`
+  read). An attach that comes back before that sweep is served the set
+  as it is; a cm lost meanwhile is then repaired by the sweep within two
+  intervals, as for any subscribed channel, and reaches the attachment
+  as a live presence event. An attach with the default modes includes
   `PRESENCE_SUBSCRIBE`, so it seeds a set even on a channel with no
   presence; dropping the set rather than sweeping it keeps such a
   channel out of the sweep once its last attachment closes. `bound`
@@ -2299,9 +2302,9 @@ name = "persisted:presence_fixtures"
     the node's member set), `store` (`--presence-sync-source=store`),
     `fallback` (a store read because seeding the member set failed); and
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
-    the store: one per channel bind, plus one after a skipped bus gap
-    (§7.2) and one each time a channel comes back from no subscribers
-    under `--bus-sweep-scope=subscribed` (§12.4).
+    the store: at most one per channel bind, plus one after a skipped bus
+    gap (§7.2) and one after each sweep that found the channel with no
+    subscribers under `--bus-sweep-scope=subscribed` (§12.4).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
@@ -2568,8 +2571,9 @@ of the store's set as of a serial:
   With `--bus-sweep-scope=subscribed` (§7.2) the set is also dropped
   when the sweep finds the channel with no attachment and no member of
   this node's, since the sweep no longer repairs a cm lost on the bus
-  for it; the next attach seeds again. So a channel seeds once per bind
-  and once more each time it comes back from no subscribers.
+  for it; the next attach seeds again. So a channel seeds on its first
+  presence `SYNC` after a bind, and again on the first one after a sweep
+  that found it with no subscribers.
   If the seed read fails, that `SYNC` is read from the store and the next
   one tries to seed again. If the backend skips cms it cannot deliver (a
   chaining bus's gap the log no longer holds, §7.2), it tells the channel,

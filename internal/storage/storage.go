@@ -103,7 +103,11 @@ type Appender interface {
 // tracked presence member. A backend may use it to skip work that only
 // matters to a local subscriber, such as the cluster bus's watermark
 // sweep (DESIGN.md §7.2). An Appender that does not implement it is
-// treated as always subscribed.
+// treated as always subscribed. core.Channel's implementation has a
+// side effect: called when there are no subscribers, it drops the
+// presence member set it derives from the delivered cms, because the
+// sweep that would repair that set is about to skip the channel. Call
+// it only to decide what the sweep reads.
 type SubscriberReporter interface {
 	HasSubscribers() bool
 }

@@ -611,3 +611,39 @@ func TestChannelWithoutSubscribersDropsMemberSet(t *testing.T) {
 	}
 	c.unpin(true)
 }
+
+// TestChannelDropDuringSeedRetriesTheSeed: the sweep finds the channel
+// with no subscribers while a seed read is in flight (an attachment that
+// closed mid-seed, or one not yet counted). The drop discards that read,
+// and the SYNC waiting on it seeds again, so it never serves a set the
+// drop meant to discard.
+func TestChannelDropDuringSeedRetriesTheSeed(t *testing.T) {
+	ctx := context.Background()
+	store := &membersStore{
+		members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005",
+		release: make(chan struct{}), entered: make(chan struct{}),
+	}
+	c, _ := testChannel(t, store, "005")
+	done := make(chan *PresenceSnapshot, 1)
+	go func() {
+		snap, err := c.PresenceSync(ctx)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- snap
+	}()
+	<-store.entered
+	if c.HasSubscribers() {
+		t.Fatal("a channel with no attachment and no member reports subscribers")
+	}
+	// The store moved on while the first read was in flight.
+	store.members, store.asOf = []*protocol.PresenceMessage{pres("009", 0, protocol.PresenceEnter, "c2", "bob", "b")}, "009"
+	close(store.release)
+	snap := <-done
+	if n := store.calls.Load(); n != 2 {
+		t.Errorf("store reads = %d, want 2 (the discarded seed, then a fresh one)", n)
+	}
+	if got := setOf(snap.Members); fmt.Sprint(got) != "[c2:bob=b]" {
+		t.Errorf("set = %v, want the fresh seed [c2:bob=b]", got)
+	}
+}
