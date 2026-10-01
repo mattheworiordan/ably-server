@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ably/ably-server/internal/storage"
 )
@@ -81,4 +82,84 @@ func lagCounts(at map[float64]uint64) []uint64 {
 		out[i] = cur
 	}
 	return out
+}
+
+// TestRegisterBusExposesStages checks the receive-side stage histograms
+// reach /metrics as ably_bus_<stage>_seconds on StageBuckets (DESIGN.md
+// §10), and that a stage the collector does not know is not exported.
+func TestRegisterBusExposesStages(t *testing.T) {
+	m := New()
+	counts := make([]uint64, len(storage.StageBuckets))
+	for i := range counts {
+		counts[i] = 2
+	}
+	counts[0] = 1
+	m.RegisterBus(&fakeBus{st: storage.BusStats{Stages: map[string]storage.LagHistogram{
+		"receive_queue_wait": {Counts: counts, Count: 3, Sum: 0.5},
+		"hold":               {Counts: make([]uint64, len(storage.StageBuckets))},
+		"append":             {Counts: counts, Count: 2, Sum: 0.01},
+		"unknown":            {Counts: counts, Count: 9},
+	}}})
+	body := scrape(t, m)
+	for _, want := range []string{
+		"# TYPE ably_bus_receive_queue_wait_seconds histogram",
+		`ably_bus_receive_queue_wait_seconds_bucket{le="0.0001"} 1`,
+		`ably_bus_receive_queue_wait_seconds_bucket{le="0.00025"} 2`,
+		`ably_bus_receive_queue_wait_seconds_bucket{le="+Inf"} 3`,
+		"ably_bus_receive_queue_wait_seconds_sum 0.5",
+		"ably_bus_hold_seconds_count 0",
+		"ably_bus_append_seconds_count 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics lacks %q", want)
+		}
+	}
+	if strings.Contains(body, "ably_bus_unknown") {
+		t.Error("/metrics exports a stage the collector does not describe")
+	}
+}
+
+// TestDeliveryStageMetrics checks the delivery-stage series after the
+// append (DESIGN.md §10): the fan-out size gauge keeps the largest value
+// since the last scrape and resets on reading, and the two histograms
+// count their observations.
+func TestDeliveryStageMetrics(t *testing.T) {
+	m := New()
+	m.DeliveryFanoutSize(5)
+	m.DeliveryFanoutSize(20000)
+	m.DeliveryFanoutSize(3)
+	m.DeliveryFanout(2 * time.Millisecond)
+	m.ConnWriteWait(300 * time.Microsecond)
+	m.ConnWriteWait(time.Second)
+	body := scrape(t, m)
+	for _, want := range []string{
+		"ably_delivery_fanout_size 20000",
+		"# TYPE ably_delivery_fanout_size gauge",
+		`ably_delivery_fanout_seconds_bucket{le="0.0025"} 1`,
+		"ably_delivery_fanout_seconds_count 1",
+		`ably_conn_write_wait_seconds_bucket{le="0.0005"} 1`,
+		"ably_conn_write_wait_seconds_count 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics lacks %q", want)
+		}
+	}
+	if body := scrape(t, m); !strings.Contains(body, "ably_delivery_fanout_size 0") {
+		t.Error("ably_delivery_fanout_size did not reset after a scrape")
+	}
+	var nilM *Metrics
+	nilM.DeliveryFanoutSize(1)
+	nilM.DeliveryFanout(time.Second)
+	nilM.ConnWriteWait(time.Second)
+}
+
+func scrape(t *testing.T, m *Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body, err := io.ReadAll(rec.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
 }

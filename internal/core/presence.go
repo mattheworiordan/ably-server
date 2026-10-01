@@ -67,7 +67,18 @@ type memoEntry struct {
 // SYNC frame here, one per wire format, so a snapshot served to many
 // attaches is encoded once.
 func (s *PresenceSnapshot) Memo(key any, build func() any) any {
-	e, _ := s.memo.LoadOrStore(key, &memoEntry{})
+	return memoize(&s.memo, key, build)
+}
+
+// memoize returns the value build makes for key in m, calling build at
+// most once per key. Concurrent callers for a key that is still being
+// built wait for it. The common case, a key already built, takes no
+// lock and allocates nothing.
+func memoize(m *sync.Map, key any, build func() any) any {
+	e, ok := m.Load(key)
+	if !ok {
+		e, _ = m.LoadOrStore(key, &memoEntry{})
+	}
 	me := e.(*memoEntry)
 	me.once.Do(func() { me.v = build() })
 	return me.v

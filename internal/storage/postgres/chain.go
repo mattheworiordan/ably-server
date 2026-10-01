@@ -110,8 +110,9 @@ type busEvent struct {
 	prev    string                   // the channel's serial before this cm ("" if unknown)
 	cm      *protocol.ChannelMessage // nil for a pointer whose body is not yet read
 	src     eventSource
-	fetched bool  // cm was read from the log by serial (a pointer), not carried by the bus
-	sentAt  int64 // when the publisher sent the bus message (Unix ns; 0 if the bus does not say)
+	fetched bool      // cm was read from the log by serial (a pointer), not carried by the bus
+	sentAt  int64     // when the publisher sent the bus message (Unix ns; 0 if the bus does not say)
+	heldAt  time.Time // when the delivery point first held it (zero if never held)
 }
 
 // resolvePointer reads a pointer event's body from the log, outside
@@ -231,11 +232,20 @@ func (cs *channelStore) watermark() string {
 // cms are keyed by predecessor; two offers of the same cm keep the one
 // that carries a body.
 func (cs *channelStore) holdLocked(ev busEvent) {
+	if ev.heldAt.IsZero() {
+		ev.heldAt = time.Now()
+	}
 	if cs.pending == nil {
 		cs.pending = make(map[string]busEvent)
 	}
-	if old, ok := cs.pending[ev.prev]; ok && old.cm != nil && ev.cm == nil {
-		return
+	if old, ok := cs.pending[ev.prev]; ok {
+		if old.cm != nil && ev.cm == nil {
+			return
+		}
+		// The hold started with the first offer of this cm.
+		if !old.heldAt.IsZero() && old.heldAt.Before(ev.heldAt) {
+			ev.heldAt = old.heldAt
+		}
 	}
 	cs.pending[ev.prev] = ev
 }
@@ -310,7 +320,10 @@ func (cs *channelStore) appendEventLocked(ev busEvent) bool {
 	default:
 		cs.st().inline.Add(1)
 	}
-	cs.appender.Append(ev.cm)
+	if !ev.heldAt.IsZero() {
+		cs.st().observeStage(stageHold, time.Since(ev.heldAt))
+	}
+	cs.appendTimed(ev.cm)
 	switch {
 	case ev.src == srcFastPath:
 	case ev.fetched:
@@ -319,6 +332,16 @@ func (cs *channelStore) appendEventLocked(ev busEvent) bool {
 		cs.st().observeLag(lagInline, ev.sentAt, ev.cm)
 	}
 	return true
+}
+
+// appendTimed hands cm to the appender, recording the time the Append
+// took (ably_bus_append_seconds): Append wakes every attachment parked on
+// the channel, so on a channel with many subscribers it is where a bus
+// worker spends its time.
+func (cs *channelStore) appendTimed(cm *protocol.ChannelMessage) {
+	start := time.Now()
+	cs.appender.Append(cm)
+	cs.st().observeStage(stageAppend, time.Since(start))
 }
 
 // armGapFillLocked arms the gap-fill timer, unless it is armed already
@@ -440,7 +463,7 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 		cs.lastSeen = cm.ChannelSerial
 		cs.delivered++
 		cs.st().filled.Add(1)
-		cs.appender.Append(cm)
+		cs.appendTimed(cm)
 		cs.st().observeLag(lagFilled, 0, cm)
 	}
 	if upTo != "" && upTo > cs.lastSeen {
@@ -457,7 +480,7 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 				cs.lastSeen = ev.serial
 				cs.delivered++
 				cs.st().filled.Add(1)
-				cs.appender.Append(ev.cm)
+				cs.appendTimed(ev.cm)
 				cs.st().observeLag(lagFilled, ev.sentAt, ev.cm)
 			}
 		}

@@ -27,7 +27,16 @@ type busCollector struct {
 	src     storage.BusStatser
 	info    *prometheus.Desc
 	lag     *prometheus.Desc
+	stages  map[string]*prometheus.Desc // by storage.BusStats.Stages key
 	metrics []busMetric
+}
+
+// busStageHelp is the help text of each receive-side stage histogram,
+// exported as ably_bus_<stage>_seconds (DESIGN.md §10).
+var busStageHelp = map[string]string{
+	"receive_queue_wait": "nats bus: time from the publishing node sending a bus message to a dispatch worker taking it off its shard queue (NATS transit plus the shard queue wait; the two nodes' clocks), for every message received (DESIGN.md §10).",
+	"hold":               "Time a cm that arrived ahead of its predecessor was held before its append (DESIGN.md §7.2, §10).",
+	"append":             "Time inside the channel's Append for one cm the bus delivered, which links it onto the live list and wakes every attachment parked on the channel (DESIGN.md §5.1, §10).",
 }
 
 func newBusCollector(src storage.BusStatser) *busCollector {
@@ -42,6 +51,10 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 		lag: prometheus.NewDesc("ably_bus_delivery_lag_seconds",
 			"Time from a cm's commit to its append on this node, for cms from another node (the publisher fast path is not included), by delivery path (inline, fetched, filled). Measured from the bus message's send time on the nats bus, else the cm's stored timestamp (DESIGN.md §10).",
 			[]string{"path"}, nil),
+		stages: make(map[string]*prometheus.Desc, len(busStageHelp)),
+	}
+	for stage, help := range busStageHelp {
+		c.stages[stage] = prometheus.NewDesc("ably_bus_"+stage+"_seconds", help, nil, nil)
 	}
 	add := func(name, help string, gauge bool, get func(storage.BusStats) float64) {
 		c.metrics = append(c.metrics, busMetric{desc: prometheus.NewDesc("ably_bus_"+name, help, nil, nil), gauge: gauge, get: get})
@@ -91,6 +104,9 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 func (c *busCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.info
 	ch <- c.lag
+	for _, d := range c.stages {
+		ch <- d
+	}
 	for _, m := range c.metrics {
 		ch <- m.desc
 	}
@@ -121,5 +137,18 @@ func (c *busCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 		ch <- prometheus.MustNewConstHistogram(c.lag, h.Count, h.Sum, buckets, path)
+	}
+	for stage, h := range st.Stages {
+		desc, ok := c.stages[stage]
+		if !ok {
+			continue
+		}
+		buckets := make(map[float64]uint64, len(storage.StageBuckets))
+		for i, le := range storage.StageBuckets {
+			if i < len(h.Counts) {
+				buckets[le] = h.Counts[i]
+			}
+		}
+		ch <- prometheus.MustNewConstHistogram(desc, h.Count, h.Sum, buckets)
 	}
 }

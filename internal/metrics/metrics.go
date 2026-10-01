@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -44,7 +46,22 @@ type Metrics struct {
 	presenceSyncs     *prometheus.CounterVec
 	presenceSyncByKey sync.Map // snapshot label -> prometheus.Counter
 	presenceSeeds     prometheus.Counter
+
+	// Delivery stages after Append (DESIGN.md §10): the fan-out time to
+	// each sampled attachment's frame being queued, the wait of a sampled
+	// connection's frame in its outbound queue, and the largest fan-out
+	// of any Append since the last scrape.
+	deliveryFanout prometheus.Histogram
+	connWriteWait  prometheus.Histogram
+	fanoutMax      atomic.Int64
 }
+
+// DeliverySampleEvery is the sampling rate of the per-attachment and
+// per-connection delivery histograms (ably_delivery_fanout_seconds,
+// ably_conn_write_wait_seconds): one connection in this many records
+// them, so a fan-out to tens of thousands of attachments does not make
+// as many observations on one histogram (DESIGN.md §10).
+const DeliverySampleEvery = 8
 
 // New builds a Metrics with its own registry (so instances are isolated
 // and tests don't collide on the global default registry) and registers
@@ -120,6 +137,16 @@ func New() *Metrics {
 			Name: "ably_presence_sync_seeds_total",
 			Help: "Local presence member sets seeded from the store: at most one per channel bind (DESIGN.md §12.4).",
 		}),
+		deliveryFanout: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ably_delivery_fanout_seconds",
+			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
+			Buckets: storage.StageBuckets,
+		}),
+		connWriteWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ably_conn_write_wait_seconds",
+			Help:    "Time from a frame being queued on a connection's outbound queue to its socket write completing, for one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
+			Buckets: storage.StageBuckets,
+		}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -140,6 +167,12 @@ func New() *Metrics {
 		m.slowConsumerDisconnects,
 		m.presenceSyncs,
 		m.presenceSeeds,
+		m.deliveryFanout,
+		m.connWriteWait,
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "ably_delivery_fanout_size",
+			Help: "The largest number of attachments open on a channel when a cm was appended to it, since the previous scrape (DESIGN.md §10). Reading it resets it.",
+		}, func() float64 { return float64(m.fanoutMax.Swap(0)) }),
 	)
 	return m
 }
@@ -309,4 +342,37 @@ func (m *Metrics) PresenceSeed() {
 		return
 	}
 	m.presenceSeeds.Inc()
+}
+
+// DeliveryFanoutSize records the number of attachments open on a channel
+// at an append, keeping the largest since the last scrape
+// (ably_delivery_fanout_size).
+func (m *Metrics) DeliveryFanoutSize(n int64) {
+	if m == nil {
+		return
+	}
+	for {
+		cur := m.fanoutMax.Load()
+		if n <= cur || m.fanoutMax.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// DeliveryFanout observes the time from a cm's append to its frame being
+// queued for one sampled attachment (ably_delivery_fanout_seconds).
+func (m *Metrics) DeliveryFanout(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.deliveryFanout.Observe(d.Seconds())
+}
+
+// ConnWriteWait observes the time one sampled frame spent between being
+// queued and being written (ably_conn_write_wait_seconds).
+func (m *Metrics) ConnWriteWait(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.connWriteWait.Observe(d.Seconds())
 }

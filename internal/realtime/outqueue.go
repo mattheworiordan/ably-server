@@ -23,6 +23,9 @@ type outFrame struct {
 	data   []byte
 	wsType int
 	action protocol.Action
+	// queued is when a sampled connection queued the frame (zero
+	// otherwise), for ably_conn_write_wait_seconds (DESIGN.md §10).
+	queued time.Time
 }
 
 // outQueue is a connection's bounded outbound queue (DESIGN.md §5.2). It

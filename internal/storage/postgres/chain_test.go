@@ -217,3 +217,52 @@ func TestNATSEnvelopeRoundTrip(t *testing.T) {
 		t.Fatalf("pointer decoded as %+v, err=%v", got, err)
 	}
 }
+
+// TestChainRecordsReceiveStages checks the receive-side stage histograms
+// (DESIGN.md §10): every append is timed (ably_bus_append_seconds), and a
+// cm held for its predecessor records the hold (ably_bus_hold_seconds),
+// which ends the moment the predecessor arrives, not on the gap-fill
+// timer (parked an hour out here).
+func TestChainRecordsReceiveStages(t *testing.T) {
+	cs, rec := newTestChain(t)
+	cs.stats = &busStats{}
+	cs.seed("s0")
+	cs.deliverChained(ev("s2", "s1"))
+	time.Sleep(20 * time.Millisecond)
+	cs.deliverChained(ev("s1", "s0"))
+	if want := []string{"s1", "s2"}; !slices.Equal(rec.serials, want) {
+		t.Fatalf("delivered %v, want %v", rec.serials, want)
+	}
+	st := cs.stats.stageSnapshot()
+	if n := st["append"].Count; n != 2 {
+		t.Errorf("append observations = %d, want 2", n)
+	}
+	hold := st["hold"]
+	if hold.Count != 1 {
+		t.Fatalf("hold observations = %d, want 1 (only s2 was held)", hold.Count)
+	}
+	if hold.Sum < 0.02 || hold.Sum > 5 {
+		t.Errorf("hold time = %vs, want about the 20 ms s2 waited", hold.Sum)
+	}
+}
+
+// TestChainHoldTimeSpansAReplacedOffer: when a held pointer (no body) is
+// replaced by a later offer of the same cm that carries one, the hold
+// time still runs from the first offer.
+func TestChainHoldTimeSpansAReplacedOffer(t *testing.T) {
+	cs, rec := newTestChain(t)
+	cs.stats = &busStats{}
+	cs.seed("s0")
+	pointer := ev("s2", "s1")
+	pointer.cm = nil
+	cs.deliverChained(pointer)
+	time.Sleep(30 * time.Millisecond)
+	cs.deliverChained(ev("s2", "s1"))
+	cs.deliverChained(ev("s1", "s0"))
+	if want := []string{"s1", "s2"}; !slices.Equal(rec.serials, want) {
+		t.Fatalf("delivered %v, want %v", rec.serials, want)
+	}
+	if hold := cs.stats.stageSnapshot()["hold"]; hold.Count != 1 || hold.Sum < 0.03 {
+		t.Errorf("hold = %d observations, %vs; want 1 of at least the 30 ms since the pointer", hold.Count, hold.Sum)
+	}
+}

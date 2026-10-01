@@ -314,6 +314,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		reauth:            make(chan time.Time, 1),
 		resumeError:       resumeError,
 		lastMsgSerial:     -1,
+		sampled:           deliverySampleSeq.Add(1)%metrics.DeliverySampleEvery == 0,
 	}
 
 	// The upgrade succeeded: count the connection and time its lifetime,

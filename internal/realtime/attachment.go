@@ -83,6 +83,10 @@ type attachment struct {
 	// connections through memo (connection.queueShared); nil sends
 	// through out.
 	outShared func(context.Context, *protocol.ProtocolMessage, memoizer) bool
+	// sampled is set on one connection's attachments in
+	// metrics.DeliverySampleEvery: they record the fan-out time of each
+	// live frame (ably_delivery_fanout_seconds, DESIGN.md §10).
+	sampled bool
 	// connID is the owning connection's id, and echo its `echo` setting.
 	// When echo is false the fan-out skips message cms this connection
 	// published itself (DESIGN.md §2.1).
@@ -444,16 +448,25 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 				"channelSerial", cm.ChannelSerial, "name", cm.Messages[0].Name)
 			return true
 		}
-		if !a.send(&protocol.ProtocolMessage{
+		msgs := a.resolveAppends(cm.Messages, backlog)
+		frame := &protocol.ProtocolMessage{
 			Action:        protocol.ActionMessage,
 			Channel:       new(a.channelName),
 			ChannelSerial: cm.ChannelSerial,
-			Messages:      a.resolveAppends(cm.Messages, backlog),
-		}) {
+			Messages:      msgs,
+		}
+		// With no append delta to resolve, the frame is the same for
+		// every attachment on the channel, so it is encoded once per
+		// wire format and shared (DESIGN.md §5.1).
+		if !a.sendLive(frame, backlog, sameItems(msgs, cm.Messages)) {
 			return false
 		}
-		a.logger.Trace("message delivered",
-			"channelSerial", cm.ChannelSerial, "name", cm.Messages[0].Name, "selfEcho", selfEcho)
+		// Guarded: the arguments allocate on every delivery, even with
+		// trace logging off.
+		if a.logger.Enabled(a.ctx, logging.LevelTrace) {
+			a.logger.Trace("message delivered",
+				"channelSerial", cm.ChannelSerial, "name", cm.Messages[0].Name, "selfEcho", selfEcho)
+		}
 		a.metrics.MessageDelivered()
 		return true
 	}
@@ -461,12 +474,12 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 		if !a.hasMode(protocol.FlagPresenceSubscribe) {
 			return true
 		}
-		return a.send(&protocol.ProtocolMessage{
+		return a.sendLive(&protocol.ProtocolMessage{
 			Action:        protocol.ActionPresence,
 			Channel:       new(a.channelName),
 			ChannelSerial: cm.ChannelSerial,
 			Presence:      cm.Presence,
-		})
+		}, backlog, true)
 	}
 	if len(cm.Annotations) > 0 {
 		// An annotation cm fans out two ways (DESIGN.md §14.3), both derived
@@ -830,6 +843,33 @@ func (a *attachment) sendSync(snap *core.PresenceSnapshot) bool {
 		return a.send(msg)
 	}
 	return a.outShared(a.ctx, msg, snap)
+}
+
+// sendLive sends one frame derived from the cm the stream last returned.
+// A live frame that is the same for every attachment on the channel
+// (shareable) is encoded once per wire format on the stream's entry and
+// the bytes are shared (DESIGN.md §5.1); anything else, and every backlog
+// frame (replayed cms are read from the log, not the live list), is
+// encoded for this attachment alone. A sampled attachment records the
+// time from the cm's append to the frame being queued.
+func (a *attachment) sendLive(msg *protocol.ProtocolMessage, backlog, shareable bool) bool {
+	var ok bool
+	if !backlog && shareable && a.outShared != nil {
+		ok = a.outShared(a.ctx, msg, a.stream)
+	} else {
+		ok = a.send(msg)
+	}
+	if ok && !backlog && a.sampled {
+		a.metrics.DeliveryFanout(time.Since(a.stream.AppendedAt()))
+	}
+	return ok
+}
+
+// sameItems reports whether resolved is items itself (the same backing
+// array), which is how resolveAppends hands back a cm's messages it did
+// not need to change.
+func sameItems(resolved, items []*protocol.Message) bool {
+	return len(resolved) == len(items) && (len(items) == 0 || &resolved[0] == &items[0])
 }
 
 // send pushes a frame onto the connection's outbound queue, waiting
