@@ -47,6 +47,11 @@ type Metrics struct {
 	presenceSyncByKey sync.Map // snapshot label -> prometheus.Counter
 	presenceSeeds     prometheus.Counter
 
+	// Presence liveness (DESIGN.md §12.5): grace-window LEAVEs that could
+	// not be written, by stage, and members re-entered after a lease lapse.
+	presenceGraceLeaveErrors *prometheus.CounterVec
+	presenceReentries        prometheus.Counter
+
 	// Delivery stages after Append (DESIGN.md §10): the fan-out time to
 	// each sampled attachment's frame being queued, the wait of a sampled
 	// connection's frame in its outbound queue, and the largest fan-out
@@ -137,6 +142,14 @@ func New() *Metrics {
 			Name: "ably_presence_sync_seeds_total",
 			Help: "Local presence member sets seeded from the store: at most one per channel bind (DESIGN.md §12.4).",
 		}),
+		presenceGraceLeaveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_presence_grace_leave_errors_total",
+			Help: "Presence LEAVEs due at the end of an abruptly dropped connection's grace window that could not be written, by stage (get_channel, publish); the member stays until its node's lease ends (DESIGN.md §12.5).",
+		}, []string{"stage"}),
+		presenceReentries: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_presence_reentries_total",
+			Help: "Presence members re-entered by this node after its presence lease lapsed (DESIGN.md §12.5).",
+		}),
 		deliveryFanout: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_delivery_fanout_seconds",
 			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
@@ -167,6 +180,8 @@ func New() *Metrics {
 		m.slowConsumerDisconnects,
 		m.presenceSyncs,
 		m.presenceSeeds,
+		m.presenceGraceLeaveErrors,
+		m.presenceReentries,
 		m.deliveryFanout,
 		m.connWriteWait,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -342,6 +357,23 @@ func (m *Metrics) PresenceSeed() {
 		return
 	}
 	m.presenceSeeds.Inc()
+}
+
+// PresenceGraceLeaveError records a grace-window LEAVE that could not be
+// written; stage is "get_channel" or "publish".
+func (m *Metrics) PresenceGraceLeaveError(stage string) {
+	if m == nil {
+		return
+	}
+	m.presenceGraceLeaveErrors.WithLabelValues(stage).Inc()
+}
+
+// PresenceReentries records n members re-entered after a lease lapse.
+func (m *Metrics) PresenceReentries(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.presenceReentries.Add(float64(n))
 }
 
 // DeliveryFanoutSize records the number of attachments open on a channel

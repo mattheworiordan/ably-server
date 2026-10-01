@@ -239,6 +239,21 @@ type Options struct {
 	// is safe.
 	PresenceLeaseMode string
 
+	// OnPresenceLeaseLapse, when set, is called after this node finds its
+	// presence lease had lapsed (DESIGN.md §12.5): another node may have
+	// reaped its members and published their LEAVEs while it could not
+	// renew, so the hook re-enters them (the server wires it to
+	// realtime.Server.ReenterPresence). It runs on its own goroutine a
+	// bump interval after the lapse, with a context Close cancels; lapses
+	// reported meanwhile (a sharded node's other shards) join that one
+	// call.
+	OnPresenceLeaseLapse func(ctx context.Context)
+
+	// lapse is the notifier OpenSharded shares between its shards, so one
+	// outage seen by every shard re-enters the members once. Nil means
+	// Open makes its own from OnPresenceLeaseLapse.
+	lapse *lapseNotifier
+
 	// nodeID overrides the per-process node id that owns this Storage's
 	// presence rows (tests; OpenSharded gives every shard the same one).
 	// Empty means a fresh random id.
@@ -252,11 +267,15 @@ type Options struct {
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
 	pool      *pgxpool.Pool
-	dsn       string // retained so a LISTEN goroutine can re-dial on drop
-	series    string // per-process seriesId, embedded in every minted channelSerial
-	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
-	leaseNode bool   // PresenceLeaseNode: liveness is the node's presence_nodes row (§12.5)
-	namespace string // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
+	dsn       string         // retained so a LISTEN goroutine can re-dial on drop
+	series    string         // per-process seriesId, embedded in every minted channelSerial
+	node      string         // per-process node id, owning presence rows for the liveness lease (§12.5)
+	leaseNode bool           // PresenceLeaseNode: liveness is the node's presence_nodes row (§12.5)
+	leaseRun  leaseRun       // this node's own lease renewals, for the reaper guard (§12.5)
+	lmetrics  *leaseMetrics  // ably_presence_* liveness series
+	lapse     *lapseNotifier // calls Options.OnPresenceLeaseLapse; nil when unset
+	ownLapse  bool           // lapse is this Storage's to stop (not a shared shard notifier)
+	namespace string         // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
 	logger    *logging.Logger
 
 	retention Retention                 // resolved retention settings (§6.3)
@@ -414,6 +433,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		persisted:     persisted,
 		metrics:       newRetentionMetrics(),
 		wmetrics:      newWriteMetrics(),
+		lmetrics:      newLeaseMetrics(),
 		bindOnWrite:   opts.BindOnWrite,
 		channels:      make(map[string]*channelStore),
 		reconcileCh:   make(chan struct{}, 1),
@@ -421,8 +441,16 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		cancel:        cancel,
 		done:          loopCtx.Done(),
 	}
+	if opts.lapse != nil {
+		s.lapse = opts.lapse
+	} else {
+		s.lapse, s.ownLapse = newLapseNotifier(opts.OnPresenceLeaseLapse, logger), true
+	}
 	fail := func(err error) (*Storage, error) {
 		cancel()
+		if s.ownLapse {
+			s.lapse.stop()
+		}
 		pool.Close()
 		return nil, err
 	}
@@ -435,6 +463,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		return fail(fmt.Errorf("storage/postgres: prepare log partitions: %w", err))
 	}
 
+	leaseStart := time.Now()
 	if s.leaseNode {
 		// Take the node's lease before any presence write can run: the
 		// node-mode reaper treats the members of a node without a lease
@@ -443,6 +472,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 			return fail(fmt.Errorf("storage/postgres: take presence lease: %w", err))
 		}
 	}
+	// The reaper guard counts this node's unbroken lease from here: it
+	// reaps nothing for one lease window after Open (§12.5).
+	s.leaseRun.begin(leaseStart)
 
 	if busKind != BusPGNotify {
 		// The schema this Storage works in namespaces its bus channels
@@ -742,6 +774,9 @@ func (s *Storage) Close() error { return s.close(true) }
 // node's lease to expire as a crashed node's would (tests).
 func (s *Storage) close(graceful bool) error {
 	s.closeOnce.Do(func() {
+		if s.ownLapse {
+			s.lapse.stop() // no re-entry runs against a closing store
+		}
 		if s.lanes != nil {
 			s.lanes.close() // finish in-flight batches before the bus stops
 		}
@@ -763,6 +798,7 @@ func (s *Storage) close(graceful bool) error {
 // that to Sharded.
 func (s *Storage) Collectors() []prometheus.Collector {
 	out := append(s.metrics.collectors(), s.wmetrics.collectors()...)
+	out = append(out, s.lmetrics.collectors()...)
 	if s.shard.count == 1 {
 		out = append(out, shardsGauge(1))
 	}
@@ -1520,6 +1556,10 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	if cs.presenceLanes != nil {
 		return cs.storePresenceBatched(ctx, cs.presenceLanes, presence)
 	}
+	if storage.IsPresenceReentry(ctx) {
+		// A lease-lapse re-entry skips members still present (§12.5).
+		return cs.storePresenceTx(ctx, presence, true)
+	}
 	// Unbatched, each operation holds a pool connection for its whole
 	// transaction, including any wait on the room's row lock. Past the
 	// bound it is refused at once rather than queued, so SYNC reads and
@@ -1536,7 +1576,20 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 			return nil, false, fmt.Errorf("%w: too many presence operations in flight", storage.ErrOverloaded)
 		}
 	}
+	return cs.storePresenceTx(ctx, presence, false)
+}
 
+// storePresenceTx is StorePresence in a transaction of its own: the
+// unbatched path, a reaper's LEAVEs, and server-synthesised presence a
+// full lane could not queue (DESIGN.md §6.3, §12.5).
+//
+// onlyAbsent (the reaper's LEAVEs) leaves out every operation whose
+// member is in the presence table once the channel's row lock is held,
+// and stores nothing (a nil cm) if that leaves none. Every writer of a
+// room's presence rows holds that lock first, so the check sees every
+// ENTER committed before this transaction, and one committed after it
+// sorts after the LEAVE.
+func (cs *channelStore) storePresenceTx(ctx context.Context, presence []*protocol.PresenceMessage, onlyAbsent bool) (*protocol.ChannelMessage, bool, error) {
 	static := storage.IsStaticPresence(ctx)
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1549,6 +1602,11 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	channelSerial, prev, err := cs.advanceSerial(ctx, tx)
 	if err != nil {
 		return nil, false, err
+	}
+	if onlyAbsent {
+		if presence, err = cs.absentMembers(ctx, tx, presence); err != nil || len(presence) == 0 {
+			return nil, false, err // the rollback undoes the serial advance
+		}
 	}
 	if original, err := cs.findIdempotent(ctx, tx, nonEmptyPresenceIDs(presence), channelSerial); err != nil || original != nil {
 		return original, original != nil, err
@@ -1636,6 +1694,47 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		cs.rows.add(cs.name) // advance_channel_serial made or found the row
 	}
 	return cm, false, nil
+}
+
+// absentMembers returns the operations of presence whose member has no
+// row in the presence table, read inside tx (storePresenceTx). FOR KEY
+// SHARE makes the read wait for a reaper DELETE of one of the rows that
+// has not committed yet, so a re-entry does not skip a member that is
+// about to be gone.
+func (cs *channelStore) absentMembers(ctx context.Context, tx pgx.Tx, presence []*protocol.PresenceMessage) ([]*protocol.PresenceMessage, error) {
+	conns := make([]string, len(presence))
+	clients := make([]string, len(presence))
+	for i, p := range presence {
+		conns[i], clients[i] = p.ConnectionID, p.ClientID
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT connection_id, client_id FROM presence
+		WHERE channel = $1 AND (connection_id, client_id) IN (SELECT * FROM unnest($2::text[], $3::text[]))
+		FOR KEY SHARE`,
+		cs.name, conns, clients)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: presence lookup: %w", err)
+	}
+	present := make(map[[2]string]bool)
+	for rows.Next() {
+		var conn, client string
+		if err := rows.Scan(&conn, &client); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("storage/postgres: presence lookup: %w", err)
+		}
+		present[[2]string{conn, client}] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: presence lookup: %w", err)
+	}
+	out := presence[:0:0]
+	for _, p := range presence {
+		if !present[[2]string{p.ConnectionID, p.ClientID}] {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // StoreAnnotation persists an annotation publish on channel_messages

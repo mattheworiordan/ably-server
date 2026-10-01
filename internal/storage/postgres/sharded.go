@@ -34,6 +34,7 @@ import (
 type Sharded struct {
 	shards []*Storage
 	gauge  prometheus.Collector // ably_storage_shards
+	lapse  *lapseNotifier       // shared by every shard: one re-entry per outage (§12.5)
 }
 
 var (
@@ -69,6 +70,11 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		// (DESIGN.md §6.4, §12.5).
 		opts.nodeID = serial.NewSeriesID()
 	}
+	// One lapse notifier for every shard: an outage that lapses the
+	// node's lease on several shards re-enters its members once
+	// (DESIGN.md §12.5).
+	lapse := newLapseNotifier(opts.OnPresenceLeaseLapse, logger)
+	opts.lapse = lapse
 	open := func(i int, listID string) (*Storage, error) {
 		o := opts
 		o.DSN = dsns[i]
@@ -83,6 +89,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 
 	shards := make([]*Storage, n)
 	closeAll := func() {
+		lapse.stop()
 		for _, s := range shards {
 			if s != nil {
 				_ = s.Close()
@@ -91,6 +98,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 	}
 	first, err := open(0, "")
 	if err != nil {
+		lapse.stop()
 		return nil, err
 	}
 	shards[0] = first
@@ -116,7 +124,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		closeAll()
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
-	return &Sharded{shards: shards, gauge: shardsGauge(n)}, nil
+	return &Sharded{shards: shards, gauge: shardsGauge(n), lapse: lapse}, nil
 }
 
 // Shards is the number of shards (the DSN list's length).
@@ -151,6 +159,7 @@ func (s *Sharded) Release(ctx context.Context, name string) error {
 
 // Close closes every shard.
 func (s *Sharded) Close() error {
+	s.lapse.stop()
 	errs := make([]error, len(s.shards))
 	var wg sync.WaitGroup
 	for i, sh := range s.shards {

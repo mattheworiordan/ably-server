@@ -482,6 +482,26 @@ func IsServerPresence(ctx context.Context) bool {
 	return v || IsStaticPresence(ctx)
 }
 
+// presenceReentryKey marks presence the server re-enters after its
+// cluster presence lease lapsed (DESIGN.md §12.5).
+type presenceReentryKey struct{}
+
+// WithPresenceReentry marks ctx so that presence stored under it is a
+// lease-lapse re-entry: server-synthesised (WithServerPresence), and an
+// operation whose member is already in the set may be skipped, since the
+// re-entry only restores members other nodes may have reaped. Only the
+// cluster backend, the one with a lease, acts on the skip; the others
+// never re-enter.
+func WithPresenceReentry(ctx context.Context) context.Context {
+	return context.WithValue(WithServerPresence(ctx), presenceReentryKey{}, true)
+}
+
+// IsPresenceReentry reports whether ctx was marked by WithPresenceReentry.
+func IsPresenceReentry(ctx context.Context) bool {
+	v, _ := ctx.Value(presenceReentryKey{}).(bool)
+	return v
+}
+
 // Discontinuous is implemented by an Appender that keeps state derived
 // from the cms delivered to it (core.Channel's presence member set,
 // DESIGN.md §12.4). A backend calls Discontinuity when it skips cms it

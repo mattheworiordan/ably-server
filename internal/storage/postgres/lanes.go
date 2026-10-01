@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strconv"
@@ -36,6 +37,16 @@ const deferralsBeforeWait = 2
 // errLanesClosed is returned for publishes submitted to, or still queued
 // in, a closed lane set: retriable, since nothing was stored.
 var errLanesClosed = fmt.Errorf("%w: publish lanes closed", storage.ErrUnavailable)
+
+// serverQueueFactor sizes each lane's bound on queued server-synthesised
+// presence (mustAdmit): serverQueueFactor x QueueMax, beyond the normal
+// bound those publishes are exempt from.
+const serverQueueFactor = 8
+
+// errServerQueueFull is submit's answer to server-synthesised presence
+// past its lane's bound. It never reaches a client: the caller writes the
+// operation in a transaction of its own instead (storePresenceBatched).
+var errServerQueueFull = errors.New("storage/postgres: lane queue full of server-synthesised presence")
 
 // Batching configures leading-edge publish batching (DESIGN.md §6.3).
 type Batching struct {
@@ -103,9 +114,16 @@ type pending struct {
 	presence []*protocol.PresenceMessage
 	static   bool
 	// mustAdmit exempts a server-synthesised presence publish from the
-	// queue bound: nothing retries it, and a dropped LEAVE leaves its
-	// member behind (DESIGN.md §12.5).
+	// queue bound and from being dropped when its caller stops waiting:
+	// nothing retries it, and a dropped LEAVE leaves its member behind
+	// (DESIGN.md §12.5). It has a bound of its own, serverQueueFactor x
+	// QueueMax per lane; past that its caller writes it unbatched.
 	mustAdmit bool
+	// after is set when submit turns a mustAdmit publish away: the last
+	// publish of its channel then queued or in flight on the lane, which
+	// the unbatched write must wait for so the channel's operations stay
+	// in order (nil: none).
+	after *pending
 	// checkIDs is true when the ids were supplied by the client, so the
 	// publish must be checked for idempotency; server-generated ids are
 	// unique by construction and skip the lookup. Presence ids are always
@@ -265,8 +283,14 @@ type lane struct {
 
 	mu           sync.Mutex
 	queue        []*pending
+	serverQueued int // queued publishes with mustAdmit set
+	// last is, per channel, the most recently submitted publish still
+	// queued or in flight. A channel's publishes complete in queue order,
+	// so once it is done every earlier one is.
+	last         map[string]*pending
 	inflight     int
-	busy         map[string]int // channels in in-flight batches
+	running      map[*[]*pending]time.Time // in-flight batches, by start time
+	busy         map[string]int            // channels in in-flight batches
 	lastDispatch time.Time
 	timer        *time.Timer
 	closed       bool
@@ -274,27 +298,80 @@ type lane struct {
 }
 
 // submit enqueues p, failing fast when the queue is full or the lane is
-// closed.
+// closed. Server-synthesised presence (mustAdmit) is exempt from
+// QueueMax but has its own bound, serverQueueFactor x QueueMax; past it
+// submit returns errServerQueueFull.
 func (l *lane) submit(p *pending) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
 		return errLanesClosed
 	}
-	if len(l.queue) >= l.opts.QueueMax {
-		// Publishes whose callers gave up still hold queue slots until
-		// they are taken; reclaim them before refusing a live one.
-		l.reapLocked()
+	if p.mustAdmit {
+		if l.serverQueued >= serverQueueFactor*l.opts.QueueMax {
+			p.after = l.last[p.channel]
+			return errServerQueueFull
+		}
+	} else {
+		if len(l.queue) >= l.opts.QueueMax {
+			// Publishes whose callers gave up still hold queue slots until
+			// they are taken; reclaim them before refusing a live one.
+			l.reapLocked()
+		}
+		if len(l.queue) >= l.opts.QueueMax {
+			l.metrics.nacks.WithLabelValues("queue_full").Inc()
+			return storage.ErrOverloaded
+		}
 	}
-	if len(l.queue) >= l.opts.QueueMax && !p.mustAdmit {
-		l.metrics.nacks.WithLabelValues("queue_full").Inc()
-		return storage.ErrOverloaded
-	}
+	l.enqueueLocked(p)
+	return nil
+}
+
+// enqueueLocked appends p to the queue and pumps.
+func (l *lane) enqueueLocked(p *pending) {
 	p.enqueued = time.Now()
+	if p.mustAdmit {
+		l.serverQueued++
+	}
+	if l.last == nil {
+		l.last = make(map[string]*pending)
+	}
+	l.last[p.channel] = p
 	l.queue = append(l.queue, p)
 	l.depth.Set(float64(len(l.queue)))
 	l.pumpLocked()
-	return nil
+}
+
+// forgetLocked drops p from last once it is done.
+func (l *lane) forgetLocked(p *pending) {
+	if l.last[p.channel] == p {
+		delete(l.last, p.channel)
+	}
+}
+
+// after returns the last publish of channel still queued or in flight
+// on its lane, or nil.
+func (ls *laneSet) after(channel string) *pending {
+	l := ls.laneFor(channel)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.last[channel]
+}
+
+// forceSubmit queues server-synthesised presence past its bound: an
+// operation whose unbatched write could not wait for its channel's
+// earlier publishes. Queued, it still commits after them. It reports
+// false if the lane is closed.
+func (ls *laneSet) forceSubmit(p *pending) bool {
+	l := ls.laneFor(p.channel)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	l.metrics.serverForced.Inc()
+	l.enqueueLocked(p)
+	return true
 }
 
 // pumpLocked starts as many batches as the rules allow: one at once when
@@ -322,11 +399,16 @@ func (l *lane) pumpLocked() {
 		}
 		l.inflight++
 		l.lastDispatch = time.Now()
+		if l.running == nil {
+			l.running = make(map[*[]*pending]time.Time)
+		}
+		key := &batch
+		l.running[key] = l.lastDispatch
 		for _, p := range batch {
 			l.busy[p.channel]++
 		}
 		l.wg.Add(1)
-		go l.run(batch)
+		go l.run(key, batch)
 	}
 }
 
@@ -352,6 +434,7 @@ func (l *lane) takeLocked() []*pending {
 	for _, p := range l.queue {
 		switch {
 		case p.ctx.Err() != nil && !p.mustAdmit:
+			l.forgetLocked(p)
 			p.finish(pendingResult{err: p.ctx.Err()})
 		case len(batch) >= l.opts.BatchMax, l.busy[p.channel] > 0:
 			rest = append(rest, p)
@@ -359,9 +442,21 @@ func (l *lane) takeLocked() []*pending {
 			batch = append(batch, p)
 		}
 	}
-	l.queue = rest
-	l.depth.Set(float64(len(l.queue)))
+	l.setQueueLocked(rest)
 	return batch
+}
+
+// setQueueLocked replaces the queue, recounting its server-synthesised
+// publishes.
+func (l *lane) setQueueLocked(q []*pending) {
+	l.queue = q
+	l.serverQueued = 0
+	for _, p := range q {
+		if p.mustAdmit {
+			l.serverQueued++
+		}
+	}
+	l.depth.Set(float64(len(l.queue)))
 }
 
 // reapLocked drops queued publishes whose caller has given up.
@@ -369,19 +464,19 @@ func (l *lane) reapLocked() {
 	kept := l.queue[:0]
 	for _, p := range l.queue {
 		if p.ctx.Err() != nil && !p.mustAdmit {
+			l.forgetLocked(p)
 			p.finish(pendingResult{err: p.ctx.Err()})
 			continue
 		}
 		kept = append(kept, p)
 	}
 	clear(l.queue[len(kept):])
-	l.queue = kept
-	l.depth.Set(float64(len(l.queue)))
+	l.setQueueLocked(kept)
 }
 
 // run commits one batch, retrying once on failure, then hands deferred
 // publishes back to the head of the queue and releases the rest.
-func (l *lane) run(batch []*pending) {
+func (l *lane) run(key *[]*pending, batch []*pending) {
 	defer l.wg.Done()
 	start := time.Now()
 	deferred, err := l.attempt(batch)
@@ -414,14 +509,19 @@ func (l *lane) run(batch []*pending) {
 		}
 	}
 	l.inflight--
+	delete(l.running, key)
+	for _, p := range batch {
+		if err != nil || !isDeferred[p] || l.closed {
+			l.forgetLocked(p)
+		}
+	}
 	if err == nil && len(deferred) > 0 {
 		if l.closed {
 			for _, p := range deferred {
 				p.finish(pendingResult{err: errLanesClosed})
 			}
 		} else {
-			l.queue = append(append(make([]*pending, 0, len(deferred)+len(l.queue)), deferred...), l.queue...)
-			l.depth.Set(float64(len(l.queue)))
+			l.setQueueLocked(append(append(make([]*pending, 0, len(deferred)+len(l.queue)), deferred...), l.queue...))
 		}
 	}
 	l.pumpLocked()
@@ -465,8 +565,8 @@ func (l *lane) stop() {
 		l.timer.Stop()
 	}
 	queued := l.queue
-	l.queue = nil
-	l.depth.Set(0)
+	l.setQueueLocked(nil)
+	clear(l.last)
 	l.mu.Unlock()
 	for _, p := range queued {
 		p.finish(pendingResult{err: errLanesClosed})
@@ -485,6 +585,12 @@ type writeMetrics struct {
 	deferred      prometheus.Counter
 	retries       prometheus.Counter
 	nacks         *prometheus.CounterVec
+	// serverUnbatched counts server-synthesised presence written in its
+	// own transaction because its lane's server-presence bound was full;
+	// serverForced, that queued past the bound instead because its
+	// channel's earlier publishes did not complete in its caller's time.
+	serverUnbatched prometheus.Counter
+	serverForced    prometheus.Counter
 }
 
 func newWriteMetrics() *writeMetrics {
@@ -531,9 +637,17 @@ func newWriteMetrics() *writeMetrics {
 			Name: "ably_publish_nacks_total",
 			Help: "Publishes refused by the batching layer, by reason (queue_full, commit_failed), and unbatched presence writes refused over the in-flight bound (presence_inflight).",
 		}, []string{"reason"}),
+		serverUnbatched: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_publish_server_presence_unbatched_total",
+			Help: "Server-synthesised presence (teardown and grace LEAVEs) written in a transaction of its own, after its channel's earlier publishes, because its lane already held " + strconv.Itoa(serverQueueFactor) + " x --publish-queue-max of it (DESIGN.md §6.3).",
+		}),
+		serverForced: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_publish_server_presence_forced_total",
+			Help: "Server-synthesised presence queued past its lane's bound because its channel's earlier publishes did not complete within its caller's deadline, so it could not be written around them (DESIGN.md §6.3).",
+		}),
 	}
 }
 
 func (m *writeMetrics) collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.lanes, m.lingerMax, m.lingerMin, m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks}
+	return []prometheus.Collector{m.lanes, m.lingerMax, m.lingerMin, m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks, m.serverUnbatched, m.serverForced}
 }

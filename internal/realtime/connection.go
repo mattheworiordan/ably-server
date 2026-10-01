@@ -86,10 +86,24 @@ type connection struct {
 	authStarted    bool
 
 	// entered tracks the presence members this connection has entered,
-	// per channel: channel -> set of clientIds. Used to synthesise LEAVE
-	// on DETACH and on connection teardown (DESIGN.md §12.5). Only
-	// touched from the single read-loop goroutine (dispatch + teardown).
-	entered map[string]map[string]struct{}
+	// per channel: channel -> clientId -> a copy of the member's last
+	// ENTER/UPDATE/PRESENT. Used to synthesise LEAVE on DETACH and on
+	// connection teardown, and to re-enter the members after a presence
+	// lease lapse (DESIGN.md §12.5). The read goroutine writes it; the
+	// lease-lapse re-entry and a grace hand-over read or extend it from
+	// other goroutines, so enteredMu guards it. presenceClosed, set under
+	// enteredMu when teardown takes the set, ends both.
+	enteredMu      sync.Mutex
+	entered        map[string]map[string]*protocol.PresenceMessage
+	presenceClosed bool
+
+	// presMu orders this connection's presence writes with a lease-lapse
+	// re-entry of its members (DESIGN.md §12.5): a client's ENTER, UPDATE
+	// or LEAVE, a DETACH's LEAVEs and teardown each hold it while they
+	// publish, and the re-entry holds it from reading entered until its
+	// ENTERs are stored, so it cannot resurrect a member the client has
+	// just left.
+	presMu sync.Mutex
 
 	// srv is the owning Server, used at teardown to schedule the delayed
 	// presence LEAVE for an abrupt disconnect (DESIGN.md §12.5). Set once
@@ -216,8 +230,9 @@ func (c *connection) run(ctx context.Context) {
 
 	// Synthesise LEAVE for every presence member this connection still
 	// holds, so other subscribers see the departures (DESIGN.md §12.5).
-	// The worker has stopped and only the read goroutine ever touches the
-	// entered set, so this runs race-free.
+	// The worker has stopped; teardown takes the entered set under
+	// enteredMu and closes it, so no re-entry or hand-over adds to it
+	// afterwards.
 	//
 	// Deliberate departures — a clean client CLOSE or a graceful server
 	// shutdown — leave immediately. An abrupt disconnect (transport drop,
