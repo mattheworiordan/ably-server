@@ -61,7 +61,15 @@ type connection struct {
 	// it records each frame's wait in the outbound queue
 	// (ably_conn_write_wait_seconds) and its attachments the fan-out time
 	// (ably_delivery_fanout_seconds, DESIGN.md §10).
-	sampled     bool
+	sampled bool
+	// requested is when the WebSocket upgrade request reached the server,
+	// and connectedAt (unix nanoseconds, set by the write loop) when the
+	// CONNECTED frame was written: the two ends of ably_connect_seconds,
+	// and connectedAt the start of ably_client_attach_delay_seconds
+	// (DESIGN.md §10). connectedAt is read once, by the first ATTACH.
+	requested   time.Time
+	connectedAt atomic.Int64
+	attachSeen  bool // the read loop has handled an ATTACH; read loop only
 	attachments map[string]*attachment
 
 	// publishQ is the per-connection publish pipeline: one buffered
@@ -196,12 +204,12 @@ func (c *connection) run(ctx context.Context) {
 	// CONNECTED is the first frame we emit; buffer is empty here.
 	// resumeError (a declined resume/recover, DESIGN.md §4.3) rides along
 	// so the SDK sees the fresh connectionId as a resume failure.
-	if !c.queue(ctx, &protocol.ProtocolMessage{
+	if !c.queueObserved(ctx, &protocol.ProtocolMessage{
 		Action:            protocol.ActionConnected,
 		ConnectionID:      c.id,
 		ConnectionDetails: c.connectionDetails(),
 		Error:             c.resumeError,
-	}) {
+	}, nil, c.connectedWritten) {
 		return
 	}
 
@@ -451,6 +459,13 @@ func (c *connection) handleClose(ctx context.Context) {
 // live anchor before entering the live MESSAGE forwarding loop (subject
 // to the replay cap).
 func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMessage) {
+	received := time.Now()
+	if !c.attachSeen {
+		c.attachSeen = true
+		if at := c.connectedAt.Load(); at != 0 {
+			c.metrics.ClientAttachDelay(received.Sub(time.Unix(0, at)))
+		}
+	}
 	name := msg.GetChannel()
 	// An invalid channel name (empty, a reserved leading character such as
 	// ':' or '[', a line break) is rejected with ERROR 40010 (DESIGN.md §4,
@@ -564,6 +579,8 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// §5.1).
 	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	a.outShared = c.queueShared
+	a.outObserved = c.queueObserved
+	a.received = received
 	if c.srv != nil {
 		t := c.srv.appendTracking
 		a.seen = newSeenSet(t.SeenMax)
@@ -574,6 +591,18 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)
 	go a.run()
+}
+
+// connectedWritten runs on the write loop once the CONNECTED frame is on
+// the wire: it records the time since the upgrade request
+// (ably_connect_seconds) and notes when, for the first ATTACH
+// (ably_client_attach_delay_seconds, DESIGN.md §10).
+func (c *connection) connectedWritten(int) {
+	now := time.Now()
+	c.connectedAt.Store(now.UnixNano())
+	if !c.requested.IsZero() {
+		c.metrics.ConnectWritten(now.Sub(c.requested))
+	}
 }
 
 // permittedModes maps the connection's capability to the channel-mode
@@ -885,19 +914,37 @@ func frameKey(action protocol.Action, format protocol.Format) sharedFrameKey {
 // once per format however many attachments it is sent to. The encoded
 // bytes are shared read-only between connections.
 func (c *connection) queueShared(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
-	type encoded struct {
+	return c.queueObserved(ctx, msg, memo, nil)
+}
+
+// queueObserved queues msg like queueShared (or like queue when memo is
+// nil) and, when written is set, has the write loop call it once the
+// frame is on the wire. An attach uses it to time its ATTACHED and SYNC
+// frames (ably_attach_seconds, DESIGN.md §10).
+func (c *connection) queueObserved(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer, written func(bytes int)) bool {
+	var (
 		f   outFrame
 		err error
+	)
+	if memo == nil {
+		f, err = c.encode(msg)
+	} else {
+		type encoded struct {
+			f   outFrame
+			err error
+		}
+		e := memo.Memo(frameKey(msg.Action, c.format), func() any {
+			f, err := c.encode(msg)
+			return encoded{f, err}
+		}).(encoded)
+		f, err = e.f, e.err
 	}
-	e := memo.Memo(frameKey(msg.Action, c.format), func() any {
-		f, err := c.encode(msg)
-		return encoded{f, err}
-	}).(encoded)
-	if e.err != nil {
-		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", e.err)
+	if err != nil {
+		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", err)
 		return false
 	}
-	return c.push(ctx, e.f)
+	f.written = written
+	return c.push(ctx, f)
 }
 
 // push queues an encoded frame (see queue).
@@ -981,6 +1028,9 @@ func (c *connection) writeLoop(ctx context.Context) {
 				if err := c.writeFrame(f); err != nil {
 					return
 				}
+				if f.written != nil {
+					f.written(len(f.data))
+				}
 				if !f.queued.IsZero() {
 					c.metrics.ConnWriteWait(time.Since(f.queued))
 				}
@@ -1022,7 +1072,9 @@ func (c *connection) writeFrame(f outFrame) error {
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
-		c.logger.Warn("write timed out; closing connection", "timeout", c.writeTimeout)
+		c.logger.Warn("write timed out; closing connection", "timeout", c.writeTimeout,
+			"frame", f.action.String(), "bytes", len(f.data), "queuedBytes", c.out.queuedBytes())
+		c.metrics.WriteTimeout(f.action.String())
 		if c.slow.CompareAndSwap(false, true) {
 			c.metrics.SlowConsumerDisconnect("write_timeout")
 		}

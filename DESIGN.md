@@ -987,7 +987,12 @@ was exceeded) would misdescribe it. Other subscribers are unaffected: a
 slow attachment waits on its own connection's queue, never on the
 channel, and the channel's live list is shared. The
 `ably_slow_consumer_disconnects_total{reason}` counter (`queue_full` or
-`write_timeout`) records each disconnect (§10).
+`write_timeout`) records each disconnect (§10), and
+`ably_write_timeouts_total{frame}` counts each write that missed its
+deadline by the action of the frame being written (`presence`, `sync`,
+`message`, ...), so a timeout on a large `SYNC` frame can be told from
+one on live traffic. The warning logged names the frame, its size and
+the bytes still queued.
 
 **Buffers.** The WebSocket read buffer is per connection
 (`--ws-read-buffer-size`, default 1 KiB: inbound frames on a subscriber
@@ -2650,6 +2655,41 @@ name = "persisted:presence_fixtures"
     (counter), grace-window LEAVEs that could not be written, by stage
     (`get_channel`, `publish`), and `ably_presence_reentries_total`
     (counter), members re-entered after the node's presence lease lapsed.
+  - Connect and attach (§4, §12.4), on every connection and attach:
+    `ably_connect_seconds` (histogram, buckets 1 ms to about 33 s), from a
+    WebSocket upgrade request reaching the server to its `CONNECTED` frame
+    being written; `ably_client_attach_delay_seconds` (same buckets), from
+    that `CONNECTED` being written to the connection's first `ATTACH`
+    being read: the client's turnaround plus the network, which the server
+    does not control (an `ATTACH` read before the write loop has noted the
+    `CONNECTED` write is not sampled); and `ably_attach_seconds{until}` (same buckets),
+    from a new attachment's `ATTACH` being read to its `ATTACHED`
+    (`attached`) or its final presence `SYNC` frame (`synced`) being
+    written. Together they split a client's measured connect-and-attach
+    time into the server's part and the client's part.
+  - Presence sync stages (§12.4): `ably_presence_sync_stage_seconds{stage}`
+    (histogram, same buckets): `snapshot` (obtaining the snapshot: the
+    seed read, the refresh-window wait, the rebuild), `queue` (encoding
+    and queueing the frame, including backpressure) and `write` (from
+    queueing starting to the frame being written, so it includes `queue`
+    and the frames queued ahead of it), for the `SYNC` of an attach;
+    `ably_presence_sync_frame_bytes` (histogram, 256 B to 2 MiB), the
+    encoded size of each `SYNC` frame written, on attach or on a client
+    `SYNC`; and
+    `ably_presence_syncs_skipped_total{reason}` (counter), the `SYNC`s
+    that delivered no set: `closed` (the attachment or its connection
+    ended while the snapshot was being obtained, logged at debug level)
+    or `error` (the snapshot could not be read, logged as a warning).
+  - Cluster mode only, the Postgres connection pool (§6.3):
+    `ably_storage_pool_max_conns`, `ably_storage_pool_acquired_conns`,
+    `ably_storage_pool_idle_conns` (gauges) and
+    `ably_storage_pool_acquires_total`,
+    `ably_storage_pool_empty_acquires_total` (acquires that found no idle
+    connection), `ably_storage_pool_canceled_acquires_total`,
+    `ably_storage_pool_acquire_seconds_total`,
+    `ably_storage_pool_empty_acquire_wait_seconds_total` (counters), read
+    from the pool on each scrape. A starved pool delays every storage
+    call, including the presence seed read that attaches wait on.
   - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
     the SYNC snapshots served, by how each was obtained: `cached` (the
     channel's current snapshot), `waited` (rebuilt by another attach
@@ -3042,9 +3082,17 @@ of the store's set as of a serial:
   the channel is bound: one store read per bind, shared by concurrent
   attaches. `Members` returns the set and its as-of serial from one
   snapshot of the store, so the set is exactly the fold of every cm up to
-  that serial. The cms the node delivers while the read is in flight are
-  buffered and folded on top: those at or below the as-of serial are
-  already in the seed and are skipped, those after it are applied.
+  that serial. The read runs on its own context, not on the context of
+  the attach that started it: an attach whose connection closes stops
+  waiting, and the read goes on for the attaches still waiting. It is
+  cancelled only when no attach is waiting for it any more; an attach
+  that arrives while a cancelled read is ending waits for it and seeds
+  afresh. (On a room that fills fast, many attaches wait on one seed; if
+  each closing connection cancelled it, every waiter would start the read
+  again and queue for a pool connection again.) The cms the node
+  delivers while the read is in flight are buffered and folded on top:
+  those at or below the as-of serial are already in the seed and are
+  skipped, those after it are applied.
 - It is then **maintained** from every presence cm the node delivers on
   the channel, which arrive in channelSerial order (§7.2) and include
   other nodes' operations and the reaper's synthesised LEAVEs: ENTER,
@@ -3081,6 +3129,21 @@ of the store's set as of a serial:
   re-seeded set after its channel update, as on attach. The memory and
   disk backends deliver each presence cm under the lock that mints it,
   so their cms also arrive in serial order.
+
+A snapshot that cannot be obtained skips the `SYNC`: the `ATTACHED`
+then carries no `HAS_PRESENCE`. When the attachment has already ended
+(its connection closed while it waited), that is expected and only
+counted; a failed store read is logged
+(`ably_presence_syncs_skipped_total{reason}`, §10).
+
+The set goes out as one `SYNC` frame. For a 2,000-member room the
+frames measured locally were up to about 512 KB (msgpack,
+`ably_presence_sync_frame_bytes`); the measured write timeouts
+under load were on live `PRESENCE` frames, not on `SYNC` frames
+(`ably_write_timeouts_total{frame}`), so the frame is not paged. Paging
+would also need a sync id the SDKs parse: ably-js matches the cursor with
+`^[\w-]+:`, which a channelSerial containing `@` never matches, so it
+ends the sync at the first page.
 
 In `store` mode every `SYNC` reads `Members` from the store, as before the
 local set existed. Either way the store's set stays authoritative (§12.5):

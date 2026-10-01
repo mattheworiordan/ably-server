@@ -86,6 +86,15 @@ type attachment struct {
 	// connections through memo (connection.queueShared); nil sends
 	// through out.
 	outShared func(context.Context, *protocol.ProtocolMessage, memoizer) bool
+	// outObserved is outShared (or out, for a nil memoizer) with a
+	// callback the write loop runs once the frame is on the wire
+	// (connection.queueObserved); the attach times its ATTACHED and SYNC
+	// frames with it. Nil falls back to outShared and out.
+	outObserved func(context.Context, *protocol.ProtocolMessage, memoizer, func(bytes int)) bool
+	// received is when the connection read the ATTACH that created this
+	// attachment, the start of ably_attach_seconds (DESIGN.md §10). Zero
+	// for attachments made outside a connection (tests). Set before run.
+	received time.Time
 	// sampled is set on one connection's attachments in
 	// metrics.DeliverySampleEvery: they record the fan-out time of each
 	// live frame (ably_delivery_fanout_seconds, DESIGN.md §10).
@@ -362,10 +371,13 @@ func (a *attachment) run() {
 	// arrives on the live cursor, and the client converges by serial.
 	var snap *core.PresenceSnapshot
 	if a.hasMode(protocol.FlagPresenceSubscribe) {
+		began := time.Now()
 		var err error
 		if snap, err = a.stream.Channel().PresenceSync(a.ctx); err != nil {
-			a.logger.Warn("presence sync: Members failed; skipping sync", "err", err)
+			a.syncSkipped(a.ctx, err)
 			snap = nil
+		} else {
+			a.metrics.PresenceSyncSnapshot(time.Since(began))
 		}
 	}
 	hasSync := snap != nil && len(snap.Members) > 0
@@ -393,7 +405,7 @@ func (a *attachment) run() {
 		Error:         errInfo,
 		Params:        a.echoParams(),
 	}
-	if !a.send(attached) {
+	if !a.sendAttached(attached) {
 		return
 	}
 
@@ -401,7 +413,7 @@ func (a *attachment) run() {
 	// single frame suffices at our scale; the channelSerial carries the
 	// sync cursor — "<serial>:" with an empty cursor part marks the set
 	// complete (paging is a later phase, DESIGN.md §12.4).
-	if hasSync && !a.sendSync(snap) {
+	if hasSync && !a.sendSync(snap, true) {
 		return
 	}
 
@@ -460,10 +472,10 @@ func (a *attachment) signalDiscontinuity(serial string) bool {
 	if a.hasMode(protocol.FlagPresenceSubscribe) {
 		var err error
 		if snap, err = a.stream.Channel().PresenceSync(a.ctx); err != nil {
+			a.syncSkipped(a.ctx, err)
 			if a.ctx.Err() != nil {
 				return false
 			}
-			a.logger.Warn("presence sync after a discontinuity: Members failed; skipping sync", "err", err)
 			snap = nil
 		}
 	}
@@ -484,7 +496,7 @@ func (a *attachment) signalDiscontinuity(serial string) bool {
 	}) {
 		return false
 	}
-	return !hasSync || a.sendSync(snap)
+	return !hasSync || a.sendSync(snap, false)
 }
 
 // forward delivers one ChannelMessage to the connection as the wire
@@ -882,10 +894,38 @@ func (a *attachment) resync(ctx context.Context) {
 	}
 	snap, err := a.stream.Channel().PresenceSyncNow(ctx)
 	if err != nil {
-		a.logger.Warn("presence resync: Members failed; skipping", "err", err)
+		a.syncSkipped(ctx, err)
 		return
 	}
-	a.sendSync(snap)
+	a.sendSync(snap, false)
+}
+
+// syncSkipped records a SYNC that delivers no presence set because its
+// snapshot could not be obtained (ably_presence_syncs_skipped_total,
+// DESIGN.md §12.4). When ctx has ended, the attachment or its connection
+// is already going away and nobody is waiting for the set: that is
+// counted as "closed" and logged at debug level. Anything else is a
+// failed store read, counted as "error" and logged as a warning; the
+// client then has no presence set until it re-attaches or sends SYNC.
+func (a *attachment) syncSkipped(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		a.metrics.PresenceSyncSkipped("closed")
+		a.logger.Debug("presence sync: attachment closed while obtaining the snapshot; skipping sync", "err", err)
+		return
+	}
+	a.metrics.PresenceSyncSkipped("error")
+	a.logger.Warn("presence sync: snapshot failed; skipping sync", "err", err)
+}
+
+// sendAttached queues an attach's ATTACHED frame, timing it from the
+// ATTACH being read to the frame being written (ably_attach_seconds,
+// DESIGN.md §10).
+func (a *attachment) sendAttached(msg *protocol.ProtocolMessage) bool {
+	if a.outObserved == nil || a.received.IsZero() {
+		return a.send(msg)
+	}
+	received, m := a.received, a.metrics
+	return a.outObserved(a.ctx, msg, nil, func(int) { m.AttachWritten(time.Since(received)) })
 }
 
 // sendSync delivers snap as one SYNC frame. A single frame carries the
@@ -894,17 +934,39 @@ func (a *attachment) resync(ctx context.Context) {
 // the reconciliation in one step (paging is a later phase, DESIGN.md
 // §12.4). The frame is the same for every attach snap is served to, so
 // it is encoded once per wire format.
-func (a *attachment) sendSync(snap *core.PresenceSnapshot) bool {
+//
+// The frame's size is recorded (ably_presence_sync_frame_bytes) and, for
+// the SYNC of an attach (onAttach), its queue and write stages
+// (ably_presence_sync_stage_seconds) and the time from the ATTACH being
+// read to the frame being written (ably_attach_seconds{until="synced"}).
+func (a *attachment) sendSync(snap *core.PresenceSnapshot, onAttach bool) bool {
 	msg := &protocol.ProtocolMessage{
 		Action:        protocol.ActionSync,
 		Channel:       new(a.channelName),
 		ChannelSerial: snap.AsOf + ":",
 		Presence:      snap.Members,
 	}
-	if a.outShared == nil {
-		return a.send(msg)
+	if a.outObserved == nil {
+		if a.outShared == nil {
+			return a.send(msg)
+		}
+		return a.outShared(a.ctx, msg, snap)
 	}
-	return a.outShared(a.ctx, msg, snap)
+	m, received := a.metrics, a.received
+	queued := time.Now()
+	ok := a.outObserved(a.ctx, msg, snap, func(bytes int) {
+		m.PresenceSyncFrame(bytes)
+		if onAttach {
+			m.PresenceSyncWritten(time.Since(queued))
+			if !received.IsZero() {
+				m.AttachSynced(time.Since(received))
+			}
+		}
+	})
+	if ok && onAttach {
+		m.PresenceSyncQueued(time.Since(queued))
+	}
+	return ok
 }
 
 // sendLive sends one frame derived from the cm the stream last returned.
