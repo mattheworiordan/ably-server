@@ -19,6 +19,17 @@ import (
 // disappears from Members and a synthetic LEAVE reaches node B's
 // appender exactly once.
 func TestCrashedNodePresenceReaped(t *testing.T) {
+	testCrashedNodePresenceReaped(t, Batching{})
+}
+
+// TestCrashedNodePresenceReapedBatched is TestCrashedNodePresenceReaped
+// with presence writes batched (DESIGN.md §12.5): the ENTER and the
+// reaper's synthesised LEAVE both commit through the publish lanes.
+func TestCrashedNodePresenceReapedBatched(t *testing.T) {
+	testCrashedNodePresenceReaped(t, Batching{Lanes: 4})
+}
+
+func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
 	// Shrink the lease/bump/reaper cadences so the test runs in seconds.
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
@@ -27,7 +38,7 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 	ctx := context.Background()
 
 	// Node A: the node that will "crash". Enters presence; no appender.
-	sa, err := Open(ctx, Options{DSN: dsn})
+	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching})
 	if err != nil {
 		t.Fatalf("Open node A: %v", err)
 	}
@@ -42,7 +53,7 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 	}
 
 	// Node B: the surviving node. Observes presence via its appender.
-	sb, err := Open(ctx, Options{DSN: dsn})
+	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching})
 	if err != nil {
 		t.Fatalf("Open node B: %v", err)
 	}
@@ -96,13 +107,25 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 // fixture member carries an 'infinity' lease and a sentinel owner, so
 // node B's reaper never removes it.
 func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
+	testStaticFixturePresenceSurvivesReaper(t, Batching{})
+}
+
+// TestStaticFixturePresenceSurvivesReaperBatched is
+// TestStaticFixturePresenceSurvivesReaper with presence writes batched:
+// the batch's upsert must stamp the fixture's sentinel owner and
+// 'infinity' lease as the unbatched one does.
+func TestStaticFixturePresenceSurvivesReaperBatched(t *testing.T) {
+	testStaticFixturePresenceSurvivesReaper(t, Batching{Lanes: 4})
+}
+
+func testStaticFixturePresenceSurvivesReaper(t *testing.T, batching Batching) {
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
 
-	sa, err := Open(ctx, Options{DSN: dsn})
+	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching})
 	if err != nil {
 		t.Fatalf("Open node A: %v", err)
 	}
@@ -112,7 +135,7 @@ func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
 		t.Fatalf("Channel node A: %v", err)
 	}
 
-	sb, err := Open(ctx, Options{DSN: dsn})
+	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching})
 	if err != nil {
 		t.Fatalf("Open node B: %v", err)
 	}

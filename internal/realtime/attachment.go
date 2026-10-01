@@ -79,6 +79,10 @@ type attachment struct {
 	// queue (connection.queue); false means the frame was not queued
 	// and the attachment should stop.
 	out func(context.Context, *protocol.ProtocolMessage) bool
+	// outShared queues a frame whose encoding is shared across
+	// connections through memo (connection.queueShared); nil sends
+	// through out.
+	outShared func(context.Context, *protocol.ProtocolMessage, memoizer) bool
 	// connID is the owning connection's id, and echo its `echo` setting.
 	// When echo is false the fan-out skips message cms this connection
 	// published itself (DESIGN.md §2.1).
@@ -339,19 +343,15 @@ func (a *attachment) run() {
 	// HAS_PRESENCE flag can be set. The snapshot is taken at-or-after the
 	// live anchor; any member that enters or leaves past the anchor also
 	// arrives on the live cursor, and the client converges by serial.
-	var (
-		syncMembers []*protocol.PresenceMessage
-		syncAsOf    string
-	)
+	var snap *core.PresenceSnapshot
 	if a.hasMode(protocol.FlagPresenceSubscribe) {
-		members, asOf, err := a.channel.Members(a.ctx)
-		if err != nil {
+		var err error
+		if snap, err = a.stream.Channel().PresenceSync(a.ctx); err != nil {
 			a.logger.Warn("presence sync: Members failed; skipping sync", "err", err)
-		} else if len(members) > 0 {
-			syncMembers = presentSnapshot(members)
-			syncAsOf = asOf
+			snap = nil
 		}
 	}
+	hasSync := snap != nil && len(snap.Members) > 0
 
 	// ATTACHED.flags carries the effective channel-mode set (DESIGN.md
 	// §4.2), plus the status flags below.
@@ -364,7 +364,7 @@ func (a *attachment) run() {
 	if len(replay) > 0 {
 		flags |= protocol.FlagHasBacklog
 	}
-	if len(syncMembers) > 0 {
+	if hasSync {
 		flags |= protocol.FlagHasPresence
 	}
 
@@ -384,15 +384,8 @@ func (a *attachment) run() {
 	// single frame suffices at our scale; the channelSerial carries the
 	// sync cursor — "<serial>:" with an empty cursor part marks the set
 	// complete (paging is a later phase, DESIGN.md §12.4).
-	if len(syncMembers) > 0 {
-		if !a.send(&protocol.ProtocolMessage{
-			Action:        protocol.ActionSync,
-			Channel:       new(a.channelName),
-			ChannelSerial: syncAsOf + ":",
-			Presence:      syncMembers,
-		}) {
-			return
-		}
+	if hasSync && !a.sendSync(snap) {
+		return
 	}
 
 	// Replay (resume/rewind) is backlog delivery: appends arrive as full
@@ -794,20 +787,31 @@ func (a *attachment) resync(ctx context.Context) {
 	if !a.hasMode(protocol.FlagPresenceSubscribe) {
 		return
 	}
-	members, asOf, err := a.channel.Members(ctx)
+	snap, err := a.stream.Channel().PresenceSyncNow(ctx)
 	if err != nil {
 		a.logger.Warn("presence resync: Members failed; skipping", "err", err)
 		return
 	}
-	// A single frame carries the whole set at our scale; the "<serial>:"
-	// channelSerial (empty cursor part) marks the sync complete so the
-	// client ends its sync and applies the reconciliation in one step.
-	a.send(&protocol.ProtocolMessage{
+	a.sendSync(snap)
+}
+
+// sendSync delivers snap as one SYNC frame. A single frame carries the
+// whole set at our scale; the "<serial>:" channelSerial (empty cursor
+// part) marks the sync complete so the client ends its sync and applies
+// the reconciliation in one step (paging is a later phase, DESIGN.md
+// §12.4). The frame is the same for every attach snap is served to, so
+// it is encoded once per wire format.
+func (a *attachment) sendSync(snap *core.PresenceSnapshot) bool {
+	msg := &protocol.ProtocolMessage{
 		Action:        protocol.ActionSync,
 		Channel:       new(a.channelName),
-		ChannelSerial: asOf + ":",
-		Presence:      presentSnapshot(members),
-	})
+		ChannelSerial: snap.AsOf + ":",
+		Presence:      snap.Members,
+	}
+	if a.outShared == nil {
+		return a.send(msg)
+	}
+	return a.outShared(a.ctx, msg, snap)
 }
 
 // send pushes a frame onto the connection's outbound queue, waiting

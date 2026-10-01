@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ably/ably-server/internal/logging"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 )
@@ -61,6 +63,16 @@ type Channel struct {
 	// channel with members is not evicted (DESIGN.md §5.1). Nil when
 	// empty. Guarded by mu.
 	members map[string]struct{}
+	// pv is the local member set SYNC is served from (presence.go,
+	// DESIGN.md §12.4). Unlike members it holds the whole set, seeded from
+	// the store on first use. Guarded by mu.
+	pv memberView
+
+	// syncSource and syncRefresh configure SYNC (PresenceSync); metrics
+	// receives its series (nil-safe). Set before the Channel is shared.
+	syncSource  string
+	syncRefresh time.Duration
+	metrics     *metrics.Metrics
 
 	// Lifecycle state for idle-channel eviction (DESIGN.md §5.1), guarded
 	// by life. Kept apart from mu so that pinning a channel for an
@@ -87,12 +99,31 @@ type Channel struct {
 // populate with the watermark serial.
 func newChannel(name string) *Channel {
 	return &Channel{
-		name:     name,
-		ready:    make(chan struct{}),
-		tail:     &entry{notify: make(chan struct{})},
-		bound:    make(chan struct{}),
-		released: make(chan struct{}),
+		name:        name,
+		ready:       make(chan struct{}),
+		tail:        &entry{notify: make(chan struct{})},
+		bound:       make(chan struct{}),
+		released:    make(chan struct{}),
+		syncSource:  PresenceSyncLocal,
+		syncRefresh: DefaultPresenceSyncRefresh,
 	}
+}
+
+// now reads the clock the Channel's SYNC snapshots age by: the
+// Manager's, or the wall clock for a Channel built outside one.
+func (c *Channel) now() int64 {
+	if c.mgr != nil {
+		return c.mgr.now()
+	}
+	return time.Now().UnixNano()
+}
+
+// logger returns the Manager's logger, or the default.
+func (c *Channel) logger() *logging.Logger {
+	if c.mgr != nil {
+		return c.mgr.logger
+	}
+	return logging.Default()
 }
 
 // errNoManager is returned when an evicted Channel that was built
@@ -179,12 +210,15 @@ func (c *Channel) idle(now int64, timeout time.Duration) bool {
 }
 
 // HasSubscribers reports whether anything in this process receives the
-// channel's cms: an open Stream (an attachment) or a presence member
-// this node has seen enter and not leave, whose LEAVE must still arrive
-// for eviction to proceed. A channel bound only for a REST operation or
-// kept bound after its last detach has none. Implements
-// storage.SubscriberReporter; the cluster bus's watermark sweep reads
-// only channels that have subscribers (DESIGN.md §7.2).
+// channel's cms: an open Stream (an attachment), a presence member this
+// node has seen enter and not leave, whose LEAVE must still arrive for
+// eviction to proceed, or the local presence member set (presence.go),
+// seeded or seeding, which folds every delivered presence cm and is
+// served to the next attach's SYNC, so a cm lost on the bus must still
+// be swept into it (DESIGN.md §7.2, §12.4). A channel bound only for a
+// REST operation, or kept bound after its last detach with no member
+// set, has none. Implements storage.SubscriberReporter; the cluster
+// bus's watermark sweep reads only channels that have subscribers.
 func (c *Channel) HasSubscribers() bool {
 	c.life.Lock()
 	refs := c.refs
@@ -194,7 +228,7 @@ func (c *Channel) HasSubscribers() bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.members) > 0
+	return len(c.members) > 0 || c.pv.seeded || c.pv.seeding != nil
 }
 
 // Name returns the channel name.
@@ -390,6 +424,9 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 
 	if len(cm.Presence) > 0 {
 		c.trackMembers(cm.Presence)
+		if c.pv.seeded || c.pv.seeding != nil {
+			c.pv.observe(cm)
+		}
 	}
 	e := &entry{cm: cm, notify: make(chan struct{})}
 	c.tail.next = e

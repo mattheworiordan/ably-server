@@ -851,29 +851,35 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 				cs.members[key] = p
 			}
 		}
-	}
-	cs.mu.Unlock()
-
-	if !idempotent {
+		// Delivered under cs.mu, so concurrent presence publishes reach
+		// the appender in serial order, as the local member set that SYNC
+		// is served from requires (DESIGN.md §12.4). The memory backend
+		// does the same; cs.mu is never taken under the appender's lock.
 		cs.deliver(resultCM)
 	}
+	cs.mu.Unlock()
 	return resultCM, idempotent, nil
 }
 
 // Members returns the in-memory membership set (sorted by Serial) plus
 // the channel's current watermark — the last channelSerial persisted in
-// the log, or empty if the channel has no cms.
+// the log, or empty if the channel has no cms. The watermark is read
+// under cs.mu, which StorePresence holds from mint to fold, so every
+// presence cm at or below it is in the set and none above it is: the
+// exact as-of point a node's local member set seeds from (DESIGN.md
+// §12.4). A message publish racing the read may advance the watermark
+// past the last presence cm, which changes no member.
 func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
 
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
 	for _, p := range cs.members {
 		out = append(out, p)
 	}
-	cs.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
 
 	var asOf string

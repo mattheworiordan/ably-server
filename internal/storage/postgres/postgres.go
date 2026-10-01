@@ -219,6 +219,15 @@ type Options struct {
 	// without ensure_channel.
 	BindOnWrite bool
 
+	// PresenceMaxInflight bounds the presence writes this Storage runs
+	// in their own transaction at once (those not batched, DESIGN.md
+	// §12.5), so a convoy on one room's row lock cannot hold the whole
+	// pool; a presence write beyond it fails at once with
+	// storage.ErrOverloaded. Zero means DefaultPresenceInflightPerLane x
+	// Batching.Lanes (x DefaultPublishLanes when batching is off);
+	// negative means no bound.
+	PresenceMaxInflight int
+
 	// shard is this Storage's place in a shard list, set by OpenSharded
 	// (DESIGN.md §6.4). The zero value is a lone Storage.
 	shard shardSlot
@@ -244,6 +253,11 @@ type Storage struct {
 	bindOnWrite           bool
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
+
+	// presenceLanes is lanes when presence is batched too, else nil;
+	// presenceSlots bounds unbatched presence writes (nil: unbounded).
+	presenceLanes *laneSet
+	presenceSlots chan struct{}
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
 	clockOffset atomic.Int64
@@ -442,6 +456,12 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 
 	if batching.enabled() {
 		s.lanes = newLaneSet(batching, s, s.wmetrics)
+		if !batching.PresenceUnbatched {
+			s.presenceLanes = s.lanes
+		}
+	}
+	if n := presenceMaxInflight(opts.PresenceMaxInflight, batching); n > 0 {
+		s.presenceSlots = make(chan struct{}, n)
 	}
 	if !s.bindOnWrite {
 		s.rows = newRowCache(rowCacheSize)
@@ -628,7 +648,27 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		cs.ready = make(chan struct{})
 	}
 	s.setRetention(cs)
+	cs.presenceLanes, cs.presenceSlots, cs.wmetrics = s.presenceLanes, s.presenceSlots, s.wmetrics
 	return cs
+}
+
+// DefaultPresenceInflightPerLane is the default bound on unbatched
+// presence writes per publish lane (Options.PresenceMaxInflight).
+const DefaultPresenceInflightPerLane = 4
+
+// presenceMaxInflight resolves Options.PresenceMaxInflight: the bound
+// on unbatched presence writes, or 0 for none.
+func presenceMaxInflight(n int, b Batching) int {
+	switch {
+	case n < 0:
+		return 0
+	case n > 0:
+		return n
+	case b.enabled():
+		return DefaultPresenceInflightPerLane * b.Lanes
+	default:
+		return DefaultPresenceInflightPerLane * DefaultPublishLanes
+	}
 }
 
 // boundStore returns the channelStore bound to name with a live
@@ -713,6 +753,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // row this node owns, in one UPDATE on the bump cadence (DESIGN.md
 // §12.5). A live node thus keeps its members' expires_at ahead of now,
 // so only a crashed node's rows ever lapse and become reapable.
+//
+// Rows another transaction holds locked are skipped rather than waited
+// for: that transaction is a presence write, which stamps a fresh lease
+// or deletes the row, or the reaper. A batched presence write locks
+// several rows in one transaction, so a bump that waited could deadlock
+// with it; a row skipped once is bumped next round, well inside the
+// lease window.
 func (s *Storage) presenceLeaseBumpLoop(ctx context.Context) {
 	defer s.wg.Done()
 	t := time.NewTicker(presenceLeaseBumpInterval)
@@ -723,7 +770,9 @@ func (s *Storage) presenceLeaseBumpLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			if _, err := s.pool.Exec(ctx,
-				`UPDATE presence SET expires_at = now() + make_interval(secs => $2) WHERE node_id = $1`,
+				`UPDATE presence SET expires_at = now() + make_interval(secs => $2)
+				 WHERE (channel, connection_id, client_id) IN (
+				   SELECT channel, connection_id, client_id FROM presence WHERE node_id = $1 FOR UPDATE SKIP LOCKED)`,
 				s.node, presenceLeaseWindow.Seconds(),
 			); err != nil && ctx.Err() == nil {
 				s.logger.Warn("storage/postgres: presence lease bump failed", "err", err)
@@ -754,10 +803,15 @@ func (s *Storage) presenceReaperLoop(ctx context.Context) {
 // The DELETE ... RETURNING takes a row lock per row, so when several
 // nodes reap concurrently exactly one node's statement yields (and thus
 // emits the LEAVE for) any given row. Rows are drained before the LEAVE
-// publishes because StorePresence acquires its own pooled conn.
+// publishes because StorePresence acquires its own pooled conn. Rows
+// another transaction holds locked are skipped (a presence write is
+// renewing or removing them), as in the lease bump, so the reaper cannot
+// deadlock with a batched presence write; a row still lapsed is reaped
+// next round.
 func (s *Storage) reapExpiredPresence(ctx context.Context) {
 	rows, err := s.pool.Query(ctx,
-		`DELETE FROM presence WHERE expires_at < now()
+		`DELETE FROM presence WHERE (channel, connection_id, client_id) IN (
+		   SELECT channel, connection_id, client_id FROM presence WHERE expires_at < now() FOR UPDATE SKIP LOCKED)
 		 RETURNING channel, connection_id, client_id`)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -800,7 +854,7 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 			ClientID:     o.clientID,
 			ConnectionID: o.connID,
 		}
-		if _, _, err := cs.StorePresence(ctx, []*protocol.PresenceMessage{leave}); err != nil && ctx.Err() == nil {
+		if _, _, err := cs.StorePresence(storage.WithServerPresence(ctx), []*protocol.PresenceMessage{leave}); err != nil && ctx.Err() == nil {
 			s.logger.Warn("storage/postgres: presence reap LEAVE failed", "channel", o.channel, "err", err)
 		} else if err == nil {
 			s.logger.Debug("storage/postgres: reaped orphaned presence member", "channel", o.channel, "clientId", o.clientID, "connectionId", o.connID)
@@ -1102,6 +1156,14 @@ type channelStore struct {
 	retention    time.Duration
 	clock        *atomic.Int64
 	floorMin     string
+
+	// presenceLanes is lanes when presence operations are batched too
+	// (nil otherwise); presenceSlots bounds the presence operations this
+	// Storage runs in their own transaction at once (nil: no bound). Both
+	// DESIGN.md §12.5.
+	presenceLanes *laneSet
+	presenceSlots chan struct{}
+	wmetrics      *writeMetrics
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the
@@ -1521,6 +1583,26 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		return nil, false, err
 	}
 
+	if cs.presenceLanes != nil {
+		return cs.storePresenceBatched(ctx, cs.presenceLanes, presence)
+	}
+	// Unbatched, each operation holds a pool connection for its whole
+	// transaction, including any wait on the room's row lock. Past the
+	// bound it is refused at once rather than queued, so SYNC reads and
+	// publishes always find a connection (DESIGN.md §12.5).
+	// Server-synthesised presence (a LEAVE nothing would retry) is exempt.
+	if cs.presenceSlots != nil && !storage.IsServerPresence(ctx) {
+		select {
+		case cs.presenceSlots <- struct{}{}:
+			defer func() { <-cs.presenceSlots }()
+		default:
+			if cs.wmetrics != nil {
+				cs.wmetrics.nacks.WithLabelValues("presence_inflight").Inc()
+			}
+			return nil, false, fmt.Errorf("%w: too many presence operations in flight", storage.ErrOverloaded)
+		}
+	}
+
 	static := storage.IsStaticPresence(ctx)
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1823,43 +1905,62 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 }
 
 // Members returns the channel's presence projection plus the channel's
-// current watermark serial as the as-of point.
+// current watermark serial as the as-of point. Both are read in one
+// REPEATABLE READ snapshot, pipelined in one round trip, so the set is
+// exactly the fold of every cm up to and including the as-of serial and
+// of none after it: presence writes fold the set and advance the
+// watermark in the same transaction, under the channel's row lock. A
+// node seeding its local member set from this (DESIGN.md §12.4) can then
+// fold exactly the cms after the as-of serial.
 func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
 
-	rows, err := cs.pool.Query(ctx,
-		`SELECT payload FROM presence WHERE channel = $1 ORDER BY channel_serial, client_id`, cs.name)
-	if err != nil {
-		return nil, "", fmt.Errorf("storage/postgres: members query: %w", err)
+	b := &pgx.Batch{}
+	b.Queue(`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`)
+	b.Queue(`SELECT payload FROM presence WHERE channel = $1 ORDER BY channel_serial, client_id`, cs.name)
+	b.Queue(`SELECT channel_serial FROM channels WHERE name = $1`, cs.name)
+	b.Queue(`COMMIT`)
+	br := cs.pool.SendBatch(ctx, b)
+	defer br.Close()
+	if _, err := br.Exec(); err != nil {
+		return nil, "", fmt.Errorf("storage/postgres: members begin: %w", err)
 	}
-	defer rows.Close()
 
-	var out []*protocol.PresenceMessage
-	for rows.Next() {
-		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
-			return nil, "", fmt.Errorf("storage/postgres: scan member: %w", err)
+	out, err := func() ([]*protocol.PresenceMessage, error) {
+		rows, err := br.Query()
+		if err != nil {
+			return nil, fmt.Errorf("storage/postgres: members query: %w", err)
 		}
-		var p protocol.PresenceMessage
-		if err := msgpack.Unmarshal(payload, &p); err != nil {
-			return nil, "", fmt.Errorf("storage/postgres: decode member: %w", err)
+		defer rows.Close()
+		var out []*protocol.PresenceMessage
+		for rows.Next() {
+			var payload []byte
+			if err := rows.Scan(&payload); err != nil {
+				return nil, fmt.Errorf("storage/postgres: scan member: %w", err)
+			}
+			var p protocol.PresenceMessage
+			if err := msgpack.Unmarshal(payload, &p); err != nil {
+				return nil, fmt.Errorf("storage/postgres: decode member: %w", err)
+			}
+			out = append(out, &p)
 		}
-		out = append(out, &p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("storage/postgres: members rows: %w", err)
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("storage/postgres: members rows: %w", err)
+		}
+		return out, nil
+	}()
+	if err != nil {
+		return nil, "", err
 	}
 
 	var asOf string
-	if err := cs.pool.QueryRow(ctx,
-		`SELECT channel_serial FROM channels WHERE name = $1`, cs.name,
-	).Scan(&asOf); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return out, "", nil
-		}
+	if err := br.QueryRow().Scan(&asOf); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, "", fmt.Errorf("storage/postgres: members watermark: %w", err)
+	}
+	if _, err := br.Exec(); err != nil {
+		return nil, "", fmt.Errorf("storage/postgres: members commit: %w", err)
 	}
 	return out, asOf, nil
 }

@@ -65,6 +65,13 @@ type Batching struct {
 	// meanwhile share the commit. Zero (the default) commits at once, the
 	// leading edge.
 	LingerMin time.Duration
+
+	// PresenceUnbatched commits every presence operation in its own
+	// transaction even when publishes are batched, as before presence
+	// batching existed. The zero value routes presence through the lanes
+	// with messages (DESIGN.md §6.3, §12.5); the server's
+	// --presence-batching=false sets it.
+	PresenceUnbatched bool
 }
 
 func (b Batching) enabled() bool { return b.Lanes > 0 }
@@ -83,15 +90,26 @@ func (b Batching) resolve() Batching {
 	return b
 }
 
-// pending is one publish waiting in a lane for its batch to commit.
+// pending is one publish waiting in a lane for its batch to commit: a
+// message publish (msgs) or a presence operation (presence), never both.
 type pending struct {
 	channel string
 	cs      *channelStore // nil in lane unit tests
 	msgs    []*protocol.Message
 	batchID string
+	// presence is a presence publish's operations, folded into the
+	// presence table in the batch's transaction (DESIGN.md §12.5);
+	// static marks fixture members, stored with a non-expiring lease.
+	presence []*protocol.PresenceMessage
+	static   bool
+	// mustAdmit exempts a server-synthesised presence publish from the
+	// queue bound: nothing retries it, and a dropped LEAVE leaves its
+	// member behind (DESIGN.md §12.5).
+	mustAdmit bool
 	// checkIDs is true when the ids were supplied by the client, so the
 	// publish must be checked for idempotency; server-generated ids are
-	// unique by construction and skip the lookup.
+	// unique by construction and skip the lookup. Presence ids are always
+	// checked, as StorePresence does unbatched.
 	checkIDs bool
 
 	ctx       context.Context
@@ -121,6 +139,17 @@ type pendingResult struct {
 
 func newPending(ctx context.Context, channel string) *pending {
 	return &pending{channel: channel, ctx: ctx, done: make(chan struct{})}
+}
+
+// ids returns the publish's non-empty item ids, in item order: the ids
+// the idempotency lookup and the in-batch duplicate check compare. A
+// message publish's ids are all stamped (storage.StampMessageIDs); a
+// synthesised presence event (a teardown or reaper LEAVE) has none.
+func (p *pending) ids() []string {
+	if p.presence != nil {
+		return nonEmptyPresenceIDs(p.presence)
+	}
+	return nonEmptyIDs(p.msgs)
 }
 
 // finish records the result and releases the waiting caller.
@@ -257,7 +286,7 @@ func (l *lane) submit(p *pending) error {
 		// they are taken; reclaim them before refusing a live one.
 		l.reapLocked()
 	}
-	if len(l.queue) >= l.opts.QueueMax {
+	if len(l.queue) >= l.opts.QueueMax && !p.mustAdmit {
 		l.metrics.nacks.WithLabelValues("queue_full").Inc()
 		return storage.ErrOverloaded
 	}
@@ -315,12 +344,14 @@ func (l *lane) armTimerLocked(d time.Duration) {
 
 // takeLocked removes and returns up to BatchMax queued publishes whose
 // channels are not in flight, in queue order. Publishes whose caller has
-// already given up are dropped, whether or not their channel is busy.
+// already given up are dropped, whether or not their channel is busy,
+// except server-synthesised presence (mustAdmit): a LEAVE whose bounded
+// caller stopped waiting must still be stored, or its member stays.
 func (l *lane) takeLocked() []*pending {
 	var batch, rest []*pending
 	for _, p := range l.queue {
 		switch {
-		case p.ctx.Err() != nil:
+		case p.ctx.Err() != nil && !p.mustAdmit:
 			p.finish(pendingResult{err: p.ctx.Err()})
 		case len(batch) >= l.opts.BatchMax, l.busy[p.channel] > 0:
 			rest = append(rest, p)
@@ -337,7 +368,7 @@ func (l *lane) takeLocked() []*pending {
 func (l *lane) reapLocked() {
 	kept := l.queue[:0]
 	for _, p := range l.queue {
-		if p.ctx.Err() != nil {
+		if p.ctx.Err() != nil && !p.mustAdmit {
 			p.finish(pendingResult{err: p.ctx.Err()})
 			continue
 		}
@@ -498,7 +529,7 @@ func newWriteMetrics() *writeMetrics {
 		}),
 		nacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ably_publish_nacks_total",
-			Help: "Publishes refused by the batching layer, by reason (queue_full, commit_failed).",
+			Help: "Publishes refused by the batching layer, by reason (queue_full, commit_failed), and unbatched presence writes refused over the in-flight bound (presence_inflight).",
 		}, []string{"reason"}),
 	}
 }

@@ -1,8 +1,10 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -52,21 +54,60 @@ func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs [
 	if err != nil {
 		return nil, false, err
 	}
-	if cs.preInsertRow && !cs.rowEnsured.Load() {
-		// Create the row if absent, as ensure_channel would, but without
-		// its ON CONFLICT DO UPDATE: that takes the row lock, which would
-		// queue this publish behind a hot channel's in-flight batch.
-		if _, err := cs.pool.Exec(ctx, `
-			INSERT INTO channels (name, channel_serial, initial_channel_serial)
-			SELECT $1, s, s FROM (SELECT format_channel_serial((extract(epoch from clock_timestamp()) * 1000)::BIGINT, 0, $2) AS s) seed
-			ON CONFLICT (name) DO NOTHING`, cs.name, cs.series); err != nil {
-			return nil, false, fmt.Errorf("storage/postgres: create channel row: %w", err)
-		}
-		cs.rowEnsured.Store(true)
+	if err := cs.ensureRow(ctx); err != nil {
+		return nil, false, err
 	}
 	p := newPending(ctx, cs.name)
 	p.cs, p.msgs, p.batchID, p.checkIDs = cs, msgs, batchID, clientIDs
 	return lanes.publish(p)
+}
+
+// storePresenceBatched is storeBatched for a presence publish (DESIGN.md
+// §6.3, §12.5): the operations join a lane's batch, which mints their
+// channelSerial with the batch's other publishes and folds them into the
+// presence table in the same transaction. The text columns a presence
+// operation writes are checked here, so one bad operation cannot fail a
+// batch.
+func (cs *channelStore) storePresenceBatched(ctx context.Context, lanes *laneSet, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+	if !validText(cs.name) {
+		return nil, false, storage.ErrInvalidChannelName
+	}
+	for _, pm := range presence {
+		if !validText(pm.ID) || !validText(pm.ClientID) || !validText(pm.ConnectionID) {
+			return nil, false, storage.ErrInvalidMessageID
+		}
+	}
+	if err := cs.ensureRow(ctx); err != nil {
+		return nil, false, err
+	}
+	p := newPending(ctx, cs.name)
+	p.cs, p.presence, p.static = cs, presence, storage.IsStaticPresence(ctx)
+	p.mustAdmit = storage.IsServerPresence(ctx)
+	p.checkIDs = len(p.ids()) > 0
+	return lanes.publish(p)
+}
+
+// ensureRow creates the channel's row before a message or presence
+// publish is queued, under Options.BindOnWrite only, if this store has
+// never seen it, so a batch never has to insert one. Otherwise (the
+// default) it does nothing: the batch's publish_batch_lock creates a
+// missing row in the round trip that locks the rows, for presence
+// operations exactly as for messages (DESIGN.md §6.3 "Channel rows").
+func (cs *channelStore) ensureRow(ctx context.Context) error {
+	if !cs.preInsertRow || cs.rowEnsured.Load() {
+		return nil
+	}
+	// Create the row if absent, as ensure_channel would, but without its
+	// ON CONFLICT DO UPDATE: that takes the row lock, which would queue
+	// this publish behind a hot channel's in-flight batch.
+	if _, err := cs.pool.Exec(ctx, `
+		INSERT INTO channels (name, channel_serial, initial_channel_serial)
+		SELECT $1, s, s FROM (SELECT format_channel_serial((extract(epoch from clock_timestamp()) * 1000)::BIGINT, 0, $2) AS s) seed
+		ON CONFLICT (name) DO NOTHING`, cs.name, cs.series); err != nil {
+		return fmt.Errorf("storage/postgres: create channel row: %w", err)
+	}
+	cs.rowEnsured.Store(true)
+	return nil
 }
 
 // batchSlot is one publish's place in a batch transaction.
@@ -232,9 +273,9 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 		sl.ord = len(channels)
 		byOrd[sl.ord] = sl
 		if sl.p.checkIDs || sl.p.retried {
-			for _, m := range sl.p.msgs {
+			for _, id := range sl.p.ids() {
 				idCM = append(idCM, int32(sl.ord))
-				ids = append(ids, m.ID)
+				ids = append(ids, id)
 			}
 		}
 	}
@@ -297,12 +338,8 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 
 	// Stamp and encode the fresh publishes.
 	var (
-		rChannel, rSerial, rKind, rMsgSerial []string
-		rIdx                                 []int32
-		rID                                  []*string
-		rPayload                             [][]byte
-		rPersisted                           []bool
-		items                                []batchItem
+		rows  batchRows
+		items []batchItem
 	)
 	for i := range slots {
 		sl := &slots[i]
@@ -310,34 +347,23 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 			continue
 		}
 		p := sl.p
-		w := &busWrite{serial: sl.serial, kind: storage.KindMessage}
+		var err error
+		if p.presence != nil {
+			sl.cm, err = rows.addPresence(p, sl.serial)
+		} else {
+			sl.cm, err = rows.addMessages(p, sl.serial)
+		}
+		if err != nil {
+			rollback()
+			return nil, err
+		}
+		w := &busWrite{serial: sl.serial, kind: storage.KindMessage, rows: rows.last}
+		if p.presence != nil {
+			w.kind = storage.KindPresence
+		}
 		if s.bus.chains() {
 			w.prev = sl.prev
 		}
-		for idx, m := range p.msgs {
-			m.Serial = serial.MessageSerial(sl.serial, idx)
-			m.Action = protocol.MessageCreate
-			storage.StampCreateVersion(m)
-			payload, err := msgpack.Marshal(m)
-			if err != nil {
-				rollback()
-				return nil, fmt.Errorf("storage/postgres: encode message %d: %w", idx, err)
-			}
-			var id *string
-			if m.ID != "" {
-				id = &m.ID
-			}
-			rChannel = append(rChannel, p.channel)
-			rSerial = append(rSerial, sl.serial)
-			rIdx = append(rIdx, int32(idx))
-			rID = append(rID, id)
-			rKind = append(rKind, string(storage.KindMessage))
-			rPayload = append(rPayload, payload)
-			rMsgSerial = append(rMsgSerial, m.Serial)
-			rPersisted = append(rPersisted, p.cs.persisted)
-			w.rows = append(w.rows, payload)
-		}
-		sl.cm = &protocol.ChannelMessage{ID: p.batchID, ChannelSerial: sl.serial, Messages: p.msgs}
 		items = append(items, batchItem{cs: p.cs, cm: sl.cm, w: w})
 		// Every mint replaces the last: a mint under the row lock, with the
 		// ids checked (a retry always checks them), proves no earlier
@@ -354,16 +380,9 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 		}
 	}
 
-	// Round trip 2: rows, the bus hook, COMMIT.
+	// Round trip 2: rows, the presence fold, the bus hook, COMMIT.
 	b = &pgx.Batch{}
-	if len(rChannel) > 0 {
-		b.Queue(`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, persisted)
-			SELECT * FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::bytea[], $7::text[], $8::bool[])`,
-			rChannel, rSerial, rIdx, rID, rKind, rPayload, rMsgSerial, rPersisted)
-		b.Queue(`INSERT INTO messages (channel, message_serial, payload, deleted, persisted)
-			SELECT c, s, p, FALSE, e FROM unnest($1::text[], $2::text[], $3::bytea[], $4::bool[]) AS t(c, s, p, e)`,
-			rChannel, rMsgSerial, rPayload, rPersisted)
-	}
+	rows.queue(b, s.node)
 	queued, err := beforeCommitBatch(ctx, s.bus, b, nil, items)
 	if err != nil {
 		rollback()
@@ -431,17 +450,202 @@ func planBatch(batch []*pending) []batchSlot {
 			byID = map[string]int{}
 			seen[p.channel] = byID
 		}
-		for _, m := range p.msgs {
-			if j, ok := byID[m.ID]; ok {
+		pids := p.ids()
+		for _, id := range pids {
+			if j, ok := byID[id]; ok {
 				slots[i].dupOf = j
 				break
 			}
 		}
 		if slots[i].dupOf < 0 {
-			for _, m := range p.msgs {
-				byID[m.ID] = i
+			for _, id := range pids {
+				byID[id] = i
 			}
 		}
 	}
 	return slots
+}
+
+// batchRows accumulates a batch transaction's rows as the column arrays
+// its unnest statements take: the log rows of every fresh publish, the
+// latest-version projection rows of message publishes, and the presence
+// operations folded to one final state per member (DESIGN.md §6.3,
+// §12.5).
+type batchRows struct {
+	// channel_messages, one entry per item.
+	channel, serial, kind []string
+	idx                   []int32
+	id, msgSerial         []*string
+	payload               [][]byte
+	persisted             []bool
+
+	// messages, one entry per message item.
+	mChannel, mSerial []string
+	mPayload          [][]byte
+	mPersisted        []bool
+
+	// presence: the batch's operations folded in batch order, one entry
+	// per member, indexed by member.
+	member map[memberRef]int
+	fold   []presenceFold
+
+	// last holds the payloads of the publish added last: its busWrite
+	// rows.
+	last [][]byte
+}
+
+// memberRef is a presence row's key.
+type memberRef struct{ channel, connID, clientID string }
+
+// presenceFold is a member's final state after a batch's operations on
+// it: removed (leave), or present with the last ENTER/UPDATE's payload.
+type presenceFold struct {
+	memberRef
+	leave   bool
+	serial  string // the channelSerial of the last operation
+	payload []byte
+	static  bool
+}
+
+// addMessages stamps a message publish with its minted serial, encodes
+// it, and adds its log and projection rows.
+func (r *batchRows) addMessages(p *pending, channelSerial string) (*protocol.ChannelMessage, error) {
+	r.last = make([][]byte, 0, len(p.msgs))
+	for idx, m := range p.msgs {
+		m.Serial = serial.MessageSerial(channelSerial, idx)
+		m.Action = protocol.MessageCreate
+		storage.StampCreateVersion(m)
+		payload, err := msgpack.Marshal(m)
+		if err != nil {
+			return nil, fmt.Errorf("storage/postgres: encode message %d: %w", idx, err)
+		}
+		r.addLog(p, channelSerial, idx, m.ID, storage.KindMessage, payload, &m.Serial)
+		r.mChannel = append(r.mChannel, p.channel)
+		r.mSerial = append(r.mSerial, m.Serial)
+		r.mPayload = append(r.mPayload, payload)
+		r.mPersisted = append(r.mPersisted, p.cs.persisted)
+	}
+	return &protocol.ChannelMessage{ID: p.batchID, ChannelSerial: channelSerial, Messages: p.msgs}, nil
+}
+
+// addPresence stamps a presence publish with its minted serial, encodes
+// it, adds its log rows, and folds its operations into the batch's
+// member states in order: a later operation on the same member replaces
+// an earlier one, so an ENTER then a LEAVE in one batch removes the
+// member, as two transactions in that order would.
+func (r *batchRows) addPresence(p *pending, channelSerial string) (*protocol.ChannelMessage, error) {
+	r.last = make([][]byte, 0, len(p.presence))
+	for idx, pm := range p.presence {
+		storage.StampPresenceMember(pm, channelSerial, idx)
+		payload, err := msgpack.Marshal(pm)
+		if err != nil {
+			return nil, fmt.Errorf("storage/postgres: encode presence %d: %w", idx, err)
+		}
+		r.addLog(p, channelSerial, idx, pm.ID, storage.KindPresence, payload, nil)
+
+		ref := memberRef{channel: p.channel, connID: pm.ConnectionID, clientID: pm.ClientID}
+		f := presenceFold{memberRef: ref, serial: channelSerial, payload: payload, static: p.static}
+		switch pm.Action {
+		case protocol.PresenceLeave, protocol.PresenceAbsent:
+			f = presenceFold{memberRef: ref, leave: true, serial: channelSerial}
+		}
+		if r.member == nil {
+			r.member = make(map[memberRef]int)
+		}
+		if i, ok := r.member[ref]; ok {
+			r.fold[i] = f
+		} else {
+			r.member[ref] = len(r.fold)
+			r.fold = append(r.fold, f)
+		}
+	}
+	return &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: p.presence}, nil
+}
+
+// addLog adds one channel_messages row. id and message_serial are NULL
+// when absent, as the unbatched inserts store them.
+func (r *batchRows) addLog(p *pending, channelSerial string, idx int, id string, kind storage.Kind, payload []byte, msgSerial *string) {
+	var idArg *string
+	if id != "" {
+		idArg = &id
+	}
+	r.channel = append(r.channel, p.channel)
+	r.serial = append(r.serial, channelSerial)
+	r.idx = append(r.idx, int32(idx))
+	r.id = append(r.id, idArg)
+	r.kind = append(r.kind, string(kind))
+	r.payload = append(r.payload, payload)
+	r.msgSerial = append(r.msgSerial, msgSerial)
+	r.persisted = append(r.persisted, p.cs.persisted)
+	r.last = append(r.last, payload)
+}
+
+// queue queues the batch's row statements on b: the log rows, the
+// projection rows, then the presence fold as one DELETE for the members
+// that left and one upsert for the rest. Each member appears once. Lock
+// order among the rows does not matter for deadlocks: every writer of a
+// room's presence rows holds the room's channels row lock first, and the
+// lease bump and reaper, which do not, skip locked rows.
+func (r *batchRows) queue(b *pgx.Batch, node string) {
+	if len(r.channel) > 0 {
+		b.Queue(`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, persisted)
+			SELECT * FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::bytea[], $7::text[], $8::bool[])`,
+			r.channel, r.serial, r.idx, r.id, r.kind, r.payload, r.msgSerial, r.persisted)
+	}
+	if len(r.mChannel) > 0 {
+		b.Queue(`INSERT INTO messages (channel, message_serial, payload, deleted, persisted)
+			SELECT c, s, p, FALSE, e FROM unnest($1::text[], $2::text[], $3::bytea[], $4::bool[]) AS t(c, s, p, e)`,
+			r.mChannel, r.mSerial, r.mPayload, r.mPersisted)
+	}
+	if len(r.fold) == 0 {
+		return
+	}
+	folds := slices.Clone(r.fold)
+	slices.SortFunc(folds, func(a, b presenceFold) int {
+		return cmp.Or(cmp.Compare(a.channel, b.channel), cmp.Compare(a.connID, b.connID), cmp.Compare(a.clientID, b.clientID))
+	})
+	var (
+		dChannel, dConn, dClient                   []string
+		uChannel, uConn, uClient, uSerial, uNodeID []string
+		uPayload                                   [][]byte
+		uStatic                                    []bool
+	)
+	for _, f := range folds {
+		if f.leave {
+			dChannel = append(dChannel, f.channel)
+			dConn = append(dConn, f.connID)
+			dClient = append(dClient, f.clientID)
+			continue
+		}
+		uChannel = append(uChannel, f.channel)
+		uConn = append(uConn, f.connID)
+		uClient = append(uClient, f.clientID)
+		uSerial = append(uSerial, f.serial)
+		uPayload = append(uPayload, f.payload)
+		uStatic = append(uStatic, f.static)
+		if f.static {
+			// Static fixture member (DESIGN.md §9, §12.5): the sentinel
+			// owner and an 'infinity' lease, as the unbatched upsert.
+			uNodeID = append(uNodeID, fixtureNodeID)
+		} else {
+			uNodeID = append(uNodeID, node)
+		}
+	}
+	if len(dChannel) > 0 {
+		b.Queue(`DELETE FROM presence
+			WHERE (channel, connection_id, client_id) IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))`,
+			dChannel, dConn, dClient)
+	}
+	if len(uChannel) > 0 {
+		b.Queue(`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
+			SELECT c, k, l, s, p, n, CASE WHEN st THEN 'infinity'::timestamptz ELSE now() + make_interval(secs => $8) END
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[], $6::text[], $7::bool[]) AS t(c, k, l, s, p, n, st)
+			ORDER BY c, k, l
+			ON CONFLICT (channel, connection_id, client_id)
+			DO UPDATE SET channel_serial = EXCLUDED.channel_serial,
+			              payload = EXCLUDED.payload,
+			              node_id = EXCLUDED.node_id,
+			              expires_at = EXCLUDED.expires_at`,
+			uChannel, uConn, uClient, uSerial, uPayload, uNodeID, uStatic, presenceLeaseWindow.Seconds())
+	}
 }

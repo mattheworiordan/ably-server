@@ -122,6 +122,20 @@
 # row inside the batch transaction. See DESIGN.md §6.3.
 # publish-bind-on-write = false
 
+# The presence path (DESIGN.md §12.4, §12.5). presence-sync-source picks
+# where an attach's SYNC comes from: "local" (this node's member set,
+# seeded from the store once per channel bind and kept current from the
+# presence events the node delivers) or "store" (a store read per
+# attach). Cluster mode: presence-batching commits presence enter,
+# update and leave in the publish lanes' batches (false: each in its own
+# transaction); presence-max-inflight bounds the presence writes
+# committed in their own transaction at once per database, beyond which
+# they are refused with 42910 (0 reads as unset: 4 x publish-lanes;
+# negative: no bound).
+# presence-sync-source = "local"
+# presence-batching = true
+# presence-max-inflight = 16
+
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
 # shutdown-grace = "10s"

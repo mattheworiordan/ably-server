@@ -1,5 +1,6 @@
 # SDK compatibility harness output (see compat/README.md)
 /compat-results-*.json
+/tmp/compatibility/
 
 # Local task-tracking notes, not published
 /backlog/

@@ -18,6 +18,7 @@ import (
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // DefaultHeartbeatInterval is the cadence of server-driven HEARTBEAT
@@ -434,7 +435,7 @@ func (s *Server) fireConnectionLeaves(ctx context.Context, connID, channel strin
 	if len(leaves) == 0 {
 		return
 	}
-	if _, _, err := ch.PublishPresence(ctx, leaves); err != nil {
+	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leaves); err != nil {
 		s.logger.Warn("delayed leave publish failed", "channel", channel, "err", err)
 	}
 }

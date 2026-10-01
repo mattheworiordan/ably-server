@@ -440,6 +440,36 @@ func WithStaticPresence(ctx context.Context) context.Context {
 	return context.WithValue(ctx, staticPresenceKey{}, true)
 }
 
+// serverPresenceKey marks presence the server synthesises rather than
+// a client publishes: the LEAVEs of a torn-down connection, of an
+// abrupt disconnect's grace window, and of the cluster reaper
+// (DESIGN.md §12.5).
+type serverPresenceKey struct{}
+
+// WithServerPresence marks ctx so that presence stored under it is
+// treated as server-synthesised: a backend must not refuse it for load
+// (the publish-queue and in-flight bounds), since nothing retries it
+// and a dropped LEAVE leaves its member behind.
+func WithServerPresence(ctx context.Context) context.Context {
+	return context.WithValue(ctx, serverPresenceKey{}, true)
+}
+
+// IsServerPresence reports whether ctx was marked by WithServerPresence
+// or WithStaticPresence (fixture members are server-made too).
+func IsServerPresence(ctx context.Context) bool {
+	v, _ := ctx.Value(serverPresenceKey{}).(bool)
+	return v || IsStaticPresence(ctx)
+}
+
+// Discontinuous is implemented by an Appender that keeps state derived
+// from the cms delivered to it (core.Channel's presence member set,
+// DESIGN.md §12.4). A backend calls Discontinuity when it skips cms it
+// could not deliver, so the appender rebuilds that state from the store
+// rather than carry on without them.
+type Discontinuous interface {
+	Discontinuity()
+}
+
 // IsStaticPresence reports whether ctx was marked by WithStaticPresence.
 func IsStaticPresence(ctx context.Context) bool {
 	v, _ := ctx.Value(staticPresenceKey{}).(bool)
