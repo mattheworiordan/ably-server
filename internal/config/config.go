@@ -41,8 +41,8 @@ type File struct {
 	// Bus selects cluster mode's cross-node bus, "pgnotify", "postgres"
 	// or "nats" (DESIGN.md §7.2); NATSURL and NATSInlineMaxBytes
 	// configure the nats bus; the PostgresNotify* keys configure the
-	// postgres bus; BusSweepInterval and BusSweepScope the chaining
-	// buses' safety-net sweep. Durations are strings, like ShutdownGrace;
+	// postgres bus; BusSweepInterval the chaining buses' safety-net
+	// sweep. Durations are strings, like ShutdownGrace;
 	// a zero int means absent.
 	Bus                string `toml:"bus"`
 	NATSURL            string `toml:"nats-url"`
@@ -57,7 +57,6 @@ type File struct {
 	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
 	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`
 	BusSweepInterval         string `toml:"bus-sweep-interval"`
-	BusSweepScope            string `toml:"bus-sweep-scope"`
 	// MessageRetention and PersistedRetention are duration strings (e.g.
 	// "2m", "24h") for the cluster-mode message log's retention classes
 	// (DESIGN.md §6.3, §9).

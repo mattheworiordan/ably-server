@@ -1987,8 +1987,8 @@ The `postgres` and `nats` buses share one delivery point
   SDK re-enters its own presence members on an `ATTACHED` without
   `RESUMED` (RTP17i). Counted in
   `ably_channel_discontinuities_total{reason}` (§10).
-- **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
-  only bound channels with a subscriber on this node: an open
+- **Sweep scope.** The sweep reads only bound channels with a subscriber
+  on this node: an open
   attachment, or a presence member the node has seen enter and not leave
   (whose LEAVE eviction waits for). A channel the sweep finds with
   neither also drops its local presence member set (§12.4): that set is
@@ -2002,13 +2002,11 @@ The `postgres` and `nats` buses share one delivery point
   as a live presence event. An attach with the default modes includes
   `PRESENCE_SUBSCRIBE`, so it seeds a set even on a channel with no
   presence; dropping the set rather than sweeping it keeps such a
-  channel out of the sweep once its last attachment closes. `bound`
-  sweeps every bound channel,
-  the behaviour before the scope existed. A channel bound only by a REST
-  request, or kept bound after its last detach until eviction, has
+  channel out of the sweep once its last attachment closes. A channel
+  bound only by a REST request, or kept bound after its last detach until eviction, has
   nobody on this node a lost cm could be late for, so reading it is
-  waste: in a 15-minute shape-D run the full sweep was about a quarter of
-  Postgres's time. The bound: a lost bus message on a subscribed channel
+  waste: in a 15-minute shape-D run, sweeping every bound channel took
+  about a quarter of Postgres's time. The bound: a lost bus message on a subscribed channel
   with no later cm is delivered up to two intervals late (60 s at the
   default). On a channel with no local subscriber nothing is waiting for
   it. The binding goes on receiving the bus, so a later cm's predecessor
@@ -2431,8 +2429,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
 --postgres-notify-window 50ms   coalescing window (coalesced mode)
 --postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
---bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (30s) (§7.2)
---bus-sweep-scope subscribed  channels that sweep reads: subscribed (an attachment or presence member here) or bound (all)
+--bus-sweep-interval 0s       chaining buses' safety-net sweep of channels with a local subscriber; 0 = bus default (30s) (§7.2)
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -2472,7 +2469,7 @@ Configuration may also be supplied via an optional TOML config file
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `nats-creds`, `nats-tls-ca`, `nats-tls-cert`,
 `nats-tls-key`, `postgres-notify-mode`, `postgres-notify-window`,
-`postgres-notify-max-pending`, `bus-sweep-interval`, `bus-sweep-scope`, `shutdown-grace`,
+`postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
@@ -2505,7 +2502,7 @@ supplies a value nothing more specific set.
 
 A bus setting the chosen `--bus` does not use (a `--nats-*` setting under
 `pgnotify` or `postgres`, a `--postgres-notify-*` setting under `pgnotify`
-or `nats`, `--bus-sweep-*` under `pgnotify`), given by flag, env or file,
+or `nats`, `--bus-sweep-interval` under `pgnotify`), given by flag, env or file,
 is named in a warning at startup rather than dropped silently. The bus,
 the retentions and the persisted namespaces must be the same on every
 node of a cluster, which the database enforces at startup (§11).
@@ -2520,6 +2517,9 @@ in a warning at startup.
 - `--publish-bind-on-write` (`publish-bind-on-write`): replaced by the
   write-only publish path (§5.1) and in-batch channel row creation (§6.3,
   "Channel rows"), which were its `false` default.
+- `--bus-sweep-scope` (`bus-sweep-scope`): the sweep always reads only
+  the bound channels with a local subscriber, its `subscribed` default
+  (§7.2 "Sweep scope"); `bound` is gone.
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -2665,7 +2665,7 @@ name = "persisted:presence_fixtures"
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
     the store: at most one per channel bind, plus one after a skipped bus
     gap (§7.2) and one after each sweep that found the channel with no
-    subscribers under `--bus-sweep-scope=subscribed` (§12.4).
+    subscribers (§12.4).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
@@ -3071,8 +3071,7 @@ of the store's set as of a serial:
   connection's read loop, so it never waits: an out-of-date snapshot is
   rebuilt at once.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
-  With `--bus-sweep-scope=subscribed` (§7.2) the set is also dropped
-  when the sweep finds the channel with no attachment and no member of
+  The set is also dropped when the bus sweep (§7.2) finds the channel with no attachment and no member of
   this node's, since the sweep no longer repairs a cm lost on the bus
   for it; the next attach seeds again. So a channel seeds on its first
   presence `SYNC` after a bind, and again on the first one after a sweep

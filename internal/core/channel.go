@@ -305,9 +305,8 @@ func (c *Channel) idle(now int64, timeout time.Duration) bool {
 // this node has seen enter and not leave, whose LEAVE must still arrive
 // for eviction to proceed. A channel bound only for a REST operation or
 // kept bound after its last detach has none. Implements
-// storage.SubscriberReporter; with --bus-sweep-scope=subscribed the
-// cluster bus's watermark sweep reads only channels that have
-// subscribers (DESIGN.md §7.2).
+// storage.SubscriberReporter: the cluster bus's watermark sweep reads
+// only channels that have subscribers (DESIGN.md §7.2).
 //
 // A channel found with none also drops its local presence member set
 // (presence.go, DESIGN.md §12.4), so the next attach's SYNC seeds it

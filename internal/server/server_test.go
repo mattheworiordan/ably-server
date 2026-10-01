@@ -634,9 +634,9 @@ func TestRunWarnsAboutIgnoredBusSettings(t *testing.T) {
 }
 
 func TestBusSettingsIgnored(t *testing.T) {
-	given := map[string]bool{"nats-url": true, "bus-sweep-scope": true, "postgres-notify-mode": false}
-	if got := strings.Join(busSettingsIgnored("pgnotify", given), ","); got != "bus-sweep-scope,nats-url" {
-		t.Errorf("pgnotify ignores %q, want bus-sweep-scope,nats-url", got)
+	given := map[string]bool{"nats-url": true, "bus-sweep-interval": true, "postgres-notify-mode": false}
+	if got := strings.Join(busSettingsIgnored("pgnotify", given), ","); got != "bus-sweep-interval,nats-url" {
+		t.Errorf("pgnotify ignores %q, want bus-sweep-interval,nats-url", got)
 	}
 	if got := busSettingsIgnored("nats", given); len(got) != 0 {
 		t.Errorf("nats ignores %v, want none", got)

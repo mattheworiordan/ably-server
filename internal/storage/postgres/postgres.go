@@ -193,17 +193,12 @@ type Options struct {
 	NotifyMaxPending int
 
 	// SweepInterval is how often a chaining bus (BusPostgres, BusNATS)
-	// compares every bound channel's delivery mark with its committed
-	// serial and catches up a channel that has fallen behind. Zero means
+	// compares the delivery mark of every bound channel with a subscriber
+	// on this node (storage.SubscriberReporter) with its committed serial
+	// and catches up a channel that has fallen behind. Zero means
 	// the bus's default: DefaultPostgresSweepInterval or
 	// DefaultNATSSweepInterval.
 	SweepInterval time.Duration
-
-	// SweepScope selects the bound channels the watermark sweep reads
-	// (DESIGN.md §7.2): SweepSubscribed, only those whose appender reports
-	// a subscriber on this node (storage.SubscriberReporter), or
-	// SweepBound, every bound channel. Empty means SweepSubscribed.
-	SweepScope string
 
 	// Retention configures how long the message log keeps each class of
 	// channel (DESIGN.md §6.3). The zero value applies the defaults.
@@ -343,7 +338,6 @@ type Storage struct {
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
-	sweepAll                    bool          // sweep every bound channel, not only subscribed ones
 	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
 	catchUpSlots                chan struct{} // bounds batched catch-up queries in flight on the node (chain.go)
 	reconcileJitter             time.Duration // cap on the wait before a reconnect reconcile, copied at Open
@@ -381,10 +375,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		if mode, err = ParseNotifyMode(string(opts.NotifyMode)); err != nil {
 			return nil, fmt.Errorf("storage/postgres: %w", err)
 		}
-	}
-	sweepScope, err := ParseSweepScope(opts.SweepScope)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	leaseMode, err := ParsePresenceLeaseMode(opts.PresenceLeaseMode)
 	if err != nil {
@@ -487,7 +477,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		reconnectBase:   listenReconnectBaseDelay,
 		reconnectMax:    listenReconnectMaxDelay,
 		sweepInterval:   opts.SweepInterval,
-		sweepAll:        sweepScope == SweepBound,
 		timing:          currentChainTiming(),
 		reconcileJitter: reconcileJitterMax,
 		retention:       retention,

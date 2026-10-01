@@ -88,20 +88,14 @@
 # sweep instead (env: ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING).
 # postgres-notify-max-pending = 65536
 
-# How often bus = "postgres" or "nats" checks the channels in
-# bus-sweep-scope against their committed serial and catches up one that
-# fell behind, as a duration string; "0s" means the bus default, 30s
-# (env: ABLY_SERVER_BUS_SWEEP_INTERVAL). A message whose bus delivery was
-# lost, with no later message on its channel, is delivered at most about
-# two intervals late.
+# How often bus = "postgres" or "nats" checks each bound channel with an
+# attachment or a presence member on this node against its committed
+# serial and catches up one that fell behind, as a duration string; "0s"
+# means the bus default, 30s (env: ABLY_SERVER_BUS_SWEEP_INTERVAL). A
+# message whose bus delivery was lost, with no later message on its
+# channel, is delivered at most about two intervals late. bus = "pgnotify"
+# has no sweep and ignores it. See DESIGN.md §7.2.
 # bus-sweep-interval = "0s"
-
-# Which bound channels that sweep reads (env: ABLY_SERVER_BUS_SWEEP_SCOPE):
-# "subscribed" (the default; channels with an attachment or a presence
-# member on this node) or "bound" (every bound channel, including ones
-# bound only by a REST request or not yet evicted after their last
-# detach). See DESIGN.md §7.2.
-# bus-sweep-scope = "subscribed"
 
 # Cluster mode: how long a channel outside any persisted namespace keeps
 # its message log, the continuity window a client can resume across

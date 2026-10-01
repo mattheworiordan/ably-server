@@ -93,30 +93,6 @@ var catchUpHook atomic.Pointer[func(names []string) (done func())]
 // sweepChunk caps the channel names in one watermark sweep query.
 const sweepChunk = 1000
 
-// Watermark sweep scopes accepted by Options.SweepScope (DESIGN.md
-// §7.2).
-const (
-	// SweepSubscribed sweeps only the bound channels with a subscriber on
-	// this node: an attachment or a tracked presence member
-	// (storage.SubscriberReporter). The default.
-	SweepSubscribed = "subscribed"
-	// SweepBound sweeps every bound channel, the behaviour before sweep
-	// scopes existed.
-	SweepBound = "bound"
-)
-
-// ParseSweepScope validates a sweep scope. The empty string is the
-// default, SweepSubscribed.
-func ParseSweepScope(s string) (string, error) {
-	switch s {
-	case "", SweepSubscribed:
-		return SweepSubscribed, nil
-	case SweepBound:
-		return SweepBound, nil
-	}
-	return "", fmt.Errorf("unknown bus sweep scope %q (valid: %s, %s)", s, SweepSubscribed, SweepBound)
-}
-
 // sweepNamesHook, when set, receives the channel names of each watermark
 // sweep query (tests count what the sweep reads). Nil in production.
 var sweepNamesHook atomic.Pointer[func(names []string)]
@@ -981,19 +957,15 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 	return firstErr
 }
 
-// sweepStores returns the bound channels the watermark sweep reads: every
-// one under SweepBound; under SweepSubscribed only those whose appender
-// has a subscriber on this node (an appender that cannot say counts as
-// subscribed). A channel with no local subscriber has nobody a lost cm
+// sweepStores returns the bound channels the watermark sweep reads: those
+// whose appender has a subscriber on this node (an appender that cannot
+// say counts as subscribed). A channel with no local subscriber has nobody a lost cm
 // could be late for: its binding goes on receiving the bus, a later
 // subscriber sees whatever the delivery point appends from then on, and
 // a lost tail is caught up within two sweeps of the channel gaining a
 // subscriber (DESIGN.md §7.2).
 func (s *Storage) sweepStores() []*channelStore {
 	stores := s.boundStores()
-	if s.sweepAll {
-		return stores
-	}
 	kept := stores[:0]
 	for _, cs := range stores {
 		if r, ok := cs.appender.(storage.SubscriberReporter); ok && !r.HasSubscribers() {
