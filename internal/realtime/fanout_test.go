@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,18 +30,37 @@ type fanoutRig struct {
 	queued sync.WaitGroup
 	cancel context.CancelFunc
 	atts   []*attachment
+	pool   *core.FanoutPool
+	// pooled counts the frames the fan-out pool queued, and full the
+	// frames it could not queue (no room in the connection's queue).
+	pooled atomic.Int64
+	full   atomic.Int64
+}
+
+// rigOptions configures newFanoutRigWith. With pool set, the channel's
+// Manager has that fan-out pool and every attachment may be pooled
+// (DESIGN.md §5.1); setup, when set, adjusts attachment i before it
+// runs.
+type rigOptions struct {
+	shared bool
+	pool   *core.FanoutPool
+	setup  func(i int, a *attachment)
 }
 
 // Connection i uses formats[i%len(formats)]; every attachment has modes.
 func newFanoutRig(tb testing.TB, n int, formats []protocol.Format, modes int64, shared bool) *fanoutRig {
+	return newFanoutRigWith(tb, n, formats, modes, rigOptions{shared: shared})
+}
+
+func newFanoutRigWith(tb testing.TB, n int, formats []protocol.Format, modes int64, opts rigOptions) *fanoutRig {
 	tb.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	manager := core.NewManager(memory.New(memory.Options{}))
+	manager := core.NewManagerWithOptions(memory.New(memory.Options{}), core.Options{FanoutPool: opts.pool})
 	ch, err := manager.GetChannel(ctx, "fanout")
 	if err != nil {
 		tb.Fatal(err)
 	}
-	r := &fanoutRig{ch: ch, cancel: cancel}
+	r := &fanoutRig{ch: ch, cancel: cancel, pool: opts.pool}
 	logger := logging.New(slog.DiscardHandler)
 	r.queued.Add(n) // the ATTACHED frames
 	for i := range n {
@@ -55,12 +75,26 @@ func newFanoutRig(tb testing.TB, n int, formats []protocol.Format, modes int64, 
 			return ok
 		}
 		a := newAttachment(ctx, "fanout", stream.Channel(), stream, "", false, modes, modes, nil, out, fmt.Sprintf("conn-%d", i), true, nil, logger)
-		if shared {
+		if opts.shared || opts.pool != nil {
 			a.outShared = func(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
 				ok := c.queueShared(ctx, msg, memo)
 				r.queued.Done()
 				return ok
 			}
+		}
+		if opts.pool != nil {
+			a.enablePool(c.encode, func(action protocol.Action, memo memoizer, build func() any) bool {
+				if !c.tryQueueShared(action, memo, build) {
+					r.full.Add(1)
+					return false
+				}
+				r.pooled.Add(1)
+				r.queued.Done()
+				return true
+			})
+		}
+		if opts.setup != nil {
+			opts.setup(i, a)
 		}
 		r.conns = append(r.conns, c)
 		r.atts = append(r.atts, a)
@@ -91,6 +125,7 @@ func (r *fanoutRig) close() {
 	for _, a := range r.atts {
 		<-a.done
 	}
+	r.pool.Close()
 }
 
 // publish publishes one message and waits until every attachment has
@@ -231,20 +266,30 @@ func TestFanoutAppendDeltaNotShared(t *testing.T) {
 // BenchmarkFanoutEnqueue measures shape M's hot path on one node: one
 // publish on a channel with 20,000 subscriber attachments, timed from
 // the publish to every attachment's frame being queued on its
-// connection, with each attachment encoding its own frame (per-attachment)
-// and with the frame encoded once per format and shared (shared).
+// connection, with each attachment encoding its own frame (per-attachment),
+// with the frame encoded once per format and shared (shared), and with
+// the shared frame queued by a fan-out pool of GOMAXPROCS workers while
+// the attachment goroutines stay parked (pool, DESIGN.md §5.1).
 func BenchmarkFanoutEnqueue(b *testing.B) {
 	const n = 20000
 	payload := strings.Repeat("x", 470)
 	for _, format := range []protocol.Format{protocol.FormatMsgpack, protocol.FormatJSON} {
-		for _, shared := range []bool{false, true} {
-			name := fmt.Sprintf("format=%v/per-attachment", format)
-			if shared {
-				name = fmt.Sprintf("format=%v/shared", format)
-			}
-			b.Run(name, func(b *testing.B) {
-				r := newFanoutRig(b, n, []protocol.Format{format}, protocol.FlagSubscribe, shared)
+		for _, mode := range []string{"per-attachment", "shared", "pool"} {
+			b.Run(fmt.Sprintf("format=%v/%s", format, mode), func(b *testing.B) {
+				opts := rigOptions{shared: mode == "shared"}
+				if mode == "pool" {
+					opts.pool = core.NewFanoutPool(core.DefaultFanoutWorkers(), core.DefaultFanoutThreshold)
+				}
+				r := newFanoutRigWith(b, n, []protocol.Format{format}, protocol.FlagSubscribe, opts)
 				defer r.close()
+				if mode == "pool" {
+					// Let every attachment join the pool: a first publish is
+					// delivered by the goroutines, which then join.
+					r.publish(b, &protocol.Message{Name: "warm", Data: payload})
+					r.drain()
+					time.Sleep(100 * time.Millisecond)
+					r.pooled.Store(0)
+				}
 				b.ResetTimer()
 				for b.Loop() {
 					r.publish(b, &protocol.Message{Name: "tick", Data: payload, ClientID: "publisher"})
@@ -253,6 +298,10 @@ func BenchmarkFanoutEnqueue(b *testing.B) {
 					b.StartTimer()
 				}
 				b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N), "µs/fanout")
+				if mode == "pool" {
+					// The share of frames the pool queued (1: every one).
+					b.ReportMetric(float64(r.pooled.Load())/float64(n*b.N), "pooled")
+				}
 			})
 		}
 	}
@@ -308,5 +357,47 @@ func TestDeliveryStagesSampled(t *testing.T) {
 			t.Fatalf("after a delivery on a sampled connection: fan-out recorded %v, write wait recorded %v", fanout, wait)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// BenchmarkFanoutAppendDelta measures the fan-out of a channel streaming
+// appends (DESIGN.md §5.1, §13.3): 20,000 subscribers that have all seen
+// the message, then one append after another, each delivered as a
+// delta, timed from the append to every frame queued. Appends take the
+// per-attachment path, so with the fan-out pool on (pool) the attachment
+// goroutines deliver them; it must cost no more than without the pool
+// (shared).
+func BenchmarkFanoutAppendDelta(b *testing.B) {
+	const n = 20000
+	for _, mode := range []string{"shared", "pool"} {
+		b.Run(mode, func(b *testing.B) {
+			opts := rigOptions{shared: mode == "shared"}
+			if mode == "pool" {
+				opts.pool = core.NewFanoutPool(core.DefaultFanoutWorkers(), core.DefaultFanoutThreshold)
+			}
+			r := newFanoutRigWith(b, n, []protocol.Format{protocol.FormatJSON}, protocol.FlagSubscribe, opts)
+			defer r.close()
+			r.queued.Add(n)
+			r.ch.Append(&protocol.ChannelMessage{ChannelSerial: "s000000", Messages: []*protocol.Message{{Serial: "s000000:000", Data: "start"}}})
+			r.queued.Wait()
+			r.drain()
+			time.Sleep(100 * time.Millisecond)
+			delta := &protocol.Message{Action: protocol.MessageAppend, Serial: "s000000:000", Data: "+tok"}
+			i := 0
+			b.ResetTimer()
+			for b.Loop() {
+				i++
+				r.queued.Add(n)
+				r.ch.Append(&protocol.ChannelMessage{ChannelSerial: fmt.Sprintf("s%06d", i), Messages: []*protocol.Message{{
+					Action: protocol.MessageUpdate, Serial: "s000000:000", Data: "start+tok",
+					Alt: map[string]*protocol.Message{protocol.DeltaAppend: delta},
+				}}})
+				r.queued.Wait()
+				b.StopTimer()
+				r.drain()
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N), "µs/fanout")
+		})
 	}
 }

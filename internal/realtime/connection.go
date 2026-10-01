@@ -564,6 +564,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// §5.1).
 	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	a.outShared = c.queueShared
+	a.enablePool(c.encode, c.tryQueueShared)
 	if c.srv != nil {
 		t := c.srv.appendTracking
 		a.seen = newSeenSet(t.SeenMax)
@@ -885,19 +886,40 @@ func frameKey(action protocol.Action, format protocol.Format) sharedFrameKey {
 // once per format however many attachments it is sent to. The encoded
 // bytes are shared read-only between connections.
 func (c *connection) queueShared(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
-	type encoded struct {
-		f   outFrame
-		err error
-	}
 	e := memo.Memo(frameKey(msg.Action, c.format), func() any {
 		f, err := c.encode(msg)
-		return encoded{f, err}
-	}).(encoded)
+		return sharedFrame{f, err}
+	}).(sharedFrame)
 	if e.err != nil {
 		c.logger.Warn("encode error; dropping frame", "action", msg.Action.String(), "err", e.err)
 		return false
 	}
 	return c.push(ctx, e.f)
+}
+
+// sharedFrame is a shared frame's encoding as kept on a memoizer.
+type sharedFrame struct {
+	f   outFrame
+	err error
+}
+
+// tryQueueShared is queueShared for the fan-out pool (DESIGN.md §5.1):
+// build returns the frame's sharedFrame and is called only if memo has
+// no encoding for action in this connection's format yet, and the frame
+// is queued only if the outbound queue has room now. A pool worker must
+// never wait on one connection, so false (no room, the queue closed, an
+// encode error) hands the frame back to the attachment's goroutine,
+// whose push waits under backpressure or fails as usual.
+func (c *connection) tryQueueShared(action protocol.Action, memo memoizer, build func() any) bool {
+	e := memo.Memo(frameKey(action, c.format), build).(sharedFrame)
+	if e.err != nil {
+		return false
+	}
+	f := e.f
+	if c.sampled {
+		f.queued = time.Now()
+	}
+	return c.out.tryPush(f)
 }
 
 // push queues an encoded frame (see queue).

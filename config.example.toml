@@ -206,6 +206,16 @@
 # (env: ABLY_SERVER_ATTACHMENT_SEEN_MAX).
 # attachment-seen-max = 4096
 
+# The fan-out pool (DESIGN.md §5.1): on a channel with more than
+# delivery-fanout-threshold attachments on this node, this many workers
+# deliver each live message to the attachments, instead of one
+# goroutine per attachment; a pooled channel leaves the pool when it
+# falls to half the threshold. 0 disables the pool; the default is
+# GOMAXPROCS (env: ABLY_SERVER_DELIVERY_FANOUT_POOL,
+# ABLY_SERVER_DELIVERY_FANOUT_THRESHOLD).
+# delivery-fanout-pool = 8
+# delivery-fanout-threshold = 1000
+
 # How long an idle HTTP keep-alive connection is kept open waiting for
 # the next request (DESIGN.md §2.2) (env: ABLY_SERVER_HTTP_IDLE_TIMEOUT).
 # http-idle-timeout = "120s"

@@ -127,6 +127,10 @@ func TestMetricsEndpoint(t *testing.T) {
 	assertMetricAtLeast(t, body, "ably_messages_published_total", 1)
 	assertMetricAtLeast(t, body, "ably_messages_delivered_total", 1)
 	assertMetricAtLeast(t, body, "ably_publish_latency_seconds_count", 1)
+	// The fan-out pool's gauges (DESIGN.md §5.1, §10): the pool is on by
+	// default, idle here.
+	assertMetricAtLeast(t, body, "ably_delivery_fanout_pool_queue_depth", 0)
+	assertMetricAtLeast(t, body, "ably_delivery_fanout_pool_busy", 0)
 
 	// Histograms always export their _count series even with zero
 	// observations; the connection is still open, so just assert presence.

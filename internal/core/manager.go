@@ -61,6 +61,12 @@ type Options struct {
 	// PresenceSyncRefresh bounds how often a busy channel's SYNC snapshot
 	// is rebuilt. Zero means DefaultPresenceSyncRefresh.
 	PresenceSyncRefresh time.Duration
+
+	// FanoutPool, when non-nil, fans out the live cms of channels with
+	// more than its threshold of attachments (DESIGN.md §5.1). The
+	// Manager does not own it: the caller closes it after the
+	// connections are gone.
+	FanoutPool *FanoutPool
 }
 
 // Manager owns the set of active Channels in this process. It pairs
@@ -79,6 +85,7 @@ type Manager struct {
 	logger      *logging.Logger
 	syncSource  string
 	syncRefresh time.Duration
+	pool        *FanoutPool
 
 	// now reads the Manager's monotonic clock in nanoseconds. A field so
 	// tests can drive eviction without sleeping.
@@ -128,6 +135,7 @@ func newManager(store storage.Storage, opts Options, now func() int64) *Manager 
 		logger:      opts.Logger,
 		syncSource:  opts.PresenceSyncSource,
 		syncRefresh: opts.PresenceSyncRefresh,
+		pool:        opts.FanoutPool,
 		now:         now,
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
@@ -235,6 +243,7 @@ func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error)
 		ch := newChannel(name)
 		ch.mgr = m
 		ch.syncSource, ch.syncRefresh, ch.metrics = m.syncSource, m.syncRefresh, m.metrics
+		ch.pool = m.pool
 		ch.lastUsed = m.now()
 		sh.channels[name] = ch
 		sh.mu.Unlock()

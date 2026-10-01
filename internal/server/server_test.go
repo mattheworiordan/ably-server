@@ -533,6 +533,35 @@ func TestRunAttachmentSeenMaxInvalid(t *testing.T) {
 	}
 }
 
+func TestRunDeliveryFanoutInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		args       []string
+		env        map[string]string
+		file       string
+		code       int
+	}{
+		{name: "pool negative", args: []string{"--delivery-fanout-pool=-1"}, want: "--delivery-fanout-pool must not be negative", code: 2},
+		{name: "pool env negative", env: map[string]string{fanoutPoolEnv: "-2"}, want: "--delivery-fanout-pool must not be negative", code: 2},
+		{name: "pool env malformed", env: map[string]string{fanoutPoolEnv: "many"}, want: "invalid integer", code: 1},
+		{name: "pool file negative", file: `delivery-fanout-pool = -1`, want: "--delivery-fanout-pool must not be negative", code: 2},
+		{name: "threshold zero", args: []string{"--delivery-fanout-threshold=0"}, want: "--delivery-fanout-threshold must be positive", code: 2},
+		{name: "threshold env malformed", env: map[string]string{fanoutThresholdEnv: "lots"}, want: "invalid integer", code: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--keys=app.key:secret"}, tc.args...)
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != tc.code || !strings.Contains(out.String(), tc.want) {
+				t.Errorf("exit = %d, output %q; want %d and %q", code, out.String(), tc.code, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunPublishBatchingMalformedIsStartupError(t *testing.T) {
 	for _, tc := range []struct {
 		name, want string

@@ -40,6 +40,9 @@ import (
 type entry struct {
 	cm   *protocol.ChannelMessage
 	next *entry
+	// seq numbers the entries of one Channel's list in order (the
+	// sentinel is 0), so the fan-out pool can compare positions.
+	seq uint64
 	// wake holds each slot's wake channel: nil until a Stream parks on
 	// the slot, closedWaker once Append has linked next. Its length is
 	// fixed when the entry is made.
@@ -104,6 +107,13 @@ func (e *entry) wait(slot uint64) <-chan struct{} {
 	return w.c
 }
 
+// woken reports whether the wake-up for slot has run, so e.next is
+// linked. Unlike wait it makes no channel. False does not mean next is
+// unlinked: Append wakes after it links.
+func (e *entry) woken(slot uint64) bool {
+	return e.wake[slot&uint64(len(e.wake)-1)].Load() == closedWaker
+}
+
 // wakeAll wakes every Stream parked at e. Called once, by the Append
 // that linked e.next, after the link: a Stream that makes a slot's
 // channel after this finds closedWaker instead and does not park.
@@ -158,6 +168,17 @@ type Channel struct {
 	syncSource  string
 	syncRefresh time.Duration
 	metrics     *metrics.Metrics
+	// pool, when non-nil, takes over the fan-out of this channel's live
+	// cms while it has more than the pool's threshold of attachments
+	// (FanoutPool, DESIGN.md §5.1). Set before the Channel is shared.
+	pool *FanoutPool
+	// stripes holds the pooled Streams, one stripe per pool worker. Nil
+	// until the first Stream joins; made under mu and then kept.
+	stripes []fanoutStripe
+	// poolHold is the entry seq before which no Stream joins the pool:
+	// set when most of a stripe refused an entry (FanoutPool), so a
+	// channel streaming appends stays on its goroutines.
+	poolHold atomic.Uint64
 
 	// Lifecycle state for idle-channel eviction (DESIGN.md §5.1), guarded
 	// by life. Kept apart from mu so that pinning a channel for an
@@ -548,8 +569,12 @@ func (c *Channel) link(cm *protocol.ChannelMessage) *entry {
 	e := newEntry(cm, c.subs.Load())
 	e.at = time.Now()
 	prev := c.tail
+	e.seq = prev.seq + 1
 	prev.next = e
 	c.tail = e
+	if c.stripes != nil {
+		c.markStripes()
+	}
 	return prev
 }
 
@@ -574,8 +599,14 @@ func (c *Channel) Discontinuity(reason storage.DiscontinuityReason) {
 	e.discontinuity = true
 	e.at = time.Now()
 	prev := c.tail
+	e.seq = prev.seq + 1
 	prev.next = e
 	c.tail = e
+	// Pooled Streams are handed back at the marker (walkStripe), so their
+	// goroutines tell their clients.
+	if c.stripes != nil {
+		c.markStripes()
+	}
 	c.mu.Unlock()
 	prev.wakeAll() // outside mu, as in Append
 }
@@ -624,17 +655,50 @@ func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	ch.attachSeq++
-	return &Stream{cursor: ch.tail, ch: ch, slot: ch.attachSeq}, nil
+	return &Stream{cursor: ch.tail, ch: ch, slot: ch.attachSeq, joinIdx: -1, subIdx: -1}, nil
 }
 
 // Stream is an attachment's per-channel view of the linked list. Its
 // methods are not safe for concurrent use; an attachment is expected
 // to drive a single Stream from one goroutine.
+//
+// On a channel with a FanoutPool, a Stream with a delivery function
+// (SetDeliver) may be pooled inside Next: while it is, the pool's worker
+// owns the cursor and calls the delivery function, and Next stays
+// parked. Ownership passes only through the stripe's locks and the
+// handback channel, so whatever the delivery function touches is
+// touched by one goroutine at a time, with a happens-before edge at
+// each handover (DESIGN.md §5.1).
 type Stream struct {
 	cursor *entry
 	ch     *Channel
 	slot   uint64 // selects the wake slot this Stream parks on (entry.wait)
 	closed atomic.Bool
+
+	// deliver is the pool's fast path (SetDeliver); nil keeps the Stream
+	// off the pool.
+	deliver func(*protocol.ChannelMessage) bool
+	// handback receives a token from the stripe's worker when it hands
+	// the Stream back to its goroutine. Made by the first join, capacity
+	// one; one token per join at most.
+	handback chan struct{}
+	// joinIdx is the Stream's index in its stripe's joins (guarded by
+	// Channel.mu) and subIdx its index in the stripe's subs (guarded by
+	// the stripe's mu); -1 when not there.
+	joinIdx, subIdx int
+}
+
+// SetDeliver lets the Stream be pooled (FanoutPool, DESIGN.md §5.1).
+// While pooled, a pool worker calls fn with each entry's cm, in list
+// order, with the cursor already on that entry (so Memo and AppendedAt
+// refer to it), and never while the Stream's goroutine is in any other
+// Stream method. fn returns true once it has delivered the cm, or
+// skipped it as the per-goroutine path would; false refuses it, and
+// must leave no trace of the attempt: the Stream is then handed back
+// with its cursor before that entry, and the next Next returns it.
+// Called by the Stream's goroutine, before its first Next.
+func (s *Stream) SetDeliver(fn func(*protocol.ChannelMessage) bool) {
+	s.deliver = fn
 }
 
 // Channel returns the Channel this Stream is attached to. It differs
@@ -702,7 +766,23 @@ func (s *Stream) Memo(key any, build func() any) any {
 // Discontinuity reports true and the ChannelMessage is serial-only (no
 // items), carrying the serial of the cm before the marker. A caller that
 // forwards it as a cm forwards nothing.
+//
+// With a pool and a delivery function set (SetDeliver), Next first
+// joins the channel's pool when the channel is above the pool's
+// threshold and no entry is waiting, and stays parked while the pool
+// delivers; once the pool hands the Stream back, it returns the next
+// entry as usual.
 func (s *Stream) Next(ctx context.Context) (*protocol.ChannelMessage, error) {
+	if s.deliver != nil && s.ch.pool != nil {
+		if hb := s.ch.join(s); hb != nil {
+			select {
+			case <-hb:
+			case <-ctx.Done():
+				s.ch.leave(s)
+				return nil, ctx.Err()
+			}
+		}
+	}
 	select {
 	case <-s.cursor.wait(s.slot):
 		s.cursor = s.cursor.next
