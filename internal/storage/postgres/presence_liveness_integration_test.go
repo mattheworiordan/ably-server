@@ -13,23 +13,43 @@ import (
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
+// leaseModes are the presence lease modes every liveness test runs in
+// (DESIGN.md §12.5).
+var leaseModes = []string{PresenceLeaseNode, PresenceLeaseMember}
+
+// forEachLeaseMode runs f once per presence lease mode.
+func forEachLeaseMode(t *testing.T, f func(t *testing.T, mode string)) {
+	for _, mode := range leaseModes {
+		t.Run(mode, func(t *testing.T) { f(t, mode) })
+	}
+}
+
+// crash stops a Storage as a crashed process would stop: its lease-bump
+// loop ends and it never releases its lease.
+func crash(t *testing.T, s *Storage) {
+	t.Helper()
+	if err := s.close(false); err != nil {
+		t.Fatalf("crash: %v", err)
+	}
+}
+
 // TestCrashedNodePresenceReaped enters a presence member on node A,
 // kills node A without teardown (so it stops bumping its lease), and
 // verifies node B reaps the orphan within a lease window: the member
 // disappears from Members and a synthetic LEAVE reaches node B's
-// appender exactly once.
+// appender exactly once. In both lease modes.
 func TestCrashedNodePresenceReaped(t *testing.T) {
-	testCrashedNodePresenceReaped(t, Batching{})
+	forEachLeaseMode(t, func(t *testing.T, mode string) { testCrashedNodePresenceReaped(t, Batching{}, mode) })
 }
 
 // TestCrashedNodePresenceReapedBatched is TestCrashedNodePresenceReaped
 // with presence writes batched (DESIGN.md §12.5): the ENTER and the
 // reaper's synthesised LEAVE both commit through the publish lanes.
 func TestCrashedNodePresenceReapedBatched(t *testing.T) {
-	testCrashedNodePresenceReaped(t, Batching{Lanes: 4})
+	forEachLeaseMode(t, func(t *testing.T, mode string) { testCrashedNodePresenceReaped(t, Batching{Lanes: 4}, mode) })
 }
 
-func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
+func testCrashedNodePresenceReaped(t *testing.T, batching Batching, mode string) {
 	// Shrink the lease/bump/reaper cadences so the test runs in seconds.
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
@@ -38,7 +58,7 @@ func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
 	ctx := context.Background()
 
 	// Node A: the node that will "crash". Enters presence; no appender.
-	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching})
+	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching, PresenceLeaseMode: mode})
 	if err != nil {
 		t.Fatalf("Open node A: %v", err)
 	}
@@ -53,7 +73,7 @@ func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
 	}
 
 	// Node B: the surviving node. Observes presence via its appender.
-	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching})
+	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching, PresenceLeaseMode: mode})
 	if err != nil {
 		t.Fatalf("Open node B: %v", err)
 	}
@@ -79,10 +99,8 @@ func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
 		return memberPresent(t, ctx, chB, "alice")
 	})
 
-	// Crash node A: Close stops its lease-bump loop, so alice's row lapses.
-	if err := sa.Close(); err != nil {
-		t.Fatalf("Close node A: %v", err)
-	}
+	// Crash node A: its lease-bump loop stops, so its lease lapses.
+	crash(t, sa)
 
 	// Within a lease window, node B's reaper deletes the orphan and emits
 	// a synthetic LEAVE.
@@ -102,12 +120,12 @@ func testCrashedNodePresenceReaped(t *testing.T, batching Batching) {
 }
 
 // TestStaticFixturePresenceSurvivesReaper enters a static fixture member
-// (storage.WithStaticPresence) on node A, then closes node A so its
+// (storage.WithStaticPresence) on node A, then crashes node A so its
 // lease-bump loop stops. A normal member would lapse and be reaped, but a
 // fixture member carries an 'infinity' lease and a sentinel owner, so
-// node B's reaper never removes it.
+// node B's reaper never removes it. In both lease modes.
 func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
-	testStaticFixturePresenceSurvivesReaper(t, Batching{})
+	forEachLeaseMode(t, func(t *testing.T, mode string) { testStaticFixturePresenceSurvivesReaper(t, Batching{}, mode) })
 }
 
 // TestStaticFixturePresenceSurvivesReaperBatched is
@@ -115,17 +133,17 @@ func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
 // the batch's upsert must stamp the fixture's sentinel owner and
 // 'infinity' lease as the unbatched one does.
 func TestStaticFixturePresenceSurvivesReaperBatched(t *testing.T) {
-	testStaticFixturePresenceSurvivesReaper(t, Batching{Lanes: 4})
+	forEachLeaseMode(t, func(t *testing.T, mode string) { testStaticFixturePresenceSurvivesReaper(t, Batching{Lanes: 4}, mode) })
 }
 
-func testStaticFixturePresenceSurvivesReaper(t *testing.T, batching Batching) {
+func testStaticFixturePresenceSurvivesReaper(t *testing.T, batching Batching, mode string) {
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
 
-	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching})
+	sa, err := Open(ctx, Options{DSN: dsn, Batching: batching, PresenceLeaseMode: mode})
 	if err != nil {
 		t.Fatalf("Open node A: %v", err)
 	}
@@ -135,7 +153,7 @@ func testStaticFixturePresenceSurvivesReaper(t *testing.T, batching Batching) {
 		t.Fatalf("Channel node A: %v", err)
 	}
 
-	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching})
+	sb, err := Open(ctx, Options{DSN: dsn, Batching: batching, PresenceLeaseMode: mode})
 	if err != nil {
 		t.Fatalf("Open node B: %v", err)
 	}
@@ -162,9 +180,7 @@ func testStaticFixturePresenceSurvivesReaper(t *testing.T, batching Batching) {
 	// Node A "crashes": its bump loop stops. A normal member would lapse
 	// within a lease window; wait several reaper cycles and assert the
 	// fixture member is still present on node B.
-	if err := sa.Close(); err != nil {
-		t.Fatalf("Close node A: %v", err)
-	}
+	crash(t, sa)
 	time.Sleep(presenceLeaseWindow + 10*presenceReaperInterval)
 	if !memberPresent(t, ctx, chB, "fixture_client") {
 		t.Fatal("static fixture member was reaped, want it to survive indefinitely")

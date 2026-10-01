@@ -84,15 +84,15 @@ var (
 	listenReconnectMaxDelay  = 5 * time.Second
 )
 
-// Presence liveness lease + crashed-node reaper timings (DESIGN.md
-// §12.5). presenceLeaseWindow is how long a member's lease is valid
-// without a refresh; presenceLeaseBumpInterval is the cadence at which
-// a live node bumps the lease for all of its own rows (comfortably
-// shorter than the window so a live node's members never expire); and
-// presenceReaperInterval is how often each node sweeps for lapsed
-// leases. Making these operator-configurable is a follow-up — they are
-// effectively constant in production, package vars only so integration
-// tests can shrink them.
+// Presence liveness lease + dead-node reaper timings (DESIGN.md
+// §12.5). presenceLeaseWindow is how long a lease (a node's, or in
+// member lease mode a member row's) is valid without a refresh;
+// presenceLeaseBumpInterval is the cadence at which a live node renews
+// it (comfortably shorter than the window so a live node's members
+// never expire); and presenceReaperInterval is how often each node
+// sweeps for lapsed leases. Making these operator-configurable is a
+// follow-up: they are effectively constant in production, package vars
+// only so integration tests can shrink them.
 var (
 	presenceLeaseWindow       = 30 * time.Second
 	presenceLeaseBumpInterval = 10 * time.Second
@@ -117,8 +117,9 @@ var (
 
 // fixtureNodeID is the sentinel owner recorded on static fixture presence
 // rows (DESIGN.md §9, §12.5). It is not a real node id, so no live node's
-// lease-bump loop (WHERE node_id = $node) ever touches these rows; paired
-// with an 'infinity' lease they are never reaped.
+// member-mode lease bump (WHERE node_id = $node) ever touches these rows,
+// and the reapers of both lease modes leave rows with this owner and an
+// 'infinity' lease alone.
 const fixtureNodeID = "__fixtures__"
 
 // DefaultPostgresSweepInterval is the postgres bus's default watermark
@@ -228,6 +229,21 @@ type Options struct {
 	// negative means no bound.
 	PresenceMaxInflight int
 
+	// PresenceLeaseMode selects how presence liveness is leased
+	// (DESIGN.md §12.5): PresenceLeaseNode, one lease row per node that
+	// the node renews, or PresenceLeaseMember, a lease on every member
+	// row that the node renews with one UPDATE of all its rows. Empty
+	// means PresenceLeaseNode. Every node sharing a database should run
+	// the same mode; each mode's reaper removes the other's rows of dead
+	// nodes and leaves the other's live ones alone, so a rolling switch
+	// is safe.
+	PresenceLeaseMode string
+
+	// nodeID overrides the per-process node id that owns this Storage's
+	// presence rows (tests; OpenSharded gives every shard the same one).
+	// Empty means a fresh random id.
+	nodeID string
+
 	// shard is this Storage's place in a shard list, set by OpenSharded
 	// (DESIGN.md §6.4). The zero value is a lone Storage.
 	shard shardSlot
@@ -239,6 +255,7 @@ type Storage struct {
 	dsn       string // retained so a LISTEN goroutine can re-dial on drop
 	series    string // per-process seriesId, embedded in every minted channelSerial
 	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
+	leaseNode bool   // PresenceLeaseNode: liveness is the node's presence_nodes row (§12.5)
 	namespace string // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
 	logger    *logging.Logger
 
@@ -314,6 +331,14 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
+	leaseMode, err := ParsePresenceLeaseMode(opts.PresenceLeaseMode)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: %w", err)
+	}
+	node := opts.nodeID
+	if node == "" {
+		node = serial.NewSeriesID()
+	}
 	if busKind == BusNATS && opts.NATSURL == "" {
 		return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
 	}
@@ -373,7 +398,8 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool:          pool,
 		dsn:           opts.DSN,
 		series:        serial.NewSeriesID(),
-		node:          serial.NewSeriesID(),
+		node:          node,
+		leaseNode:     leaseMode == PresenceLeaseNode,
 		logger:        logger,
 		shard:         slot,
 		ident:         ident,
@@ -407,6 +433,15 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	// never delays startup.
 	if err := s.preparePartitions(ctx); err != nil {
 		return fail(fmt.Errorf("storage/postgres: prepare log partitions: %w", err))
+	}
+
+	if s.leaseNode {
+		// Take the node's lease before any presence write can run: the
+		// node-mode reaper treats the members of a node without a lease
+		// as orphans (DESIGN.md §12.5).
+		if _, err := s.takeNodeLease(ctx); err != nil {
+			return fail(fmt.Errorf("storage/postgres: take presence lease: %w", err))
+		}
 	}
 
 	if busKind != BusPGNotify {
@@ -629,16 +664,17 @@ func (s *Storage) Release(_ context.Context, name string) error {
 // storage-only or transient store).
 func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
 	cs := &channelStore{
-		pool:     s.pool,
-		series:   s.series,
-		node:     s.node,
-		name:     name,
-		appender: appender,
-		bus:      s.bus,
-		logger:   s.logger,
-		done:     s.done,
-		timing:   s.timing,
-		stats:    &s.stats,
+		pool:      s.pool,
+		series:    s.series,
+		node:      s.node,
+		leaseNode: s.leaseNode,
+		name:      name,
+		appender:  appender,
+		bus:       s.bus,
+		logger:    s.logger,
+		done:      s.done,
+		timing:    s.timing,
+		stats:     &s.stats,
 	}
 	cs.preInsertRow, cs.rows = s.bindOnWrite, s.rows
 	if s.busKind == BusPostgres {
@@ -696,16 +732,24 @@ func (s *Storage) boundStores() []*channelStore {
 }
 
 // Close stops the background goroutines (the bus and the presence
-// lease-bump and reaper loops), closes the bus and releases the pool. A
-// LISTEN goroutine owns closing its own conn, so Close only cancels and
-// waits.
-func (s *Storage) Close() error {
+// lease-bump and reaper loops), in node lease mode deletes the node's
+// presence lease row (DESIGN.md §12.5), closes the bus and releases the
+// pool. A LISTEN goroutine owns closing its own conn, so Close only
+// cancels and waits.
+func (s *Storage) Close() error { return s.close(true) }
+
+// close is Close; graceful false skips the lease release, leaving the
+// node's lease to expire as a crashed node's would (tests).
+func (s *Storage) close(graceful bool) error {
 	s.closeOnce.Do(func() {
 		if s.lanes != nil {
 			s.lanes.close() // finish in-flight batches before the bus stops
 		}
 		s.cancel()
 		s.wg.Wait()
+		if graceful && s.leaseNode {
+			s.releaseNodeLease()
+		}
 		s.bus.close()
 		s.pool.Close()
 	})
@@ -746,119 +790,6 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-t.C:
 		return true
-	}
-}
-
-// presenceLeaseBumpLoop refreshes the liveness lease for every presence
-// row this node owns, in one UPDATE on the bump cadence (DESIGN.md
-// §12.5). A live node thus keeps its members' expires_at ahead of now,
-// so only a crashed node's rows ever lapse and become reapable.
-//
-// Rows another transaction holds locked are skipped rather than waited
-// for: that transaction is a presence write, which stamps a fresh lease
-// or deletes the row, or the reaper. A batched presence write locks
-// several rows in one transaction, so a bump that waited could deadlock
-// with it; a row skipped once is bumped next round, well inside the
-// lease window.
-func (s *Storage) presenceLeaseBumpLoop(ctx context.Context) {
-	defer s.wg.Done()
-	t := time.NewTicker(presenceLeaseBumpInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if _, err := s.pool.Exec(ctx,
-				`UPDATE presence SET expires_at = now() + make_interval(secs => $2)
-				 WHERE (channel, connection_id, client_id) IN (
-				   SELECT channel, connection_id, client_id FROM presence WHERE node_id = $1 FOR UPDATE SKIP LOCKED)`,
-				s.node, presenceLeaseWindow.Seconds(),
-			); err != nil && ctx.Err() == nil {
-				s.logger.Warn("storage/postgres: presence lease bump failed", "err", err)
-			}
-		}
-	}
-}
-
-// presenceReaperLoop periodically sweeps presence rows whose lease has
-// lapsed (DESIGN.md §12.5). See reapExpiredPresence for the mechanics.
-func (s *Storage) presenceReaperLoop(ctx context.Context) {
-	defer s.wg.Done()
-	t := time.NewTicker(presenceReaperInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.reapExpiredPresence(ctx)
-		}
-	}
-}
-
-// reapExpiredPresence deletes every presence row past its lease and
-// synthesises a LEAVE for each through the normal publish path, so
-// subscribers on every node observe the departure (DESIGN.md §12.5).
-// The DELETE ... RETURNING takes a row lock per row, so when several
-// nodes reap concurrently exactly one node's statement yields (and thus
-// emits the LEAVE for) any given row. Rows are drained before the LEAVE
-// publishes because StorePresence acquires its own pooled conn. Rows
-// another transaction holds locked are skipped (a presence write is
-// renewing or removing them), as in the lease bump, so the reaper cannot
-// deadlock with a batched presence write; a row still lapsed is reaped
-// next round.
-func (s *Storage) reapExpiredPresence(ctx context.Context) {
-	rows, err := s.pool.Query(ctx,
-		`DELETE FROM presence WHERE (channel, connection_id, client_id) IN (
-		   SELECT channel, connection_id, client_id FROM presence WHERE expires_at < now() FOR UPDATE SKIP LOCKED)
-		 RETURNING channel, connection_id, client_id`)
-	if err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("storage/postgres: presence reap query failed", "err", err)
-		}
-		return
-	}
-
-	type orphan struct{ channel, connID, clientID string }
-	var orphans []orphan
-	for rows.Next() {
-		var o orphan
-		if err := rows.Scan(&o.channel, &o.connID, &o.clientID); err != nil {
-			rows.Close()
-			s.logger.Warn("storage/postgres: presence reap scan failed", "err", err)
-			return
-		}
-		orphans = append(orphans, o)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("storage/postgres: presence reap rows failed", "err", err)
-		}
-		return
-	}
-
-	for _, o := range orphans {
-		// Publish through a transient channelStore rather than the
-		// registered one: the registered store (if any) must keep its
-		// appender binding, and the transient one still mints a serial,
-		// inserts the LEAVE cm and NOTIFYs, reaching every node's
-		// appender via the LISTEN round-trip. Match the teardown-LEAVE
-		// shape (§12.5): action + connectionId + clientId, no id (a
-		// fresh publish, must not collide with the ENTER's idempotency
-		// key).
-		cs := s.newChannelStore(o.channel, nil)
-		leave := &protocol.PresenceMessage{
-			Action:       protocol.PresenceLeave,
-			ClientID:     o.clientID,
-			ConnectionID: o.connID,
-		}
-		if _, _, err := cs.StorePresence(storage.WithServerPresence(ctx), []*protocol.PresenceMessage{leave}); err != nil && ctx.Err() == nil {
-			s.logger.Warn("storage/postgres: presence reap LEAVE failed", "channel", o.channel, "err", err)
-		} else if err == nil {
-			s.logger.Debug("storage/postgres: reaped orphaned presence member", "channel", o.channel, "clientId", o.clientID, "connectionId", o.connID)
-		}
 	}
 }
 
@@ -1129,12 +1060,15 @@ type channelStore struct {
 	node     string
 	name     string
 	appender storage.Appender
-	bus      Bus
-	logger   *logging.Logger
-	done     <-chan struct{} // the owning Storage's shutdown signal
-	timing   chainTiming
-	stats    *busStats // the owning Storage's bus counters (nil in unit tests)
-	pgChan   string    // the postgres bus's notification channel (pgChannelName)
+	// leaseNode is the owning Storage's leaseNode: member rows get an
+	// 'infinity' lease, their node's lease being the one that counts.
+	leaseNode bool
+	bus       Bus
+	logger    *logging.Logger
+	done      <-chan struct{} // the owning Storage's shutdown signal
+	timing    chainTiming
+	stats     *busStats // the owning Storage's bus counters (nil in unit tests)
+	pgChan    string    // the postgres bus's notification channel (pgChannelName)
 
 	// persisted selects the channel's retention class: the value of the
 	// persisted partition key on every row it writes (DESIGN.md §6.3).
@@ -1657,8 +1591,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 			if static {
 				// Static fixture member (DESIGN.md §9, §12.5): a sentinel
 				// owner and an 'infinity' lease so no lease-bump loop claims
-				// it and the reaper (WHERE expires_at < now()) never deletes
-				// it. It belongs to no connection, so nothing ever
+				// it and neither lease mode's reaper deletes it (both skip
+				// the sentinel owner). It belongs to no connection, so nothing ever
 				// synthesises a LEAVE for it.
 				if _, err := tx.Exec(ctx,
 					`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
@@ -1674,19 +1608,21 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 				}
 				break
 			}
-			// Stamp the owning node and a fresh lease (§12.5): this
-			// node's bump loop keeps expires_at ahead while it lives; if
-			// it crashes, the reaper on another node deletes the row once
-			// the lease lapses and emits a synthetic LEAVE.
+			// Stamp the owning node (§12.5) and, in member lease mode,
+			// a fresh lease that this node's bump loop keeps ahead while
+			// it lives. In node lease mode the row's liveness is its
+			// node's lease, so the row's own is 'infinity'. If the node
+			// dies, the reaper on another node deletes the row once the
+			// lease lapses and emits a synthetic LEAVE.
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))
+				 VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $8 THEN 'infinity'::timestamptz ELSE now() + make_interval(secs => $7) END)
 				 ON CONFLICT (channel, connection_id, client_id)
 				 DO UPDATE SET channel_serial = EXCLUDED.channel_serial,
 				               payload = EXCLUDED.payload,
 				               node_id = EXCLUDED.node_id,
 				               expires_at = EXCLUDED.expires_at`,
-				cs.name, p.ConnectionID, p.ClientID, channelSerial, payload, cs.node, presenceLeaseWindow.Seconds(),
+				cs.name, p.ConnectionID, p.ClientID, channelSerial, payload, cs.node, presenceLeaseWindow.Seconds(), cs.leaseNode,
 			); err != nil {
 				return nil, false, fmt.Errorf("storage/postgres: presence upsert: %w", err)
 			}

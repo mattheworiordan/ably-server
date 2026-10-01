@@ -131,10 +131,15 @@
 # transaction); presence-max-inflight bounds the presence writes
 # committed in their own transaction at once per database, beyond which
 # they are refused with 42910 (0 reads as unset: 4 x publish-lanes;
-# negative: no bound).
+# negative: no bound). Cluster mode: presence-lease-mode picks how
+# presence liveness is leased: "node" (one lease row per node, renewed
+# every 10s; the members of a node whose lease lapses are reaped) or
+# "member" (a lease on every member row, all renewed every 10s by one
+# UPDATE). Every node sharing a database should use the same mode.
 # presence-sync-source = "local"
 # presence-batching = true
 # presence-max-inflight = 16
+# presence-lease-mode = "node"
 
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).

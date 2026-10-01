@@ -71,11 +71,13 @@ type File struct {
 	// The presence path (DESIGN.md §12.4, §12.5, §9): the SYNC source
 	// ("local" or "store"), whether presence writes join the publish
 	// batches (a pointer, since its default is true and a file must be
-	// able to turn it off), and the bound on unbatched presence writes
-	// in flight (zero means absent).
+	// able to turn it off), the bound on unbatched presence writes
+	// in flight (zero means absent), and the liveness lease mode ("node"
+	// or "member").
 	PresenceSyncSource  string `toml:"presence-sync-source"`
 	PresenceBatching    *bool  `toml:"presence-batching"`
 	PresenceMaxInflight int    `toml:"presence-max-inflight"`
+	PresenceLeaseMode   string `toml:"presence-lease-mode"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual

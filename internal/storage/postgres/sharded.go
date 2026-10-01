@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ably/ably-server/internal/logging"
+	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
 )
 
@@ -61,6 +62,12 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 	logger := opts.Logger
 	if logger == nil {
 		logger = logging.Default()
+	}
+	if opts.nodeID == "" {
+		// One node id on every shard: the node's presence lease row lives
+		// in each shard's presence_nodes, beside the members it owns there
+		// (DESIGN.md §6.4, §12.5).
+		opts.nodeID = serial.NewSeriesID()
 	}
 	open := func(i int, listID string) (*Storage, error) {
 		o := opts

@@ -82,6 +82,7 @@ const (
 	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
 	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
+	presenceLeaseModeEnv   = "ABLY_SERVER_PRESENCE_LEASE_MODE"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -277,6 +278,7 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
 	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
 	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
+	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
 	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction at once per database before new ones are refused with 42910; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
@@ -400,6 +402,7 @@ func Run(ctx context.Context, opts Opts) int {
 			PresenceUnbatched: !*presenceBatching,
 		},
 		presenceMaxInflight: *presenceMaxInflight,
+		presenceLeaseMode:   *presenceLeaseMode,
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -442,7 +445,7 @@ func Run(ctx context.Context, opts Opts) int {
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
-	logger.Info("presence path", "syncSource", syncSource, "batching", *presenceBatching, "maxInflight", *presenceMaxInflight)
+	logger.Info("presence path", "syncSource", syncSource, "batching", *presenceBatching, "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
@@ -868,7 +871,8 @@ type clusterOptions struct {
 	persisted        func(channel string) bool // persisted-namespace resolver
 	bindOnWrite      bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 
-	presenceMaxInflight int // unbatched presence writes in flight (DESIGN.md §12.5)
+	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
+	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
 }
 
 // options returns the postgres.Options every bus shares.
@@ -882,6 +886,7 @@ func (c clusterOptions) options() postgres.Options {
 		BindOnWrite: c.bindOnWrite,
 
 		PresenceMaxInflight: c.presenceMaxInflight,
+		PresenceLeaseMode:   c.presenceLeaseMode,
 	}
 }
 
@@ -903,6 +908,9 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		}
 		if _, err := postgres.ParseSweepScope(cluster.sweepScope); err != nil {
 			return nil, fmt.Errorf("invalid --bus-sweep-scope: %w", err)
+		}
+		if _, err := postgres.ParsePresenceLeaseMode(cluster.presenceLeaseMode); err != nil {
+			return nil, fmt.Errorf("invalid --presence-lease-mode: %w", err)
 		}
 		switch cluster.bus {
 		case postgres.BusPGNotify:
