@@ -17,6 +17,7 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
@@ -174,6 +175,39 @@ func serialsOf(ms []*protocol.ProtocolMessage) []string {
 		out[i] = m.ChannelSerial
 	}
 	return out
+}
+
+// TestFanoutPoolDiscontinuity checks a discontinuity (DESIGN.md §5.1,
+// §7.2) on a pooled channel end to end at the attachment: every pooled
+// attachment queues the channel update (ATTACHED without RESUMED,
+// 80016) between the cms around the marker, and the pool delivers the
+// cm after it once the attachments have rejoined.
+func TestFanoutPoolDiscontinuity(t *testing.T) {
+	const n = 10
+	r := newFanoutRigWith(t, n, []protocol.Format{protocol.FormatJSON}, protocol.FlagSubscribe, rigOptions{pool: core.NewFanoutPool(2, 2)})
+	defer r.close()
+	r.warmPool(t, n)
+	r.drain()
+
+	r.queued.Add(n)
+	r.ch.Discontinuity(storage.DiscontinuityLogGap)
+	waitGroup(t, &r.queued)
+	r.warmPool(t, n)
+	for i, fs := range r.drain() {
+		ms := decodeFrames(t, fs)
+		if len(ms) < 2 {
+			t.Fatalf("attachment %d: %d frames, want the update then the messages", i, len(ms))
+		}
+		up := ms[0]
+		if up.Action != protocol.ActionAttached || up.Flags&protocol.FlagResumed != 0 || up.Error == nil || up.Error.Code != 80016 {
+			t.Fatalf("attachment %d: first frame %v flags %d error %+v; want ATTACHED without RESUMED, 80016", i, up.Action, up.Flags, up.Error)
+		}
+		for _, m := range ms[1:] {
+			if m.Action != protocol.ActionMessage {
+				t.Fatalf("attachment %d: %v after the update, want only MESSAGEs", i, m.Action)
+			}
+		}
+	}
 }
 
 // TestFanoutPoolFramesMatchGoroutinePath checks that a frame the

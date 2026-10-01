@@ -390,7 +390,10 @@ func TestFanoutPoolHoldAfterRefusal(t *testing.T) {
 // Discontinuity set, in order between the cms around it, without
 // setting the hold, and that the Streams rejoin for the cm after it.
 func TestFanoutPoolDiscontinuityHandedBack(t *testing.T) {
-	pool := NewFanoutPool(2, 2)
+	// One worker, so all 6 Streams share a stripe: enough members
+	// (fanoutHoldMinRefused) that counting the marker as a refusal would
+	// set the hold.
+	pool := NewFanoutPool(1, 2)
 	defer pool.Close()
 	c := newReadyChannel("test", "000000")
 	c.pool = pool
