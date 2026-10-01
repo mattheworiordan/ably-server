@@ -536,6 +536,11 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// §5.1).
 	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	a.outShared = c.queueShared
+	if c.srv != nil {
+		t := c.srv.appendTracking
+		a.seen = newSeenSet(t.SeenMax)
+		a.trackCreates = t.tracksCreates(name)
+	}
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)

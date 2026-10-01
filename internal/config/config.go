@@ -91,6 +91,9 @@ type File struct {
 	ConnWriteTimeout     string `toml:"conn-write-timeout"`
 	WSReadBufferSize     int64  `toml:"ws-read-buffer-size"`
 	WSWriteBufferSize    int64  `toml:"ws-write-buffer-size"`
+	// AttachmentSeenMax caps the message serials one attachment remembers
+	// for append delivery (DESIGN.md §13.3, §9); zero means absent.
+	AttachmentSeenMax int `toml:"attachment-seen-max"`
 	// HTTPIdleTimeout is the raw duration string for --http-idle-timeout
 	// (DESIGN.md §2.2, §9).
 	HTTPIdleTimeout string `toml:"http-idle-timeout"`
@@ -117,7 +120,9 @@ type KeyEntry struct {
 // Namespace is one [[namespaces]] entry (DESIGN.md §9, §12.5): a
 // namespace id plus feature flags mirroring test-app-setup's post_apps
 // shape. Persisted selects the retention class in cluster mode (§6.3);
-// MutableMessages and PushEnabled are recorded but inert.
+// MutableMessages makes attachments track every delivered message so a
+// create's first append is a delta (DESIGN.md §13.3); PushEnabled is
+// recorded but inert.
 type Namespace struct {
 	ID              string `toml:"id"`
 	Persisted       bool   `toml:"persisted"`

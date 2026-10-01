@@ -177,6 +177,12 @@
 # ws-read-buffer-size = 1024
 # ws-write-buffer-size = 4096
 
+# Message serials one attachment remembers so a later append is sent as
+# a delta; the oldest are evicted first, and an evicted message's next
+# append is sent as the full version (DESIGN.md §13.3)
+# (env: ABLY_SERVER_ATTACHMENT_SEEN_MAX).
+# attachment-seen-max = 4096
+
 # How long an idle HTTP keep-alive connection is kept open waiting for
 # the next request (DESIGN.md §2.2) (env: ABLY_SERVER_HTTP_IDLE_TIMEOUT).
 # http-idle-timeout = "120s"
@@ -197,8 +203,12 @@
 # [[namespaces]] entries mirror the Ably test-app-setup post_apps shape:
 # a namespace `id` plus feature flags. In cluster mode `persisted = true`
 # gives the namespace's channels (names starting "<id>:") the
-# persisted-retention above instead of the continuity window. The other
-# flags are parsed and recorded but inert.
+# persisted-retention above instead of the continuity window.
+# `mutableMessages = true` makes an attachment on the namespace's channels
+# remember every delivered message, so the first append to a message it
+# saw created is sent as a delta (DESIGN.md §13.3); on other channels only
+# messages that already carry an append are remembered. `pushEnabled` is
+# parsed and recorded but inert.
 #
 # [[namespaces]]
 # id = "persisted"

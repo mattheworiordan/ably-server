@@ -98,8 +98,17 @@ type attachment struct {
 	// seen tracks the message identity serials this attachment has
 	// delivered since attach, so the first append for a not-yet-seen
 	// message is a full aggregated update and later appends arrive as
-	// deltas (DESIGN.md §13.3). Touched only by the run goroutine.
-	seen map[string]struct{}
+	// deltas (DESIGN.md §13.3). It is bounded (seenSet); a serial it no
+	// longer holds gets the full version, which is always correct.
+	// Touched only by the run goroutine.
+	seen seenSet
+	// trackCreates is set when the channel's namespace has mutable
+	// messages enabled, so a message delivered without an append delta
+	// (a create) may later receive appends and is recorded in seen. On
+	// any other channel only messages that carry an append delta are
+	// recorded, so ordinary traffic records nothing (DESIGN.md §13.3).
+	// Set before run starts.
+	trackCreates bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -139,7 +148,8 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		metrics:        m,
 		logger:         logger,
 		appendModeFull: params[ParamAppendMode] == AppendModeFull,
-		seen:           make(map[string]struct{}),
+		seen:           newSeenSet(DefaultAttachmentSeenMax),
+		trackCreates:   true,
 		ctx:            ctx,
 		cancel:         cancel,
 		done:           make(chan struct{}),
@@ -510,8 +520,16 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 // not-yet-seen message is always the full aggregate so the subscriber
 // has complete state before later deltas apply. The decision is
 // all-or-nothing across the cm's messages, matching the atomic frame.
-// Every message's identity is then recorded as seen. The internal Alt
-// carrier is stripped from any message delivered as a full version.
+// The internal Alt carrier is stripped from any message delivered as a
+// full version.
+//
+// A message's identity is then recorded as seen only when a later delta
+// for it could be delivered as a delta: it carries an append delta, or
+// the channel is in a mutable-messages namespace (trackCreates), so a
+// create may be appended to later. Nothing is recorded under
+// appendMode=full. The seen set is bounded; a serial it has evicted or
+// never recorded makes the next append a full version, which is always
+// a valid delivery (DESIGN.md §13.3).
 func (a *attachment) resolveAppends(msgs []*protocol.Message, backlog bool) []*protocol.Message {
 	a.mu.Lock()
 	appendModeFull := a.appendModeFull
@@ -519,17 +537,17 @@ func (a *attachment) resolveAppends(msgs []*protocol.Message, backlog bool) []*p
 	asDeltas := !backlog && !appendModeFull
 	if asDeltas {
 		for _, m := range msgs {
-			if m.HasAppendDelta() && m.Serial != "" {
-				if _, ok := a.seen[m.Serial]; !ok {
-					asDeltas = false
-					break
-				}
+			if m.HasAppendDelta() && m.Serial != "" && !a.seen.has(m.Serial) {
+				asDeltas = false
+				break
 			}
 		}
 	}
-	for _, m := range msgs {
-		if m.Serial != "" {
-			a.seen[m.Serial] = struct{}{}
+	if !appendModeFull {
+		for _, m := range msgs {
+			if m.Serial != "" && (a.trackCreates || m.HasAppendDelta()) {
+				a.seen.add(m.Serial)
+			}
 		}
 	}
 

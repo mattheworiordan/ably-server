@@ -68,6 +68,7 @@ const (
 	wsReadBufEnv       = "ABLY_SERVER_WS_READ_BUFFER_SIZE"
 	wsWriteBufEnv      = "ABLY_SERVER_WS_WRITE_BUFFER_SIZE"
 	httpIdleEnv        = "ABLY_SERVER_HTTP_IDLE_TIMEOUT"
+	attachSeenMaxEnv   = "ABLY_SERVER_ATTACHMENT_SEEN_MAX"
 
 	messageRetentionEnv   = "ABLY_SERVER_MESSAGE_RETENTION"
 	persistedRetentionEnv = "ABLY_SERVER_PERSISTED_RETENTION"
@@ -165,6 +166,11 @@ func Run(ctx context.Context, opts Opts) int {
 		return 1
 	}
 	wsWriteBufDefault, err := config.DefaultInt64(opts.Getenv(wsWriteBufEnv), file.WSWriteBufferSize, realtime.DefaultWSWriteBufferSize)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	attachSeenMaxDefault, err := config.DefaultInt(opts.Getenv(attachSeenMaxEnv), file.AttachmentSeenMax, realtime.DefaultAttachmentSeenMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
 		return 1
@@ -291,6 +297,7 @@ func Run(ctx context.Context, opts Opts) int {
 	connWriteTimeout := fs.Duration("conn-write-timeout", connWriteTimeoutDefault, "deadline for one frame write, and the longest wait for room in a full outbound queue, before the connection is closed as a slow consumer (DESIGN.md §5.2) (env: "+connWriteTOEnv+")")
 	wsReadBufferSize := fs.Int64("ws-read-buffer-size", wsReadBufDefault, "per-connection WebSocket read buffer in bytes (DESIGN.md §5.2) (env: "+wsReadBufEnv+")")
 	wsWriteBufferSize := fs.Int64("ws-write-buffer-size", wsWriteBufDefault, "WebSocket write buffer in bytes, pooled and held only during a write (DESIGN.md §5.2) (env: "+wsWriteBufEnv+")")
+	attachmentSeenMax := fs.Int("attachment-seen-max", attachSeenMaxDefault, "message serials one attachment remembers so a later append is sent as a delta; the oldest are evicted and an evicted message's next append is sent as the full version (DESIGN.md §13.3) (env: "+attachSeenMaxEnv+")")
 	httpIdleTimeout := fs.Duration("http-idle-timeout", httpIdleDefault, "how long an idle HTTP keep-alive connection is kept open for the next request (DESIGN.md §2.2) (env: "+httpIdleEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
@@ -314,6 +321,11 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 	if *connOutboundMaxBytes <= 0 || *connWriteTimeout <= 0 || *wsReadBufferSize <= 0 || *wsWriteBufferSize <= 0 {
 		fmt.Fprintln(opts.Out, "--conn-outbound-max-bytes, --conn-write-timeout, --ws-read-buffer-size and --ws-write-buffer-size must be positive")
+		return 2
+	}
+
+	if *attachmentSeenMax <= 0 {
+		fmt.Fprintln(opts.Out, "--attachment-seen-max must be positive")
 		return 2
 	}
 
@@ -461,6 +473,10 @@ func Run(ctx context.Context, opts Opts) int {
 
 	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
 	rt.SetRemainPresentFor(*remainPresentFor)
+	rt.SetAppendTracking(realtime.AppendTracking{
+		Mutable: mutableNamespaces(file.Namespaces),
+		SeenMax: *attachmentSeenMax,
+	})
 	rt.SetConnLimits(realtime.ConnLimits{
 		OutboundMaxBytes: *connOutboundMaxBytes,
 		WriteTimeout:     *connWriteTimeout,
@@ -648,9 +664,25 @@ func splitTrim(in []string) []string {
 // namespace its name starts with (the part before the first ':') is a
 // [[namespaces]] entry with persisted = true.
 func persistedNamespaces(namespaces []config.Namespace) func(string) bool {
+	return namespaceResolver(namespaces, func(ns config.Namespace) bool { return ns.Persisted })
+}
+
+// mutableNamespaces returns the resolver for append tracking (DESIGN.md
+// §13.3, §9): a channel is mutable when the namespace its name starts
+// with is a [[namespaces]] entry with mutableMessages = true. An
+// attachment on such a channel remembers every delivered message, so a
+// create's first append is sent as a delta; elsewhere only messages
+// that already carry an append are remembered.
+func mutableNamespaces(namespaces []config.Namespace) func(string) bool {
+	return namespaceResolver(namespaces, func(ns config.Namespace) bool { return ns.MutableMessages })
+}
+
+// namespaceResolver reports, for a channel name, whether the namespace
+// before its first ':' is a [[namespaces]] entry for which flag is true.
+func namespaceResolver(namespaces []config.Namespace, flag func(config.Namespace) bool) func(string) bool {
 	set := make(map[string]bool)
 	for _, ns := range namespaces {
-		if ns.Persisted && ns.ID != "" {
+		if flag(ns) && ns.ID != "" {
 			set[ns.ID] = true
 		}
 	}

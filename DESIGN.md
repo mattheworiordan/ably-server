@@ -2144,6 +2144,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --ws-read-buffer-size 1024    per-connection WebSocket read buffer, bytes (§5.2)
 --ws-write-buffer-size 4096   pooled WebSocket write buffer, bytes (§5.2)
 --http-idle-timeout 120s      how long an idle HTTP keep-alive connection is kept open (§2.2)
+--attachment-seen-max 4096    message serials one attachment remembers for append deltas; oldest evicted (§13.3)
 --message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
 --persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
 --publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
@@ -2172,7 +2173,7 @@ Configuration may also be supplied via an optional TOML config file
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
-`message-retention`, `persisted-retention`, `publish-lanes`,
+`attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
 `publish-queue-max`, `publish-bind-on-write`, `presence-sync-source`,
 `presence-batching`, `presence-max-inflight` —
@@ -2207,9 +2208,12 @@ that JSON into this config rather than the server parsing it):
 - `[[namespaces]]` — a namespace `id` plus the `persisted`,
   `mutableMessages`, and `pushEnabled` feature flags. `persisted` selects
   the retention class of the namespace's channels in cluster mode (§6.3).
-  `mutableMessages` and `pushEnabled` are **parsed and recorded but
-  behaviourally inert**; they exist so a provisioner can round-trip the
-  full app shape. A namespace with no `id` is a startup error.
+  `mutableMessages` does not gate update, delete or append (they work on
+  every channel); it only selects which delivered messages an attachment
+  remembers for append deltas (§13.3). `pushEnabled` is **parsed and
+  recorded but behaviourally inert**; it exists so a provisioner can
+  round-trip the full app shape. A namespace with no `id` is a startup
+  error.
 - `[[channels]]` — a channel `name` plus nested `[[channels.presence]]`
   member entries (`clientId`, `data`, `encoding`). At startup, before the
   listener opens, each member is entered through the normal
@@ -2805,6 +2809,22 @@ delete:
   carrying the aggregate, after which it receives subsequent appends
   incrementally. This needs per-attachment tracking of which message
   identities the subscriber has seen since attach.
+- That tracking is bounded so that it does not grow with every message
+  a long-lived attachment receives. An attachment records a serial only
+  when a later delta for it is possible: the delivered message carries
+  an append, or the channel is in a namespace with `mutableMessages`
+  (§9), where a create may be appended to later. Ordinary messages on
+  other channels record nothing, and nothing is recorded under
+  `appendMode=full`. The record holds at most `--attachment-seen-max`
+  serials (default 4096) per attachment, in two generations of half that
+  size; a serial is evicted when half the cap of other serials has been
+  recorded since it was last delivered, so a message that is still being
+  appended to stays. Eviction is safe by construction: a serial the
+  attachment does not hold is treated as not yet seen, so its next
+  append is delivered as the full `action: update` aggregate, which is
+  always a valid delivery under the conflation rule below. On a channel
+  outside a `mutableMessages` namespace the first append after a create
+  is therefore a full update, and later appends are deltas.
 - The server may **conflate**: coalesce multiple appends, drop superseded
   intermediate versions, or deliver an append as a full rolled-up
   `update`. The only guarantee is that the last version a subscriber
