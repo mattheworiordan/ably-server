@@ -3,13 +3,11 @@ package postgres
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
@@ -80,6 +78,13 @@ type Bus interface {
 	// beforeCommit runs inside the publish transaction once the cm's
 	// rows are written, just before COMMIT.
 	beforeCommit(ctx context.Context, tx pgx.Tx, cs *channelStore, w *busWrite) error
+
+	// beforeCommitBatch is beforeCommit for a batched publish
+	// transaction: it queues on b, in item order, what beforeCommit would
+	// run for each item (one pipelined round trip with the batch's
+	// inserts, DESIGN.md §6.3), and sets each item's w.notified and
+	// w.pointer flags.
+	beforeCommitBatch(ctx context.Context, b *pgx.Batch, items []batchItem) error
 
 	// afterCommit runs once the publish transaction has committed. prev
 	// is the channel's serial before this publish ("" when the bus does
@@ -278,35 +283,6 @@ type batchItem struct {
 	w  *busWrite
 }
 
-// batchBeforeCommitter is implemented by a Bus whose in-transaction hook
-// can be queued into a batched publish's pipelined round trip: it queues
-// on b, in item order, what beforeCommit would run for each item (and
-// sets each w's notified and pointer flags). A Bus that does not
-// implement it gets its beforeCommit run once per item on the open
-// transaction instead (beforeCommitBatch), at the cost of a round trip
-// each; every bus in this package implements it.
-type batchBeforeCommitter interface {
-	beforeCommitBatch(ctx context.Context, b *pgx.Batch, items []batchItem) error
-}
-
-// beforeCommitBatch runs bus's in-transaction hook for a batch: queued
-// on b when the bus supports it (queued is true), otherwise per item on
-// tx, which the caller has brought up to date with the batch's inserts.
-func beforeCommitBatch(ctx context.Context, bus Bus, b *pgx.Batch, tx pgx.Tx, items []batchItem) (queued bool, err error) {
-	if bb, ok := bus.(batchBeforeCommitter); ok {
-		return true, bb.beforeCommitBatch(ctx, b, items)
-	}
-	if tx == nil {
-		return false, nil
-	}
-	for _, it := range items {
-		if err := bus.beforeCommit(ctx, tx, it.cs, it.w); err != nil {
-			return false, err
-		}
-	}
-	return false, nil
-}
-
 // beforeCommitBatch queues one broker NOTIFY per cm, in batch order, as
 // a single statement: the batched form of pgNotifyBus.beforeCommit.
 func (b *pgNotifyBus) beforeCommitBatch(_ context.Context, batch *pgx.Batch, items []batchItem) error {
@@ -353,51 +329,3 @@ func (b *pgBus) beforeCommitBatch(_ context.Context, batch *pgx.Batch, items []b
 		chans, payloads)
 	return nil
 }
-
-// connTx adapts a *pgx.Conn on which a transaction was opened with an
-// explicit BEGIN to pgx.Tx, so a Bus without a batched hook can run its
-// beforeCommit inside a batched publish transaction. Commit and Rollback
-// are the caller's; Begin (a savepoint) is not supported.
-type connTx struct{ conn *pgx.Conn }
-
-var _ pgx.Tx = connTx{}
-
-func (t connTx) Begin(context.Context) (pgx.Tx, error) {
-	return nil, errors.New("storage/postgres: nested transaction in a batched publish")
-}
-func (t connTx) Commit(ctx context.Context) error {
-	tag, err := t.conn.Exec(ctx, "COMMIT")
-	if err != nil {
-		return err
-	}
-	if tag.String() != "COMMIT" {
-		// An aborted transaction answers COMMIT with ROLLBACK, which
-		// pgx.Tx reports as ErrTxCommitRollback.
-		return pgx.ErrTxCommitRollback
-	}
-	return nil
-}
-func (t connTx) Rollback(ctx context.Context) error {
-	_, err := t.conn.Exec(ctx, "ROLLBACK")
-	return err
-}
-func (t connTx) CopyFrom(ctx context.Context, name pgx.Identifier, cols []string, src pgx.CopyFromSource) (int64, error) {
-	return t.conn.CopyFrom(ctx, name, cols, src)
-}
-func (t connTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
-	return t.conn.SendBatch(ctx, b)
-}
-func (t connTx) LargeObjects() pgx.LargeObjects { return pgx.LargeObjects{} } // unused by the buses
-func (t connTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
-	return t.conn.Prepare(ctx, name, sql)
-}
-func (t connTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	return t.conn.Exec(ctx, sql, args...)
-}
-func (t connTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	return t.conn.Query(ctx, sql, args...)
-}
-func (t connTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	return t.conn.QueryRow(ctx, sql, args...)
-}
-func (t connTx) Conn() *pgx.Conn { return t.conn }

@@ -266,7 +266,8 @@ type Storage struct {
 	wmetrics  *writeMetrics
 	// bindOnWrite is Options.BindOnWrite; rows remembers channels known to
 	// have a row (nil when bindOnWrite). ensureCalls and rowReads count the
-	// binds that ran ensure_channel and those that read a known row.
+	// binds that ran ensure_channel and those that read a known row
+	// (ably_storage_channel_binds_total{source}).
 	bindOnWrite           bool
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
@@ -782,6 +783,16 @@ func (s *Storage) stopGapTimers() {
 // that to Sharded.
 func (s *Storage) Collectors() []prometheus.Collector {
 	out := append(s.metrics.collectors(), s.wmetrics.collectors()...)
+	for _, src := range []struct {
+		label string
+		n     *atomic.Uint64
+	}{{"ensure", &s.ensureCalls}, {"read", &s.rowReads}} {
+		out = append(out, prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "ably_storage_channel_binds_total",
+			Help:        "Channel binds on this node by how the channels row was read: ensure (ensure_channel, which writes) or read (a plain read of a row the node knows exists).",
+			ConstLabels: prometheus.Labels{"source": src.label},
+		}, func() float64 { return float64(src.n.Load()) }))
+	}
 	if s.shard.count == 1 {
 		out = append(out, shardsGauge(1))
 	}
@@ -1896,7 +1907,7 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 // watermark in the same transaction, under the channel's row lock. A
 // node seeding its local member set from this (DESIGN.md §12.4) can then
 // fold exactly the cms after the as-of serial.
-func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+func (cs *channelStore) Members(ctx context.Context) (members []*protocol.PresenceMessage, asOfSerial string, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -1907,7 +1918,13 @@ func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessag
 	b.Queue(`SELECT channel_serial FROM channels WHERE name = $1`, cs.name)
 	b.Queue(`COMMIT`)
 	br := cs.pool.SendBatch(ctx, b)
-	defer br.Close()
+	defer func() {
+		// Every result is read below, so Close finds nothing unread; what
+		// it reports is the only sign of a statement that did not complete.
+		if cerr := br.Close(); cerr != nil && retErr == nil {
+			members, asOfSerial, retErr = nil, "", fmt.Errorf("storage/postgres: members close: %w", cerr)
+		}
+	}()
 	if _, err := br.Exec(); err != nil {
 		return nil, "", fmt.Errorf("storage/postgres: members begin: %w", err)
 	}

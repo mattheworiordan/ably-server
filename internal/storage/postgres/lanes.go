@@ -452,12 +452,6 @@ func (l *lane) attempt(batch []*pending) ([]*pending, error) {
 	return l.c.commitBatch(ctx, batch)
 }
 
-// close fails queued publishes and waits for in-flight batches.
-func (l *lane) close() {
-	l.stop()
-	l.wg.Wait()
-}
-
 // stop marks the lane closed and fails its queued publishes, without
 // waiting for the batches in flight.
 func (l *lane) stop() {
