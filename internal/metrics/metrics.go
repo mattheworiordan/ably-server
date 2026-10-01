@@ -53,6 +53,26 @@ type Metrics struct {
 	presenceGraceLeaveErrors *prometheus.CounterVec
 	presenceReentries        prometheus.Counter
 
+	// Attach and presence SYNC timing (DESIGN.md §10, §12.4): the time
+	// from an ATTACH being read to its ATTACHED and its final SYNC frame
+	// being written, the stages of a SYNC, the size of each SYNC frame
+	// written, the SYNCs skipped by reason, and the write timeouts by the
+	// action of the frame whose write missed its deadline. The label
+	// children are resolved once (attachUntil etc.) so the per-attach path
+	// does no label lookup.
+	connectSeconds         prometheus.Histogram
+	clientAttachDelay      prometheus.Histogram
+	attachSeconds          *prometheus.HistogramVec
+	attachAttached         prometheus.Observer
+	attachSynced           prometheus.Observer
+	presenceSyncStage      *prometheus.HistogramVec
+	presenceSyncSnapshot   prometheus.Observer
+	presenceSyncQueue      prometheus.Observer
+	presenceSyncWrite      prometheus.Observer
+	presenceSyncFrameBytes prometheus.Histogram
+	presenceSyncsSkipped   *prometheus.CounterVec
+	writeTimeouts          *prometheus.CounterVec
+
 	// Delivery stages after Append (DESIGN.md §10): the fan-out time to
 	// each sampled attachment's frame being queued, the wait of a sampled
 	// connection's frame in its outbound queue, and the largest fan-out
@@ -155,6 +175,39 @@ func New() *Metrics {
 			Name: "ably_presence_reentries_total",
 			Help: "Presence members re-entered by this node after its presence lease lapsed (DESIGN.md §12.5).",
 		}),
+		connectSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ably_connect_seconds",
+			Help:    "Time from a WebSocket upgrade request reaching the server to its CONNECTED frame being written (DESIGN.md §10).",
+			Buckets: AttachBuckets,
+		}),
+		clientAttachDelay: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ably_client_attach_delay_seconds",
+			Help:    "Time from a connection's CONNECTED frame being written to its first ATTACH being read: the client's turnaround plus the network, which the server does not control (DESIGN.md §10).",
+			Buckets: AttachBuckets,
+		}),
+		attachSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "ably_attach_seconds",
+			Help:    "Time from a new attachment's ATTACH frame being read to a frame of its attach being written to the socket, by which frame (DESIGN.md §10): attached (the ATTACHED frame), synced (the final presence SYNC frame, on an attach that delivers one).",
+			Buckets: AttachBuckets,
+		}, []string{"until"}),
+		presenceSyncStage: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "ably_presence_sync_stage_seconds",
+			Help:    "Stages of an attach's presence SYNC (DESIGN.md §12.4): snapshot (obtaining the snapshot: the seed read, the refresh-window wait, the rebuild), queue (encoding and queueing the SYNC frame, including backpressure), write (from queueing starting to the frame being written, so it includes queue and the frames queued ahead of it).",
+			Buckets: AttachBuckets,
+		}, []string{"stage"}),
+		presenceSyncFrameBytes: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ably_presence_sync_frame_bytes",
+			Help:    "Encoded size of each presence SYNC frame written to a connection (DESIGN.md §12.4).",
+			Buckets: prometheus.ExponentialBuckets(256, 2, 14),
+		}),
+		presenceSyncsSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_presence_syncs_skipped_total",
+			Help: "Attach and client SYNCs that delivered no presence set, by reason (DESIGN.md §12.4): closed (the attachment or connection ended while the snapshot was being obtained), error (the snapshot could not be read).",
+		}, []string{"reason"}),
+		writeTimeouts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_write_timeouts_total",
+			Help: "Socket writes that missed the write timeout, closing the connection, by the action of the frame being written (DESIGN.md §5.2).",
+		}, []string{"frame"}),
 		deliveryFanout: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_delivery_fanout_seconds",
 			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
@@ -190,13 +243,31 @@ func New() *Metrics {
 		m.presenceReentries,
 		m.deliveryFanout,
 		m.connWriteWait,
+		m.connectSeconds,
+		m.clientAttachDelay,
+		m.attachSeconds,
+		m.presenceSyncStage,
+		m.presenceSyncFrameBytes,
+		m.presenceSyncsSkipped,
+		m.writeTimeouts,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "ably_delivery_fanout_size",
 			Help: "The largest number of attachments open on a channel when a cm was appended to it, since the previous scrape (DESIGN.md §10). Reading it resets it.",
 		}, func() float64 { return float64(m.fanoutMax.Swap(0)) }),
 	)
+	m.attachAttached = m.attachSeconds.WithLabelValues("attached")
+	m.attachSynced = m.attachSeconds.WithLabelValues("synced")
+	m.presenceSyncSnapshot = m.presenceSyncStage.WithLabelValues("snapshot")
+	m.presenceSyncQueue = m.presenceSyncStage.WithLabelValues("queue")
+	m.presenceSyncWrite = m.presenceSyncStage.WithLabelValues("write")
 	return m
 }
+
+// AttachBuckets are the upper bounds, in seconds, of the attach and
+// presence SYNC histograms (ably_attach_seconds,
+// ably_presence_sync_stage_seconds): 1 ms to about 33 s, so the tail of
+// an attach under load stays inside the buckets.
+var AttachBuckets = prometheus.ExponentialBuckets(0.001, 2, 16)
 
 // RegisterBus exports a cluster bus's counters (DESIGN.md §7.2, §10) as
 // ably_bus_* series, read from src on every scrape. No-op on a nil
@@ -451,4 +522,97 @@ func (m *Metrics) ConnWriteWait(d time.Duration) {
 		return
 	}
 	m.connWriteWait.Observe(d.Seconds())
+}
+
+// ConnectWritten observes the time from a WebSocket upgrade request to
+// its CONNECTED frame being written (ably_connect_seconds).
+func (m *Metrics) ConnectWritten(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.connectSeconds.Observe(d.Seconds())
+}
+
+// ClientAttachDelay observes the time from a connection's CONNECTED
+// frame being written to its first ATTACH being read
+// (ably_client_attach_delay_seconds).
+func (m *Metrics) ClientAttachDelay(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.clientAttachDelay.Observe(d.Seconds())
+}
+
+// AttachWritten observes the time from an ATTACH being read to its
+// ATTACHED frame being written (ably_attach_seconds{until="attached"}).
+func (m *Metrics) AttachWritten(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.attachAttached.Observe(d.Seconds())
+}
+
+// AttachSynced observes the time from an ATTACH being read to its final
+// presence SYNC frame being written (ably_attach_seconds{until="synced"}).
+func (m *Metrics) AttachSynced(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.attachSynced.Observe(d.Seconds())
+}
+
+// PresenceSyncSnapshot observes the time an attach took to obtain its
+// SYNC snapshot (ably_presence_sync_stage_seconds{stage="snapshot"}).
+func (m *Metrics) PresenceSyncSnapshot(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.presenceSyncSnapshot.Observe(d.Seconds())
+}
+
+// PresenceSyncQueued observes the time an attach took to encode and
+// queue its SYNC frame (ably_presence_sync_stage_seconds{stage="queue"}).
+func (m *Metrics) PresenceSyncQueued(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.presenceSyncQueue.Observe(d.Seconds())
+}
+
+// PresenceSyncWritten observes the time from an attach starting to queue
+// its SYNC frame to the frame being written
+// (ably_presence_sync_stage_seconds{stage="write"}).
+func (m *Metrics) PresenceSyncWritten(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.presenceSyncWrite.Observe(d.Seconds())
+}
+
+// PresenceSyncFrame observes the encoded size of one SYNC frame written
+// (ably_presence_sync_frame_bytes).
+func (m *Metrics) PresenceSyncFrame(bytes int) {
+	if m == nil {
+		return
+	}
+	m.presenceSyncFrameBytes.Observe(float64(bytes))
+}
+
+// PresenceSyncSkipped records a SYNC that delivered no presence set;
+// reason is "closed" or "error" (ably_presence_syncs_skipped_total).
+func (m *Metrics) PresenceSyncSkipped(reason string) {
+	if m == nil {
+		return
+	}
+	m.presenceSyncsSkipped.WithLabelValues(reason).Inc()
+}
+
+// WriteTimeout records a socket write that missed its deadline; frame is
+// the action of the frame being written, lower case
+// (ably_write_timeouts_total).
+func (m *Metrics) WriteTimeout(frame string) {
+	if m == nil {
+		return
+	}
+	m.writeTimeouts.WithLabelValues(frame).Inc()
 }

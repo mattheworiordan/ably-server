@@ -243,6 +243,7 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 // expired, etc.), which the SDK maps to the FAILED state, then closes
 // (DESIGN.md §2.1, §3; mirrors the reference frontdoor's closeWithError).
 func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	requested := time.Now()
 	// Resolve the wire format before upgrading; a bad format is a genuine
 	// bad request, not an auth failure, so it stays an HTTP-level rejection.
 	format, err := protocol.FormatFromQuery(r.URL.Query().Get("format"))
@@ -332,6 +333,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		resumeError:       resumeError,
 		lastMsgSerial:     -1,
 		sampled:           deliverySampleSeq.Add(1)%metrics.DeliverySampleEvery == 0,
+		requested:         requested,
 	}
 
 	// The upgrade succeeded: count the connection and time its lifetime,

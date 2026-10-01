@@ -891,10 +891,10 @@ func (s *Storage) stopGapTimers() {
 }
 
 // Collectors returns the backend's Prometheus collectors (the
-// ably_storage_* retention series and the ably_publish_* batching series,
-// DESIGN.md §10), for registration on the process registry. A lone
-// Storage also reports ably_storage_shards (1); a shard of a list leaves
-// that to Sharded.
+// ably_storage_* retention and pool series and the ably_publish_*
+// batching series, DESIGN.md §10), for registration on the process
+// registry. A lone Storage also reports ably_storage_shards (1); a shard
+// of a list leaves that to Sharded.
 func (s *Storage) Collectors() []prometheus.Collector {
 	out := append(s.metrics.collectors(), s.wmetrics.collectors()...)
 	out = append(out, s.lmetrics.collectors()...)
@@ -908,6 +908,7 @@ func (s *Storage) Collectors() []prometheus.Collector {
 			ConstLabels: prometheus.Labels{"source": src.label},
 		}, func() float64 { return float64(src.n.Load()) }))
 	}
+	out = append(out, newPoolCollector(s.pool))
 	if s.shard.count == 1 {
 		out = append(out, shardsGauge(1))
 	}

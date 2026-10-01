@@ -103,7 +103,7 @@ func newSnapshot(members []*protocol.PresenceMessage, asOf string) *PresenceSnap
 // Guarded by Channel.mu.
 type memberView struct {
 	seeded  bool
-	seeding chan struct{} // non-nil while a seed read is in flight; closed when it ends
+	seeding *seedRun // non-nil while a seed read is in flight
 	buffer  []*protocol.ChannelMessage
 	// gen counts discontinuities; a seed read started under an older gen
 	// is discarded.
@@ -302,58 +302,112 @@ func (c *Channel) storeSnapshot(ctx context.Context) (*PresenceSnapshot, error) 
 	return newSnapshot(members, asOf), nil
 }
 
+// seedRun is one seed read of the local member set in flight. done is
+// closed when it ends; err is its error, set before done is closed. The
+// read runs on its own context, cancelled only when every attach waiting
+// on it has stopped waiting (waiters falls to zero): then cancelled is
+// set, and an attach that comes along before the read has ended waits
+// for it to end and starts a fresh one. waiters, cancelled and err are
+// guarded by Channel.mu.
+type seedRun struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	waiters   int
+	cancelled bool
+	err       error
+}
+
 // seedMembers seeds the local member set from the store, once per bind;
 // concurrent callers wait for the one read. The store's set and as-of
 // serial come from one snapshot, so the cms delivered meanwhile, which
 // the view buffers, fold on top of it exactly: those at or below the
 // as-of serial are already in it, those after are not.
+//
+// The read is shared by every attach waiting on it, so it does not run
+// on the context of the attach that happened to start it: an attach
+// whose connection closes stops waiting, and the read goes on for the
+// others; it is cancelled only once no attach is waiting for it.
+// Otherwise each closing connection would cancel the read and send every
+// waiter back to start another, which on a busy pool means queueing for
+// a connection again (DESIGN.md §12.4).
 func (c *Channel) seedMembers(ctx context.Context) error {
 	c.mu.Lock()
 	for !c.pv.seeded {
-		if wait := c.pv.seeding; wait != nil {
+		run := c.pv.seeding
+		if run != nil && run.cancelled {
+			// Abandoned by its waiters and ending: wait for it, then seed
+			// afresh.
 			c.mu.Unlock()
 			select {
-			case <-wait:
+			case <-run.done:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 			c.mu.Lock()
 			continue
 		}
-		done := make(chan struct{})
-		c.pv.seeding, c.pv.buffer = done, nil
-		gen := c.pv.gen
+		if run == nil {
+			readCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+			run = &seedRun{done: make(chan struct{}), cancel: cancel}
+			c.pv.seeding, c.pv.buffer = run, nil
+			go c.runSeed(readCtx, run, c.pv.gen)
+		}
+		run.waiters++
 		c.mu.Unlock()
-
-		members, asOf, err := c.store.Members(ctx)
-
-		c.mu.Lock()
-		c.pv.seeding = nil
-		close(done)
-		if err != nil {
-			c.pv.buffer = nil
+		select {
+		case <-run.done:
+		case <-ctx.Done():
+			c.mu.Lock()
+			if run.waiters--; run.waiters == 0 && c.pv.seeding == run {
+				run.cancelled = true
+				run.cancel()
+			}
 			c.mu.Unlock()
-			return err
+			return ctx.Err()
 		}
-		if c.pv.gen != gen {
-			// A discontinuity during the read: the buffer misses cms the
-			// read may not have seen. Seed again.
-			c.pv.buffer = nil
-			continue
+		c.mu.Lock()
+		run.waiters--
+		if run.err != nil {
+			c.mu.Unlock()
+			return run.err
 		}
-		c.pv.members = make(map[string]*protocol.PresenceMessage, len(members))
-		for _, p := range members {
-			c.pv.members[storage.MemberKey(p.ConnectionID, p.ClientID)] = p
-		}
-		c.pv.asOf = asOf
-		for _, cm := range c.pv.buffer {
-			c.pv.fold(cm)
-		}
-		c.pv.buffer, c.pv.seeded = nil, true
-		c.metrics.PresenceSeed()
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// runSeed reads the store's member set for run and installs it as the
+// local set, folding the cms buffered meanwhile. A discontinuity during
+// the read (gen moved on) discards it: the buffer misses cms the read
+// may not have seen, and the waiters start another seed. So does a read
+// its waiters abandoned (cancelled), which nobody is waiting for.
+func (c *Channel) runSeed(ctx context.Context, run *seedRun, gen int) {
+	members, asOf, err := c.store.Members(ctx)
+	run.cancel()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer close(run.done)
+	c.pv.seeding = nil
+	if run.cancelled {
+		c.pv.buffer = nil
+		return
+	}
+	run.err = err
+	if err != nil || c.pv.gen != gen {
+		c.pv.buffer = nil
+		return
+	}
+	c.pv.members = make(map[string]*protocol.PresenceMessage, len(members))
+	for _, p := range members {
+		c.pv.members[storage.MemberKey(p.ConnectionID, p.ClientID)] = p
+	}
+	c.pv.asOf = asOf
+	for _, cm := range c.pv.buffer {
+		c.pv.fold(cm)
+	}
+	c.pv.buffer, c.pv.seeded = nil, true
+	c.metrics.PresenceSeed()
 }
 
 // dropMemberViewLocked drops the local member set so the next SYNC seeds

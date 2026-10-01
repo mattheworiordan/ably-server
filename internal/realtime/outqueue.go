@@ -26,6 +26,10 @@ type outFrame struct {
 	// queued is when a sampled connection queued the frame (zero
 	// otherwise), for ably_conn_write_wait_seconds (DESIGN.md §10).
 	queued time.Time
+	// written, when set, is called by the write loop once the frame is on
+	// the wire, with its size in bytes. An attach sets it on its ATTACHED
+	// and SYNC frames to time them (ably_attach_seconds, DESIGN.md §10).
+	written func(bytes int)
 }
 
 // outQueue is a connection's bounded outbound queue (DESIGN.md §5.2). It

@@ -734,3 +734,149 @@ func TestDiscontinuityBeforeInitializeLinksNoMarker(t *testing.T) {
 		t.Error("a marker was linked before Initialize")
 	}
 }
+
+// TestPresenceSyncSeedOutlivesCancelledStarter: the seed read is shared,
+// so the attach that started it closing does not cancel it. The other
+// waiters get the set from that one read instead of each starting
+// another (DESIGN.md §12.4).
+func TestPresenceSyncSeedOutlivesCancelledStarter(t *testing.T) {
+	store := &membersStore{
+		members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")},
+		asOf:    "005",
+		release: make(chan struct{}),
+		entered: make(chan struct{}),
+	}
+	c, _ := testChannel(t, store, "005")
+
+	starter, cancel := context.WithCancel(context.Background())
+	starterErr := make(chan error, 1)
+	go func() {
+		_, err := c.PresenceSync(starter)
+		starterErr <- err
+	}()
+	<-store.entered // the starter's seed read is in flight
+
+	type result struct {
+		snap *PresenceSnapshot
+		err  error
+	}
+	waiter := make(chan result, 1)
+	go func() {
+		snap, err := c.PresenceSync(context.Background())
+		waiter <- result{snap, err}
+	}()
+	waitForSeedWaiters(t, c, 2)
+	cancel()
+	if err := <-starterErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("starter err = %v, want context.Canceled", err)
+	}
+	close(store.release)
+	r := <-waiter
+	if r.err != nil {
+		t.Fatalf("waiter: %v", r.err)
+	}
+	if got := setOf(r.snap.Members); fmt.Sprint(got) != "[c1:alice=a]" {
+		t.Errorf("waiter set = %v, want [c1:alice=a]", got)
+	}
+	if n := store.calls.Load(); n != 1 {
+		t.Errorf("store Members calls = %d, want 1: the starter's cancellation restarted the seed", n)
+	}
+}
+
+// waitForSeedWaiters waits until n attaches are waiting on c's in-flight
+// seed read.
+func waitForSeedWaiters(t *testing.T, c *Channel, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		got := 0
+		if run := c.pv.seeding; run != nil {
+			got = run.waiters
+		}
+		c.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("seed waiters = %d, want %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestPresenceSyncSeedCancelledWhenAbandoned: once no attach is waiting
+// for the seed read it is cancelled, so it does not hold a pool
+// connection for nobody; the next attach seeds afresh (DESIGN.md §12.4).
+func TestPresenceSyncSeedCancelledWhenAbandoned(t *testing.T) {
+	store := &membersStore{
+		members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")},
+		asOf:    "005",
+		release: make(chan struct{}),
+		entered: make(chan struct{}),
+	}
+	c, _ := testChannel(t, store, "005")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.PresenceSync(ctx)
+		errc <- err
+	}()
+	<-store.entered
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	// The abandoned read ends (membersStore returns on its context);
+	// the next attach does not inherit its cancellation.
+	close(store.release)
+	snap, err := c.PresenceSync(context.Background())
+	if err != nil {
+		t.Fatalf("PresenceSync after the abandoned seed: %v", err)
+	}
+	if got := setOf(snap.Members); fmt.Sprint(got) != "[c1:alice=a]" {
+		t.Errorf("set = %v, want [c1:alice=a]", got)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Errorf("store Members calls = %d, want 2 (the abandoned seed, then a fresh one)", n)
+	}
+}
+
+// TestPresenceSyncSeedErrorReachesEveryWaiter: a seed read that fails
+// fails for every attach waiting on it, and each reads the store for its
+// SYNC; the next attach tries to seed again (DESIGN.md §12.4).
+func TestPresenceSyncSeedErrorReachesEveryWaiter(t *testing.T) {
+	store := &membersStore{
+		asOf:    "005",
+		err:     errors.New("database down"),
+		release: make(chan struct{}),
+		entered: make(chan struct{}),
+	}
+	c, _ := testChannel(t, store, "005")
+	errc := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := c.PresenceSync(context.Background())
+			errc <- err
+		}()
+	}
+	<-store.entered
+	waitForSeedWaiters(t, c, 2)
+	close(store.release)
+	for range 2 {
+		if err := <-errc; err == nil || err.Error() != "database down" {
+			t.Errorf("err = %v, want the store's error from the fallback read", err)
+		}
+	}
+	// One seed read, then one fallback store read per waiter.
+	if n := store.calls.Load(); n != 3 {
+		t.Errorf("store Members calls = %d, want 3", n)
+	}
+	c.mu.Lock()
+	seeded, seeding := c.pv.seeded, c.pv.seeding
+	c.mu.Unlock()
+	if seeded || seeding != nil {
+		t.Errorf("after a failed seed: seeded %v, seeding %v; want neither, so the next SYNC seeds again", seeded, seeding)
+	}
+}
