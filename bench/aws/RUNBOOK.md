@@ -256,7 +256,7 @@ Optional, with defaults:
 | `TEARDOWN_ALL` | 0 | `90-teardown.sh`: also delete the ECR repositories (ecr only), the billing alarms and their SNS topic. ghcr packages are never touched. |
 | `KEEP_POSTGRES` | 0 | `80-terminate.sh`: terminate everything except the Postgres instances. |
 | `AUTO_TERMINATE_AFTER_RUN`, `OVERRIDE_BUDGET_GUARD`, `FORCE_NO_ALARM` | 0 | See the safety rails. |
-| `SKIP_BOOT_WAIT`, `SKIP_OBSERVABILITY`, `KEEP_WORK_DIR` | 0 | Skip waiting for cloud-init, skip `55-observability.sh`, keep rendered user-data for inspection. |
+| `SKIP_BOOT_WAIT`, `SKIP_OBSERVABILITY`, `KEEP_WORK_DIR` | 0 | Skip waiting for cloud-init (secrets are still delivered over SSH), skip `55-observability.sh`, keep rendered user-data for inspection (it carries no secret). |
 | `DRY_RUN` | 0 | `1` prints every aws, ssh and scp call and runs nothing. |
 
 ### Image registry
@@ -282,11 +282,12 @@ environment.
   names a customer or an account, which is why public is acceptable here.
 - **Private packages: `GHCR_PULL_TOKEN`.** Export a token with `read:packages`
   (a classic personal access token) before `40-nodes.sh` and `50-loadgen.sh`; every box
-  then runs `docker login ghcr.io` at boot. The trade-off: the token is written
-  into each box's user-data, so anyone who can read instance attributes in the account
-  can read it, it sits in root's Docker config on the box, and it is live until you revoke
-  it. Use a token created for this run with nothing but `read:packages`, and revoke it at
-  teardown. Public packages avoid all of that.
+  then runs `docker login ghcr.io` at boot. The token is not written into user-data:
+  the launching script copies it to the box over SSH (see "Secrets and user-data"
+  below) and the boot script reads and deletes it. It still sits in root's Docker
+  config on the box and is live until you revoke it. Use a token created for this
+  run with nothing but `read:packages`, and revoke it at teardown. Public packages
+  avoid all of that.
 - **ECR.** `IMAGE_REGISTRY_KIND=ecr`: `00-preflight.sh` looks for each repository with
   `describe-repositories` and creates only a missing one (tagged, or untagged when the
   role may not tag). If `ecr:CreateRepository` is denied it stops and says so. It does not
@@ -577,7 +578,7 @@ lets the conductor read each box's clock offset at the start and end of a run
 (`GET /v1/clock`); the run record prints them and the run fails if one is above
 5 ms. A box that cannot measure is recorded as "not measured" and only the
 negative-latency check guards against skew on it. The conductor also takes
-`--fault-hook CMD --fault-at D --time-limit D --log --state`; add them by
+`--fault-hook CMD --fault-kind node-kill|bus-kill|other --fault-at D --time-limit D --log --state`; add them by
 setting `CONDUCTOR_CMD` (the tokens `{SCENARIO}` and `{RUN_ID}` are replaced).
 `NODE_VCPU` and `NODE_MEMORY_GB` default from `NODE_INSTANCE_TYPE` (vCPUs from
 the size, memory at 2 GiB per vCPU, which holds for the c7i family); set them
@@ -635,7 +636,7 @@ version, image id and settings read back from the database, `.runs`).
 - **`00-preflight.sh` reports a denied action.** Sign in with a role that has it, or ask for it. Nothing was created. Actions this design does not need (RDS, key pairs, placement groups, stop and start, standalone volumes, Cost Explorer, `budgets:ViewBudget`, service quotas) are not probed or are informational.
 - **Preflight says the terminate permission is only weakly checked.** `ec2:TerminateInstances` cannot be proven without an instance; `80-terminate.sh` and `90-teardown.sh` are the real test, so try them on the smoke fleet first.
 - **`10-network.sh` or `30-nats.sh` fails on an address.** NATS servers take fixed private addresses from `NATS_IP_OFFSET` in the subnet; if another instance already holds one, pick another offset.
-- **The database password and the API key are in EC2 user-data.** Anyone who can describe instance attributes in the account can read them, and they appear in `docker inspect` on the box (the Postgres password is in the container's environment). The bench database is throwaway and only reachable inside the security group; do not reuse the password anywhere.
+- **Secrets and user-data.** No secret is written into EC2 user-data (which anyone who can describe instance attributes can read, and which stays on the box under `/var/lib/cloud`). The API key, the database password and DSNs, and the registry pull token go to a fresh box over SSH instead: the boot script (`templates/secrets.sh`) waits up to 20 minutes for `/home/ec2-user/.bench-secrets.env`, which `lib.sh deliver_boot_secrets` copies as soon as SSH answers (the scripts do this before `wait_boot`; it needs SSH even with `SKIP_BOOT_WAIT=1`). The boot script loads the file untraced and deletes it, and containers take the values from the environment by name, so none is on a command line or in the boot log. `RECONFIGURE=1` re-delivers what the role needs. Remaining exposure: the values are in the containers' environment (`docker inspect` on the box, which only `ec2-user` and root can run) and, for the registry token, in root's Docker config. `test/userdata-lint.sh` fails if a rendered user-data contains the API key, a `postgres://` URL with a password, the pull token or its variable name. The bench database is throwaway and only reachable inside the security group; do not reuse the password anywhere. The conductor box still passes a DSN to `psql` on its command line once, to create the `pg_stat_statements` extension.
 - **Untagged IAM role, instance profile, SNS topic or ECR repository.** Tagging on create needs `iam:TagRole`, `iam:TagInstanceProfile`, `sns:TagResource` and `ecr:TagResource`. When the role lacks one, the script logs a warning and creates the resource untagged (every create goes through the same helper); `90-teardown.sh` still removes the IAM entities by name from STATE (a denied IAM delete is a warning: the role and profile cost nothing), and leaves an untagged ECR repository alone.
 - **Teardown says a read failed.** Teardown refuses to treat a failed read as "nothing there". Fix the sign-in or permission and run it again; STATE is kept until it verifies clean. A denied `tag:GetResources` is not such a failure: the final listing then runs service by service, and a service whose list call is denied is named in a warning ("could not verify").
 - **STATE.json was lost.** `90-teardown.sh --yes` still works. To continue instead, re-run `10-network.sh`, `20-postgres.sh` (with `PG_PASSWORD`), `30-nats.sh`, `40-nodes.sh` and `50-loadgen.sh`: they find existing resources by tag and name and refill STATE.

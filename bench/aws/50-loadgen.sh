@@ -37,16 +37,18 @@ spend_gate
 init_work_dir
 ids=()
 names=()
+fresh=()
 launch_group() { # <role> <count> <type> <command>
   local role=$1 count=$2 type=$3 cmd=$4 i name existed ud role_only
   ud="$BENCH_WORK_DIR/userdata-$role.sh"
   render_userdata "$ud" loadgen "IMAGE=$image" "CMD=$cmd"
   role_only="$BENCH_WORK_DIR/role-$role.sh"
-  render_template "$BENCH_AWS_DIR/templates/loadgen.sh" "IMAGE=$image" "CMD=$cmd" >"$role_only"
+  render_role_script loadgen "IMAGE=$image" "CMD=$cmd" >"$role_only"
   for i in $(seq 1 "$count"); do
     name=$(iname "$role" "$i")
     names+=("$name")
     existed=$(find_instance "$name")
+    if [ -z "$existed" ]; then fresh+=("$name"); fi
     ids+=("$(launch_instance "$name" "$role" "$type" "$ud")")
     if [ -n "$existed" ] && [ "${RECONFIGURE:-0}" = 1 ]; then
       apply_role_script "$name" "$role_only"
@@ -59,13 +61,17 @@ launch_group publisher "$PUBLISHER_COUNT" "$PUBLISHER_INSTANCE_TYPE" "$PUBLISHER
 
 # Conductor: no placement group (it only talks to the others), compose plugin on.
 cud="$BENCH_WORK_DIR/userdata-conductor.sh"
-INSTALL_COMPOSE=1 render_userdata "$cud" conductor "IMAGE=$image" "PGBENCH_IMAGE=$PGBENCH_IMAGE" "DSNS=$dsns"
+INSTALL_COMPOSE=1 render_userdata "$cud" conductor "IMAGE=$image" "PGBENCH_IMAGE=$PGBENCH_IMAGE"
 cname=$(iname conductor 1)
 names+=("$cname")
+if [ -z "$(find_instance "$cname")" ]; then conductor_fresh=1; else conductor_fresh=0; fi
 ids+=("$(launch_instance "$cname" conductor "$CONDUCTOR_INSTANCE_TYPE" "$cud" "" 0)")
 
 wait_instances_running "${ids[@]}"
 refresh_instances
+# No secret is in any user-data: the registry pull token (if any) and the conductor's DSNs go over SSH.
+for name in ${fresh[@]+"${fresh[@]}"}; do deliver_boot_secrets "$name"; done
+if [ "$conductor_fresh" = 1 ]; then deliver_boot_secrets "$cname" "BENCH_DSNS=$dsns"; fi
 wait_boot "${names[@]}"
 _state_update '.loadgen = {image:$img,generators:($g|tonumber),publishers:($p|tonumber),generator_cmd:$gc,publisher_cmd:$pc}' \
   --arg img "$image" --arg g "$LOADGEN_COUNT" --arg p "$PUBLISHER_COUNT" --arg gc "$LOADGEN_CMD" --arg pc "$PUBLISHER_CMD"

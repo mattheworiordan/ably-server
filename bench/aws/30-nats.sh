@@ -38,6 +38,7 @@ for i in $(seq 1 "$NATS_COUNT"); do
   urls+="${urls:+,}nats://$ip:$NATS_CLIENT_PORT"
   name=$(iname nats "$i")
   names+=("$name")
+  if [ -z "$(find_instance "$name")" ]; then fresh+=("$name"); fi
   ud="$BENCH_WORK_DIR/userdata-nats-$i.sh"
   render_userdata "$ud" nats "SERVER_NAME=nats-$i" "CLIENT_PORT=$NATS_CLIENT_PORT" "MONITOR_PORT=$NATS_MONITOR_PORT" \
     "ROUTE_PORT=$NATS_ROUTE_PORT" "ROUTES=$routes" "NATS_IMAGE=$NATS_IMAGE" \
@@ -49,6 +50,8 @@ refresh_instances
 state_set '.nats.urls' "$urls"
 state_set '.nats.image' "$NATS_IMAGE"
 state_set_json '.nats.count' "$NATS_COUNT"
+# Only a registry pull token (if any) goes over SSH; nothing secret is in the user-data.
+for name in ${fresh[@]+"${fresh[@]}"}; do deliver_boot_secrets "$name"; done
 wait_boot "${names[@]}"
 cost_checkpoint
 log_line 30-nats "NATS cluster of $NATS_COUNT up ($NATS_INSTANCE_TYPE, $NATS_IMAGE): $urls" "40-nodes.sh"

@@ -1105,17 +1105,24 @@ wait_boot() {
 # render_userdata <outfile> <role-template> KEY=VALUE...
 # Output is templates/common.sh plus templates/<role-template>.sh. The common part
 # logs in to the image registry: ecr with the instance profile; ghcr only when
-# GHCR_PULL_TOKEN is set (public packages need no login; the token then sits in the
-# user-data, RUNBOOK section 3); none not at all.
+# GHCR_PULL_TOKEN is set (public packages need no login); none not at all.
+#
+# No secret is ever rendered into user-data (EC2 keeps it readable from the
+# instance metadata service and in the console). The API key, the database
+# password and DSNs, and the registry token reach a box over SSH instead:
+# templates/secrets.sh makes the boot script wait for a file that
+# deliver_boot_secrets copies, and the roles read it from the environment.
 render_userdata() {
-  local out=$1 role=$2
+  local out=$1 role=$2 has_token=0
   shift 2
-  case "${GHCR_PULL_TOKEN:-}" in *[!A-Za-z0-9_]*) die "GHCR_PULL_TOKEN may contain only letters, digits and _ (it is written into user-data)" ;; esac
+  case "${GHCR_PULL_TOKEN:-}" in *[!A-Za-z0-9_]*) die "GHCR_PULL_TOKEN may contain only letters, digits and _ (it is written to a shell env file)" ;; esac
   case "$GHCR_PULL_USER" in *[!A-Za-z0-9-]*) die "GHCR_PULL_USER may contain only letters, digits and - (it is written into user-data)" ;; esac
+  if [ -n "${GHCR_PULL_TOKEN:-}" ]; then has_token=1; fi
   {
     render_template "$BENCH_AWS_DIR/templates/common.sh" \
       "REGION=${AWS_REGION:-}" "REGISTRY_KIND=$IMAGE_REGISTRY_KIND" "REGISTRY_HOST=$REGISTRY_HOST" \
-      "GHCR_PULL_USER=$GHCR_PULL_USER" "GHCR_PULL_TOKEN=${GHCR_PULL_TOKEN:-}" \
+      "GHCR_PULL_USER=$GHCR_PULL_USER" "HAS_REGISTRY_TOKEN=$has_token" \
+      "SECRETS_LOADER=$(cat "$BENCH_AWS_DIR/templates/secrets.sh")" \
       "NODE_EXPORTER_IMAGE=$NODE_EXPORTER_IMAGE" "NODE_EXPORTER_PORT=$NODE_EXPORTER_PORT" \
       "COMPOSE_VERSION=$DOCKER_COMPOSE_VERSION" "INSTALL_COMPOSE=${INSTALL_COMPOSE:-0}" \
       "MAX_UPTIME_MIN=$((FLEET_MAX_UPTIME_H * 60))" "SSH_PUBKEY=$(ssh_pubkey)"
@@ -1129,12 +1136,65 @@ render_userdata() {
   [ "$size" -lt 16000 ] || die "user-data for $role is $size bytes; the EC2 limit is 16384"
 }
 
-# apply_role_script <instance-name> <role-script-file>: re-run a role part of
-# the user-data on a live box (new image tag, new flags). The role scripts
-# remove their own container first.
+# render_role_script <role-template> KEY=VALUE...: the role part of the
+# user-data on its own, with the secrets loader in front, to stdout. For
+# apply_role_script.
+render_role_script() {
+  local role=$1
+  shift
+  cat "$BENCH_AWS_DIR/templates/secrets.sh"
+  printf '\n'
+  render_template "$BENCH_AWS_DIR/templates/$role.sh" "$@"
+}
+
+# boot_secrets_file <outfile> BENCH_NAME=value...: writes the shell env file
+# deliver_boot_secrets copies (mode 0600), with the registry pull token when
+# GHCR_PULL_TOKEN is set. Returns 1 when there is nothing to deliver.
+boot_secrets_file() {
+  local out=$1 kv k v
+  shift
+  (umask 077 && : >"$out")
+  if [ -n "${GHCR_PULL_TOKEN:-}" ]; then set -- "BENCH_REGISTRY_TOKEN=$GHCR_PULL_TOKEN" "$@"; fi
+  for kv in "$@"; do
+    k=${kv%%=*}
+    v=${kv#*=}
+    case "$k" in BENCH_[A-Z_]*) ;; *) die "secret name $k must start with BENCH_" ;; esac
+    case "$v" in *"'"* | *$'\n'*) die "secret $k may not contain a quote or a newline" ;; esac
+    printf "%s='%s'\n" "$k" "$v" >>"$out"
+  done
+  [ -s "$out" ]
+}
+
+# deliver_boot_secrets <instance-name> BENCH_NAME=value...: a freshly launched
+# box's boot script waits for its secrets (templates/secrets.sh); this waits for
+# SSH and copies them over it. Call it for a box that was just launched, before
+# wait_boot, and for none else (an already booted box would leave the file
+# lying there). Nothing is copied when the box needs no secret.
+deliver_boot_secrets() {
+  local name=$1 f
+  shift
+  init_work_dir
+  f="$BENCH_WORK_DIR/secrets-$name.env"
+  if boot_secrets_file "$f" "$@"; then
+    wait_ssh "$name"
+    scp_to "$name" "$f" /home/ec2-user/.bench-secrets.env
+    ssh_do "$name" 'chmod 600 /home/ec2-user/.bench-secrets.env'
+    log "delivered boot secrets to $name over SSH (none is in its user-data)"
+  fi
+  rm -f "$f"
+}
+
+# apply_role_script <instance-name> <role-script-file> [BENCH_NAME=value...]:
+# re-run a role part of the user-data on a live box (new image tag, new flags).
+# The role scripts remove their own container first. Secrets the role needs
+# (any given) are delivered first, as for a new box; a role that needs none,
+# like loadgen, gets none, and an already-booted box keeps its registry login.
 apply_role_script() {
-  scp_to "$1" "$2" /tmp/role.sh
-  ssh_do "$1" 'chmod 600 /tmp/role.sh; sudo bash -euo pipefail /tmp/role.sh; rm -f /tmp/role.sh'
+  local name=$1 script=$2
+  shift 2
+  if [ "$#" -gt 0 ]; then deliver_boot_secrets "$name" "$@"; fi
+  scp_to "$name" "$script" /tmp/role.sh
+  ssh_do "$name" 'chmod 600 /tmp/role.sh; sudo bash -euo pipefail /tmp/role.sh; rm -f /tmp/role.sh'
 }
 
 # iname <role> <index>: the Name tag of an instance.

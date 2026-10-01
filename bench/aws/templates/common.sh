@@ -6,6 +6,8 @@ set -euxo pipefail
 install -m 600 /dev/null /var/log/bench-userdata.log
 exec > >(tee -a /var/log/bench-userdata.log) 2>&1
 
+@@SECRETS_LOADER@@
+
 # SSH access. There is no EC2 key pair in this account: authorise the
 # operator's public key for ec2-user here.
 install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh
@@ -100,7 +102,8 @@ fi
 
 # Image registry login. ecr: the instance profile (it can take a minute to become
 # usable, so retry). ghcr: public packages need no login; a pull token is used only
-# when one was given (it is in this user-data: RUNBOOK section 3). none: nothing.
+# when one was given, and it arrives over SSH, not in this user-data (templates/
+# secrets.sh, RUNBOOK section 3). none: nothing.
 case "@@REGISTRY_KIND@@" in
   ecr)
     for _ in $(seq 1 12); do
@@ -110,9 +113,11 @@ case "@@REGISTRY_KIND@@" in
     done
     ;;
   ghcr)
-    if [ -n "@@GHCR_PULL_TOKEN@@" ]; then
+    if [ "@@HAS_REGISTRY_TOKEN@@" = 1 ]; then
+      bench_load_secrets
       set +x # keep the token out of the boot log
-      printf '%s' '@@GHCR_PULL_TOKEN@@' | docker login ghcr.io -u '@@GHCR_PULL_USER@@' --password-stdin
+      printf '%s' "$BENCH_REGISTRY_TOKEN" | docker login ghcr.io -u '@@GHCR_PULL_USER@@' --password-stdin
+      unset BENCH_REGISTRY_TOKEN
       set -x
     fi
     ;;

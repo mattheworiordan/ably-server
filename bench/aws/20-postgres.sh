@@ -60,13 +60,15 @@ conf=$(render_postgres_conf PRIVATE_IP_AT_BOOT "$max_conn" "$ram_mib")
 
 # ---- Instances
 names=()
+fresh=()
 for shard in $(seq 1 "$SHARDS"); do
   name="${PROJECT_TAG}-pg-${PG_STORAGE}"
   if [ "$SHARDS" -gt 1 ]; then name="${name}-s${shard}"; fi
   names+=("$name")
   ud="$BENCH_WORK_DIR/userdata-${name}.sh"
   render_userdata "$ud" postgres "POSTGRESQL_CONF=$conf" "CLIENT_CIDR=$client_cidr" "DATA_DEVICE=$PG_DATA_DEVICE" \
-    "DB_USER=$DB_USER" "DB_NAME=$DB_NAME" "PG_IMAGE=$PG_IMAGE" "PG_PASSWORD=$RDS_PASSWORD"
+    "DB_USER=$DB_USER" "DB_NAME=$DB_NAME" "PG_IMAGE=$PG_IMAGE"
+  if [ -z "$(find_instance "$name")" ]; then fresh+=("$name"); fi
   DATA_VOLUME_SPEC="$PG_STORAGE_GB $PG_STORAGE $PG_IOPS $PG_TP" launch_instance "$name" postgres "$PG_INSTANCE_TYPE" "$ud" >/dev/null
   log "postgres instance $name: $PG_INSTANCE_TYPE, $PG_STORAGE ${PG_STORAGE_GB} GB, ${PG_IOPS} IOPS${PG_TP:+, $PG_TP MB/s}"
 done
@@ -75,6 +77,8 @@ ids=()
 for name in "${names[@]}"; do ids+=("$(inst_field "$name" id)"); done
 wait_instances_running "${ids[@]}"
 refresh_instances
+# The database password is not in the user-data: the boot script waits for it, SSH delivers it.
+for name in ${fresh[@]+"${fresh[@]}"}; do deliver_boot_secrets "$name" "BENCH_PG_PASSWORD=$RDS_PASSWORD"; done
 wait_boot "${names[@]}"
 
 # ---- Wait for pg_isready over SSH, verify the settings that matter, record DSNs

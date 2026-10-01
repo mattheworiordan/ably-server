@@ -149,6 +149,29 @@ case "$(defaults_out ignored)" in */home/nobody-in-particular/*) echo "FAIL a de
 state_dir_mode=$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/newdir/sub/state.json" PROJECT_TAG=t AWS_REGION=r bash -c 'source "$0"; state_init; stat -f %Lp "$(dirname "$ACTIVE_STATE")" 2>/dev/null || stat -c %a "$(dirname "$ACTIVE_STATE")"' "$HERE/../lib.sh")
 check "the state directory is private" 700 "$state_dir_mode"
 
+# boot secrets: written to a private env file, never to user-data
+sf="$tmp/secrets.env"
+check "a registry token is added to the secrets file" "BENCH_REGISTRY_TOKEN='tok_123'
+BENCH_API_KEY='bench.a:b'" "$(GHCR_PULL_TOKEN=tok_123 boot_secrets_file "$sf" 'BENCH_API_KEY=bench.a:b' && cat "$sf")"
+check "the secrets file is private" 600 "$(stat -f %Lp "$sf" 2>/dev/null || stat -c %a "$sf")"
+check "no secrets and no token: nothing to deliver" bad "$( (unset GHCR_PULL_TOKEN; boot_secrets_file "$sf" && echo ok) || echo bad)"
+check "a secret with a quote is refused" bad "$( (boot_secrets_file "$sf" "BENCH_X=a'b" 2>/dev/null) || echo bad)"
+check "a secret not named BENCH_ is refused" bad "$( (boot_secrets_file "$sf" "API_KEY=x" 2>/dev/null) || echo bad)"
+# the loader the boot script runs: loads the file untraced, removes it, is idempotent
+loader_out=$(env -i PATH="$PATH" BENCH_SECRETS_FILE="$tmp/delivered.env" bash -c '
+  printf "BENCH_DSN='"'"'postgres://u:p@h/db'"'"'\n" >"$BENCH_SECRETS_FILE"
+  source "$0"
+  set -x
+  bench_load_secrets 2>"$BENCH_SECRETS_FILE.trace"
+  set +x
+  echo "$BENCH_DSN $BENCH_SECRETS_LOADED $([ -e "$BENCH_SECRETS_FILE" ] && echo file-kept || echo file-removed)"
+  bench_load_secrets && echo again-ok
+  grep -c "p@h" "$BENCH_SECRETS_FILE.trace" || true' "$HERE/../templates/secrets.sh" 2>/dev/null)
+check "the loader loads, removes the file, and stays idempotent" "postgres://u:p@h/db 1 file-removed
+again-ok
+0" "$loader_out"
+check "the loader fails when nothing arrives" bad "$( (env -i PATH="$PATH" BENCH_SECRETS_FILE="$tmp/never.env" bash -c 'seq() { echo 1; }; sleep() { :; }; source "$0"; bench_load_secrets' "$HERE/../templates/secrets.sh" 2>/dev/null) || echo bad)"
+
 # the operator's public key goes into user-data
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment\n' >"$tmp/key.pub"
 check "ssh public key is read" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment' "$(SSH_PUBLIC_KEY_PATH="$tmp/key.pub" ssh_pubkey)"

@@ -36,12 +36,16 @@ password=Secretpassword0123456789
 docker network create --subnet 172.30.77.0/24 "$net" >/dev/null
 conf=$(render_postgres_conf PRIVATE_IP_AT_BOOT 300 4096)
 render_template "$AWS_DIR/templates/postgres.sh" "POSTGRESQL_CONF=$conf" CLIENT_CIDR=172.30.77.0/24 DATA_DEVICE=/dev/sdf \
-  DB_USER=ably DB_NAME=ably PG_IMAGE=postgres:17 "PG_PASSWORD=$password" >"$tmp/role.sh"
+  DB_USER=ably DB_NAME=ably PG_IMAGE=postgres:17 >"$tmp/role.sh"
+# The password is delivered over SSH in the real flow (templates/secrets.sh); here the same loader reads a local file.
+printf "BENCH_PG_PASSWORD='%s'\n" "$password" >"$tmp/secrets.env"
 
 # From "2. Configuration" on; swap only the EC2 specifics.
 mkdir -p "$tmp/etc"
 {
   echo 'set -euo pipefail'
+  echo "export BENCH_SECRETS_FILE='$tmp/secrets.env'"
+  cat "$AWS_DIR/templates/secrets.sh"
   sed -n '/^# 2\. Configuration/,$p' "$tmp/role.sh" |
     grep -v -e '^TOKEN=' -e 'bench-ready' |
     sed -e "s#^PRIVATE_IP=.*#PRIVATE_IP=$ip#" \
