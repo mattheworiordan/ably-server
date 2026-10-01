@@ -335,27 +335,6 @@ func TestPresenceSyncWaitersShareOneRebuild(t *testing.T) {
 	}
 }
 
-func TestPresenceSyncStoreModeReadsStoreEveryTime(t *testing.T) {
-	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
-	c, _ := testChannel(t, store, "005")
-	c.syncSource = PresenceSyncStore
-	for range 3 {
-		snap, err := c.PresenceSync(context.Background())
-		if err != nil {
-			t.Fatalf("PresenceSync: %v", err)
-		}
-		if snap.AsOf != "005" || fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
-			t.Errorf("store snapshot = %v as of %q", setOf(snap.Members), snap.AsOf)
-		}
-	}
-	if n := store.calls.Load(); n != 3 {
-		t.Errorf("store Members calls = %d, want 3", n)
-	}
-	if c.pv.seeded {
-		t.Error("store mode seeded a local set")
-	}
-}
-
 func TestPresenceSyncSeedFailureFallsBackAndRetries(t *testing.T) {
 	store := &membersStore{err: errors.New("database down")}
 	c, _ := testChannel(t, store, "005")
@@ -387,17 +366,6 @@ func TestPresenceSnapshotMemoBuildsOnce(t *testing.T) {
 	s.Memo(2, build)
 	if n := builds.Load(); n != 2 {
 		t.Errorf("builds = %d, want one per key", n)
-	}
-}
-
-func TestParsePresenceSyncSource(t *testing.T) {
-	for in, want := range map[string]string{"": PresenceSyncLocal, "local": PresenceSyncLocal, "store": PresenceSyncStore} {
-		if got, err := ParsePresenceSyncSource(in); err != nil || got != want {
-			t.Errorf("ParsePresenceSyncSource(%q) = %q, %v", in, got, err)
-		}
-	}
-	if _, err := ParsePresenceSyncSource("postgres"); err == nil {
-		t.Error("an unknown source was accepted")
 	}
 }
 

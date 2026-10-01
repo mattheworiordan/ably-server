@@ -83,7 +83,6 @@ const (
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 
-	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
 	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
 	presenceLeaseModeEnv   = "ABLY_SERVER_PRESENCE_LEASE_MODE"
@@ -276,7 +275,6 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
 	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
 	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
 	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction at once per database before new ones are refused with 42910; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
@@ -319,11 +317,6 @@ func Run(ctx context.Context, opts Opts) int {
 	})
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
-		return 2
-	}
-	syncSource, err := core.ParsePresenceSyncSource(*presenceSyncSource)
-	if err != nil {
-		fmt.Fprintln(opts.Out, "--presence-sync-source:", err)
 		return 2
 	}
 	if *channelIdleTimeout < 0 {
@@ -473,15 +466,14 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	manager := core.NewManagerWithOptions(store, core.Options{
-		IdleTimeout:        *channelIdleTimeout,
-		Metrics:            m,
-		Logger:             logger,
-		PresenceSyncSource: syncSource,
+		IdleTimeout: *channelIdleTimeout,
+		Metrics:     m,
+		Logger:      logger,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
-	logger.Info("presence path", "syncSource", syncSource, "batching", *presenceBatching, "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
+	logger.Info("presence path", "batching", *presenceBatching, "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a

@@ -153,9 +153,8 @@ type Channel struct {
 	// the store on first use. Guarded by mu.
 	pv memberView
 
-	// syncSource and syncRefresh configure SYNC (PresenceSync); metrics
-	// receives its series (nil-safe). Set before the Channel is shared.
-	syncSource  string
+	// syncRefresh configures SYNC (PresenceSync); metrics receives its
+	// series (nil-safe). Set before the Channel is shared.
 	syncRefresh time.Duration
 	metrics     *metrics.Metrics
 
@@ -193,7 +192,6 @@ func newChannel(name string) *Channel {
 		tail:        newEntry(nil, 0),
 		bound:       make(chan struct{}),
 		released:    make(chan struct{}),
-		syncSource:  PresenceSyncLocal,
 		syncRefresh: DefaultPresenceSyncRefresh,
 	}
 }

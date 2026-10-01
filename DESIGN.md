@@ -2441,7 +2441,6 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
---presence-sync-source local  where an attach's presence SYNC comes from: local (the node's member set) or store (§12.4)
 --presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
 --presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
 --presence-lease-mode node    cluster mode: presence liveness lease per node (node) or per member row (member) (§12.5)
@@ -2465,7 +2464,7 @@ Configuration may also be supplied via an optional TOML config file
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`,
-`publish-queue-max`, `presence-sync-source`,
+`publish-queue-max`,
 `presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
@@ -2515,6 +2514,11 @@ in a warning at startup.
   publish at once, the leading edge that was its `0s` default (§6.3
   "Publish batching"). A linger floor gave no measured gain in the scale
   runs; the batch depth it aimed at is set by the lane count instead.
+- `--presence-sync-source` (`presence-sync-source`): a node always serves
+  an attach's presence `SYNC` from its own member set, the `local`
+  default (§12.4), and reads the store only when seeding that set fails
+  (`ably_presence_syncs_total{snapshot="fallback"}`); `store`, a store
+  read per attach, is gone with its `snapshot="store"` series value.
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -2655,8 +2659,7 @@ name = "persisted:presence_fixtures"
     the SYNC snapshots served, by how each was obtained: `cached` (the
     channel's current snapshot), `waited` (rebuilt by another attach
     after waiting out the refresh window), `built` (rebuilt from
-    the node's member set), `store` (`--presence-sync-source=store`),
-    `fallback` (a store read because seeding the member set failed); and
+    the node's member set), `fallback` (a store read because seeding the member set failed); and
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
     the store: at most one per channel bind, plus one after a skipped bus
     gap (§7.2) and one after each sweep that found the channel with no
@@ -3034,9 +3037,8 @@ attach point: an SDK takes the set as final once the sync ends
 (`presence.get()` returns it), so operations the snapshot misses cannot
 follow in a later frame.
 
-**Where the snapshot comes from** (`--presence-sync-source`, default
-`local`). In `local` mode a node serves `SYNC` from its own copy of the
-channel's member set, held by the node's `core.Channel` (§5.1) as a cache
+**Where the snapshot comes from.** A node serves `SYNC` from its own copy
+of the channel's member set, held by the node's `core.Channel` (§5.1) as a cache
 of the store's set as of a serial:
 
 - It is **seeded** from `Members` the first time a `SYNC` needs it after
@@ -3082,9 +3084,8 @@ of the store's set as of a serial:
   disk backends deliver each presence cm under the lock that mints it,
   so their cms also arrive in serial order.
 
-In `store` mode every `SYNC` reads `Members` from the store, as before the
-local set existed. Either way the store's set stays authoritative (§12.5):
-`GET .../presence` and the delayed-LEAVE checks always read the store.
+The store's set stays authoritative (§12.5): `GET .../presence` and the
+delayed-LEAVE checks always read the store.
 Series: `ably_presence_syncs_total{snapshot}`,
 `ably_presence_sync_seeds_total` (§10).
 

@@ -122,11 +122,7 @@
 # publish-linger-max = "5ms"
 # publish-queue-max = 10000
 
-# The presence path (DESIGN.md §12.4, §12.5). presence-sync-source picks
-# where an attach's SYNC comes from: "local" (this node's member set,
-# seeded from the store once per channel bind and kept current from the
-# presence events the node delivers) or "store" (a store read per
-# attach). Cluster mode: presence-batching commits presence enter,
+# The presence path (DESIGN.md §12.5). Cluster mode: presence-batching commits presence enter,
 # update and leave in the publish lanes' batches (false: each in its own
 # transaction); presence-max-inflight bounds the presence writes
 # committed in their own transaction at once per database, beyond which
@@ -136,7 +132,6 @@
 # every 10s; the members of a node whose lease lapses are reaped) or
 # "member" (a lease on every member row, all renewed every 10s by one
 # UPDATE). Every node sharing a database should use the same mode.
-# presence-sync-source = "local"
 # presence-batching = true
 # presence-max-inflight = 0
 # presence-lease-mode = "node"

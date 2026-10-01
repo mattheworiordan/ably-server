@@ -68,13 +68,12 @@ type File struct {
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
-	// The presence path (DESIGN.md §12.4, §12.5, §9): the SYNC source
-	// ("local" or "store"), whether presence writes join the publish
+	// The presence path (DESIGN.md §12.5, §9): whether presence writes
+	// join the publish
 	// batches (a pointer, since its default is true and a file must be
 	// able to turn it off), the bound on unbatched presence writes
 	// in flight (zero means absent), and the liveness lease mode ("node"
 	// or "member").
-	PresenceSyncSource  string `toml:"presence-sync-source"`
 	PresenceBatching    *bool  `toml:"presence-batching"`
 	PresenceMaxInflight int    `toml:"presence-max-inflight"`
 	PresenceLeaseMode   string `toml:"presence-lease-mode"`
