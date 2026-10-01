@@ -237,10 +237,12 @@ func (ls *laneSet) close() {
 		}
 		close(done)
 	}()
+	grace := time.NewTimer(laneCloseGrace)
 	select {
 	case <-done:
-	case <-time.After(laneCloseGrace):
+	case <-grace.C:
 	}
+	grace.Stop()
 	ls.cancel()
 	<-done
 }

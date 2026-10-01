@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"testing"
@@ -326,5 +327,54 @@ func TestChainHoldMapIsCappedAndOverflowForcesAGapFill(t *testing.T) {
 	}
 	if left != 0 {
 		t.Errorf("pending after the fill = %d, want 0", left)
+	}
+}
+
+// Closing the Storage stops every bound channel's gap-fill timer, and a
+// closed Storage arms none, so no fill starts against a closing pool.
+func TestStorageCloseStopsGapTimers(t *testing.T) {
+	cs, _ := newTestChain(t)
+	cs.seed("s0")
+	cs.deliverChained(ev("s2", "s1")) // s1 never arrives: arms the gap fill
+	if cs.gapTimer == nil {
+		t.Fatal("gap fill not armed")
+	}
+	s := &Storage{channels: map[string]*channelStore{"room": cs}}
+	s.stopGapTimers()
+	if cs.gapTimer != nil {
+		t.Fatal("gap timer still armed after stopGapTimers")
+	}
+}
+
+func TestClosedStorageArmsNoGapFill(t *testing.T) {
+	rec := &chainRecorder{}
+	done := make(chan struct{})
+	close(done)
+	cs := &channelStore{
+		name: "room", appender: rec, logger: logging.Default(), done: done,
+		timing: chainTiming{gapDelay: time.Millisecond, gapMaxDelay: time.Millisecond, fetchTimeout: time.Second},
+	}
+	cs.seed("s0")
+	cs.deliverChained(ev("s2", "s1"))
+	if cs.gapTimer != nil {
+		t.Fatal("a closed Storage armed a gap fill")
+	}
+}
+
+// Log reads of the delivery point run on the Storage's loop context, so
+// closing the Storage cancels one in flight.
+func TestFetchContextFollowsTheStorageLoopContext(t *testing.T) {
+	loop, cancel := context.WithCancel(context.Background())
+	cs := &channelStore{ctx: loop, timing: chainTiming{fetchTimeout: time.Hour}}
+	ctx, done := cs.fetchContext()
+	defer done()
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) < 59*time.Minute {
+		t.Fatalf("fetch context deadline = %v (ok=%v), want the fetch timeout", dl, ok)
+	}
+	cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("fetch context not cancelled when the loop context was")
 	}
 }

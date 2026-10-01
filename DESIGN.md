@@ -2592,7 +2592,12 @@ On SIGTERM the server enters a graceful shutdown:
    (§12.5) already past its timer to finish writing, so none fires after
    the storage is closed. Pending ones that have not reached their timer
    are abandoned: the node's members go with it.
-5. Close storage.
+5. Close storage. For the Postgres backend this finishes in-flight publish
+   batches (up to 5 seconds, then cancels them), cancels the background
+   loops, stops every channel's pending gap-fill timer, and cancels a gap
+   fill or pointer read in flight (they run on the storage's own context,
+   with a 10 second fetch timeout) before it releases the pool, so closing
+   never waits on a log read.
 
 In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection

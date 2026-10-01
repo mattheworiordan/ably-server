@@ -673,6 +673,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		bus:       s.bus,
 		logger:    s.logger,
 		done:      s.done,
+		ctx:       s.loopCtx,
 		timing:    s.timing,
 		stats:     &s.stats,
 	}
@@ -746,6 +747,7 @@ func (s *Storage) close(graceful bool) error {
 			s.lanes.close() // finish in-flight batches before the bus stops
 		}
 		s.cancel()
+		s.stopGapTimers()
 		s.wg.Wait()
 		if graceful && s.leaseNode {
 			s.releaseNodeLease()
@@ -754,6 +756,23 @@ func (s *Storage) close(graceful bool) error {
 		s.pool.Close()
 	})
 	return nil
+}
+
+// stopGapTimers stops every bound channel's pending gap-fill timer, so no
+// fill starts against the pool once Close is releasing it. A fill already
+// reading the log runs on the cancelled loop context and ends at once.
+func (s *Storage) stopGapTimers() {
+	s.mu.Lock()
+	stores := make([]*channelStore, 0, len(s.channels))
+	for _, cs := range s.channels {
+		stores = append(stores, cs)
+	}
+	s.mu.Unlock()
+	for _, cs := range stores {
+		cs.hwmMu.Lock()
+		cs.stopGapFillLocked()
+		cs.hwmMu.Unlock()
+	}
 }
 
 // Collectors returns the backend's Prometheus collectors (the
@@ -1090,6 +1109,7 @@ type channelStore struct {
 	bus       Bus
 	logger    *logging.Logger
 	done      <-chan struct{} // the owning Storage's shutdown signal
+	ctx       context.Context // the owning Storage's loop context (nil in unit-test stubs)
 	timing    chainTiming
 	stats     *busStats // the owning Storage's bus counters (nil in unit tests)
 	pgChan    string    // the postgres bus's notification channel (pgChannelName)

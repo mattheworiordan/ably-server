@@ -129,6 +129,18 @@ type busEvent struct {
 	heldAt  time.Time // when the delivery point first held it (zero if never held)
 }
 
+// fetchContext is the context of one log read by the delivery point (a
+// pointer's body, a gap-fill page): the Storage's loop context, so closing
+// the Storage cancels a read in flight instead of leaving pool.Close to
+// wait for it, bounded by the fetch timeout.
+func (cs *channelStore) fetchContext() (context.Context, context.CancelFunc) {
+	parent := cs.ctx
+	if parent == nil {
+		parent = context.Background() // a unit-test stub with no Storage
+	}
+	return context.WithTimeout(parent, cs.timing.fetchTimeout)
+}
+
 // resolvePointer reads a pointer event's body from the log, outside
 // hwmMu, so a slow read never blocks the channel's other deliveries (the
 // publisher fast path among them). An event the delivery point would
@@ -139,7 +151,7 @@ func (cs *channelStore) resolvePointer(ev busEvent) busEvent {
 	if ev.cm != nil || ev.serial <= cs.watermark() {
 		return ev
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
+	ctx, cancel := cs.fetchContext()
 	defer cancel()
 	cm, err := loadChannelMessagePool(ctx, cs.pool, cs.name, ev.serial)
 	if err != nil {
@@ -378,7 +390,7 @@ func (cs *channelStore) appendTimed(cm *protocol.ChannelMessage) {
 // or a fill is in flight (the fill re-arms when it finishes if a gap is
 // left), so fills never overlap.
 func (cs *channelStore) armGapFillLocked(d time.Duration) {
-	if cs.gapTimer != nil || cs.filling {
+	if cs.gapTimer != nil || cs.filling || cs.closed() {
 		return
 	}
 	cs.gapTimer = time.AfterFunc(d, cs.fillGap)
@@ -416,7 +428,7 @@ func (cs *channelStore) fillGap() {
 	cs.hwmMu.Unlock()
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
+		ctx, cancel := cs.fetchContext()
 		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, cs.rangeFloor(), rangePageSize)
 		cancel()
 
