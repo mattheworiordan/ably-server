@@ -2,7 +2,9 @@ package loadgen
 
 import (
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,12 +44,14 @@ type RunRecord struct {
 	Fault     *FaultRecord `json:"fault,omitempty"`
 	// ServerBoundPerAttachment is BoundRatio: server channels bound over
 	// generator attachments at the end of the hold.
-	ServerBoundPerAttachment float64  `json:"server_channels_bound_per_generator_attachment,omitempty"`
-	Checks                   []Check  `json:"checks"`
-	Pass                     bool     `json:"pass"`
-	Verdict                  string   `json:"verdict"`
-	Errors                   []string `json:"errors,omitempty"`
-	Jobs                     []JobRef `json:"jobs"`
+	ServerBoundPerAttachment float64 `json:"server_channels_bound_per_generator_attachment,omitempty"`
+	Checks                   []Check `json:"checks"`
+	// UnsampledNote says what covers the channels outside the sample.
+	UnsampledNote string   `json:"unsampled_note,omitempty"`
+	Pass          bool     `json:"pass"`
+	Verdict       string   `json:"verdict"`
+	Errors        []string `json:"errors,omitempty"`
+	Jobs          []JobRef `json:"jobs"`
 }
 
 // JobRef names one generator job of the run.
@@ -395,6 +399,11 @@ func faultRelaxed(rec *RunRecord) bool {
 	return rec.Fault != nil && rec.Fault.ExitCode == 0
 }
 
+// pctOf renders a fraction as a percentage without trailing zeros.
+func pctOf(f float64) string {
+	return strconv.FormatFloat(math.Round(f*10000)/100, 'f', -1, 64) + "%"
+}
+
 func msOf(us uint64) string { return fmt.Sprintf("%.1f ms", float64(us)/1000) }
 
 // Evaluate applies the pass criteria (plan §8) to a run record, filling
@@ -487,10 +496,19 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Note: fmt.Sprintf("generator dropped %d scheduled publishes", p.Dropped)})
 		add(Check{Name: "rejected publishes", Value: fmt.Sprint(p.Rejected), Limit: "0", Pass: p.Rejected == 0, Gating: true})
 	}
+	// Channels outside the sample have no per-message check: this is the
+	// only thing that would notice loss on them.
+	minDel := spec.MinDeliveryRatio
+	if faultRelaxed(rec) {
+		minDel = min(minDel, spec.MinDeliveryRatioFault)
+	}
+	rec.UnsampledNote = fmt.Sprintf("Unsampled channels are covered only by the deliveries-vs-plan gate (>= %s of planned deliveries/s); loss below %s there is not detected.",
+		pctOf(minDel), pctOf(1-minDel))
 	if want := rec.Plan.DeliveriesPerSec; want > 0 {
 		ratio := res.Deliveries.Rate / want
-		add(Check{Name: "deliveries vs plan", Value: fmt.Sprintf("%.0f of %.0f/s (%.0f%%)", res.Deliveries.Rate, want, ratio*100),
-			Limit: fmt.Sprintf(">= %.0f%%", spec.MinDeliveryRatio*100), Pass: ratio >= spec.MinDeliveryRatio, Gating: true})
+		add(Check{Name: "deliveries vs plan", Value: fmt.Sprintf("%.0f of %.0f/s (%.2f%%)", res.Deliveries.Rate, want, ratio*100),
+			Limit: ">= " + pctOf(minDel), Pass: ratio >= minDel, Gating: true,
+			Note: fmt.Sprintf("%d of %d channels sampled; the rest are covered only by this gate", rec.Plan.SampledSubscribed, rec.Plan.SubscribedChannels)})
 	}
 	if c := res.Connections; c.Target > 0 {
 		want := float64(c.Target) * (1 - spec.MaxConnectionLoss)
@@ -581,6 +599,9 @@ func (rec *RunRecord) Markdown() string {
 			note = " (" + c.Note + ")"
 		}
 		fmt.Fprintf(&b, "| %s | %s%s | %s | %s |\n", c.Name, c.Value, note, c.Limit, res)
+	}
+	if rec.UnsampledNote != "" {
+		fmt.Fprintf(&b, "\n%s\n", rec.UnsampledNote)
 	}
 	r := rec.Result
 	b.WriteString("\n| Measure | Planned | Measured |\n|---|---|---|\n")

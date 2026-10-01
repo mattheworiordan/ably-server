@@ -185,8 +185,14 @@ type PassSpec struct {
 	// TailMargin: clock margin for the tail-loss check (default 1s).
 	TailMargin Duration `toml:"tail_margin" json:"tail_margin"`
 	// MinDeliveryRatio: deliveries/s measured over the plan's (default
-	// 0.9). Catches load that was planned but never generated.
+	// 0.99). Catches load that was planned but never generated, and is
+	// the only check on channels outside the sample, so loss on them
+	// below 1 - MinDeliveryRatio is not detected.
 	MinDeliveryRatio float64 `toml:"min_delivery_ratio" json:"min_delivery_ratio"`
+	// MinDeliveryRatioFault is the same for a run whose fault injection
+	// ran (default 0.9): a killed node's clients are away while they
+	// reconnect.
+	MinDeliveryRatioFault float64 `toml:"min_delivery_ratio_fault" json:"min_delivery_ratio_fault"`
 	// MaxLoadDrift: allowed change of the generator's own connections
 	// and attachments from the start to the end of the hold (default
 	// 0.03). Beyond it the run is invalid: node growth would measure the
@@ -200,19 +206,20 @@ type PassSpec struct {
 // DefaultPass returns plan §8's criteria.
 func DefaultPass() PassSpec {
 	return PassSpec{
-		DeliveryP50:        Duration{50 * time.Millisecond},
-		DeliveryP99:        Duration{250 * time.Millisecond},
-		DeliveryP99Str:     Duration{100 * time.Millisecond},
-		RestAckP99:         Duration{100 * time.Millisecond},
-		ConnectAttachP99:   Duration{500 * time.Millisecond},
-		MinAchievedRatio:   0.95,
-		MaxMemoryGrowth:    0.10,
-		MaxGoroutineGrowth: 0.10,
-		MaxConnectionLoss:  0.01,
-		TailMargin:         Duration{time.Second},
-		MinDeliveryRatio:   0.9,
-		MaxLoadDrift:       0.03,
-		MinAttachCoverage:  0.9,
+		DeliveryP50:           Duration{50 * time.Millisecond},
+		DeliveryP99:           Duration{250 * time.Millisecond},
+		DeliveryP99Str:        Duration{100 * time.Millisecond},
+		RestAckP99:            Duration{100 * time.Millisecond},
+		ConnectAttachP99:      Duration{500 * time.Millisecond},
+		MinAchievedRatio:      0.95,
+		MaxMemoryGrowth:       0.10,
+		MaxGoroutineGrowth:    0.10,
+		MaxConnectionLoss:     0.01,
+		TailMargin:            Duration{time.Second},
+		MinDeliveryRatio:      0.99,
+		MinDeliveryRatioFault: 0.9,
+		MaxLoadDrift:          0.03,
+		MinAttachCoverage:     0.9,
 	}
 }
 
@@ -251,6 +258,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinDeliveryRatio == 0 {
 		p.MinDeliveryRatio = d.MinDeliveryRatio
+	}
+	if p.MinDeliveryRatioFault == 0 {
+		p.MinDeliveryRatioFault = d.MinDeliveryRatioFault
 	}
 	if p.MaxLoadDrift == 0 {
 		p.MaxLoadDrift = d.MaxLoadDrift
@@ -573,14 +583,21 @@ func hash64(s string) uint64 {
 }
 
 // Sampled reports whether the serial-continuity check covers channel j of
-// class c: a deterministic SamplePercent of channels by name hash, plus
-// the first channel of every class so hot and shared channels are always
+// class c: a deterministic SamplePercent of channels by hash, plus the
+// first channel of every class so hot and shared channels are always
 // covered.
+//
+// The hash is of the scenario name, class name and channel index, not of
+// the channel name, so the run tag (which is in the name, to keep runs
+// from sharing idempotency keys) does not move the sample: the same
+// scenario samples the same channels in every run, and two runs are
+// comparable on what they covered. The multiplier does not move it
+// either, except that channels beyond the base count exist only above 1x.
 func (p *Plan) Sampled(c *ResolvedClass, j int) bool {
 	if j == 0 && p.Scenario.SamplePercent > 0 {
 		return true
 	}
-	return hash64(p.ChannelName(c, j))%10000 < p.sampleCut
+	return hash64(p.Scenario.Name+"|"+c.Name+"|"+strconv.Itoa(j))%10000 < p.sampleCut
 }
 
 // PubID names stream l of a channel. It carries the run tag so two runs
@@ -595,10 +612,13 @@ type Totals struct {
 	Attachments int64 `json:"attachments"`
 	// ChurnSlots are held on top of Attachments: the generator should
 	// hold Attachments + ChurnSlots attachments through the hold.
-	ChurnSlots         int     `json:"churn_slots"`
-	Channels           int     `json:"channels"`
-	SubscribedChannels int     `json:"subscribed_channels"`
-	SampledChannels    int     `json:"sampled_channels"`
+	ChurnSlots         int `json:"churn_slots"`
+	Channels           int `json:"channels"`
+	SubscribedChannels int `json:"subscribed_channels"`
+	SampledChannels    int `json:"sampled_channels"`
+	// SampledSubscribed counts the sampled channels that have at least
+	// one subscriber: only those are checked.
+	SampledSubscribed  int     `json:"sampled_subscribed_channels"`
 	PublishesPerSec    float64 `json:"publishes_per_sec"`
 	RESTPublishesPerS  float64 `json:"rest_publishes_per_sec"`
 	RTPublishesPerSec  float64 `json:"realtime_publishes_per_sec"`
@@ -654,6 +674,9 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 			}
 			if p.Sampled(c, j) {
 				t.SampledChannels++
+				if n > 0 {
+					t.SampledSubscribed++
+				}
 			}
 			ct.DeliveriesPerSec += float64(n) * c.RatePerChannel
 		}

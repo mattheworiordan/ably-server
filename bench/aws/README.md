@@ -304,7 +304,7 @@ claims settled (`min_attach_coverage`; reported, not gated, in a fault
 run that succeeded); achieved publish rate >= 95% of offered and offered >=
 95% of target (the generator kept up); no rejected publishes;
 connections open at the end of the hold >= 99% of target; deliveries/s
->= 90% of the plan's; the generator's own connections and attachments
+>= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
 within ±3% from hold start to end (else node growth would measure the
 generator); node RSS and goroutines grow <= 10% from the growth baseline
 to the end of the hold (reported, not gated, in a fault run). The record sets the generator's connections
@@ -337,7 +337,7 @@ run that must judge memory needs a hold of several idle timeouts (the
 #### What the correctness check sees
 
 "0 violations in N checked" is narrower than it reads. The check covers
-the *sampled* channels only (the next section lists the rest), and within
+the *sampled* channels only (see "Unsampled channels" below), and within
 them:
 
 - **From the first message on.** An attachment learns a stream's sequence
@@ -375,6 +375,19 @@ them:
   stretch would not be seen as missing. A message published to a sampled
   channel by someone other than a generator stream is ignored.
 
+**Unsampled channels.** `sample_percent` of channels (plus the first of
+every class) get the per-message checks; the other 95% in shapes F, M and
+D do not. Their only check is the deliveries-vs-plan gate: measured
+deliveries/s over the plan's, at least **99%** outside a fault run (90%
+in one that ran, `min_delivery_ratio_fault`). Loss on unsampled channels
+below 1% is therefore **not detected**, and `summary.md` says so with the
+gate's actual value. The sample is a hash of scenario name, class name
+and channel index, so it does not change with the run tag: the same
+scenario samples the same channels in every run. (It does change if the
+scenario's name, class names or channel counts change.) The sampled
+channels that have at least one subscriber are the ones checked; the
+plan and the summary count them separately.
+
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
 the node and shard curves.
@@ -391,7 +404,7 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     nodes = 10                 # node count (node curve parameter)
     shards = 1                 # Postgres shards (shard curve parameter)
     message_bytes = 470
-    sample_percent = 5         # channels under the serial-continuity check
+    sample_percent = 5         # channels under the per-message checks (the rest: delivery-rate gate only)
     server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline; absent or "0s" = 60s;
                                 # to measure growth from hold start pass --server-idle-timeout 0)
 
@@ -438,7 +451,9 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_goroutine_growth = 0.10
     max_connection_loss = 0.01
     tail_margin = "1s"
-    min_delivery_ratio = 0.9     # deliveries/s measured over planned
+    min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
+    min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded
+    min_attach_coverage = 0.9    # share of attach claims the serial logs must settle
     max_load_drift = 0.03        # generator connections and attachments, hold start to end
 
 `ably-conductor plan` prints the derived connections, attachments,

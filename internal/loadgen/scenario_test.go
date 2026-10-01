@@ -3,6 +3,7 @@ package loadgen
 import (
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -336,5 +337,36 @@ func TestScenarioServerIdleTimeout(t *testing.T) {
 		if got := sc.IdleTimeout(); got != want {
 			t.Errorf("%s: IdleTimeout = %s, want %s", toml, got, want)
 		}
+	}
+}
+
+func TestSampledSetIsIndependentOfTheRunTag(t *testing.T) {
+	sc, err := ParseScenario([]byte(testScenario))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.SamplePercent = 20
+	sampled := func(tag string) []string {
+		p, err := sc.Resolve(1, 1, tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for ci := range p.Classes {
+			c := &p.Classes[ci]
+			for j := 0; j < c.ChannelCount; j++ {
+				if p.Sampled(c, j) {
+					out = append(out, c.Name+"-"+strconv.Itoa(j))
+				}
+			}
+		}
+		return out
+	}
+	a, b := sampled("runA"), sampled("runB")
+	if len(a) == 0 {
+		t.Fatal("nothing sampled")
+	}
+	if strings.Join(a, ",") != strings.Join(b, ",") {
+		t.Fatalf("the sampled set moved with the run tag:\n%v\n%v", a, b)
 	}
 }
