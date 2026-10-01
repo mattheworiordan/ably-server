@@ -1,6 +1,9 @@
 package loadgen
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -887,5 +890,87 @@ func TestEvaluateGeneratorCPU(t *testing.T) {
 		if c.Name == "generator CPU" && c.Value != "not measured" {
 			t.Fatalf("%q", c.Value)
 		}
+	}
+}
+
+const nodeMetricsText = `# HELP ably_publish_lanes Publish batching lanes
+# TYPE ably_publish_lanes gauge
+ably_publish_lanes 2
+ably_publish_linger_max_seconds 0.005
+ably_publish_linger_min_seconds 0
+ably_storage_shards 1
+ably_bus_info{bus="nats",mode="notify"} 1
+process_resident_memory_bytes 1.5e+09
+ably_connections_open 100
+`
+
+func TestParseMetricLabels(t *testing.T) {
+	got, err := ParseMetricLabels(strings.NewReader(nodeMetricsText+"ably_bus_info{bus=\"a\\\"b\",mode=\"\"} 1\nother{x=\"1\"} 2\n"), "ably_bus_info")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("%v %v", got, err)
+	}
+	if got[0]["bus"] != "nats" || got[0]["mode"] != "notify" || got[1]["bus"] != `a"b` || got[1]["mode"] != "" {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestScrapeNodeReadsServerConfiguration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(nodeMetricsText)) }))
+	defer srv.Close()
+	s := scrapeNode(context.Background(), srv.Client(), "n1", srv.URL, PhaseHoldStart)
+	if s.Error != "" || s.Values[metricPublishLanes] != 2 || s.Info["bus"] != "nats" || s.Info["mode"] != "notify" {
+		t.Fatalf("%+v", s)
+	}
+	cfgs := ComputeServerConfig([]NodeSample{s})
+	if len(cfgs) != 1 || flagString(cfgs[0].Flags) != "publish-lanes=2 publish-linger-max=5ms publish-linger-min=0s bus=nats bus-notify-mode=notify storage-shards=1" {
+		t.Fatalf("%+v: %q", cfgs, flagString(cfgs[0].Flags))
+	}
+}
+
+func cfgNode(node, lanes string) NodeConfig {
+	return NodeConfig{Node: node, Flags: map[string]string{FlagPublishLanes: lanes, FlagBus: "nats", FlagStorageShards: "1"}}
+}
+
+func TestEvaluateServerConfiguration(t *testing.T) {
+	with := func(cfgs ...NodeConfig) *RunRecord {
+		return evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s == nil {
+				r.ServerConfig = cfgs
+				r.Bus, r.Shards = "nats", 1
+			}
+		})
+	}
+	rec := with(cfgNode("n1", "2"), cfgNode("n2", "2"), cfgNode("n3", "2"))
+	mustNotFail(t, rec, "server configuration identical on every node")
+	md := rec.Markdown()
+	if !strings.Contains(md, "Server flags in effect, read from the nodes' /metrics (identical on 3 of 3 nodes): publish-lanes=2 bus=nats storage-shards=1 (bus sweep interval: not exported by the nodes).") {
+		t.Fatalf("summary.md must print the flags the nodes ran with:\n%s", md)
+	}
+	mixed := with(cfgNode("n1", "2"), cfgNode("n2", "2"), cfgNode("n3", "4"))
+	mustFail(t, mixed, "server configuration identical on every node")
+	if md := mixed.Markdown(); !strings.Contains(md, "THE NODES DISAGREE") || !strings.Contains(md, "- n3: publish-lanes=4") {
+		t.Fatalf("%s", md)
+	}
+	// The record's shard count must be the nodes'.
+	rec = evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.ServerConfig = []NodeConfig{cfgNode("n1", "2")}
+			r.Shards = 3
+		}
+	})
+	mustFail(t, rec, "recorded shard count matches the nodes")
+	// A bus name that differs is reported, not gated.
+	rec = evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.ServerConfig = []NodeConfig{cfgNode("n1", "2")}
+			r.Bus = "pgnotify"
+		}
+	})
+	mustNotFail(t, rec, "recorded bus matches the nodes")
+	// Memory-mode nodes export none of it: reported as such.
+	rec = with(NodeConfig{Node: "n1", Flags: map[string]string{}})
+	mustNotFail(t, rec, "server configuration")
+	if !strings.Contains(rec.Markdown(), "none reported") {
+		t.Fatal(rec.Markdown())
 	}
 }

@@ -56,6 +56,9 @@ type RunRecord struct {
 	// --allow-unmeasured: node metrics and box CPU coverage are then
 	// reported, not gated, and the run is not fit to quote.
 	UnmeasuredWaived bool `json:"unmeasured_waived,omitempty"`
+	// ServerConfig is the configuration each node reported on /metrics
+	// (publish lanes, linger, bus, storage shards): what the run ran with.
+	ServerConfig []NodeConfig `json:"server_config,omitempty"`
 	// UnsampledNote says what covers the channels outside the sample.
 	UnsampledNote string   `json:"unsampled_note,omitempty"`
 	Pass          bool     `json:"pass"`
@@ -72,6 +75,118 @@ type ClockRecord struct {
 	Start *ClockOffset `json:"start,omitempty"`
 	End   *ClockOffset `json:"end,omitempty"`
 	Error string       `json:"error,omitempty"`
+}
+
+// NodeConfig is the server configuration one node reported on /metrics,
+// from its last good scrape. Flags is keyed by the server flag the value
+// came from; a flag the node did not export is absent.
+type NodeConfig struct {
+	Node  string            `json:"node"`
+	Flags map[string]string `json:"flags"`
+}
+
+// Server flag names used as NodeConfig keys.
+const (
+	FlagPublishLanes     = "publish-lanes"
+	FlagLingerMax        = "publish-linger-max"
+	FlagLingerMin        = "publish-linger-min"
+	FlagStorageShards    = "storage-shards"
+	FlagBus              = "bus"
+	FlagBusNotifyMode    = "bus-notify-mode"
+	FlagBusSweepInterval = "bus-sweep-interval"
+)
+
+var serverFlagOrder = []string{FlagPublishLanes, FlagLingerMax, FlagLingerMin, FlagBus, FlagBusNotifyMode, FlagBusSweepInterval, FlagStorageShards}
+
+// ComputeServerConfig reads each node's configuration from its last good
+// scrape. Nodes appear in name order; one that never exported any of the
+// configuration gauges (memory or disk mode, or no metrics URL) has empty
+// Flags.
+func ComputeServerConfig(samples []NodeSample) []NodeConfig {
+	last := map[string]NodeSample{}
+	for _, s := range samples {
+		if s.Error != "" || s.Values == nil {
+			continue
+		}
+		if old, ok := last[s.Node]; !ok || s.AtUS >= old.AtUS {
+			last[s.Node] = s
+		}
+	}
+	names := make([]string, 0, len(last))
+	for n := range last {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	secs := func(v float64) string { return time.Duration(math.Round(v*1e6) * 1e3).String() }
+	var out []NodeConfig
+	for _, n := range names {
+		s := last[n]
+		f := map[string]string{}
+		if v, ok := s.Values[metricPublishLanes]; ok {
+			f[FlagPublishLanes] = strconv.FormatFloat(v, 'f', -1, 64)
+		}
+		if v, ok := s.Values[metricLingerMax]; ok {
+			f[FlagLingerMax] = secs(v)
+		}
+		if v, ok := s.Values[metricLingerMin]; ok {
+			f[FlagLingerMin] = secs(v)
+		}
+		if v, ok := s.Values[metricStorageShards]; ok {
+			f[FlagStorageShards] = strconv.FormatFloat(v, 'f', -1, 64)
+		}
+		if v, ok := s.Values[metricBusSweepInterval]; ok {
+			f[FlagBusSweepInterval] = secs(v)
+		}
+		if b := s.Info["bus"]; b != "" {
+			f[FlagBus] = b
+		}
+		if m := s.Info["mode"]; m != "" {
+			f[FlagBusNotifyMode] = m
+		}
+		out = append(out, NodeConfig{Node: n, Flags: f})
+	}
+	return out
+}
+
+// flagString renders a node's flags in a fixed order.
+func flagString(f map[string]string) string {
+	var parts []string
+	for _, k := range serverFlagOrder {
+		if v, ok := f[k]; ok {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// ServerConfigVariants groups the reporting nodes by identical flags,
+// most nodes first; unreported counts nodes that exported none.
+func ServerConfigVariants(cfgs []NodeConfig) (variants []ConfigVariant, unreported int) {
+	idx := map[string]int{}
+	for _, c := range cfgs {
+		if len(c.Flags) == 0 {
+			unreported++
+			continue
+		}
+		k := flagString(c.Flags)
+		i, ok := idx[k]
+		if !ok {
+			i = len(variants)
+			idx[k] = i
+			variants = append(variants, ConfigVariant{Flags: c.Flags, Text: k})
+		}
+		variants[i].Nodes = append(variants[i].Nodes, c.Node)
+	}
+	sort.SliceStable(variants, func(a, b int) bool { return len(variants[a].Nodes) > len(variants[b].Nodes) })
+	return variants, unreported
+}
+
+// ConfigVariant is one distinct server configuration and the nodes that
+// reported it.
+type ConfigVariant struct {
+	Flags map[string]string
+	Text  string
+	Nodes []string
 }
 
 // AgentCPU is one agent box's busy CPU fraction between the start and the
@@ -561,6 +676,26 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: "< " + pctOf(spec.MaxNegativeLatency), Pass: frac < spec.MaxNegativeLatency, Gating: true,
 			Note: "latency from the actual send time below zero: the subscriber's clock is behind the publisher's"})
 	}
+	if len(rec.ServerConfig) > 0 {
+		variants, unreported := ServerConfigVariants(rec.ServerConfig)
+		switch {
+		case len(variants) == 0:
+			add(Check{Name: "server configuration", Value: "not reported by any node", Limit: "reported", Pass: true, Gating: false,
+				Note: "the nodes export their write-path flags only in cluster mode, and the inventory needs their metrics URLs"})
+		default:
+			add(Check{Name: "server configuration identical on every node", Value: fmt.Sprintf("%d configuration(s) on %d reporting nodes", len(variants), len(rec.ServerConfig)-unreported),
+				Limit: "1", Pass: len(variants) == 1, Gating: true, Note: fmt.Sprintf("%d nodes reported none", unreported)})
+			v := variants[0].Flags
+			if rec.Shards > 0 && v[FlagStorageShards] != "" && v[FlagStorageShards] != strconv.Itoa(rec.Shards) {
+				add(Check{Name: "recorded shard count matches the nodes", Value: fmt.Sprintf("record %d, nodes report %s", rec.Shards, v[FlagStorageShards]),
+					Limit: "equal", Pass: false, Gating: true, Note: "the run would be quoted under the wrong shard count"})
+			}
+			if rec.Bus != "" && v[FlagBus] != "" && !strings.EqualFold(rec.Bus, v[FlagBus]) {
+				add(Check{Name: "recorded bus matches the nodes", Value: fmt.Sprintf("record %q, nodes report %q", rec.Bus, v[FlagBus]),
+					Limit: "equal", Pass: false, Gating: false, Note: "reported only: the inventory may use another name for the same bus"})
+			}
+		}
+	}
 	if len(rec.Clocks) > 0 {
 		var measured, failed int
 		var worst int64
@@ -884,6 +1019,28 @@ func (rec *RunRecord) Markdown() string {
 	}
 	if d := r.Deliveries; d.InWindow > 0 {
 		fmt.Fprintf(&b, "\nDeliveries in the hold: %d; %d with negative latency from the send (clock skew detector).\n", d.InWindow, d.NegativeLatency)
+	}
+	if len(rec.ServerConfig) > 0 {
+		variants, unreported := ServerConfigVariants(rec.ServerConfig)
+		b.WriteString("\nServer flags in effect, read from the nodes' /metrics")
+		switch len(variants) {
+		case 0:
+			b.WriteString(": none reported (the nodes export them only in cluster mode, and the inventory needs their metrics URLs).\n")
+		case 1:
+			fmt.Fprintf(&b, " (identical on %d of %d nodes): %s", len(variants[0].Nodes), len(rec.ServerConfig), variants[0].Text)
+			if _, ok := variants[0].Flags[FlagBusSweepInterval]; !ok {
+				b.WriteString(" (bus sweep interval: not exported by the nodes)")
+			}
+			b.WriteString(".\n")
+		default:
+			b.WriteString(": THE NODES DISAGREE.\n\n")
+			for _, v := range variants {
+				fmt.Fprintf(&b, "- %s: %s\n", strings.Join(v.Nodes, ", "), v.Text)
+			}
+		}
+		if unreported > 0 && len(variants) > 0 {
+			fmt.Fprintf(&b, "%d nodes reported no flags.\n", unreported)
+		}
 	}
 	if len(rec.AgentCPU) > 0 {
 		b.WriteString("\n| Agent box | Kind | CPU busy over the hold |\n|---|---|---|\n")

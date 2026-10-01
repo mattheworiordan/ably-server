@@ -244,7 +244,7 @@ Optional, with defaults:
 | `ACTIVE_STORAGE` | first created | Which storage type the nodes use (`io2` or `gp3`). |
 | `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag, for the shipped image in run 1a). |
 | `SERVER_TAG`, `LOADGEN_TAG` | from STATE | Image tags in the registry. |
-| `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). |
+| `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). The proof ran with `--publish-lanes=2`: set `ABLY_SERVER_EXTRA_FLAGS="--publish-lanes=2"` to reproduce it. Empty means the code default, which differs (4 on this branch, DESIGN.md §6.3): with 10 to 20 nodes each lane finds little queued, so fewer lanes per node give deeper batches at the same write rate, while a smaller fleet may prefer the default. The run's `summary.md` prints the lane count the nodes reported (`ably_publish_lanes`); quote that, not this table. |
 | `NODE_GOMAXPROCS`, `NODE_GOMEMLIMIT` | unset, `13GiB` | Go runtime settings on the nodes. |
 | `NATS_IP_OFFSET`, `NATS_IMAGE` | 10, `nats:2.11` | NATS servers take the addresses from this offset in the subnet. Every third party image name (`PG_IMAGE`, `PGBENCH_IMAGE`, `NATS_IMAGE`, ...) is resolved through `BASE_IMAGE_REGISTRY`. |
 | `LOADGEN_CMD`, `PUBLISHER_CMD`, `CONDUCTOR_CMD` | see section 7 | The commands run in the `ably-loadgen` image. |

@@ -518,6 +518,7 @@ loop:
 	rec.GrowthBaselineUS = growthBaseline.UnixMicro()
 	rec.NodeStats = ComputeNodeStats(allSamples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
 	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(cfg.Inventory, allSamples, rec.MeasureEndUS, rec.GrowthBaselineUS)
+	rec.ServerConfig = ComputeServerConfig(allSamples)
 	if ns := rec.NodeStats; ns.Measured {
 		cfg.logf("server channels bound (sum of nodes): hold start %.0f, baseline (hold start + %s) %.0f, end %.0f",
 			ns.ChannelsBoundAtStart, idle, ns.ChannelsBoundAtBaseline, ns.ChannelsBoundAtEnd)
@@ -642,6 +643,7 @@ func EvaluateRunDir(runDir string, inv *Inventory) (*RunRecord, error) {
 	rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
 	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
 	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
+	rec.ServerConfig = ComputeServerConfig(rec.NodeStats.Samples)
 	rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
 	Evaluate(&rec, spec)
 	return &rec, nil

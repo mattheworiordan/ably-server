@@ -301,6 +301,15 @@ footprint.
 
 #### Run record (`results/<run-id>/`)
 
+`summary.md` and `summary.json` carry what a quoted run needs to prove
+what it was: the server flags in effect as the nodes report them
+(`ably_publish_lanes`, `ably_publish_linger_max_seconds`,
+`ably_publish_linger_min_seconds`, `ably_bus_info{bus,mode}`,
+`ably_storage_shards`, and `ably_bus_sweep_interval_seconds` if a node
+exports it; none does yet, and the summary says "not exported"), each
+box's clock offset and CPU, the nodes sampled, and the coverage of every
+check. A configuration that differs between nodes fails the run.
+
 - `plan.json`: scenario, multiplier, scale, derived totals, inventory
   (key removed), phase times.
 - `agents/<job-id>.json`: every job's summary.
@@ -309,43 +318,69 @@ footprint.
   and CPU, fault record, checks and verdict.
 - `summary.md`: the same as tables.
 
-Pass criteria (plan §8, overridable per scenario in `[pass]`): delivery
-p50 <= 50 ms and p99 <= 250 ms, from the scheduled send time and
-cross-node where there is such traffic (p99 < 100 ms reported as
-stretch; latency from the actual send time reported); REST ACK p99 <= 100 ms; connect plus
-attach p99 <= 500 ms at the target churn; zero violations of every kind
-on the sample (including `attach_gap`), with at least 90% of attach
-claims settled (`min_attach_coverage`) and the tail check covering at
-least 50% of the sampled streams (`min_tail_coverage`), both reported,
-not gated, in a fault run that succeeded; a run that publishes with no
-sampled channel that has a subscriber fails "sample coverage"; a presence
-run must have compared the end-of-hold REST member set of every sampled
-presence channel with no mismatch and no NACK (NACKs tolerated after a
-successful fault); achieved publish rate >= 95% of offered and offered >=
-95% of target (the generator kept up); no rejected publishes, no unresolved publishes and retries under 1% of
-publishes sent (`max_retry_ratio`; both waived after a successful fault,
-and retries, 429s and unresolved are printed either way); negative
-latency under 0.1% of in-window deliveries and, where the agents can
-measure it, every generator box within 5 ms of NTP at the start and end
-of the run; every inventory node sampled at hold start, at the growth
-baseline (when one falls inside the hold) and at hold end
-("N of M nodes sampled" is printed, with scrape errors), and every
-generator and publisher box under 70% CPU averaged over the hold
-(`max_generator_cpu`; read from the box's `/proc/stat`), so a saturated
-harness cannot produce a quoted number. These coverage and CPU gates,
-the retry, unresolved and delivery-rate gates stand down only for a
-fault run whose hook ran and exited 0: a hook that failed, or never ran
-before the run ended, fails the run ("fault injection") and relaxes
-nothing. `--allow-unmeasured` waives the node-metrics and CPU gates for a
-local run and is recorded as `unmeasured_waived`;
-connections open at the end of the hold >= 99% of target; deliveries/s
->= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
-within ±3% from hold start to end (else node growth would measure the
-generator); node RSS and goroutines grow <= 10% from the growth baseline
-to the end of the hold (reported, not gated, in a fault run). The record sets the generator's connections
-and attachments at hold start and end beside the nodes'
-`ably_connections_open` and `ably_channels_bound`, and gives server
-channels bound over generator attachments at the end of the hold. The footprint (vCPU and memory,
+Pass criteria (plan §8, overridable per scenario in `[pass]`). A run
+passes only if every gating check passes; "fault run" below means a
+`--fault-hook` that ran and exited 0 (see "Fault runs").
+
+*Latency and rates*
+
+- Delivery p50 <= 50 ms and p99 <= 250 ms, from the scheduled send time
+  and cross-node where there is such traffic (p99 < 100 ms reported as
+  stretch; latency from the actual send time reported).
+- REST ACK p99 <= 100 ms; connect plus attach p99 <= 500 ms at the target
+  churn.
+- Achieved publish rate >= 95% of offered; offered >= 95% of target (the
+  generator kept up); no rejected publishes; no unresolved publishes and
+  retries under 1% of publishes sent (`max_retry_ratio`), both waived in a
+  fault run (retries, 429s and unresolved are printed either way).
+- Connections open at the end of the hold >= 99% of target; deliveries/s
+  >= 99% of the plan's (90% in a fault run), which is the only check on
+  unsampled channels.
+- The generator's own connections and attachments within ±3% from hold
+  start to end (else node growth would measure the generator).
+
+*Correctness*
+
+- Zero violations of every kind on the sample, including `attach_gap` and
+  `presence_set_mismatch`; at least 90% of attach claims settled
+  (`min_attach_coverage`); the tail check covering at least 50% of the
+  sampled streams (`min_tail_coverage`); a run that publishes with no
+  sampled channel that has a subscriber fails "sample coverage".
+- A presence run must have compared the end-of-hold REST member set of
+  every sampled presence channel, with at least 90% of those members
+  settled (`min_presence_compared`), no mismatch and no NACK.
+- The coverage checks above are reported, not gated, in a fault run.
+
+*Measurement credibility*
+
+- Negative latency under 0.1% of in-window deliveries
+  (`max_negative_latency`) and, where the agents can measure it, every
+  generator box within 5 ms of NTP at the start and end of the run
+  (`max_clock_offset`).
+- Every inventory node sampled at hold start, at the growth baseline
+  (when one falls inside the hold) and at hold end; "N of M nodes
+  sampled" is printed with the scrape errors.
+- Every generator and publisher box under 70% CPU averaged over the hold
+  (`max_generator_cpu`, read from the box's `/proc/stat`), so a saturated
+  harness cannot produce a quoted number.
+- The nodes report one and the same server configuration (publish lanes,
+  linger, bus, storage shards, read from `/metrics`), and the shard count
+  in the record is the nodes'. `summary.md` prints the flags in effect.
+- Node RSS and goroutines grow <= 10% from the growth baseline to the end
+  of the hold (reported, not gated, in a fault run).
+
+*Fault runs.* A `--fault-hook` relaxes the growth, load-steadiness,
+coverage, retry, unresolved, CPU and delivery-rate gates only when it ran
+and exited 0 (the surviving nodes take the dead node's load, its metrics
+stop). A hook that failed, or never ran before the run ended, relaxes
+nothing and is itself a failing check ("fault injection").
+`--allow-unmeasured` waives the node-metrics and CPU gates for a local run
+and is recorded as `unmeasured_waived`: such a run is not fit to quote.
+
+The record sets the generator's connections and attachments at hold
+start and end beside the nodes' `ably_connections_open` and
+`ably_channels_bound`, and gives server channels bound over generator
+attachments at the end of the hold. The footprint (vCPU and memory,
 provisioned and used, per 100k connections, per 100k deliveries/s and
 per 10k writes/s) is reported, not gated.
 
