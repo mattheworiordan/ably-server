@@ -208,6 +208,35 @@ func (m *Metrics) RegisterBus(src storage.BusStatser) {
 	m.registry.MustRegister(newBusCollector(src))
 }
 
+// FanoutPoolStatser is the fan-out pool's view the
+// ably_delivery_fanout_pool_* series read on every scrape (DESIGN.md
+// §5.1, §10).
+type FanoutPoolStatser interface {
+	// QueueDepth is the number of channel stripes waiting for a worker.
+	QueueDepth() int64
+	// Busy is the number of workers walking a stripe.
+	Busy() int64
+}
+
+// RegisterFanoutPool exports the fan-out pool's queue depth and busy
+// workers as gauges read from src on every scrape. No-op on a nil
+// Metrics.
+func (m *Metrics) RegisterFanoutPool(src FanoutPoolStatser) {
+	if m == nil {
+		return
+	}
+	m.registry.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "ably_delivery_fanout_pool_queue_depth",
+			Help: "Channel stripes waiting for a fan-out pool worker: each is a channel above --delivery-fanout-threshold with entries appended that the stripe's worker has not started walking (DESIGN.md §5.1, §10).",
+		}, func() float64 { return float64(src.QueueDepth()) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "ably_delivery_fanout_pool_busy",
+			Help: "Fan-out pool workers walking a stripe at the scrape, out of --delivery-fanout-pool (DESIGN.md §5.1, §10).",
+		}, func() float64 { return float64(src.Busy()) }),
+	)
+}
+
 // Register adds further collectors to the registry, for components that
 // own their own series (the Postgres backend's ably_storage_* retention
 // series). A nil Metrics ignores the call.

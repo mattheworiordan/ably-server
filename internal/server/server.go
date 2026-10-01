@@ -75,6 +75,8 @@ const (
 	wsWriteBufEnv      = "ABLY_SERVER_WS_WRITE_BUFFER_SIZE"
 	httpIdleEnv        = "ABLY_SERVER_HTTP_IDLE_TIMEOUT"
 	attachSeenMaxEnv   = "ABLY_SERVER_ATTACHMENT_SEEN_MAX"
+	fanoutPoolEnv      = "ABLY_SERVER_DELIVERY_FANOUT_POOL"
+	fanoutThresholdEnv = "ABLY_SERVER_DELIVERY_FANOUT_THRESHOLD"
 
 	messageRetentionEnv   = "ABLY_SERVER_MESSAGE_RETENTION"
 	persistedRetentionEnv = "ABLY_SERVER_PERSISTED_RETENTION"
@@ -178,6 +180,16 @@ func Run(ctx context.Context, opts Opts) int {
 		return 1
 	}
 	attachSeenMaxDefault, err := config.DefaultInt(opts.Getenv(attachSeenMaxEnv), file.AttachmentSeenMax, realtime.DefaultAttachmentSeenMax)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	fanoutPoolDefault, err := config.DefaultIntPtr(opts.Getenv(fanoutPoolEnv), file.DeliveryFanoutPool, core.DefaultFanoutWorkers())
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	fanoutThresholdDefault, err := config.DefaultInt(opts.Getenv(fanoutThresholdEnv), file.DeliveryFanoutThreshold, core.DefaultFanoutThreshold)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
 		return 1
@@ -310,6 +322,8 @@ func Run(ctx context.Context, opts Opts) int {
 	wsReadBufferSize := fs.Int64("ws-read-buffer-size", wsReadBufDefault, "per-connection WebSocket read buffer in bytes (DESIGN.md §5.2) (env: "+wsReadBufEnv+")")
 	wsWriteBufferSize := fs.Int64("ws-write-buffer-size", wsWriteBufDefault, "WebSocket write buffer in bytes, pooled and held only during a write (DESIGN.md §5.2) (env: "+wsWriteBufEnv+")")
 	attachmentSeenMax := fs.Int("attachment-seen-max", attachSeenMaxDefault, "message serials one attachment remembers so a later append is sent as a delta; the oldest are evicted and an evicted message's next append is sent as the full version (DESIGN.md §13.3) (env: "+attachSeenMaxEnv+")")
+	fanoutPool := fs.Int("delivery-fanout-pool", fanoutPoolDefault, "fan-out pool workers that deliver the live messages of a channel with more than --delivery-fanout-threshold attachments, instead of one goroutine per attachment; 0 disables the pool; default GOMAXPROCS (DESIGN.md §5.1) (env: "+fanoutPoolEnv+")")
+	fanoutThreshold := fs.Int("delivery-fanout-threshold", fanoutThresholdDefault, "attachments on one channel above which its live messages are delivered by the fan-out pool; a pooled channel leaves the pool at half this (DESIGN.md §5.1) (env: "+fanoutThresholdEnv+")")
 	httpIdleTimeout := fs.Duration("http-idle-timeout", httpIdleDefault, "how long an idle HTTP keep-alive connection is kept open for the next request (DESIGN.md §2.2) (env: "+httpIdleEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
@@ -358,6 +372,14 @@ func Run(ctx context.Context, opts Opts) int {
 
 	if *attachmentSeenMax <= 0 {
 		fmt.Fprintln(opts.Out, "--attachment-seen-max must be positive")
+		return 2
+	}
+	if *fanoutPool < 0 {
+		fmt.Fprintln(opts.Out, "--delivery-fanout-pool must not be negative")
+		return 2
+	}
+	if *fanoutThreshold <= 0 {
+		fmt.Fprintln(opts.Out, "--delivery-fanout-threshold must be positive")
 		return 2
 	}
 
@@ -492,12 +514,20 @@ func Run(ctx context.Context, opts Opts) int {
 		m.Register(c.Collectors()...)
 	}
 
+	// The fan-out pool (DESIGN.md §5.1). Deferred before the Manager, so
+	// it closes after it, and after rt.Shutdown has closed the
+	// connections whose attachments it delivers to.
+	pool := core.NewFanoutPool(*fanoutPool, *fanoutThreshold)
+	defer pool.Close()
+	m.RegisterFanoutPool(pool) // zero while the pool is disabled
+	logger.Info("delivery fan-out", "poolWorkers", pool.Workers(), "threshold", *fanoutThreshold)
 	manager := core.NewManagerWithOptions(store, core.Options{
 		IdleTimeout:        *channelIdleTimeout,
 		Metrics:            m,
 		Logger:             logger,
 		WriteOnlyPublish:   !*publishBindOnWrite,
 		PresenceSyncSource: syncSource,
+		FanoutPool:         pool,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.

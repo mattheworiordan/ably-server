@@ -86,6 +86,17 @@ type attachment struct {
 	// connections through memo (connection.queueShared); nil sends
 	// through out.
 	outShared func(context.Context, *protocol.ProtocolMessage, memoizer) bool
+	// tryShared queues a shared live frame without waiting
+	// (connection.tryQueueShared): the fan-out pool's fast path
+	// (deliverPooled). encode marshals a frame in the connection's wire
+	// format, and liveBuild encodes the frame for liveCM, the cm being
+	// delivered; it is made once so a delivery does not allocate a
+	// closure. Nil tryShared keeps the attachment off the pool. Set by
+	// enablePool before run starts.
+	tryShared func(protocol.Action, memoizer, func() any) bool
+	encode    func(*protocol.ProtocolMessage) (outFrame, error)
+	liveBuild func() any
+	liveCM    *protocol.ChannelMessage
 	// sampled is set on one connection's attachments in
 	// metrics.DeliverySampleEvery: they record the fan-out time of each
 	// live frame (ably_delivery_fanout_seconds, DESIGN.md §10).
@@ -107,7 +118,9 @@ type attachment struct {
 	// message is a full aggregated update and later appends arrive as
 	// deltas (DESIGN.md §13.3). It is bounded (seenSet); a serial it no
 	// longer holds gets the full version, which is always correct.
-	// Touched only by the run goroutine.
+	// Touched only by whoever owns the stream's cursor: the run goroutine,
+	// or the fan-out pool's worker while the stream is pooled
+	// (deliverPooled), never both at once.
 	seen seenSet
 	// trackCreates is set when the channel's namespace has mutable
 	// messages enabled, so a message delivered without an append delta
@@ -413,6 +426,14 @@ func (a *attachment) run() {
 		}
 	}
 
+	// From here on, on a channel above the fan-out pool's threshold, the
+	// pool may deliver live cms through deliverPooled while Next stays
+	// parked (DESIGN.md §5.1); anything it refuses comes back through
+	// Next and forward below.
+	if a.tryShared != nil {
+		a.stream.SetDeliver(a.deliverPooled)
+	}
+
 	for {
 		cm, err := a.stream.Next(a.ctx)
 		if err != nil {
@@ -578,6 +599,102 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 			ChannelSerial: cm.ChannelSerial,
 			Annotations:   cm.Annotations,
 		})
+	}
+	return true
+}
+
+// enablePool lets the fan-out pool deliver this attachment's live cms
+// (DESIGN.md §5.1): encode marshals a frame in the connection's format
+// and tryShared queues a shared frame without waiting. Called before
+// run.
+func (a *attachment) enablePool(encode func(*protocol.ProtocolMessage) (outFrame, error), tryShared func(protocol.Action, memoizer, func() any) bool) {
+	a.encode, a.tryShared = encode, tryShared
+	a.liveBuild = func() any {
+		cm := a.liveCM
+		msg := &protocol.ProtocolMessage{
+			Channel:       new(a.channelName),
+			ChannelSerial: cm.ChannelSerial,
+		}
+		if len(cm.Messages) > 0 {
+			msg.Action, msg.Messages = protocol.ActionMessage, cm.Messages
+		} else {
+			msg.Action, msg.Presence = protocol.ActionPresence, cm.Presence
+		}
+		f, err := a.encode(msg)
+		return sharedFrame{f, err}
+	}
+}
+
+// deliverPooled is the fan-out pool's delivery function for this
+// attachment's stream (core.Stream.SetDeliver, DESIGN.md §5.1). A pool
+// worker calls it for each live cm while the stream is pooled, with the
+// run goroutine parked in Next, so it may touch what forward touches.
+// It delivers what forward would send as a shared frame (a MESSAGE with
+// no append delta, a PRESENCE), skips what forward would skip (a mode
+// the attachment lacks, an echo=false self-echo), and returns false for
+// everything else (an append, which may be a delta for this attachment,
+// §13.3; an annotation; a frame the connection's queue has no room for
+// now; a cancelled attachment): the stream is then handed back and the
+// run goroutine delivers that cm itself, waiting under backpressure as
+// it always does. The frame is the same bytes forward's shared path
+// queues, so which path delivers a cm does not show on the wire.
+//
+// A refusal leaves nothing behind but curSerial, already set to the
+// cm's serial, which the run goroutine sets again before forwarding it.
+func (a *attachment) deliverPooled(cm *protocol.ChannelMessage) bool {
+	if a.ctx.Err() != nil {
+		return false
+	}
+	a.mu.Lock()
+	a.curSerial = cm.ChannelSerial
+	modes, appendModeFull := a.modes, a.appendModeFull
+	a.mu.Unlock()
+	var action protocol.Action
+	switch {
+	case len(cm.Messages) > 0:
+		if modes&protocol.FlagSubscribe == 0 {
+			return true
+		}
+		if !a.echo && a.connID != "" && cm.Messages[0].ConnectionID == a.connID {
+			return true
+		}
+		for _, m := range cm.Messages {
+			if m.HasAppendDelta() {
+				return false
+			}
+		}
+		action = protocol.ActionMessage
+	case len(cm.Presence) > 0:
+		if modes&protocol.FlagPresenceSubscribe == 0 {
+			return true
+		}
+		action = protocol.ActionPresence
+	default:
+		return false
+	}
+	a.liveCM = cm
+	ok := a.tryShared(action, a.stream, a.liveBuild)
+	a.liveCM = nil
+	if !ok {
+		return false
+	}
+	if action == protocol.ActionMessage {
+		// As resolveAppends records a message with no append delta.
+		if !appendModeFull && a.trackCreates {
+			for _, m := range cm.Messages {
+				if m.Serial != "" {
+					a.seen.add(m.Serial)
+				}
+			}
+		}
+		if a.logger.Enabled(a.ctx, logging.LevelTrace) {
+			a.logger.Trace("message delivered by the fan-out pool",
+				"channelSerial", cm.ChannelSerial, "name", cm.Messages[0].Name)
+		}
+		a.metrics.MessageDelivered()
+	}
+	if a.sampled {
+		a.metrics.DeliveryFanout(time.Since(a.stream.AppendedAt()))
 	}
 	return true
 }

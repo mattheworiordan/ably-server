@@ -102,6 +102,13 @@ type File struct {
 	// AttachmentSeenMax caps the message serials one attachment remembers
 	// for append delivery (DESIGN.md §13.3, §9); zero means absent.
 	AttachmentSeenMax int `toml:"attachment-seen-max"`
+	// DeliveryFanoutPool is the fan-out pool's worker count (DESIGN.md
+	// §5.1, §9): a pointer, since 0 disables the pool and must be
+	// distinguishable from absent. DeliveryFanoutThreshold is the
+	// attachment count above which a channel is pooled; zero means
+	// absent.
+	DeliveryFanoutPool      *int `toml:"delivery-fanout-pool"`
+	DeliveryFanoutThreshold int  `toml:"delivery-fanout-threshold"`
 	// HTTPIdleTimeout is the raw duration string for --http-idle-timeout
 	// (DESIGN.md §2.2, §9).
 	HTTPIdleTimeout string `toml:"http-idle-timeout"`
@@ -271,6 +278,15 @@ func DefaultBoolPtr(env string, file *bool, fallback bool) (bool, error) {
 		return *file, nil
 	}
 	return DefaultBool(env, false, fallback)
+}
+
+// DefaultIntPtr is DefaultInt for an option whose file value may be
+// zero over a non-zero fallback: file is nil when absent.
+func DefaultIntPtr(env string, file *int, fallback int) (int, error) {
+	if env == "" && file != nil {
+		return *file, nil
+	}
+	return DefaultInt(env, 0, fallback)
 }
 
 // DefaultInt64 is Default for an integer-valued flag: env, if set, is

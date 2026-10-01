@@ -260,6 +260,30 @@ func TestDefaultInt(t *testing.T) {
 	}
 }
 
+func TestDefaultIntPtr(t *testing.T) {
+	zero, five := 0, 5
+	for _, tc := range []struct {
+		env  string
+		file *int
+		want int
+	}{
+		{"", nil, 7},      // fallback
+		{"", &zero, 0},    // a file zero wins over the fallback
+		{"", &five, 5},    // file
+		{"3", &five, 3},   // env wins over file
+		{"0", nil, 0},     // env zero
+		{"-1", &zero, -1}, // env, validated by the caller
+	} {
+		got, err := DefaultIntPtr(tc.env, tc.file, 7)
+		if err != nil || got != tc.want {
+			t.Errorf("DefaultIntPtr(%q, %v, 7) = %v, %v; want %v", tc.env, tc.file, got, err, tc.want)
+		}
+	}
+	if _, err := DefaultIntPtr("x", nil, 7); err == nil {
+		t.Error("DefaultIntPtr with malformed env value error = nil, want an error")
+	}
+}
+
 func TestLoadParsesBusKeys(t *testing.T) {
 	path := writeTOML(t, `
 mode = "cluster"

@@ -686,6 +686,23 @@ per-attachment buffered fan-out channel: each attachment proceeds at
 its own pace, lagging the live tail with no upper bound but its own
 memory footprint.
 
+On a channel with more than `--delivery-fanout-threshold` attachments
+on the node (default 1,000), the cursor can instead be walked by the
+node's fan-out pool (§5.1): once the attachment goroutine has delivered
+its replay and caught up with the tail, it hands its cursor to a pool
+worker and stays parked. The worker delivers each live cm the
+attachment would receive as a shared frame (a `MESSAGE` with no append
+delta, a `PRESENCE`), applying the same mode and `echo` checks, and
+hands the cursor back, positioned before the cm, for anything else: an
+append (which may be a delta for this attachment, §13.3), an
+annotation, a frame the connection's queue has no room for, or a
+cancelled attachment. The goroutine then delivers that cm through
+`forward` and offers the cursor to the pool again on its next step.
+Control frames (`ATTACHED`, `DETACHED`, `ERROR`, the presence `SYNC`)
+never go through the pool. Either way each cm reaches the attachment
+once and in list order, because only one of the two holds the cursor
+at a time and the handover happens between entries.
+
 The starting cursor depends on how the attachment was created:
 
 - Fresh attach (no `channelSerial`, no `rewind`) — `a.e = channel.Tail()`,
@@ -806,7 +823,7 @@ no attachment retains a reference (see Memory below).
 
 **Fan-out cost.** On a channel with tens of thousands of attachments on
 one node (shape M's hot channel has about 20,000 per node), one Append
-wakes that many goroutines at once, and three things decide how long the
+wakes that many goroutines at once, and four things decide how long the
 last of them takes to queue its frame:
 
 - *Wake channels.* Parking on a Go channel takes the channel's lock, so
@@ -835,12 +852,119 @@ last of them takes to queue its frame:
   log, not the live list) are encoded per attachment. The `echo=false`
   filter (§2.1) only skips a frame, so it does not stop the sharing.
 
+- *Fan-out pool.* Even with the above, a fan-out to 20,000 attachments
+  readies 20,000 goroutines at once, and on the fleet the in-node
+  fan-out was the whole delivery tail (shape M at five times the
+  target: `ably_delivery_fanout_seconds` p99 487 ms on one node with
+  36,000 attachments on the hot channel, against 0.8 ms of socket-write
+  wait and 0.1 ms in Append, with the nodes at 18 to 26% CPU). A
+  goroutine woken by the network poller then also waits behind them in
+  the run queue. So a channel with more than `--delivery-fanout-threshold`
+  attachments (default 1,000) hands its live cms to the node's fan-out
+  pool (`--delivery-fanout-pool`, default GOMAXPROCS workers, 0
+  disables it). Its attachments are split into one stripe per worker
+  (by attach number), and after each Append the worker for a stripe
+  walks each member's cursor to the tail, queuing the entry's shared
+  frame straight onto the member's connection queue. A fan-out then
+  readies at most one goroutine per worker plus the connections' write
+  loops, however many attachments the channel has.
+
+  How it keeps per-attachment order and exactly-once delivery:
+
+  - *One owner per cursor.* An attachment's cursor is moved either by
+    its own goroutine or by its stripe's worker, never both. The
+    goroutine joins the pool (in `Stream.Next`) only when the channel
+    is above the threshold and its cursor is at the tail, so the pool
+    never has to deliver an entry linked before the join; it then parks
+    until the worker hands the cursor back or its context ends. A
+    stripe belongs to one worker, so one cursor never has two workers.
+  - *Handover at an entry boundary.* The worker advances a cursor one
+    entry at a time and calls the attachment's delivery function. If
+    that refuses the entry (above: an append, an annotation, a full
+    connection queue, a cancelled attachment), the worker puts the
+    cursor back before the entry and hands the attachment back, and
+    the goroutine's next step returns that entry. A refusal does
+    nothing visible first, so the entry is delivered once, by the
+    goroutine. A discontinuity marker (§7.2) is handed back the same
+    way without calling the delivery function, so the goroutine tells
+    the client (an `ATTACHED` without `RESUMED`, 80016) in order, and
+    it sets no hold (below). When the channel falls to half the
+    threshold, the worker hands every member back; the gap between the
+    join and leave points keeps a channel near the threshold from moving
+    all its attachments on every attach and detach.
+  - *Appends and annotations.* These entries take the per-attachment
+    path, so on a pooled channel each one hands every attachment back
+    and wakes its goroutine, as without the pool, and each goroutine
+    then rejoins through the Channel's mutex. A channel streaming
+    appends (token streaming, reactions) would pay for that on every
+    entry: `BenchmarkFanoutAppendDelta` measured 17.5 to 17.9 ms per
+    append fan-out to 20,000 attachments against 13 to 15 ms without the
+    pool. So when at least half of a stripe, and at least 4 members,
+    refuse in the same walk, the stripe holds the channel off the pool
+    for the next 64 entries (before handing anyone back, so no goroutine
+    rejoins first): its attachments stay on their goroutines, parked on
+    the wake slots, and rejoin only after 64 entries. A refusal by a few
+    members (a full connection queue) sets no hold. With the hold the
+    benchmark is at parity with the per-goroutine path (11.0 to 11.9 ms
+    without the pool, 11.3 to 11.4 ms with it). The hold counts entries,
+    not time: on a channel publishing once a second, one append keeps it
+    off the pool for about a minute, during which its fan-out costs what
+    it did before the pool, never more.
+  - *State reads.* The delivery function reads the attachment's modes,
+    `appendMode` and `curSerial` under the attachment's mutex, as the
+    goroutine does (a repeat `ATTACH` and a reauth change them from the
+    read loop), and `echo` and the connection id are fixed. The seen set
+    for append deltas (§13.3) has no lock: it belongs to whoever holds
+    the cursor, and each handover passes through the stripe's mutex or
+    the handback channel, which orders one owner's writes before the
+    next owner's reads. The pool records a delivered message in the set
+    exactly as `forward` does, so a create the pool delivered makes the
+    next append a delta.
+  - *Never waiting on a connection.* A worker queues a frame only if
+    the connection's queue has room now; otherwise the attachment goes
+    back to its goroutine, which waits under backpressure and, if the
+    client is not reading, disconnects it as a slow consumer (§5.2),
+    exactly as before. One slow client never holds up its stripe.
+  - *No lost wake-up.* Append marks a stripe pending and queues it on
+    its worker under the Channel's mutex, and the worker clears the
+    mark and reads the tail under the same mutex at the start of its
+    walk, so an entry linked after that read queues the stripe again.
+    A stripe is queued at most once at a time, so a worker's queue
+    holds at most one item per pooled channel, and back-to-back Appends
+    coalesce into one walk that delivers every entry in order. A walk
+    holds the stripe's own mutex, not the Channel's, so it never holds
+    up an Append or an Attach; a goroutine leaving the pool on its
+    context's end takes the stripe's mutex, so once it has left, no
+    worker is delivering to it (a `DETACHED` queued after the
+    attachment stops is still its last frame).
+
+  The trade-off: the pool bounds runnable goroutines but adds a queue
+  between the append and the delivery, so an entry's frames are queued
+  stripe by stripe, at the pace of W workers, instead of all at once
+  by as many goroutines as the scheduler runs; and the entry, with its
+  one shared frame per wire format in use, stays alive until the
+  slowest stripe has walked past it (as it stays alive today until the
+  slowest attachment goroutine has). The memory this adds is bounded:
+  the pool holds no frames of its own and never waits on a connection,
+  so a pooled channel retains only the entries appended while its
+  slowest stripe's walk is behind: about R × L × (E + F × S) per pooled
+  channel, for an append rate R, a stripe lag L (the walk time plus the
+  wait in the worker's queue, at most one walk per other pooled channel
+  on that worker), an entry of E bytes, F formats and a frame of S
+  bytes. At shape M's hot channel (1 publish a second, 470-byte
+  messages, a walk of a few milliseconds) that is under one entry. An
+  attachment the pool hands back retains entries as any attachment
+  goroutine does (Memory, below). Connection queues share the frame's
+  bytes, so 20,000 queues holding one entry's frame hold one copy of
+  it.
+
 `BenchmarkFanoutEnqueue` (`internal/realtime`) measures one publish to
 20,000 attachments, from the publish to every frame queued, on 8 cores
 of a laptop: about 41 ms (msgpack) and 36 ms (JSON) on the code before
-these changes (the same benchmark run on a copy of the earlier tree), and
-about 7 ms for either with them. The socket writes that follow are not
-in it.
+these changes (the same benchmark run on a copy of the earlier tree),
+about 7 to 8 ms for either with the wake slots and encode-once, and
+about 2 to 2.5 ms with the fan-out pool (8 workers). The socket writes
+that follow are not in it.
 
 The first `ATTACH` to a name (or the first publish, or any REST read)
 creates the Channel and binds it: `storage.Channel(name, channel)`
@@ -1827,7 +1951,9 @@ right after the persist commits. A publish is:
      linking the cm onto the live list.
 
 Local subscribers parked on the previous tail's wake channels wake up and
-observe the new entry. ACK/201 fires once `Publish` returns; the
+observe the new entry; on a channel above `--delivery-fanout-threshold`
+attachments, Append also queues the channel on the fan-out pool's
+workers, which deliver the entry to the pooled attachments (§5.1). ACK/201 fires once `Publish` returns; the
 linked-list update has already happened by then.
 
 ### 7.2 Cluster bus
@@ -2451,6 +2577,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --ws-write-buffer-size 4096   pooled WebSocket write buffer, bytes (§5.2)
 --http-idle-timeout 120s      how long an idle HTTP keep-alive connection is kept open (§2.2)
 --attachment-seen-max 4096    message serials one attachment remembers for append deltas; oldest evicted (§13.3)
+--delivery-fanout-pool N      fan-out pool workers for channels above the threshold; default GOMAXPROCS, 0 disables (§5.1)
+--delivery-fanout-threshold 1000  attachments on one channel above which the fan-out pool delivers its live cms; leaves at half (§5.1)
 --message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
 --persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
 --publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
@@ -2481,7 +2609,8 @@ Configuration may also be supplied via an optional TOML config file
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
-`attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
+`attachment-seen-max`, `delivery-fanout-pool`, `delivery-fanout-threshold`,
+`message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
 `publish-queue-max`, `publish-bind-on-write`, `presence-sync-source`,
 `presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
@@ -2645,7 +2774,13 @@ name = "persisted:presence_fixtures"
     (gauge) is the largest number of attachments open on a channel when a
     cm was appended to it (the attachments that append fans out to), since
     the previous scrape; reading it resets it, so it is meant for one
-    scraper.
+    scraper. On a pooled channel (§5.1) the fan-out time includes the
+    wait for the stripe's worker. The fan-out pool exports
+    `ably_delivery_fanout_pool_queue_depth` (gauge), the channel stripes
+    waiting for a worker, and `ably_delivery_fanout_pool_busy` (gauge),
+    the workers walking a stripe at the scrape; a queue that stays
+    above zero with every worker busy means the pool is the bottleneck
+    and wants more workers.
   - Presence liveness (§12.5): `ably_presence_grace_leave_errors_total{stage}`
     (counter), grace-window LEAVEs that could not be written, by stage
     (`get_channel`, `publish`), and `ably_presence_reentries_total`

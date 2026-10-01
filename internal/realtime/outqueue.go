@@ -117,7 +117,9 @@ func (q *outQueue) push(ctx context.Context, f outFrame) error {
 }
 
 // tryPush appends f only if it fits now, without waiting. Used for the
-// shutdown DISCONNECTED, which must not block the shutdown goroutine.
+// shutdown DISCONNECTED, which must not block the shutdown goroutine,
+// and by the fan-out pool, whose workers must not wait on one
+// connection (DESIGN.md §5.1).
 func (q *outQueue) tryPush(f outFrame) bool {
 	q.mu.Lock()
 	if q.closed || (q.head != len(q.frames) && q.bytes+int64(len(f.data)) > q.max) {
