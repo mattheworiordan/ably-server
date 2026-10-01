@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -416,6 +417,10 @@ func Run(ctx context.Context, opts Opts) int {
 		logger.Info("tracing enabled")
 	}
 
+	// The realtime server is built after the storage, but the cluster
+	// storage's presence lease-lapse hook re-enters its connections'
+	// members (DESIGN.md §12.5), so the hook reaches it through rtRef.
+	var rtRef atomic.Pointer[realtime.Server]
 	store, err := openStorage(ctx, *mode, *dataDir, clusterOptions{
 		dsn:              *postgresDSN,
 		bus:              *bus,
@@ -450,6 +455,11 @@ func Run(ctx context.Context, opts Opts) int {
 		},
 		presenceMaxInflight: *presenceMaxInflight,
 		presenceLeaseMode:   *presenceLeaseMode,
+		onPresenceLeaseLapse: func(ctx context.Context) {
+			if rt := rtRef.Load(); rt != nil {
+				rt.ReenterPresence(ctx)
+			}
+		},
 	})
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -511,6 +521,7 @@ func Run(ctx context.Context, opts Opts) int {
 
 	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
 	rt.SetRemainPresentFor(*remainPresentFor)
+	rtRef.Store(rt)
 	rt.SetAppendTracking(realtime.AppendTracking{
 		Mutable: mutableNamespaces(file.Namespaces),
 		SeenMax: *attachmentSeenMax,
@@ -959,6 +970,10 @@ type clusterOptions struct {
 
 	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
 	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
+
+	// onPresenceLeaseLapse re-enters this node's presence members after
+	// its lease lapsed (postgres.Options.OnPresenceLeaseLapse, §12.5).
+	onPresenceLeaseLapse func(ctx context.Context)
 }
 
 // options returns the postgres.Options every bus shares.
@@ -973,8 +988,9 @@ func (c clusterOptions) options() postgres.Options {
 		PersistedNamespaces: c.persistedNamespaces,
 		BindOnWrite:         c.bindOnWrite,
 
-		PresenceMaxInflight: c.presenceMaxInflight,
-		PresenceLeaseMode:   c.presenceLeaseMode,
+		PresenceMaxInflight:  c.presenceMaxInflight,
+		PresenceLeaseMode:    c.presenceLeaseMode,
+		OnPresenceLeaseLapse: c.onPresenceLeaseLapse,
 	}
 }
 

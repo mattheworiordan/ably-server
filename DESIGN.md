@@ -132,7 +132,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable, and also while the bus connection is down with `--bus=nats` (NATS) or `--bus=postgres` (LISTEN) (§7.2) |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -1453,7 +1453,9 @@ keep their order. Per lane:
 5. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
    Beyond it a publish is refused at once with Ably error **42910** (HTTP
    429 on REST, a NACK on realtime): nothing is stored and the client
-   should back off and retry.
+   should back off and retry. Presence the server synthesises is exempt
+   from that bound but has its own, 8 x `--publish-queue-max` of it per
+   lane (below, "Presence in a batch").
 
 Inside a batch, in two round trips (migration `0003_publish_batch`):
 
@@ -1521,10 +1523,29 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   LEAVE or a fixture ENTER has no id, so it may be stored twice if the
   first attempt's COMMIT landed: a second LEAVE for a member already
   gone, or a second ENTER that upserts the same row. Presence the server
-  synthesises (a teardown, grace or reaper LEAVE, a fixture member) is
-  queued even past `--publish-queue-max`, and still committed if its
-  bounded caller stops waiting first: nothing retries it, and a dropped
-  LEAVE would leave its member behind.
+  synthesises (a teardown or grace LEAVE, a fixture member) is queued
+  even past `--publish-queue-max`, and still
+  committed if its bounded caller stops waiting first: nothing retries
+  it, and a dropped LEAVE would leave its member behind (for as long as
+  its node lives, in node lease mode). It has a bound of its own, 8 x
+  `--publish-queue-max` of it queued per lane, so a commit that stalls
+  during a mass disconnect cannot grow the queue without limit. Beyond
+  that bound it is not refused but written in a transaction of its own,
+  as with `--presence-batching=false`, once the publishes of its channel
+  that were queued or in flight on the lane when it was turned away have
+  completed (so it never overtakes an earlier operation on the channel,
+  such as the ENTER of the member it removes), and once one of the
+  `--presence-max-inflight` slots is free (so the overflow holds at most
+  that many pool connections); each counts in
+  `ably_publish_server_presence_unbatched_total`. If its caller's deadline
+  ends before both, it is queued after those publishes after all, past the
+  bound, and commits when they do
+  (`ably_publish_server_presence_forced_total`): the bound gives way only
+  for a channel whose earlier publishes are themselves stuck. A
+  publish on the same channel queued after it was turned away can still
+  commit before it; for a teardown or grace LEAVE that is another member's
+  operation, since the departed connection writes nothing more. (The
+  reaper's LEAVEs and lease-lapse re-entries never join a batch, §12.5.)
 
 **Channel rows.** A channel's `channels` row (its serial and initial
 serial) is created by the first write or bind that needs it. A batched
@@ -1566,7 +1587,10 @@ Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
 `ably_publish_batch_retries_total` and
 `ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`, and
 `presence_inflight` for an unbatched presence write refused over its
-in-flight bound, §12.5).
+in-flight bound, §12.5), `ably_publish_server_presence_unbatched_total`
+(server-synthesised presence written outside a full lane, above) and
+`ably_publish_server_presence_forced_total` (queued past the bound
+because its channel's earlier publishes were stuck).
 
 ### 6.4 Channel sharding
 
@@ -1622,7 +1646,7 @@ does once, a sharded node does once per shard, against that shard only.
 | Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard; at most 4 batched catch-up queries in flight per node, over all its shards |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
-| `/readyz` | account-wide | ready while shard 0 and a majority of the shards (each with its bus) are reachable; see "A shard that is down" below |
+| `/readyz` | account-wide | ready while shard 0 and a majority of the shards are reachable, each with its pool, its bus and its publish lanes (§11); the error names the shard; see "A shard that is down" below |
 | `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
 | `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
 | `GET /stats` stub | account-wide | touches no storage |
@@ -2518,8 +2542,14 @@ name = "persisted:presence_fixtures"
     `ably_publish_linger_min_seconds` (gauges, the configuration),
     `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
-    `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`
-    (counters) and `ably_publish_lane_queue_depth{lane}` (gauge).
+    `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`,
+    `ably_publish_server_presence_unbatched_total`,
+    `ably_publish_server_presence_forced_total` (counters) and
+    `ably_publish_lane_queue_depth{lane}` (gauge).
+  - Cluster mode only, from presence liveness (§12.5):
+    `ably_presence_reaps_deferred_total` (reaper rounds the reaper guard
+    skipped) and `ably_presence_lease_lapses_total` (renewals that found
+    the node's own lease had lapsed) (counters).
   - Delivery stages after the append (§5.1, §5.2), from one connection in
     8 so a fan-out to tens of thousands of attachments does not make as
     many observations on one histogram: `ably_delivery_fanout_seconds`
@@ -2536,6 +2566,10 @@ name = "persisted:presence_fixtures"
     cm was appended to it (the attachments that append fans out to), since
     the previous scrape; reading it resets it, so it is meant for one
     scraper.
+  - Presence liveness (§12.5): `ably_presence_grace_leave_errors_total{stage}`
+    (counter), grace-window LEAVEs that could not be written, by stage
+    (`get_channel`, `publish`), and `ably_presence_reentries_total`
+    (counter), members re-entered after the node's presence lease lapsed.
   - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
     the SYNC snapshots served, by how each was obtained: `cached` (the
     channel's current snapshot), `waited` (rebuilt by another attach
@@ -2690,6 +2724,29 @@ On SIGTERM the server enters a graceful shutdown:
    at the deadline is force-closed immediately.
 3. Concurrently, drain in-flight REST handlers.
 4. Close storage.
+
+**Readiness.** `/readyz` (§2.2) is what an orchestrator or load balancer
+should route on. In `memory` and `disk` mode it is always 200. In
+`cluster` mode it returns 503, and logs the reason at Warn, unless all of
+these hold, each within the probe's 2 s:
+
+- the Postgres pool answers a ping;
+- the bus is connected: the LISTEN connection for `--bus=postgres`, the
+  NATS connection for `--bus=nats` (§7.2); `pgnotify` does not gate
+  readiness on its LISTEN connection, which re-dials and reconciles on
+  its own;
+- every publish lane is completing its commits: no lane's oldest queued
+  publish has waited longer than one commit attempt (15 s), and no batch
+  has been committing for longer than two (a commit and its retry). A
+  node whose lanes are wedged (a stuck connection, starved goroutines)
+  still pings, but cannot ACK a publish; this takes it out of rotation.
+  The error names the lane.
+
+With several Postgres shards (§6.4) each condition must hold on every
+shard, and the error names the shard. Readiness is independent of the
+presence lease (§12.5): the lease bump runs on its own timer whatever the
+traffic, so an idle node never lapses, and a lapsed lease is repaired by
+re-entry rather than by leaving rotation.
 
 In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection
@@ -2926,8 +2983,9 @@ into it transactionally and `Members` reads it (§6). Per backend:
   `--publish-lanes=0`) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
   per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
-  16 when batching is off; server-synthesised LEAVEs are exempt, as in
-  the lanes, §6.3, so a mass disconnect with batching off can still hold
+  16 when batching is off; server-synthesised LEAVEs are exempt (in the
+  lanes they have a bound of their own, §6.3), so a mass disconnect with
+  batching off can still hold
   many pool connections with LEAVEs, as before the bound existed): one
   beyond the bound is refused at once with
   Ably error **42910** (a NACK; the client should back off and retry) and
@@ -2957,25 +3015,40 @@ Departure:
   the connection is not coming back, so there is nothing to wait for.
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
-  immediately. It captures the member entries it still owns (from the
-  authoritative set, by member serial) and schedules their LEAVE for
-  `remainPresentFor` later. At that point each LEAVE is published through
-  `StorePresence` — *unless* the member has since been superseded: an entry
-  now absent (already left) or carrying a different serial (the same
-  `connectionId` resumed and re-entered, §8/§4.3) is left alone. This
-  suppression is re-checked against the set **at write time**, not by
-  cancelling a timer, so it stays correct when the resume lands on a
-  different node in cluster mode — the re-enter is visible in the shared
-  `presence` table there too. A graceful shutdown abandons any *already*
-  pending delayed LEAVEs (the node is departing).
+  immediately. It hands the members it still holds (its own record of
+  what it entered, with each member's last state; no store read) to the
+  server, keyed by `connectionId`, for `remainPresentFor`. If a
+  connection resumes that `connectionId` in the window (§4.3, §8), it
+  takes the members over: it owns them from then on, so its own DETACH,
+  CLOSE or drop leaves them, and no LEAVE is written for the dropped
+  connection. Otherwise, at the end of the window, one LEAVE per channel
+  is published through `StorePresence`; if a connection with that
+  `connectionId` is live by then (it resumed while the dropped one was
+  still tearing down) it takes the members over instead. A second
+  abrupt drop of the same `connectionId` in the window merges its
+  members into the pending entry and restarts the wait. A LEAVE that
+  cannot be written (the channel cannot be bound, or the store refuses
+  it) is logged at Warn and counted in
+  `ably_presence_grace_leave_errors_total{stage}` (`get_channel`,
+  `publish`); in cluster mode the member then stays until its node's
+  lease ends. A graceful shutdown abandons any *already* pending delayed
+  LEAVEs (the node is departing).
+
+  The registry is the whole answer because a resume only ever reaches the
+  node that issued the connectionKey: the key's HMAC secret is per process
+  (§8), so a resume on another node gets a fresh `connectionId` and
+  80018. An earlier version re-read the store at write time and compared
+  member serials, to catch a resume that re-entered on another node; that
+  case cannot occur, the comparison protected nothing the registry does
+  not, and its store read could fail (it did, under load) and drop the
+  LEAVE.
 
 Because the server holds no other per-connection state across disconnects
 (§4.3), this grace is self-contained — it is the *only* thing kept alive
 for a dropped connection, independent of connection-state resume (still a
-non-goal). A resume that never re-enters presence still leaves after the
-window; a reconnect under a *new* `connectionId` (e.g. from `suspended`)
-leaves the old member to age out over the window while the client re-enters
-afresh.
+non-goal). A resume keeps its members whether or not the client re-enters;
+a reconnect under a *new* `connectionId` (e.g. from `suspended`) leaves the
+old member to age out over the window while the client re-enters afresh.
 
 **Crashed cluster nodes.** A node that dies without running teardown
 leaves orphaned rows in the `presence` table — the one case the LEAVE
@@ -2996,18 +3069,21 @@ published once. `--presence-lease-mode` selects where the lease lives:
   (node_id, expires_at)`. The bump is one upsert of that row, so its cost
   does not grow with the node's members and it never writes or locks a
   member row; a member row's own `expires_at` is `'infinity'`. A node is
-  **alive** while its row exists with `expires_at >= now()`, and dead
+  **alive** while its row exists with `expires_at` no more than one bump
+  interval in the past (`expires_at >= now() - 10s`: the margin absorbs
+  clock skew between nodes and a bump that is late by a tick), and dead
   otherwise. The reaper lists the node ids that own members (a skip scan
   over `presence_node_idx`, one index probe per distinct owner) with no
-  live lease, plus the expired lease rows, and for each deletes the
+  live lease, plus the dead lease rows, and for each deletes the
   node's members in chunks of 1000, re-checking the lease in every chunk
   so a node that renews part way stops being reaped; once every chunk is
-  deleted it publishes their LEAVEs (32 at a time when presence is
-  batched), then deletes the node's lease row once it owns no member.
+  deleted it publishes their LEAVEs, then deletes the node's lease row
+  once it owns no member.
 - **member**: the behaviour before node leases; every member row carries
   its own `expires_at`, renewed by one `UPDATE ... WHERE node_id = $node`
   of all of the node's rows per bump, and the reaper deletes every row
-  with `expires_at < now()`. At 100k members per node that bump rewrites
+  whose lease is dead by the same rule (`expires_at < now() - 10s`). At
+  100k members per node that bump rewrites
   and row-locks 100k rows every 10s, which convoys with presence batches
   writing the same rows (§6.3). Kept for A/B comparison.
 
@@ -3027,20 +3103,97 @@ with an upsert before serving, so the reaper fires on the old process's
 members only if the gap between the two processes exceeded the lease
 window.
 
+*Reaper LEAVEs.* The LEAVEs of one channel's reaped members are one
+presence publish, written in a transaction of its own (never batched),
+up to 8 channels at a time; a dead node with members on 100k channels
+therefore takes 100k transactions to announce (not measured at that
+scale). Once that transaction holds the channel's
+row lock it reads which of the members are in the `presence` table
+again and leaves those out, storing nothing if none is left. Every
+writer of a room's presence rows holds that lock first, so this sees any
+ENTER committed before it, and an ENTER committed after it sorts after
+the LEAVE: a node that re-enters its members after a lapse (below) is
+never undone by a LEAVE the reaper had not yet published.
+
 *Bound.* A member is never reaped while its node is alive: the reaper
-deletes only rows whose node has no unexpired lease, checked in the
+deletes only rows whose node has no live lease, checked in the
 deleting statement. A dead node's members are deleted within the lease
-window after its last renewal plus one reaper interval (30s + 5s, the
-same bound as member mode) plus the chunked deletes themselves (about
-0.7s for 100k members in a local test on a 1M-row table), then their
-LEAVEs follow at publish throughput. Several reaping nodes take
-different chunks of one dead node at once (`SKIP LOCKED`); each deletes
-and announces only its own. As in member mode, a reaper that stops after
-deleting rows and before publishing their LEAVEs loses those LEAVEs. A
-live node that cannot renew for longer than the lease window (a stall or
-a partition from Postgres) is treated as dead: its members may be
-reaped, and its next bump renews (or re-creates) the row and logs a
-warning.
+window after its last renewal plus one bump interval plus one reaper
+interval (30s + 10s + 5s, the same bound as member mode) plus the
+chunked deletes themselves (about 0.7s for 100k members in a local test
+on a 1M-row table), then their LEAVEs follow at publish throughput.
+Several reaping nodes take different chunks of one dead node at once
+(`SKIP LOCKED`); each deletes and announces only its own. As in member
+mode, a reaper that stops after deleting rows and before publishing their
+LEAVEs loses those LEAVEs. Every reaper statement runs under a
+`statement_timeout` of half a bump interval: a chunk `DELETE` checks its
+node's lease as of the moment it started, so one that started just
+before the node renewed must not run on into the node's re-entry (below),
+which starts a bump interval after the renewal. A statement that times
+out deletes nothing and is retried next round.
+
+*Reaper guard.* Every node's lease lives in the same database, so an
+outage of that database longer than the lease window (a failover, a
+partition of every node from it) lapses every lease at once, and the
+first reaper to run after recovery would find every live node dead and
+publish a LEAVE for every connected member. So a node reaps only while
+it has itself renewed its lease without a break for at least one lease
+window, and while its own last renewal is less than a window old. A
+failed renewal, a renewal that finds the lease had lapsed, and `Open`
+each start the wait again. After an outage every live node renews within
+one bump interval, well inside the window every reaper waits, so none
+of them is reaped; a node that died meanwhile is reaped one window after
+the reapers came back. A deferred round counts in
+`ably_presence_reaps_deferred_total` and logs at Info, at most once per
+lease window, with the reason. The guard applies in both lease modes.
+
+*Lapse and re-entry.* A node that could not renew for longer than the
+window while other nodes could (a stall, a partition of that node
+alone) may have had its members reaped and their LEAVEs published, while
+its connections are still open. Its next renewal finds the lapse (the
+row had to be re-created, or more than a window passed from the start of
+the previous renewal to the completion of this one: the database stamps
+a renewal somewhere in between, so a renewal that waited for a pool
+connection or a slow network is caught; at worst a lapse is reported
+that did not happen), logs a warning, counts it in
+`ably_presence_lease_lapses_total`, and calls the storage's lapse hook
+(`postgres.Options.OnPresenceLeaseLapse`) one bump interval later: long
+enough for a reaper statement that was already running to finish, and
+for the other shards of a sharded node, which share one hook and renew
+on their own ticks, to report the same outage, so it runs once. The
+server sets the hook to re-enter the node's members (*Re-entry*). A
+lapse after an outage of the whole database finds no member reaped (the
+guard); the node cannot tell, so it re-enters anyway, but the re-entry
+writes only members missing from the table and publishes nothing for the
+rest. It still costs one transaction per connection and channel, each
+taking the channel's row lock and then rolling back, so after an outage
+of the whole database every node adds that many row locks on its rooms
+to the recovering primary's load for a while (not measured).
+
+*Re-entry.* `realtime.Server.ReenterPresence` publishes one
+server-synthesised ENTER per channel for every member each live
+connection holds, with the member's last data, encoding and extras (each
+connection keeps a copy of its members' last ENTER, UPDATE or PRESENT for
+this), and the same for the members held for a dropped connection's grace
+window (a resume would take them over expecting them present; they still
+leave at the window's end; a grace LEAVE already written, or members a
+resume has since taken over, are skipped, so this cannot undo the resumed
+client's own LEAVE). It works on 32 connections or grace entries at a
+time. Each ENTER is
+written in a transaction of its own, after the publishes of its channel
+already queued or in flight on the lane, and leaves out every member that
+is in the table once the channel's row lock is held (the read waits for a
+reaper delete of the row that has not committed yet). Each connection's
+re-entry holds the connection's presence lock from reading its members
+until the ENTERs are stored, and the client's own presence writes,
+DETACH and teardown take the same lock, so a LEAVE the client sends
+meanwhile is stored after the re-entry, never undone by it. A re-entered
+member's subscribers see a LEAVE (the reaper's) then an ENTER, and its
+row is back with its data. Re-entries count in
+`ably_presence_reentries_total` (members actually written); a failed one
+is logged and leaves that member absent until the client next updates
+it, and one whose connection's write does not finish within 5 s is
+abandoned the same way.
 
 *Mixing modes.* Every node sharing a database should run the same mode,
 but each mode's reaper leaves the other mode's live members alone and

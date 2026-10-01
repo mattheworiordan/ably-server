@@ -3,6 +3,7 @@ package postgres
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -80,11 +81,71 @@ func (cs *channelStore) storePresenceBatched(ctx context.Context, lanes *laneSet
 	if err := cs.ensureRow(ctx); err != nil {
 		return nil, false, err
 	}
+	if storage.IsPresenceReentry(ctx) {
+		// A lease-lapse re-entry skips members still present, which a
+		// batch cannot do; it is written around the lane, after the
+		// channel's earlier publishes (DESIGN.md §12.5).
+		return cs.storePresenceAround(ctx, presence, lanes.after(cs.name), true)
+	}
 	p := newPending(ctx, cs.name)
 	p.cs, p.presence, p.static = cs, presence, storage.IsStaticPresence(ctx)
 	p.mustAdmit = storage.IsServerPresence(ctx)
 	p.checkIDs = len(p.ids()) > 0
-	return lanes.publish(p)
+	cm, idempotent, err := lanes.publish(p)
+	if !errors.Is(err, errServerQueueFull) {
+		return cm, idempotent, err
+	}
+	// The lane already holds its bound of server-synthesised presence:
+	// write this one around it (DESIGN.md §6.3). It is not refused:
+	// nothing retries it, and in node lease mode a live node's lost LEAVE
+	// leaves its member behind for as long as the node lives.
+	cm, idempotent, err = cs.storePresenceAround(ctx, presence, p.after, false)
+	if errors.Is(err, errNotWritten) {
+		// The channel's earlier publishes did not complete (or no slot
+		// came free) within the caller's deadline, so it could not be
+		// written around them without overtaking them. Queue it after
+		// them instead, past the bound; it commits when they do.
+		if lanes.forceSubmit(p) {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, errLanesClosed
+	}
+	if err == nil && cs.wmetrics != nil {
+		cs.wmetrics.serverUnbatched.Inc()
+	}
+	return cm, idempotent, err
+}
+
+// errNotWritten is storePresenceAround's answer when ctx ended before
+// the write could start.
+var errNotWritten = errors.New("storage/postgres: presence write did not start before its deadline")
+
+// storePresenceAround writes server-synthesised presence in a
+// transaction of its own, outside the lanes (DESIGN.md §6.3, §12.5):
+// first it waits for after (the last publish of the channel queued or in
+// flight on its lane when the caller looked, nil for none), so it does
+// not overtake an earlier operation on the channel, then for one of the
+// Storage's unbatched presence slots (Options.PresenceMaxInflight), so
+// such writes hold at most that many pool connections. If ctx ends first
+// it returns errNotWritten, having written nothing. onlyAbsent is
+// storePresenceTx's.
+func (cs *channelStore) storePresenceAround(ctx context.Context, presence []*protocol.PresenceMessage, after *pending, onlyAbsent bool) (*protocol.ChannelMessage, bool, error) {
+	if after != nil {
+		select {
+		case <-after.done:
+		case <-ctx.Done():
+			return nil, false, errNotWritten
+		}
+	}
+	if cs.presenceSlots != nil {
+		select {
+		case cs.presenceSlots <- struct{}{}:
+			defer func() { <-cs.presenceSlots }()
+		case <-ctx.Done():
+			return nil, false, errNotWritten
+		}
+	}
+	return cs.storePresenceTx(ctx, presence, onlyAbsent)
 }
 
 // ensureRow creates the channel's row before a message or presence

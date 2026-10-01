@@ -1216,15 +1216,16 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // HandleReadyz is the readiness probe: it reports whether the server
 // is ready to take traffic. In memory/disk mode (s.ready is nil)
-// that's always true. In cluster mode it pings Postgres and returns
-// 503 when the database is unreachable, so orchestrators stop routing
-// to a node that can't serve (DESIGN.md §2.2). No auth.
+// that's always true. In cluster mode it returns 503 unless the storage's
+// Ping passes (Postgres reachable, bus connected, publish lanes
+// completing their commits), so orchestrators stop routing to a node
+// that can't serve (DESIGN.md §2.2, §11). No auth.
 func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	if s.ready != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), readyzTimeout)
 		defer cancel()
 		if err := s.ready.Ping(ctx); err != nil {
-			s.logger.Warn("readyz: dependency unreachable", "err", err)
+			s.logger.Warn("readyz: not ready", "err", err)
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, "not ready")

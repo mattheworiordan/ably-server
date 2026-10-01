@@ -72,13 +72,15 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		}
 	}
 
-	// Track membership for teardown LEAVE (DESIGN.md §12.5) on the read
-	// goroutine, which is the only writer of the entered set. This is done
-	// optimistically before the store completes; a rare store failure
-	// would leave a spurious entry whose only effect is a harmless
-	// synthesised LEAVE for a member that never durably entered.
+	// Track membership for teardown LEAVE and lapse re-entry (DESIGN.md
+	// §12.5) on the read goroutine, which is the only goroutine that
+	// removes members from the entered set. This is done optimistically
+	// before the store completes; a rare store failure would leave a
+	// spurious entry whose only effect is a harmless synthesised LEAVE
+	// for a member that never durably entered (or, after a lease lapse,
+	// an ENTER of it).
 	for _, p := range msg.Presence {
-		c.recordPresence(msg.GetChannel(), p.ClientID, p.Action)
+		c.recordPresence(msg.GetChannel(), p)
 	}
 
 	// The presence store runs on the publish worker so its ACK stays
@@ -90,7 +92,10 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	presence := msg.Presence
 	ch := a.channel
 	c.enqueuePublish(ctx, func() {
-		if _, _, err := ch.PublishPresence(ctx, presence); err != nil {
+		c.presMu.Lock()
+		_, _, err := ch.PublishPresence(ctx, presence)
+		c.presMu.Unlock()
+		if err != nil {
 			c.logger.Warn("presence publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
 			// The retriable storage failures carry their codes, as for a
 			// publish: 42910 when the node is at its presence in-flight
@@ -149,14 +154,17 @@ func resolvePresenceClientID(connClientID, msgClientID string) (string, bool) {
 	}
 }
 
-// recordPresence updates the per-connection entered set after a
-// successful presence operation: ENTER/UPDATE/PRESENT add the member,
-// LEAVE/ABSENT remove it.
-func (c *connection) recordPresence(channel, clientID string, action protocol.PresenceAction) {
-	switch action {
+// recordPresence updates the per-connection entered set as a presence
+// operation is accepted: ENTER/UPDATE/PRESENT store a copy of the
+// message (so the store stamping the original, or a later frame, cannot
+// change it under a re-entry reading it), LEAVE/ABSENT remove the member.
+func (c *connection) recordPresence(channel string, p *protocol.PresenceMessage) {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	switch p.Action {
 	case protocol.PresenceLeave, protocol.PresenceAbsent:
 		if set, ok := c.entered[channel]; ok {
-			delete(set, clientID)
+			delete(set, p.ClientID)
 			if len(set) == 0 {
 				delete(c.entered, channel)
 			}
@@ -164,23 +172,73 @@ func (c *connection) recordPresence(channel, clientID string, action protocol.Pr
 	default: // Enter, Update, Present
 		set := c.entered[channel]
 		if set == nil {
-			set = make(map[string]struct{})
+			set = make(map[string]*protocol.PresenceMessage)
 			c.entered[channel] = set
 		}
-		set[clientID] = struct{}{}
+		cp := *p
+		set[p.ClientID] = &cp
 	}
+}
+
+// takeEntered removes and returns the members entered on channel.
+func (c *connection) takeEntered(channel string) map[string]*protocol.PresenceMessage {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	set := c.entered[channel]
+	delete(c.entered, channel)
+	return set
+}
+
+// closeEntered removes and returns every member this connection holds
+// and closes the set, so neither a lapse re-entry nor a grace hand-over
+// touches it after teardown.
+func (c *connection) closeEntered() map[string]map[string]*protocol.PresenceMessage {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	all := c.entered
+	c.entered = make(map[string]map[string]*protocol.PresenceMessage)
+	c.presenceClosed = true
+	return all
+}
+
+// adoptPresence hands members held for a dropped connection's grace
+// window to this connection, which resumed its connectionId (DESIGN.md
+// §12.5): it now owns them, so its own LEAVE paths and a lapse
+// re-entry cover them. A member the connection already holds keeps its
+// own state. It reports false, adopting nothing, if this connection's
+// teardown has already taken its set.
+func (c *connection) adoptPresence(members map[string]map[string]*protocol.PresenceMessage) bool {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	if c.presenceClosed {
+		return false
+	}
+	for channel, held := range members {
+		set := c.entered[channel]
+		if set == nil {
+			set = make(map[string]*protocol.PresenceMessage, len(held))
+			c.entered[channel] = set
+		}
+		for clientID, m := range held {
+			if _, ok := set[clientID]; !ok {
+				set[clientID] = m
+			}
+		}
+	}
+	return true
 }
 
 // leaveChannel synthesises a LEAVE for every member this connection
 // entered on channel and clears them from the entered set. Used on
 // DETACH. Best-effort: a publish failure is logged, not surfaced.
 func (c *connection) leaveChannel(ctx context.Context, channel string) {
-	set := c.entered[channel]
+	c.presMu.Lock()
+	defer c.presMu.Unlock()
+	set := c.takeEntered(channel)
 	if len(set) == 0 {
 		return
 	}
 	c.publishLeaves(ctx, channel, set)
-	delete(c.entered, channel)
 }
 
 // emitTeardownLeaves synthesises LEAVE for every member still held by
@@ -188,55 +246,118 @@ func (c *connection) leaveChannel(ctx context.Context, channel string) {
 // connection's own context is already cancelled). Called once as the
 // connection terminates (DESIGN.md §12.5).
 func (c *connection) emitTeardownLeaves() {
-	if len(c.entered) == 0 {
+	c.presMu.Lock()
+	defer c.presMu.Unlock()
+	all := c.closeEntered()
+	if len(all) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
 	defer cancel()
-	for channel, set := range c.entered {
+	for channel, set := range all {
 		c.publishLeaves(ctx, channel, set)
 	}
-	c.entered = make(map[string]map[string]struct{})
 }
 
 // scheduleTeardownLeaves hands this connection's still-held presence
 // members to the server's delayed-leave reaper (DESIGN.md §12.5), which
-// synthesises their LEAVE after the grace window unless the same
-// connectionId re-enters first. Used when the connection drops abruptly
-// (not a clean CLOSE), so a resume within the window preserves the member.
-// Only the read goroutine touches entered, and it has stopped, so this is
-// race-free.
+// synthesises their LEAVE after the grace window unless a connection
+// with the same connectionId (a resume) is live by then. Used when the
+// connection drops abruptly (not a clean CLOSE), so a resume within the
+// window preserves the member.
 func (c *connection) scheduleTeardownLeaves() {
-	if len(c.entered) == 0 {
+	c.presMu.Lock()
+	defer c.presMu.Unlock()
+	all := c.closeEntered()
+	if len(all) == 0 {
 		return
 	}
-	channels := make([]string, 0, len(c.entered))
-	for channel := range c.entered {
-		channels = append(channels, channel)
-	}
-	c.srv.scheduleConnectionLeaves(c.id, channels)
-	c.entered = make(map[string]map[string]struct{})
+	c.srv.scheduleConnectionLeaves(c.id, all)
 }
 
-// publishLeaves publishes one LEAVE per clientId in set onto channel,
+// reenterPresence publishes an ENTER, with its last data, for every
+// member this connection holds, after the node's presence lease lapsed
+// and other nodes may have reaped them (DESIGN.md §12.5). It holds presMu
+// throughout, so a LEAVE the client sends meanwhile is stored after the
+// ENTER, never before it. Members still in the store are skipped. It
+// returns the members re-entered and those that failed.
+func (c *connection) reenterPresence(ctx context.Context) (entered, failed int) {
+	c.presMu.Lock()
+	defer c.presMu.Unlock()
+	c.enteredMu.Lock()
+	if c.presenceClosed {
+		c.enteredMu.Unlock()
+		return 0, 0
+	}
+	snap := make(map[string][]*protocol.PresenceMessage, len(c.entered))
+	for channel, set := range c.entered {
+		snap[channel] = reentries(c.id, set)
+	}
+	c.enteredMu.Unlock()
+
+	for channel, enters := range snap {
+		var cm *protocol.ChannelMessage
+		ch, err := c.manager.GetChannel(ctx, channel)
+		if err == nil {
+			// Members still present are skipped (storage.WithPresenceReentry).
+			cm, _, err = ch.PublishPresence(storage.WithPresenceReentry(ctx), enters)
+		}
+		if err != nil {
+			c.logger.Warn("presence re-entry failed", "channel", channel, "members", len(enters), "err", err)
+			failed += len(enters)
+			continue
+		}
+		if cm != nil {
+			entered += len(cm.Presence)
+		}
+	}
+	return entered, failed
+}
+
+// reentries returns a server-synthesised ENTER for each member in set,
+// stamped with connID and carrying the member's last data, encoding and
+// extras (DESIGN.md §12.5).
+func reentries(connID string, set map[string]*protocol.PresenceMessage) []*protocol.PresenceMessage {
+	enters := make([]*protocol.PresenceMessage, 0, len(set))
+	for _, m := range set {
+		enters = append(enters, &protocol.PresenceMessage{
+			Action:       protocol.PresenceEnter,
+			ClientID:     m.ClientID,
+			ConnectionID: connID,
+			Data:         m.Data,
+			Encoding:     m.Encoding,
+			Extras:       m.Extras,
+		})
+	}
+	return enters
+}
+
+// publishLeaves publishes one LEAVE per member in set onto channel,
 // stamped with this connection's id.
-func (c *connection) publishLeaves(ctx context.Context, channel string, set map[string]struct{}) {
+func (c *connection) publishLeaves(ctx context.Context, channel string, set map[string]*protocol.PresenceMessage) {
 	ch, err := c.manager.GetChannel(ctx, channel)
 	if err != nil {
 		c.logger.Warn("teardown leave: GetChannel failed", "channel", channel, "err", err)
 		return
 	}
+	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leavesFor(c.id, set)); err != nil {
+		c.logger.Warn("teardown leave publish failed", "channel", channel, "err", err)
+	}
+}
+
+// leavesFor returns a synthesised LEAVE for each member in set, stamped
+// with connID: action, clientId and connectionId, no id (DESIGN.md
+// §12.5).
+func leavesFor(connID string, set map[string]*protocol.PresenceMessage) []*protocol.PresenceMessage {
 	leaves := make([]*protocol.PresenceMessage, 0, len(set))
 	for clientID := range set {
 		leaves = append(leaves, &protocol.PresenceMessage{
 			Action:       protocol.PresenceLeave,
 			ClientID:     clientID,
-			ConnectionID: c.id,
+			ConnectionID: connID,
 		})
 	}
-	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leaves); err != nil {
-		c.logger.Warn("teardown leave publish failed", "channel", channel, "err", err)
-	}
+	return leaves
 }
 
 // nack queues a NACK for msgSerial, optionally carrying an ErrorInfo.

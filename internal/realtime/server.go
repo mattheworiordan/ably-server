@@ -4,9 +4,11 @@ package realtime
 import (
 	"context"
 	"crypto/rand"
+	"maps"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -119,12 +121,16 @@ type Server struct {
 	remainPresentFor time.Duration
 
 	// reaperDone is closed by Shutdown to abandon any pending delayed
-	// presence LEAVEs (their members go with the departing node); reaperWG
-	// tracks the in-flight reaper goroutines. reaperStop guards the close
-	// against a double Shutdown.
+	// presence LEAVEs (their members go with the departing node).
+	// reaperStop guards the close against a double Shutdown.
 	reaperDone chan struct{}
 	reaperStop sync.Once
-	reaperWG   sync.WaitGroup
+
+	// graceMu guards grace, the members of abruptly dropped connections
+	// held for the presence grace window, by connectionId (DESIGN.md
+	// §12.5).
+	graceMu sync.Mutex
+	grace   map[string]*graceLeave
 
 	// appendTracking configures each attachment's seen set for append
 	// delivery (DESIGN.md §13.3); see SetAppendTracking.
@@ -206,6 +212,7 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 		byKey:             make(map[string]*connection),
 		remainPresentFor:  DefaultRemainPresentFor,
 		reaperDone:        make(chan struct{}),
+		grace:             make(map[string]*graceLeave),
 		appendTracking:    AppendTracking{}.withDefaults(),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
@@ -309,7 +316,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		out:               newOutQueue(s.limits.OutboundMaxBytes, s.limits.WriteTimeout),
 		writeTimeout:      s.limits.WriteTimeout,
 		attachments:       make(map[string]*attachment),
-		entered:           make(map[string]map[string]struct{}),
+		entered:           make(map[string]map[string]*protocol.PresenceMessage),
 		publishQ:          make(chan func(), 16),
 		reauth:            make(chan time.Time, 1),
 		resumeError:       resumeError,
@@ -325,6 +332,9 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close()
 		return
 	}
+	// A resume of a connection that dropped abruptly takes over the
+	// members held for its grace window (DESIGN.md §12.5).
+	s.claimGrace(conn)
 	opened := time.Now()
 	s.metrics.ConnectionOpened()
 	conn.logger.Info("connection opened", "clientId", clientID)
@@ -378,113 +388,259 @@ func (s *Server) deregister(c *connection) {
 	s.mu.Unlock()
 }
 
+// graceLeave is the presence members of one abruptly dropped
+// connectionId, held for the grace window before their LEAVEs
+// (DESIGN.md §12.5).
+type graceLeave struct {
+	connID  string
+	members map[string]map[string]*protocol.PresenceMessage // channel -> clientId -> last state
+	timer   *time.Timer
+	fired   bool // under Server.graceMu: the timer ran, or Shutdown or a resume claimed the entry
+
+	// mu orders a lease-lapse re-entry of these members with their
+	// LEAVEs and with their hand-over to a resumed connection. done,
+	// under mu, records that either has happened: the LEAVEs were
+	// written, or the members belong to a live connection (whose own
+	// re-entry covers them), and a re-entry of g must skip them.
+	mu   sync.Mutex
+	done bool
+}
+
+// finish marks g's members as left or handed over (graceLeave.done).
+func (g *graceLeave) finish() {
+	g.mu.Lock()
+	g.done = true
+	g.mu.Unlock()
+}
+
 // scheduleConnectionLeaves defers the synthesised presence LEAVE for a
-// connection that dropped abruptly (DESIGN.md §12.5). It captures, now,
-// the member entries the connection still owns on each channel (from the
-// authoritative store, keyed by member serial), then after remainPresentFor
-// writes their LEAVEs — unless a member has since been superseded, i.e. the
-// same connectionId resumed and re-entered, in which case its LEAVE is
-// suppressed at write time. Doing the suppression check against the store at
-// write time (rather than cancelling a local timer) keeps it correct when
-// the resume lands on a different node in cluster mode: the re-enter is
-// visible in the shared presence set there too.
-//
-// Runs synchronously to capture (fast store read) on the terminating
-// connection's goroutine, then hands off to a reaper goroutine for the wait.
-func (s *Server) scheduleConnectionLeaves(connID string, channels []string) {
+// connection that dropped abruptly (DESIGN.md §12.5). members is the
+// connection's own entered set, taken at teardown, so the decision needs
+// no read of the store (a failed read used to drop the LEAVE). After
+// remainPresentFor the LEAVEs are written unless a connection with the
+// same connectionId, a resume, is live by then: it takes the members
+// over instead (claimGrace, fireGrace). Resumes only ever reach the node
+// that issued the connectionKey (DESIGN.md §8), so this node's
+// registry is the whole answer. A second drop of the same connectionId
+// within the window merges into the pending entry and restarts its wait.
+func (s *Server) scheduleConnectionLeaves(connID string, members map[string]map[string]*protocol.PresenceMessage) {
+	s.graceMu.Lock()
+	defer s.graceMu.Unlock()
 	select {
 	case <-s.reaperDone:
 		return // shutting down: the node's presence goes with it
 	default:
 	}
-
-	// Capture the member serials to leave, now, from the authoritative set.
-	capCtx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
-	stale := make(map[string]map[string]string, len(channels)) // channel -> clientId -> member serial
-	for _, channel := range channels {
-		ch, err := s.manager.GetChannel(capCtx, channel)
-		if err != nil {
-			continue
-		}
-		members, _, err := ch.Members(capCtx)
-		if err != nil {
-			continue
-		}
-		owned := make(map[string]string)
-		for _, m := range members {
-			if m.ConnectionID == connID {
-				owned[m.ClientID] = m.Serial
+	if g := s.grace[connID]; g != nil && g.timer.Stop() {
+		for channel, held := range members {
+			set := g.members[channel]
+			if set == nil {
+				g.members[channel] = held
+				continue
 			}
+			maps.Copy(set, held)
 		}
-		if len(owned) > 0 {
-			stale[channel] = owned
-		}
-	}
-	cancel()
-	if len(stale) == 0 {
+		g.timer.Reset(s.remainPresentFor)
 		return
 	}
-
-	s.reaperWG.Go(func() {
-		t := time.NewTimer(s.remainPresentFor)
-		defer t.Stop()
-		select {
-		case <-t.C:
-		case <-s.reaperDone:
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
-		defer cancel()
-		for channel, owned := range stale {
-			s.fireConnectionLeaves(ctx, connID, channel, owned)
-		}
-	})
+	// No entry, or one whose timer has already fired: that fire handles
+	// its own members.
+	g := &graceLeave{connID: connID, members: members}
+	s.grace[connID] = g
+	g.timer = time.AfterFunc(s.remainPresentFor, func() { s.fireGrace(g) })
 }
 
-// fireConnectionLeaves writes the deferred LEAVEs for connID's members on
-// channel, suppressing any member that has been superseded since capture —
-// an entry now absent (already left) or carrying a different serial (the
-// connection resumed and re-entered), which must not be torn down.
-func (s *Server) fireConnectionLeaves(ctx context.Context, connID, channel string, owned map[string]string) {
-	ch, err := s.manager.GetChannel(ctx, channel)
-	if err != nil {
-		s.logger.Warn("delayed leave: GetChannel failed", "channel", channel, "err", err)
+// claimGrace hands the members held for c's connectionId, if any, to c:
+// it resumed that connectionId within the grace window, so their LEAVEs
+// are not written (DESIGN.md §12.5).
+func (s *Server) claimGrace(c *connection) {
+	s.graceMu.Lock()
+	g := s.grace[c.id]
+	if g == nil || !g.timer.Stop() {
+		s.graceMu.Unlock()
 		return
 	}
-	members, _, err := ch.Members(ctx)
-	if err != nil {
-		s.logger.Warn("delayed leave: Members failed", "channel", channel, "err", err)
+	delete(s.grace, c.id)
+	g.fired = true
+	s.graceMu.Unlock()
+	g.finish()
+	if !c.adoptPresence(g.members) {
+		s.scheduleConnectionLeaves(c.id, g.members)
+	}
+}
+
+// fireGrace runs when g's grace window ends. If a connection with g's
+// connectionId is live it adopts the members (it resumed while the
+// dropped one was still tearing down, so claimGrace found nothing yet);
+// if that connection is itself tearing down, the members wait a further
+// window with its own. Otherwise their LEAVEs are written, one presence
+// publish per channel. A failure is logged and counted in
+// ably_presence_grace_leave_errors_total{stage}; the member then stays
+// until its node's lease ends (cluster mode, §12.5).
+func (s *Server) fireGrace(g *graceLeave) {
+	s.graceMu.Lock()
+	if g.fired {
+		s.graceMu.Unlock()
 		return
 	}
-	current := make(map[string]string, len(members))
-	for _, m := range members {
-		if m.ConnectionID == connID {
-			current[m.ClientID] = m.Serial
+	g.fired = true
+	if s.grace[g.connID] == g {
+		delete(s.grace, g.connID)
+	}
+	s.graceMu.Unlock()
+	select {
+	case <-s.reaperDone:
+		return
+	default:
+	}
+
+	s.mu.Lock()
+	live := s.byKey[g.connID]
+	s.mu.Unlock()
+	if live != nil {
+		g.finish()
+		if !live.adoptPresence(g.members) {
+			s.scheduleConnectionLeaves(g.connID, g.members)
 		}
-	}
-	var leaves []*protocol.PresenceMessage
-	for clientID, capturedSerial := range owned {
-		if current[clientID] != capturedSerial {
-			continue // gone or re-entered: suppress
-		}
-		leaves = append(leaves, &protocol.PresenceMessage{
-			Action:       protocol.PresenceLeave,
-			ClientID:     clientID,
-			ConnectionID: connID,
-		})
-	}
-	if len(leaves) == 0 {
 		return
 	}
-	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leaves); err != nil {
-		s.logger.Warn("delayed leave publish failed", "channel", channel, "err", err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
+	defer cancel()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.done = true
+	for channel, set := range g.members {
+		ch, err := s.manager.GetChannel(ctx, channel)
+		if err != nil {
+			s.logger.Warn("delayed leave: GetChannel failed; the members stay until their node's lease ends",
+				"channel", channel, "connectionId", g.connID, "members", len(set), "err", err)
+			s.metrics.PresenceGraceLeaveError("get_channel")
+			continue
+		}
+		if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leavesFor(g.connID, set)); err != nil {
+			s.logger.Warn("delayed leave publish failed; the members stay until their node's lease ends",
+				"channel", channel, "connectionId", g.connID, "members", len(set), "err", err)
+			s.metrics.PresenceGraceLeaveError("publish")
+		}
 	}
 }
 
 // stopReaper abandons any pending delayed presence LEAVEs. Called from
 // Shutdown: the node is going away, so its connections' members go with it.
 func (s *Server) stopReaper() {
-	s.reaperStop.Do(func() { close(s.reaperDone) })
+	s.reaperStop.Do(func() {
+		close(s.reaperDone)
+		s.graceMu.Lock()
+		for id, g := range s.grace {
+			if g.timer.Stop() {
+				g.fired = true
+			}
+			delete(s.grace, id)
+		}
+		s.graceMu.Unlock()
+	})
+}
+
+// reenterConcurrency bounds the connections ReenterPresence re-enters at
+// once.
+const reenterConcurrency = 32
+
+// ReenterPresence re-enters every presence member each live connection
+// holds, with its last data, as a server-synthesised ENTER (DESIGN.md
+// §12.5). The cluster storage calls it after this node's presence lease
+// lapsed, when other nodes may have reaped the members of connections
+// that are still open, and the members held for dropped connections'
+// grace windows. Up to reenterConcurrency connections (or grace entries)
+// at once, each bounded by teardownLeaveTimeout; a failure is logged and
+// leaves that member absent until the client next updates it.
+func (s *Server) ReenterPresence(ctx context.Context) {
+	s.mu.Lock()
+	conns := make([]*connection, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	s.graceMu.Lock()
+	held := make([]*graceLeave, 0, len(s.grace))
+	for _, g := range s.grace {
+		held = append(held, g)
+	}
+	s.graceMu.Unlock()
+
+	var (
+		entered, failed atomic.Int64
+		wg              sync.WaitGroup
+	)
+	sem := make(chan struct{}, reenterConcurrency)
+	// run re-enters one connection's (or grace entry's) members, up to
+	// reenterConcurrency at once; false once ctx has ended.
+	run := func(reenter func(context.Context) (int, int)) bool {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			cctx, cancel := context.WithTimeout(ctx, teardownLeaveTimeout)
+			defer cancel()
+			n, f := reenter(cctx)
+			entered.Add(int64(n))
+			failed.Add(int64(f))
+			s.metrics.PresenceReentries(n)
+		})
+		return true
+	}
+	// Members held for a dropped connection's grace window were reaped
+	// with the rest; a resume would take them over expecting them to be
+	// present. They still leave at the window's end.
+	for _, g := range held {
+		if !run(func(cctx context.Context) (int, int) { return s.reenterGrace(cctx, g) }) {
+			break
+		}
+	}
+	for _, c := range conns {
+		if !run(c.reenterPresence) {
+			break
+		}
+	}
+	wg.Wait()
+	s.logger.Info("presence re-entered after a lease lapse", "connections", len(conns),
+		"graceHeld", len(held), "members", entered.Load(), "failed", failed.Load())
+}
+
+// reenterGrace re-enters the members held for g's grace window, unless
+// their LEAVEs have been written (ReenterPresence).
+func (s *Server) reenterGrace(ctx context.Context, g *graceLeave) (entered, failed int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return 0, 0
+	}
+	s.graceMu.Lock() // g.members grows under graceMu (a merge)
+	snap := make(map[string][]*protocol.PresenceMessage, len(g.members))
+	for channel, set := range g.members {
+		snap[channel] = reentries(g.connID, set)
+	}
+	s.graceMu.Unlock()
+	for channel, enters := range snap {
+		var cm *protocol.ChannelMessage
+		ch, err := s.manager.GetChannel(ctx, channel)
+		if err == nil {
+			// Members still present are skipped (storage.WithPresenceReentry).
+			cm, _, err = ch.PublishPresence(storage.WithPresenceReentry(ctx), enters)
+		}
+		if err != nil {
+			s.logger.Warn("presence re-entry failed", "channel", channel, "connectionId", g.connID, "members", len(enters), "err", err)
+			failed += len(enters)
+			continue
+		}
+		if cm != nil {
+			entered += len(cm.Presence)
+		}
+	}
+	return entered, failed
 }
 
 // ResolveConnectionKey resolves a REST publish's connectionKey to the live

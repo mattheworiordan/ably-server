@@ -41,6 +41,7 @@ type Sharded struct {
 	// ready, since OpenSharded only returns once all of them opened.
 	ready      []atomic.Bool
 	readyGauge prometheus.Collector
+	lapse      *lapseNotifier // shared by every shard: one re-entry per outage (§12.5)
 }
 
 var (
@@ -81,6 +82,11 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		// every shard (chain.go, DESIGN.md §7.2).
 		opts.catchUpSlots = make(chan struct{}, catchUpConcurrency)
 	}
+	// One lapse notifier for every shard: an outage that lapses the
+	// node's lease on several shards re-enters its members once
+	// (DESIGN.md §12.5).
+	lapse := newLapseNotifier(opts.OnPresenceLeaseLapse, logger)
+	opts.lapse = lapse
 	open := func(i int, listID, deploymentID string) (*Storage, error) {
 		o := opts
 		o.DSN = dsns[i]
@@ -95,6 +101,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 
 	shards := make([]*Storage, n)
 	closeAll := func() {
+		lapse.stop()
 		for _, s := range shards {
 			if s != nil {
 				_ = s.Close()
@@ -103,6 +110,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 	}
 	first, err := open(0, "", "")
 	if err != nil {
+		lapse.stop()
 		return nil, err
 	}
 	shards[0] = first
@@ -128,7 +136,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		closeAll()
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
-	sh := &Sharded{shards: shards, gauge: shardsGauge(n), ready: make([]atomic.Bool, n)}
+	sh := &Sharded{shards: shards, gauge: shardsGauge(n), ready: make([]atomic.Bool, n), lapse: lapse}
 	for i := range sh.ready {
 		sh.ready[i].Store(true)
 	}
@@ -168,6 +176,7 @@ func (s *Sharded) Release(ctx context.Context, name string) error {
 
 // Close closes every shard.
 func (s *Sharded) Close() error {
+	s.lapse.stop()
 	errs := make([]error, len(s.shards))
 	var wg sync.WaitGroup
 	for i, sh := range s.shards {

@@ -380,7 +380,7 @@ func TestFixtureMembersSurviveNodeModeReaper(t *testing.T) {
 	if !memberPresent(t, ctx, ch, "fixture") {
 		t.Fatal("fixture member was reaped by the node-mode reaper")
 	}
-	rows, err := s.pool.Query(ctx, sqlDeadNodes, fixtureNodeID)
+	rows, err := s.pool.Query(ctx, sqlDeadNodes, fixtureNodeID, deadLeaseGrace())
 	if err != nil {
 		t.Fatalf("dead nodes: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestReapChunkSparesLiveNode(t *testing.T) {
 	defer func() { _ = sb.Close() }()
 	enterMembers(t, sa, []string{"room"}, "m", 5)
 
-	got, err := sb.deleteReturning(ctx, sqlReapNodeChunk, sa.node, 1000)
+	got, err := sb.deleteReturning(ctx, sqlReapNodeChunk, sa.node, 1000, deadLeaseGrace())
 	if err != nil || len(got) != 0 {
 		t.Fatalf("chunk DELETE of a live node took %d rows (err %v), want 0", len(got), err)
 	}
@@ -444,7 +444,7 @@ func TestReapChunkSparesLiveNode(t *testing.T) {
 	if _, err := sb.pool.Exec(ctx, `UPDATE presence_nodes SET expires_at = now() - interval '1 second' WHERE node_id = $1`, sa.node); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	got, err = sb.deleteReturning(ctx, sqlReapNodeChunk, sa.node, 1000)
+	got, err = sb.deleteReturning(ctx, sqlReapNodeChunk, sa.node, 1000, deadLeaseGrace())
 	if err != nil || len(got) != 5 {
 		t.Fatalf("chunk DELETE of a dead node took %d rows (err %v), want 5", len(got), err)
 	}
