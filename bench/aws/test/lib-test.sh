@@ -149,6 +149,64 @@ case "$(defaults_out ignored)" in */home/nobody-in-particular/*) echo "FAIL a de
 state_dir_mode=$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/newdir/sub/state.json" PROJECT_TAG=t AWS_REGION=r bash -c 'source "$0"; state_init; stat -f %Lp "$(dirname "$ACTIVE_STATE")" 2>/dev/null || stat -c %a "$(dirname "$ACTIVE_STATE")"' "$HERE/../lib.sh")
 check "the state directory is private" 700 "$state_dir_mode"
 
+# boot secrets: written to a private env file, never to user-data
+sf="$tmp/secrets.env"
+check "a registry token is added to the secrets file" "BENCH_REGISTRY_TOKEN='tok_123'
+BENCH_API_KEY='bench.a:b'" "$(GHCR_PULL_TOKEN=tok_123 boot_secrets_file "$sf" 'BENCH_API_KEY=bench.a:b' && cat "$sf")"
+check "the secrets file is private" 600 "$(stat -f %Lp "$sf" 2>/dev/null || stat -c %a "$sf")"
+check "no secrets and no token: nothing to deliver" bad "$( (unset GHCR_PULL_TOKEN; boot_secrets_file "$sf" && echo ok) || echo bad)"
+check "a secret with a quote is refused" bad "$( (boot_secrets_file "$sf" "BENCH_X=a'b" 2>/dev/null) || echo bad)"
+check "a secret not named BENCH_ is refused" bad "$( (boot_secrets_file "$sf" "API_KEY=x" 2>/dev/null) || echo bad)"
+# the loader the boot script runs: loads the file untraced, removes it, is idempotent
+loader_out=$(env -i PATH="$PATH" BENCH_SECRETS_FILE="$tmp/delivered.env" bash -c '
+  printf "BENCH_DSN='"'"'postgres://u:p@h/db'"'"'\n" >"$BENCH_SECRETS_FILE"
+  source "$0"
+  set -x
+  bench_load_secrets 2>"$BENCH_SECRETS_FILE.trace"
+  set +x
+  echo "$BENCH_DSN $BENCH_SECRETS_LOADED $([ -e "$BENCH_SECRETS_FILE" ] && echo file-kept || echo file-removed)"
+  bench_load_secrets && echo again-ok
+  grep -c "p@h" "$BENCH_SECRETS_FILE.trace" || true' "$HERE/../templates/secrets.sh" 2>/dev/null)
+check "the loader loads, removes the file, and stays idempotent" "postgres://u:p@h/db 1 file-removed
+again-ok
+0" "$loader_out"
+check "the loader fails when nothing arrives" bad "$( (env -i PATH="$PATH" BENCH_SECRETS_FILE="$tmp/never.env" bash -c 'seq() { echo 1; }; sleep() { :; }; source "$0"; bench_load_secrets' "$HERE/../templates/secrets.sh" 2>/dev/null) || echo bad)"
+
+# boot secrets follow the box's state, not which run launched it: a box that
+# exists but has not finished booting (an earlier run stopped half way) gets
+# them; one that booted does not; the local copy never outlives the call.
+# (Each case runs in a subshell with its own work dir and call log.)
+# shellcheck disable=SC2030,SC2031
+{
+  mkdir -p "$tmp/wd"
+  state_put_instance pend-1 i-pend node c7i.2xlarge 10.0.0.7 198.51.100.7
+  deliver_out=$(
+    export BENCH_WORK_DIR="$tmp/wd" DRYRUN_CALLS_FILE="$tmp/deliver-pending.txt"
+    deliver_boot_secrets pend-1 'BENCH_API_KEY=k' 2>/dev/null
+    echo "left:$(ls "$tmp/wd")"
+  )
+  check "a box not yet booted gets its secrets (to a temporary name, renamed into place)" "1 1 1 left:" \
+    "$(grep -c "test -f /var/lib/bench-ready" "$tmp/deliver-pending.txt") $(grep -c "^scp .*/secrets-pend-1.env ec2-user@198.51.100.7:/home/ec2-user/.bench-secrets.env.tmp$" "$tmp/deliver-pending.txt") $(grep -c "chmod 600 /home/ec2-user/.bench-secrets.env.tmp && mv -f /home/ec2-user/.bench-secrets.env.tmp /home/ec2-user/.bench-secrets.env" "$tmp/deliver-pending.txt") $deliver_out"
+  (
+    export BENCH_WORK_DIR="$tmp/wd" DRYRUN_CALLS_FILE="$tmp/deliver-booted.txt" DRY_BOOTED="other pend-1"
+    deliver_boot_secrets pend-1 'BENCH_API_KEY=k' 2>/dev/null
+  )
+  check "a box that already booted gets none" "1 0" "$(grep -c "test -f /var/lib/bench-ready" "$tmp/deliver-booted.txt") $(grep -c '^scp ' "$tmp/deliver-booted.txt" || true)"
+  (
+    export BENCH_WORK_DIR="$tmp/wd" DRYRUN_CALLS_FILE="$tmp/deliver-none.txt"
+    unset GHCR_PULL_TOKEN
+    deliver_boot_secrets pend-1 2>/dev/null
+  )
+  check "a box that needs no secret is not contacted" absent "$([ -e "$tmp/deliver-none.txt" ] && cat "$tmp/deliver-none.txt" || echo absent)"
+  scp_fail_out=$( (
+    export BENCH_WORK_DIR="$tmp/wd"
+    scp_to() { return 1; }
+    deliver_secrets_file pend-1 'BENCH_API_KEY=k'
+  ) 2>&1 || echo "exited:$(ls "$tmp/wd")")
+  case "$scp_fail_out" in *"could not copy the boot secrets"*"exited:") check "a failed copy leaves no local secrets file" ok ok ;;
+  *) check "a failed copy leaves no local secrets file" "exited: (empty)" "$scp_fail_out" ;; esac
+}
+
 # the operator's public key goes into user-data
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment\n' >"$tmp/key.pub"
 check "ssh public key is read" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment' "$(SSH_PUBLIC_KEY_PATH="$tmp/key.pub" ssh_pubkey)"

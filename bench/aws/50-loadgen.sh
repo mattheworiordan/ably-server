@@ -42,7 +42,7 @@ launch_group() { # <role> <count> <type> <command>
   ud="$BENCH_WORK_DIR/userdata-$role.sh"
   render_userdata "$ud" loadgen "IMAGE=$image" "CMD=$cmd"
   role_only="$BENCH_WORK_DIR/role-$role.sh"
-  render_template "$BENCH_AWS_DIR/templates/loadgen.sh" "IMAGE=$image" "CMD=$cmd" >"$role_only"
+  render_role_script loadgen "IMAGE=$image" "CMD=$cmd" >"$role_only"
   for i in $(seq 1 "$count"); do
     name=$(iname "$role" "$i")
     names+=("$name")
@@ -59,13 +59,18 @@ launch_group publisher "$PUBLISHER_COUNT" "$PUBLISHER_INSTANCE_TYPE" "$PUBLISHER
 
 # Conductor: no placement group (it only talks to the others), compose plugin on.
 cud="$BENCH_WORK_DIR/userdata-conductor.sh"
-INSTALL_COMPOSE=1 render_userdata "$cud" conductor "IMAGE=$image" "PGBENCH_IMAGE=$PGBENCH_IMAGE" "DSNS=$dsns"
+INSTALL_COMPOSE=1 render_userdata "$cud" conductor "IMAGE=$image" "PGBENCH_IMAGE=$PGBENCH_IMAGE"
 cname=$(iname conductor 1)
 names+=("$cname")
 ids+=("$(launch_instance "$cname" conductor "$CONDUCTOR_INSTANCE_TYPE" "$cud" "" 0)")
 
 wait_instances_running "${ids[@]}"
 refresh_instances
+# No secret is in any user-data: the registry pull token (if any) and the conductor's DSNs go over SSH.
+# Delivered to every box that has not finished booting (also one an interrupted earlier run launched).
+for name in "${names[@]}"; do
+  if [ "$name" = "$cname" ]; then deliver_boot_secrets "$name" "BENCH_DSNS=$dsns"; else deliver_boot_secrets "$name"; fi
+done
 wait_boot "${names[@]}"
 _state_update '.loadgen = {image:$img,generators:($g|tonumber),publishers:($p|tonumber),generator_cmd:$gc,publisher_cmd:$pc}' \
   --arg img "$image" --arg g "$LOADGEN_COUNT" --arg p "$PUBLISHER_COUNT" --arg gc "$LOADGEN_CMD" --arg pc "$PUBLISHER_CMD"

@@ -65,15 +65,20 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 SQL
 
 # 3. Run it.
+# The database password arrives over SSH, not in user-data (templates/secrets.sh);
+# loaded before the pull so the delivered file is deleted first.
+bench_load_secrets
 docker pull @@PG_IMAGE@@
 docker rm -f postgres 2>/dev/null || true
-set +x # the next command carries the database password
-docker run -d --name postgres --restart unless-stopped --network host --shm-size=2g \
+set +x
+POSTGRES_PASSWORD="$BENCH_PG_PASSWORD" \
+  docker run -d --name postgres --restart unless-stopped --network host --shm-size=2g \
   --ulimit nofile=1048576:1048576 \
-  -e POSTGRES_USER=@@DB_USER@@ -e POSTGRES_DB=@@DB_NAME@@ -e 'POSTGRES_PASSWORD=@@PG_PASSWORD@@' \
+  -e POSTGRES_USER=@@DB_USER@@ -e POSTGRES_DB=@@DB_NAME@@ -e POSTGRES_PASSWORD \
   -v /data/pg/pgdata:/var/lib/postgresql/data -v /etc/postgresql:/etc/postgresql:ro \
   -v /etc/postgresql/10-extensions.sql:/docker-entrypoint-initdb.d/10-extensions.sql:ro \
   @@PG_IMAGE@@ postgres -c config_file=/etc/postgresql/postgresql.conf
+unset BENCH_PG_PASSWORD
 set -x
 ready=0
 for _ in $(seq 1 180); do

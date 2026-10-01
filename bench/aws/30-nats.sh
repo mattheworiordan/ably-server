@@ -49,6 +49,8 @@ refresh_instances
 state_set '.nats.urls' "$urls"
 state_set '.nats.image' "$NATS_IMAGE"
 state_set_json '.nats.count' "$NATS_COUNT"
+# Only a registry pull token (if any) goes over SSH; nothing secret is in the user-data.
+for name in "${names[@]}"; do deliver_boot_secrets "$name"; done
 wait_boot "${names[@]}"
 cost_checkpoint
 log_line 30-nats "NATS cluster of $NATS_COUNT up ($NATS_INSTANCE_TYPE, $NATS_IMAGE): $urls" "40-nodes.sh"

@@ -50,12 +50,14 @@ if [ -n "${NODE_GOMAXPROCS:-}" ]; then env_args+=" -e GOMAXPROCS=$NODE_GOMAXPROC
 
 spend_gate
 init_work_dir
-role_args=("IMAGE=$image" "ENV_ARGS=$env_args" "API_KEY=$api_key" "DSN=$dsns" "PORT=$SERVER_PORT"
+role_args=("IMAGE=$image" "ENV_ARGS=$env_args" "PORT=$SERVER_PORT"
   "DEBUG_PORT=$SERVER_DEBUG_PORT" "FLAGS=$flags")
+# The API key and the DSNs (database password) are not in the user-data: they go over SSH.
+node_secrets=("BENCH_API_KEY=$api_key" "BENCH_DSN=$dsns")
 ud="$BENCH_WORK_DIR/userdata-node.sh"
 render_userdata "$ud" node "${role_args[@]}"
 role_only="$BENCH_WORK_DIR/role-node.sh"
-render_template "$BENCH_AWS_DIR/templates/node.sh" "${role_args[@]}" >"$role_only"
+render_role_script node "${role_args[@]}" >"$role_only"
 
 # Scale down first (run 7 goes 20 -> 10 -> 5).
 if [ "${SCALE_DOWN:-0}" = 1 ]; then
@@ -77,12 +79,14 @@ for i in $(seq 1 "$NODE_COUNT"); do
   existed=$(find_instance "$name")
   ids+=("$(launch_instance "$name" node "$NODE_INSTANCE_TYPE" "$ud")")
   if [ -n "$existed" ] && [ "${RECONFIGURE:-0}" = 1 ]; then
-    apply_role_script "$name" "$role_only"
+    apply_role_script "$name" "$role_only" "${node_secrets[@]}"
     log "reconfigured $name"
   fi
 done
 wait_instances_running "${ids[@]}"
 refresh_instances
+# Every node that has not finished booting gets them (also one an interrupted earlier run launched).
+for name in "${names[@]}"; do deliver_boot_secrets "$name" "${node_secrets[@]}"; done
 wait_boot "${names[@]}"
 
 _state_update '.deployment = {bus:$bus,server_image:$img,extra_flags:$fl,node_count:($n|tonumber),node_type:$t,gomemlimit:$gm}' \
