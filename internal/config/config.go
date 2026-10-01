@@ -68,13 +68,9 @@ type File struct {
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
-	// The presence path (DESIGN.md §12.5, §9): whether presence writes
-	// join the publish
-	// batches (a pointer, since its default is true and a file must be
-	// able to turn it off), the bound on unbatched presence writes
-	// in flight (zero means absent), and the liveness lease mode ("node"
-	// or "member").
-	PresenceBatching    *bool  `toml:"presence-batching"`
+	// The presence path (DESIGN.md §12.5, §9): the bound on presence
+	// writes committed outside the publish lanes (zero means absent), and
+	// the liveness lease mode ("node" or "member").
 	PresenceMaxInflight int    `toml:"presence-max-inflight"`
 	PresenceLeaseMode   string `toml:"presence-lease-mode"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
@@ -266,15 +262,6 @@ func DefaultBool(env string, file bool, fallback bool) (bool, error) {
 		return true, nil
 	}
 	return fallback, nil
-}
-
-// DefaultBoolPtr is DefaultBool for an option whose file value may be
-// set to false over a true fallback: file is nil when absent.
-func DefaultBoolPtr(env string, file *bool, fallback bool) (bool, error) {
-	if env == "" && file != nil {
-		return *file, nil
-	}
-	return DefaultBool(env, false, fallback)
 }
 
 // DefaultInt64 is Default for an integer-valued flag: env, if set, is

@@ -1443,7 +1443,7 @@ thousands of writes a second: the cost of a commit is shared by every
 publish in it. It is on by default (`--publish-lanes=4`) with every bus
 (§7.2); `--publish-lanes=0` commits every publish in its own transaction.
 A presence operation (`StorePresence`, §12.2) joins the same lanes and
-batches (`--presence-batching`, default true), so ENTERs and LEAVEs from
+batches, so ENTERs and LEAVEs from
 many rooms share one commit and a room's row lock is taken once per
 batch, not once per operation (§12.5). Mutations and annotations are not
 batched.
@@ -1546,7 +1546,7 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   `--publish-queue-max` of it queued per lane, so a commit that stalls
   during a mass disconnect cannot grow the queue without limit. Beyond
   that bound it is not refused but written in a transaction of its own,
-  as with `--presence-batching=false`, once the publishes of its channel
+  as with `--publish-lanes=0`, once the publishes of its channel
   that were queued or in flight on the lane when it was turned away have
   completed (so it never overtakes an earlier operation on the channel,
   such as the ENTER of the member it removes), and once one of the
@@ -1643,8 +1643,8 @@ Series (§10): `ably_publish_lanes` and `ably_publish_linger_max_seconds`
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
 `ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`, and
-`presence_inflight` for an unbatched presence write refused over its
-in-flight bound, §12.5), `ably_publish_server_presence_unbatched_total`
+`presence_inflight` for a presence write refused over its in-flight
+bound with `--publish-lanes=0`, §12.5), `ably_publish_server_presence_unbatched_total`
 (server-synthesised presence written outside a full lane, above) and
 `ably_publish_server_presence_forced_total` (queued past the bound
 because its channel's earlier publishes were stuck), `ably_storage_channel_rows_dropped_total` and
@@ -2441,8 +2441,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
---presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
---presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
+--presence-max-inflight 0     cluster mode: presence writes committed outside the lanes at once per database; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
 --presence-lease-mode node    cluster mode: presence liveness lease per node (node) or per member row (member) (§12.5)
 ```
 
@@ -2465,7 +2464,7 @@ Configuration may also be supplied via an optional TOML config file
 `attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`,
 `publish-queue-max`,
-`presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
+`presence-max-inflight`, `presence-lease-mode` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
 retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
@@ -2519,6 +2518,12 @@ in a warning at startup.
   default (§12.4), and reads the store only when seeding that set fails
   (`ably_presence_syncs_total{snapshot="fallback"}`); `store`, a store
   read per attach, is gone with its `snapshot="store"` series value.
+- `--presence-batching` (`presence-batching`): presence writes always join
+  the publish lanes' batches when there are lanes, its `true` default
+  (§6.3 "Presence in a batch"). Turning batching off for everything,
+  `--publish-lanes=0`, is the one way to commit presence on its own, and
+  `--presence-max-inflight` stays to bound the writes committed outside
+  the lanes.
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -3109,11 +3114,12 @@ into it transactionally and `Members` reads it (§6). Per backend:
   ENTERs. `SYNC` is served from the node's member set, seeded from
   `Members` once per channel bind and maintained from delivered cms
   (§12.4); it is a cache of this table, never a second source of truth.
-  Presence writes join the publish lanes' batches (`--presence-batching`,
-  default true; §6.3 "Presence in a batch"), so one room's row lock is
-  taken once per batch rather than once per ENTER or LEAVE. A presence
-  write committed in its own transaction (`--presence-batching=false`, or
-  `--publish-lanes=0`) holds a pool connection for the whole transaction,
+  Presence writes join the publish lanes' batches (§6.3 "Presence in a
+  batch"), so one room's row lock is taken once per batch rather than
+  once per ENTER or LEAVE. A presence write committed in its own
+  transaction (every one with `--publish-lanes=0`; with lanes, a
+  lease-lapse re-entry or a server-synthesised LEAVE written around a
+  full lane) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
   per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
   16 when batching is off; server-synthesised LEAVEs are exempt (in the

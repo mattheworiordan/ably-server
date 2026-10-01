@@ -315,9 +315,8 @@ type Storage struct {
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
 
-	// presenceLanes is lanes when presence is batched too, else nil;
-	// presenceSlots bounds unbatched presence writes (nil: unbounded).
-	presenceLanes *laneSet
+	// presenceSlots bounds the presence writes committed outside the
+	// lanes (nil: unbounded).
 	presenceSlots chan struct{}
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
@@ -575,9 +574,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 
 	if batching.enabled() {
 		s.lanes = newLaneSet(batching, s, s.wmetrics)
-		if !batching.PresenceUnbatched {
-			s.presenceLanes = s.lanes
-		}
 	}
 	if n := presenceMaxInflight(opts.PresenceMaxInflight, batching); n > 0 {
 		s.presenceSlots = make(chan struct{}, n)
@@ -770,7 +766,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		cs.ready = make(chan struct{})
 	}
 	s.setRetention(cs)
-	cs.presenceLanes, cs.presenceSlots, cs.wmetrics = s.presenceLanes, s.presenceSlots, s.wmetrics
+	cs.presenceSlots, cs.wmetrics = s.presenceSlots, s.wmetrics
 	return cs
 }
 
@@ -779,7 +775,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 const DefaultPresenceInflightPerLane = 4
 
 // presenceMaxInflight resolves Options.PresenceMaxInflight: the bound
-// on unbatched presence writes, or 0 for none.
+// on presence writes committed outside the lanes, or 0 for none.
 func presenceMaxInflight(n int, b Batching) int {
 	switch {
 	case n < 0:
@@ -1245,8 +1241,9 @@ type channelStore struct {
 	// retention floor over rows a migration left in the live class. All
 	// feed RetainedSince and the idempotency window.
 	persisted bool
-	// lanes is the storage's publish batcher, nil when batching is off
-	// (DESIGN.md §6.3); a batched publish on a channel with no row yet
+	// lanes is the storage's publish batcher, shared by message and
+	// presence publishes, nil when batching is off (DESIGN.md §6.3,
+	// §12.5); a batched publish on a channel with no row yet
 	// creates it inside its batch (publish_batch_lock). rows is the
 	// storage's known-row cache.
 	lanes     *laneSet
@@ -1255,11 +1252,9 @@ type channelStore struct {
 	clock     *atomic.Int64
 	floorMin  string
 
-	// presenceLanes is lanes when presence operations are batched too
-	// (nil otherwise); presenceSlots bounds the presence operations this
-	// Storage runs in their own transaction at once (nil: no bound). Both
-	// DESIGN.md §12.5.
-	presenceLanes *laneSet
+	// presenceSlots bounds the presence operations this Storage runs in
+	// their own transaction at once, outside the lanes (nil: no bound;
+	// DESIGN.md §12.5).
 	presenceSlots chan struct{}
 	wmetrics      *writeMetrics
 
@@ -1694,8 +1689,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		return nil, false, err
 	}
 
-	if cs.presenceLanes != nil {
-		return cs.storePresenceBatched(ctx, cs.presenceLanes, presence)
+	if cs.lanes != nil {
+		return cs.storePresenceBatched(ctx, cs.lanes, presence)
 	}
 	if storage.IsPresenceReentry(ctx) {
 		// A lease-lapse re-entry skips members still present (§12.5).

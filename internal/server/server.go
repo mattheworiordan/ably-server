@@ -83,7 +83,6 @@ const (
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 
-	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
 	presenceLeaseModeEnv   = "ABLY_SERVER_PRESENCE_LEASE_MODE"
 )
@@ -213,11 +212,6 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
-	presenceBatchingDefault, err := config.DefaultBoolPtr(opts.Getenv(presenceBatchingEnv), file.PresenceBatching, true)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
 	presenceMaxInflightDefault, err := config.DefaultInt(opts.Getenv(presenceMaxInflightEnv), file.PresenceMaxInflight, 0)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -275,9 +269,8 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
 	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
-	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction at once per database before new ones are refused with 42910; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
+	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction, outside the publish lanes, at once per database: with --publish-lanes=0 a client's presence write beyond it is refused with 42910; with lanes, a lease-lapse re-entry or a server-synthesised LEAVE written around a full lane waits for a slot; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -423,8 +416,6 @@ func Run(ctx context.Context, opts Opts) int {
 			BatchMax:  *publishBatchMax,
 			LingerMax: *publishLingerMax,
 			QueueMax:  *publishQueueMax,
-
-			PresenceUnbatched: !*presenceBatching,
 		},
 		presenceMaxInflight: *presenceMaxInflight,
 		presenceLeaseMode:   *presenceLeaseMode,
@@ -473,7 +464,7 @@ func Run(ctx context.Context, opts Opts) int {
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
-	logger.Info("presence path", "batching", *presenceBatching, "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
+	logger.Info("presence path", "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
@@ -937,7 +928,7 @@ type clusterOptions struct {
 	persisted           func(channel string) bool // persisted-namespace resolver
 	persistedNamespaces []string                  // the persisted namespace ids (cluster identity, DESIGN.md §11)
 
-	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
+	presenceMaxInflight int    // presence writes in flight outside the lanes (DESIGN.md §12.5)
 	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
 
 	// onPresenceLeaseLapse re-enters this node's presence members after

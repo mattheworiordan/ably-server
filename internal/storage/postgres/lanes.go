@@ -69,13 +69,6 @@ type Batching struct {
 	// QueueMax bounds each lane's queue; beyond it a publish fails with
 	// storage.ErrOverloaded. Zero means DefaultPublishQueueMax.
 	QueueMax int
-
-	// PresenceUnbatched commits every presence operation in its own
-	// transaction even when publishes are batched, as before presence
-	// batching existed. The zero value routes presence through the lanes
-	// with messages (DESIGN.md §6.3, §12.5); the server's
-	// --presence-batching=false sets it.
-	PresenceUnbatched bool
 }
 
 func (b Batching) enabled() bool { return b.Lanes > 0 }
