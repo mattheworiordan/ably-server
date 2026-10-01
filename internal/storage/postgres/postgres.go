@@ -278,6 +278,10 @@ type Storage struct {
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
 	clockOffset atomic.Int64
+	// clockSkew (ms) is added to clockOffset whenever it is measured, so
+	// tests can move the retention floor the way MaintainPartitionsAt
+	// moves the drop cutoff. Zero in production.
+	clockSkew atomic.Int64
 	// legacyBound is the upper bound of the live-class leaf a migrated
 	// pre-partitioning log became (retention_state), or "" when there was
 	// none. Persisted channels' rows from before it sit in the live class.
@@ -558,6 +562,11 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("registered")
 	}
+	// The watermark read's snapshot is taken after now, so nothing past
+	// the watermark had committed at now (DESIGN.md §7.2).
+	cs.hwmMu.Lock()
+	cs.markProvenLocked(s.clockSerial(time.Now()))
+	cs.hwmMu.Unlock()
 	current, initial, err := s.channelRow(ctx, name)
 	if err != nil {
 		return fail(err)
@@ -1111,6 +1120,12 @@ type channelStore struct {
 	// flight. It also guards the fields below.
 	hwmMu    sync.Mutex
 	lastSeen string
+	// provenAt is the serial prefix of the latest database time at which
+	// the channel was known to have nothing committed past lastSeen: the
+	// bind's watermark read, or a bus sweep that found the channel caught
+	// up. A log read from the mark needs no continuity proof while it is
+	// inside the retention window (chain.go mustProveLocked).
+	provenAt string
 
 	// released is set by Storage.Release (or a failed bind): nothing is
 	// delivered to the appender after it. ready is closed once the bind

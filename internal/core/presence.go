@@ -356,15 +356,6 @@ func (c *Channel) seedMembers(ctx context.Context) error {
 	return nil
 }
 
-// Discontinuity drops the local member set: the storage backend skipped
-// cms it could not deliver (storage.Discontinuous), so the set may miss
-// presence operations. The next SYNC seeds it again from the store.
-func (c *Channel) Discontinuity() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.dropMemberViewLocked()
-}
-
 // dropMemberViewLocked drops the local member set so the next SYNC seeds
 // it again; a seed read in flight is discarded (its gen is stale).
 // Called with c.mu held.

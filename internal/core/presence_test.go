@@ -415,7 +415,7 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 
 	// A LEAVE for alice was skipped; the store no longer has her.
 	store.members, store.asOf = nil, "007"
-	c.Discontinuity()
+	c.Discontinuity(storage.DiscontinuityLogGap)
 	snap, err := c.PresenceSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -425,7 +425,7 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 	}
 
 	// A discontinuity during the seed read discards that read.
-	c.Discontinuity()
+	c.Discontinuity(storage.DiscontinuityLogGap)
 	store.release, store.entered = make(chan struct{}), make(chan struct{})
 	store.calls.Store(0)
 	done := make(chan *PresenceSnapshot, 1)
@@ -434,7 +434,7 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 		done <- snap
 	}()
 	<-store.entered
-	c.Discontinuity()
+	c.Discontinuity(storage.DiscontinuityLogGap)
 	store.members, store.asOf = []*protocol.PresenceMessage{pres("009", 0, protocol.PresenceEnter, "c2", "bob", "b")}, "009"
 	close(store.release)
 	snap = <-done
@@ -535,7 +535,7 @@ func TestPresenceSyncDiscontinuityDuringWait(t *testing.T) {
 	c.mgr.sleep = func(_ context.Context, d time.Duration) error {
 		clk.ns.Add(int64(d))
 		store.members, store.asOf = []*protocol.PresenceMessage{pres("012", 0, protocol.PresenceEnter, "c2", "bob", "b")}, "012"
-		c.Discontinuity()
+		c.Discontinuity(storage.DiscontinuityLogGap)
 		return nil
 	}
 	snap, err := c.PresenceSync(ctx)
@@ -645,5 +645,92 @@ func TestChannelDropDuringSeedRetriesTheSeed(t *testing.T) {
 	}
 	if got := setOf(snap.Members); fmt.Sprint(got) != "[c2:bob=b]" {
 		t.Errorf("set = %v, want the fresh seed [c2:bob=b]", got)
+	}
+}
+
+// TestDiscontinuityMarkerReachesEveryStreamInOrder: a discontinuity the
+// backend signals between two appends (storage.Discontinuous, DESIGN.md
+// §7.2) reaches every open Stream as a marker between the two cms, with
+// the serial of the cm before it, parked Streams are woken for it, and
+// the local member set is dropped so the next SYNC re-seeds.
+func TestDiscontinuityMarkerReachesEveryStreamInOrder(t *testing.T) {
+	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
+	c, _ := testChannel(t, store, "005")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.PresenceSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const streams = 3
+	type step struct {
+		serial string
+		marker bool
+	}
+	results := make(chan []step, streams)
+	parked := make(chan struct{}, streams)
+	for range streams {
+		s, err := c.Attach(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			defer s.Close()
+			var got []step
+			parked <- struct{}{}
+			for len(got) < 3 {
+				cm, err := s.Next(ctx)
+				if err != nil {
+					t.Errorf("Next: %v", err)
+					break
+				}
+				got = append(got, step{cm.ChannelSerial, s.Discontinuity()})
+				if s.Discontinuity() && (len(cm.Messages) != 0 || s.ChannelSerial() != "006") {
+					t.Errorf("marker carries %d messages at %q, want none at 006", len(cm.Messages), s.ChannelSerial())
+				}
+			}
+			results <- got
+		}()
+	}
+	for range streams {
+		<-parked
+	}
+
+	c.Append(newCM("006", "m1"))
+	c.Discontinuity(storage.DiscontinuityRetention)
+	c.Append(newCM("008", "m2"))
+
+	want := []step{{"006", false}, {"006", true}, {"008", false}}
+	for range streams {
+		select {
+		case got := <-results:
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("stream saw %v, want %v", got, want)
+			}
+		case <-ctx.Done():
+			t.Fatal("a stream did not see all three entries")
+		}
+	}
+
+	// The set was dropped with the marker: the next SYNC reads the store.
+	store.members, store.asOf = nil, "008"
+	snap, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Members) != 0 || store.calls.Load() != 2 {
+		t.Errorf("after the marker: set %v with %d store reads, want empty after a re-seed", setOf(snap.Members), store.calls.Load())
+	}
+}
+
+// TestDiscontinuityBeforeInitializeLinksNoMarker: before Initialize no
+// Stream can exist, so a discontinuity only drops the member set and the
+// list stays as it was.
+func TestDiscontinuityBeforeInitializeLinksNoMarker(t *testing.T) {
+	c := newChannel("room")
+	head := c.tail
+	c.Discontinuity(storage.DiscontinuityLogGap)
+	if c.tail != head || head.next != nil {
+		t.Error("a marker was linked before Initialize")
 	}
 }

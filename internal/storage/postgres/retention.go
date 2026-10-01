@@ -285,7 +285,7 @@ func (s *Storage) databaseNow(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("read database clock: %w", err)
 	}
 	mid := before.Add(time.Since(before) / 2)
-	s.clockOffset.Store(nowMs - mid.UnixMilli())
+	s.clockOffset.Store(nowMs - mid.UnixMilli() + s.clockSkew.Load())
 	return nowMs, nil
 }
 
@@ -388,9 +388,15 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 				continue
 			}
 			cutoff := nowMs - c.retention.Milliseconds()
+			// Oldest first, stopping at the first leaf that will not
+			// detach: the log only ever loses its oldest rows, so while a
+			// channel's cm at a delivery mark is held, every cm after it is
+			// too, which is what a catch-up from that mark relies on to
+			// prove its continuity (chain.go readRange, DESIGN.md §7.2).
+			slices.SortFunc(parts, func(a, b partition) int { return cmp.Compare(a.lo, b.lo) })
 			for _, p := range parts {
 				if p.hi > cutoff {
-					continue
+					break
 				}
 				mode := "CONCURRENTLY"
 				if p.detachPending {
@@ -399,7 +405,7 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 				if _, err := conn.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s %s`,
 					pgx.Identifier{parent}.Sanitize(), pgx.Identifier{p.name}.Sanitize(), mode)); err != nil {
 					errs = append(errs, fmt.Errorf("detach %s: %w", p.name, err))
-					continue
+					break
 				}
 				if _, err := conn.Exec(ctx, `DROP TABLE `+pgx.Identifier{p.name}.Sanitize()); err != nil {
 					errs = append(errs, fmt.Errorf("drop %s: %w", p.name, err))
@@ -593,11 +599,23 @@ func floorTo(ms, width int64) int64 {
 // towards refusing a resume. For a persisted channel the floor is at
 // least the bound of any legacy live-class leaf (see Storage.legacyBound).
 func (cs *channelStore) RetainedSince(now time.Time) string {
-	floor := fmt.Sprintf("%014d", now.UnixMilli()+cs.clock.Load()-cs.retention.Milliseconds()+clockMargin.Milliseconds())
+	var offset int64
+	if cs.clock != nil {
+		offset = cs.clock.Load()
+	}
+	floor := fmt.Sprintf("%014d", now.UnixMilli()+offset-cs.retention.Milliseconds()+clockMargin.Milliseconds())
 	if cs.persisted && cs.floorMin > floor {
 		return cs.floorMin
 	}
 	return floor
+}
+
+// clockSerial returns the serial prefix of the database time at now (this
+// node's clock corrected by the measured offset), less the clock margin,
+// so it errs early: a cm minted after the instant it names sorts at or
+// above it.
+func (s *Storage) clockSerial(now time.Time) string {
+	return fmt.Sprintf("%014d", now.UnixMilli()+s.clockOffset.Load()-clockMargin.Milliseconds())
 }
 
 // idempotencyFloor is the lower serial bound of the idempotency lookup:

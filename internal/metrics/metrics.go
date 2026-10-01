@@ -47,6 +47,8 @@ type Metrics struct {
 	presenceSyncByKey sync.Map // snapshot label -> prometheus.Counter
 	presenceSeeds     prometheus.Counter
 
+	channelDiscontinuities *prometheus.CounterVec
+
 	// Delivery stages after Append (DESIGN.md §10): the fan-out time to
 	// each sampled attachment's frame being queued, the wait of a sampled
 	// connection's frame in its outbound queue, and the largest fan-out
@@ -137,6 +139,10 @@ func New() *Metrics {
 			Name: "ably_presence_sync_seeds_total",
 			Help: "Local presence member sets seeded from the store: at most one per channel bind (DESIGN.md §12.4).",
 		}),
+		channelDiscontinuities: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ably_channel_discontinuities_total",
+			Help: "Discontinuities signalled on channels bound on this node, each sent to every attachment as an ATTACHED without RESUMED and error 80016 (DESIGN.md §7.2), by reason: retention (a catch-up from the log started below the retention floor and could not prove nothing had aged out), log_gap (a gap the bus revealed was not in the log and was skipped).",
+		}, []string{"reason"}),
 		deliveryFanout: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_delivery_fanout_seconds",
 			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
@@ -167,6 +173,7 @@ func New() *Metrics {
 		m.slowConsumerDisconnects,
 		m.presenceSyncs,
 		m.presenceSeeds,
+		m.channelDiscontinuities,
 		m.deliveryFanout,
 		m.connWriteWait,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -342,6 +349,15 @@ func (m *Metrics) PresenceSeed() {
 		return
 	}
 	m.presenceSeeds.Inc()
+}
+
+// ChannelDiscontinuity records a discontinuity signalled on a channel,
+// by reason ("retention" or "log_gap").
+func (m *Metrics) ChannelDiscontinuity(reason string) {
+	if m == nil {
+		return
+	}
+	m.channelDiscontinuities.WithLabelValues(reason).Inc()
 }
 
 // DeliveryFanoutSize records the number of attachments open on a channel

@@ -32,7 +32,14 @@ import (
 // reconnect catches every bound channel up from the log
 // (reconcileBound); and the watermark sweep (sweepWatermarks) catches a
 // lost tail with no later publish. A missed bus message makes a cm
-// late, never lost: it is committed before it is announced.
+// late, not lost, while the log still holds it: it is committed before
+// it is announced. Once it has aged out of the retention window
+// (DESIGN.md §6.3) it is lost, and every read of the log from the
+// delivery mark (gap fill, catch-up, reconcile, sweep) checks whether it
+// can still prove it saw everything after the mark (readRange). When it
+// cannot, the appender is told (storage.Discontinuous) in delivery
+// order, before the cms that survived, and the attachments tell their
+// clients.
 
 // Gap-fill tuning. gapFillDelay is how long a held cm waits for its
 // predecessor before the gap is read from the log; gapFillMaxDelay caps
@@ -382,19 +389,21 @@ func (cs *channelStore) fillGap() {
 		}
 	}
 	cs.filling = true
+	check := cs.mustProveLocked(after)
 	cs.hwmMu.Unlock()
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, rangePageSize)
+		r, err := cs.readRange(ctx, after, upTo, check)
 		cancel()
 
 		cs.hwmMu.Lock()
-		if err == nil && !cs.released && len(cms) == rangePageSize {
+		if err == nil && !cs.released && r.full {
 			// A full page: deliver it and read on from its end. The log is
 			// authoritative up to upTo only once the last page is in.
-			cs.applyRangeLocked(cms, "")
-			after = cms[len(cms)-1].ChannelSerial
+			cs.applyRangeLocked(r, "")
+			after = r.cms[len(r.cms)-1].ChannelSerial
+			check = cs.mustProveLocked(after)
 			cs.hwmMu.Unlock()
 			continue
 		}
@@ -412,7 +421,7 @@ func (cs *channelStore) fillGap() {
 			cs.gapBackoff = 0
 			cs.gapFills++
 			cs.st().gapFills.Add(1)
-			cs.applyRangeLocked(cms, upTo) // settles, re-arming if a gap is left
+			cs.applyRangeLocked(r, upTo) // settles, re-arming if a gap is left
 		}
 		cs.hwmMu.Unlock()
 		return
@@ -431,9 +440,10 @@ func (cs *channelStore) catchUp(ctx context.Context) error {
 			return nil
 		}
 		after := cs.lastSeen
+		check := cs.mustProveLocked(after)
 		cs.hwmMu.Unlock()
 
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, "", rangePageSize)
+		r, err := cs.readRange(ctx, after, "", check)
 		if err != nil {
 			cs.st().fetchErrors.Add(1)
 			return err
@@ -441,22 +451,120 @@ func (cs *channelStore) catchUp(ctx context.Context) error {
 
 		cs.hwmMu.Lock()
 		if !cs.released {
-			cs.applyRangeLocked(cms, "")
+			cs.applyRangeLocked(r, "")
 		}
 		cs.hwmMu.Unlock()
-		if len(cms) < rangePageSize {
+		if !r.full {
 			return nil
 		}
 	}
 }
 
+// rangeRead is one page of a channel's log read from its delivery mark.
+type rangeRead struct {
+	// after is the mark the read started from and upTo its upper bound
+	// ("" for none); cms are the cms in (after, upTo], ascending; full is
+	// set when they filled the page, so more may follow.
+	after, upTo string
+	cms         []*protocol.ChannelMessage
+	full        bool
+	// unproven is set when the read cannot prove it holds every cm past
+	// after (DESIGN.md §7.2): after is below the channel's retention
+	// floor, the channel has moved past it, and the cm at after is gone
+	// from the log. Partitions are dropped oldest first, so while the cm
+	// at the mark is held, so is every cm after it; once it is gone, cms
+	// between it and the oldest one returned may have aged out too.
+	// current is the channel's serial as of the read, set when the read
+	// was checked: no cm at or below it that the read did not return is
+	// still in the log.
+	unproven bool
+	current  string
+}
+
+// readRangeHook, when set, replaces the log read in readRange (the
+// chain unit tests run without a database). Nil in production.
+var readRangeHook atomic.Pointer[func(cs *channelStore, after, upTo string, check bool) (rangeRead, error)]
+
+// readRange reads one page of cms in (after, upTo] (upTo "" means
+// unbounded) for the gap fill and the catch-up. check (mustProveLocked)
+// selects the read with the continuity check (rangeRead.unproven), made
+// in the same statement as the range so the two agree; without it the
+// plain range read is used.
+func (cs *channelStore) readRange(ctx context.Context, after, upTo string, check bool) (rangeRead, error) {
+	if hook := readRangeHook.Load(); hook != nil {
+		return (*hook)(cs, after, upTo, check)
+	}
+	if !check {
+		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, rangePageSize)
+		if err != nil {
+			return rangeRead{}, err
+		}
+		return rangeRead{after: after, upTo: upTo, cms: cms, full: len(cms) == rangePageSize}, nil
+	}
+	reads, err := loadRangesChecked(ctx, cs.pool, []rangeRequest{{name: cs.name, after: after, upTo: upTo, check: true}})
+	if err != nil {
+		return rangeRead{}, err
+	}
+	return reads[cs.name], nil
+}
+
+// mustProveLocked reports whether a log read from mark after must prove
+// its continuity (DESIGN.md §7.2). A cm after the mark was minted after
+// the mark's own cm and after provenAt, the latest time the node knew
+// the channel had nothing past its mark; if either is at or above the
+// retention floor (RetainedSince, which applies the database clock
+// offset), every cm the read is looking for is still held and the plain
+// read is complete. Computed locally, with no database round trip. A
+// store with no retention configured (the unit tests) keeps everything.
+// Called with hwmMu held.
+func (cs *channelStore) mustProveLocked(after string) bool {
+	if cs.retention <= 0 {
+		return false
+	}
+	return max(after, cs.provenAt) < cs.RetainedSince(time.Now())
+}
+
+// markProvenLocked records that, as of the database time at serial
+// prefix at, the channel had nothing committed past the delivery mark
+// (mustProveLocked). Called with hwmMu held.
+func (cs *channelStore) markProvenLocked(at string) {
+	cs.provenAt = max(cs.provenAt, at)
+}
+
+// signalDiscontinuityLocked tells the appender that cms between the
+// last one it was given and the next may never reach it (storage.
+// Discontinuous, DESIGN.md §7.2), in order with its Appends: hwmMu is
+// held, as it is across every Append.
+func (cs *channelStore) signalDiscontinuityLocked(reason storage.DiscontinuityReason) {
+	cs.logger.Warn("storage/postgres: delivery on the channel is not continuous; signalling the appender", "channel", cs.name, "after", cs.lastSeen, "reason", string(reason))
+	if d, ok := cs.appender.(storage.Discontinuous); ok {
+		d.Discontinuity(reason)
+	}
+}
+
 // applyRangeLocked delivers a serial-ascending range read from the log.
+//
+// If the read could not prove its continuity (rangeRead.unproven) and
+// the mark has not moved since it was taken, the appender is told before
+// the cms that survived, and, once an unbounded read has reached the end
+// of the log, the mark moves to the channel's serial as of the read, so
+// the cms that aged out are not looked for again. A mark that moved
+// meanwhile was moved by a cm that chained on it or by another read that
+// made its own check.
+//
 // When upTo is set the log is authoritative up to it: a held cm at or
 // below upTo that the read did not return (possible only if its rows
 // were removed) is delivered from the bus copy, and the mark moves to
-// upTo, so the chain can never wedge on a cm the log no longer has.
-func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo string) {
-	for _, cm := range cms {
+// upTo, so the chain can never wedge on a cm the log no longer has. Its
+// predecessor, or the cms before upTo, were then skipped, and the
+// appender is told at the point of the skip.
+func (cs *channelStore) applyRangeLocked(r rangeRead, upTo string) {
+	signalled := false
+	if r.unproven && cs.lastSeen == r.after {
+		cs.signalDiscontinuityLocked(storage.DiscontinuityRetention)
+		signalled = true
+	}
+	for _, cm := range r.cms {
 		if cm.ChannelSerial <= cs.lastSeen {
 			continue
 		}
@@ -466,6 +574,12 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 		cs.appendTimed(cm)
 		cs.st().observeLag(lagFilled, 0, cm)
 	}
+	if signalled && !r.full && r.upTo == "" && r.current > cs.lastSeen {
+		// The read reached the log's end: every cm at or below current it
+		// did not return has aged out. (A bounded read moves the mark to
+		// its bound below; a cm past that bound may still be on the bus.)
+		cs.lastSeen = r.current
+	}
 	if upTo != "" && upTo > cs.lastSeen {
 		var stale []busEvent
 		for _, ev := range cs.pending {
@@ -474,21 +588,26 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 			}
 		}
 		sort.Slice(stale, func(i, j int) bool { return stale[i].serial < stale[j].serial })
+		cs.logger.Warn("storage/postgres: bus gap not found in the log; skipped past it", "channel", cs.name, "upTo", upTo)
 		for _, ev := range stale {
 			delete(cs.pending, ev.prev)
-			if ev.cm != nil && ev.serial > cs.lastSeen {
-				cs.lastSeen = ev.serial
-				cs.delivered++
-				cs.st().filled.Add(1)
-				cs.appendTimed(ev.cm)
-				cs.st().observeLag(lagFilled, ev.sentAt, ev.cm)
+			if ev.cm == nil || ev.serial <= cs.lastSeen {
+				continue
 			}
+			if ev.prev != cs.lastSeen && !signalled {
+				cs.signalDiscontinuityLocked(storage.DiscontinuityLogGap)
+				signalled = true
+			}
+			cs.lastSeen = ev.serial
+			cs.delivered++
+			cs.st().filled.Add(1)
+			cs.appendTimed(ev.cm)
+			cs.st().observeLag(lagFilled, ev.sentAt, ev.cm)
 		}
-		cs.logger.Warn("storage/postgres: bus gap not found in the log; skipped past it", "channel", cs.name, "upTo", upTo)
+		if upTo > cs.lastSeen && !signalled {
+			cs.signalDiscontinuityLocked(storage.DiscontinuityLogGap)
+		}
 		cs.lastSeen = upTo
-		if d, ok := cs.appender.(storage.Discontinuous); ok {
-			d.Discontinuity()
-		}
 	}
 	cs.settleLocked()
 }
@@ -599,87 +718,140 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 	return len(stores), firstErr
 }
 
-// sqlLoadRangeMany reads, for each (channel, after) pair, up to $3 cms
-// past after, every kind, ascending: one round trip for many channels.
+// sqlLoadRangeMany reads, for each (channel, after, upTo) triple, up to
+// $5 cms in (after, upTo] (an empty upTo is unbounded), every kind,
+// ascending: one round trip for many channels. A channel whose check
+// flag is set also gets, once per channel (the materialised CTE) and
+// from the same snapshot as its range, its current serial and whether
+// the cm at after is still in the log (rangeRead.unproven); for the
+// others neither is read. A channel with no cms past its mark comes back
+// as one row with a NULL serial.
 const sqlLoadRangeMany = `
-SELECT t.name, m.channel_serial, m.idx, m.kind, m.payload, m.summary
-FROM unnest($1::text[], $2::text[]) AS t(name, after)
-CROSS JOIN LATERAL (
+WITH t AS MATERIALIZED (
+	SELECT u.name, u.after, u.upto,
+		CASE WHEN u.chk THEN (SELECT c.channel_serial FROM channels c WHERE c.name = u.name) END AS current,
+		CASE WHEN u.chk THEN EXISTS (
+			SELECT 1 FROM channel_messages x WHERE x.channel = u.name AND x.channel_serial = u.after) END AS anchored
+	FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[]) AS u(name, after, upto, chk)
+)
+SELECT t.name, t.current, t.anchored, m.channel_serial, m.idx, m.kind, m.payload, m.summary
+FROM t
+LEFT JOIN LATERAL (
 	SELECT cm.channel_serial, cm.idx, cm.kind, cm.payload, cm.summary
 	FROM channel_messages cm
 	WHERE cm.channel = t.name AND cm.channel_serial IN (
 		SELECT DISTINCT channel_serial FROM channel_messages
-		WHERE channel = t.name AND channel_serial > t.after
+		WHERE channel = t.name AND channel_serial > t.after AND (t.upto = '' OR channel_serial <= t.upto)
 		ORDER BY channel_serial
-		LIMIT $3)
-) m
+		LIMIT $5)
+) m ON true
 ORDER BY t.name, m.channel_serial, m.idx
 `
 
+// rangeRequest is one channel's part of a batched range read.
+type rangeRequest struct {
+	name, after, upTo string
+	check             bool // read the continuity check (rangeRead.unproven)
+}
+
+// loadRangesChecked runs sqlLoadRangeMany for reqs (distinct names) and
+// returns each channel's page, keyed by name.
+func loadRangesChecked(ctx context.Context, pool *pgxpool.Pool, reqs []rangeRequest) (map[string]rangeRead, error) {
+	names := make([]string, len(reqs))
+	afters := make([]string, len(reqs))
+	byName := make(map[string]rangeRequest, len(reqs))
+	upTos := make([]string, len(reqs))
+	checks := make([]bool, len(reqs))
+	for i, q := range reqs {
+		names[i], afters[i], upTos[i], checks[i] = q.name, q.after, q.upTo, q.check
+		byName[q.name] = q
+	}
+	rows, err := pool.Query(ctx, sqlLoadRangeMany, names, afters, upTos, checks, rangePageSize)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: batched range read: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]rangeRead, len(reqs))
+	for rows.Next() {
+		var (
+			name                   string
+			current, channelSerial *string
+			anchored               *bool
+			kind                   *string
+			idx                    *int
+			payload, summary       []byte
+		)
+		if err := rows.Scan(&name, &current, &anchored, &channelSerial, &idx, &kind, &payload, &summary); err != nil {
+			return nil, fmt.Errorf("storage/postgres: scan batched range: %w", err)
+		}
+		r, seen := out[name]
+		if !seen {
+			r.after, r.upTo = byName[name].after, byName[name].upTo
+			if current != nil {
+				r.current = *current
+			}
+			// Checked: the channel moved past the mark, and the cm at the
+			// mark is gone.
+			r.unproven = anchored != nil && !*anchored && r.current > r.after
+		}
+		if channelSerial != nil {
+			if n := len(r.cms); n == 0 || r.cms[n-1].ChannelSerial != *channelSerial {
+				r.cms = append(r.cms, &protocol.ChannelMessage{ChannelSerial: *channelSerial})
+			}
+			if err := decodeRowInto(r.cms[len(r.cms)-1], name, *idx, *kind, payload, summary); err != nil {
+				return nil, err
+			}
+		}
+		out[name] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: batched range rows: %w", err)
+	}
+	for name, r := range out {
+		r.full = len(r.cms) == rangePageSize
+		out[name] = r
+	}
+	return out, nil
+}
+
 // catchUpMany is catchUp for many channels in one query: each channel's
-// first page past its mark is read together, and a channel whose page
-// came back full is then caught up on its own.
+// first page past its mark is read together, with the continuity check
+// for the channels whose mark is below the retention floor, and a
+// channel whose page came back full is then caught up on its own.
 func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error {
 	byName := make(map[string]*channelStore, len(stores))
-	names := make([]string, 0, len(stores))
-	afters := make([]string, 0, len(stores))
+	reqs := make([]rangeRequest, 0, len(stores))
 	for _, cs := range stores {
 		cs.hwmMu.Lock()
 		ok := cs.seeded && !cs.released
 		after := cs.lastSeen
+		check := cs.mustProveLocked(after)
 		cs.hwmMu.Unlock()
 		if !ok {
 			continue
 		}
 		byName[cs.name] = cs
-		names = append(names, cs.name)
-		afters = append(afters, after)
+		reqs = append(reqs, rangeRequest{name: cs.name, after: after, check: check})
 	}
-	if len(names) == 0 {
+	if len(reqs) == 0 {
 		return nil
 	}
 
-	rows, err := s.pool.Query(ctx, sqlLoadRangeMany, names, afters, rangePageSize)
+	reads, err := loadRangesChecked(ctx, s.pool, reqs)
 	if err != nil {
 		s.stats.fetchErrors.Add(1)
-		return fmt.Errorf("storage/postgres: batched range read: %w", err)
-	}
-	ranges := make(map[string][]*protocol.ChannelMessage, len(names))
-	for rows.Next() {
-		var (
-			name, channelSerial, kind string
-			idx                       int
-			payload, summary          []byte
-		)
-		if err := rows.Scan(&name, &channelSerial, &idx, &kind, &payload, &summary); err != nil {
-			rows.Close()
-			return fmt.Errorf("storage/postgres: scan batched range: %w", err)
-		}
-		out := ranges[name]
-		if n := len(out); n == 0 || out[n-1].ChannelSerial != channelSerial {
-			out = append(out, &protocol.ChannelMessage{ChannelSerial: channelSerial})
-		}
-		if err := decodeRowInto(out[len(out)-1], name, idx, kind, payload, summary); err != nil {
-			rows.Close()
-			return err
-		}
-		ranges[name] = out
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		s.stats.fetchErrors.Add(1)
-		return fmt.Errorf("storage/postgres: batched range rows: %w", err)
+		return err
 	}
 
 	var firstErr error
-	for name, cms := range ranges {
+	for name, r := range reads {
 		cs := byName[name]
 		cs.hwmMu.Lock()
 		if !cs.released {
-			cs.applyRangeLocked(cms, "")
+			cs.applyRangeLocked(r, "")
 		}
 		cs.hwmMu.Unlock()
-		if len(cms) == rangePageSize {
+		if r.full {
 			if err := cs.catchUp(ctx); err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -734,6 +906,9 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		if hook := sweepNamesHook.Load(); hook != nil {
 			(*hook)(names)
 		}
+		// The read's snapshot is taken after now: a channel it finds with
+		// nothing past its mark had nothing past it at now (provenAt).
+		readAt := s.clockSerial(time.Now())
 		rows, err := s.pool.Query(ctx, `SELECT name, channel_serial FROM channels WHERE name = ANY($1)`, names)
 		if err != nil {
 			return fmt.Errorf("storage/postgres: read watermarks: %w", err)
@@ -748,6 +923,9 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 			cs.hwmMu.Lock()
 			if cs.seeded && !cs.released && cs.sweptWatermark > cs.lastSeen {
 				behind = append(behind, cs)
+			}
+			if cs.seeded && cs.lastSeen >= watermark {
+				cs.markProvenLocked(readAt)
 			}
 			cs.sweptWatermark = watermark
 			cs.hwmMu.Unlock()

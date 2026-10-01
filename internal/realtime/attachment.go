@@ -415,6 +415,12 @@ func (a *attachment) run() {
 		if err != nil {
 			return
 		}
+		if a.stream.Discontinuity() {
+			if !a.signalDiscontinuity(cm.ChannelSerial) {
+				return
+			}
+			continue
+		}
 		// Advance the position a concurrent repeat ATTACH advertises to
 		// this cm's serial before delivery, so the re-ATTACHED reflects
 		// where the (never-interrupted) stream has reached.
@@ -423,6 +429,59 @@ func (a *attachment) run() {
 			return
 		}
 	}
+}
+
+// errMessagesExpired is the ATTACHED error of a channel update sent for
+// a discontinuity (DESIGN.md §7.2): the code a resume older than the
+// retention floor gets (§4.3), since the cause is the same.
+var errMessagesExpired = protocol.ErrorInfo{
+	Message:    "unable to recover channel (messages expired): a gap in delivery could not be filled from the log",
+	Code:       80016,
+	StatusCode: 404,
+}
+
+// signalDiscontinuity tells the client that cms may be missing at this
+// point of the live stream (a discontinuity marker, core.Stream.
+// Discontinuity; DESIGN.md §7.2): a server-initiated channel update
+// (RTL12), an ATTACHED with the current channelSerial, the effective
+// modes without RESUMED, and error 80016, so the SDK emits an update
+// event with resumed false and the application can reconcile. Nothing is
+// replayed and the attachment carries on with the live stream. A
+// PRESENCE_SUBSCRIBE attachment also gets the presence set again, as on
+// attach: HAS_PRESENCE and a SYNC when the set has members, so the SDK
+// replaces its set rather than clearing it (RTP19a); the channel dropped
+// its local set with the marker, so the snapshot is read afresh.
+// Returns false if a send failed.
+func (a *attachment) signalDiscontinuity(serial string) bool {
+	var snap *core.PresenceSnapshot
+	if a.hasMode(protocol.FlagPresenceSubscribe) {
+		var err error
+		if snap, err = a.stream.Channel().PresenceSync(a.ctx); err != nil {
+			if a.ctx.Err() != nil {
+				return false
+			}
+			a.logger.Warn("presence sync after a discontinuity: Members failed; skipping sync", "err", err)
+			snap = nil
+		}
+	}
+	hasSync := snap != nil && len(snap.Members) > 0
+	flags := a.modeSet()
+	if hasSync {
+		flags |= protocol.FlagHasPresence
+	}
+	a.setCurSerial(serial)
+	errInfo := errMessagesExpired
+	if !a.send(&protocol.ProtocolMessage{
+		Action:        protocol.ActionAttached,
+		Channel:       new(a.channelName),
+		ChannelSerial: serial,
+		Flags:         flags,
+		Error:         &errInfo,
+		Params:        a.echoParams(),
+	}) {
+		return false
+	}
+	return !hasSync || a.sendSync(snap)
 }
 
 // forward delivers one ChannelMessage to the connection as the wire

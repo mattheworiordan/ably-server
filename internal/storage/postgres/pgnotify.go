@@ -18,11 +18,15 @@ package postgres
 // during a bind is run from the watermark and merged with the held
 // notifications before the channel goes live (before, it replayed the
 // whole log or could drop messages). A re-bind after Release needs the
-// last two to honour the Appender contract.
+// last two to honour the Appender contract. A reconcile from a mark
+// below the retention floor also checks that the log still proves its
+// continuity and, when it cannot, tells the appender (readMissed,
+// DESIGN.md §7.2), as the chaining buses do.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -203,6 +207,11 @@ func (b *pgNotifyBus) isConnected() bool { return b.connected.Load() }
 func (cs *channelStore) deliver(cm *protocol.ChannelMessage) bool {
 	cs.hwmMu.Lock()
 	defer cs.hwmMu.Unlock()
+	return cs.deliverLocked(cm)
+}
+
+// deliverLocked is deliver with hwmMu held.
+func (cs *channelStore) deliverLocked(cm *protocol.ChannelMessage) bool {
 	if cs.released {
 		return false
 	}
@@ -268,9 +277,10 @@ func (cs *channelStore) initialize(ctx context.Context, current, initial string)
 		}
 		cs.needsReconcile = false
 		after := cs.lastSeen
+		check := cs.mustProveLocked(after)
 		cs.hwmMu.Unlock()
 
-		missed, err := cs.loadAfter(ctx, after)
+		missed, err := cs.readMissed(ctx, after, check)
 
 		cs.hwmMu.Lock()
 		if err != nil {
@@ -280,8 +290,100 @@ func (cs *channelStore) initialize(ctx context.Context, current, initial string)
 			cs.hwmMu.Unlock()
 			return err
 		}
-		cs.deliverSortedLocked(append(missed, cs.preSeed...))
+		signalled := cs.signalUnprovenLocked(missed)
+		cs.deliverSortedLocked(append(missed.cms, cs.preSeed...))
 		cs.preSeed = nil
+		cs.passExpiredLocked(missed, signalled)
+	}
+}
+
+// missedRead is a pgnotify reconcile's read of the cms after a mark:
+// the cms, and, when the mark is below the retention floor, whether the
+// read could not prove it saw every cm after the mark (rangeRead
+// documents unproven and current; here current is read before the cms
+// and the cm at the mark is looked for after them).
+type missedRead struct {
+	after    string
+	cms      []*protocol.ChannelMessage
+	unproven bool
+	current  string
+}
+
+// readMissed reads every cm committed after the mark (loadAfter) and,
+// when check is set (the mark is below the retention floor,
+// mustProveLocked, DESIGN.md §7.2), checks the read's continuity: the
+// channel's serial before the read (nothing to prove if it has not moved
+// past the mark), and, after it, whether the cm at the mark is still in
+// the log. Partitions are dropped oldest first, so a cm at the mark
+// still held after the read means nothing after it had aged out when
+// the read ran. The check costs two point reads, only for a channel
+// whose mark is that old.
+func (cs *channelStore) readMissed(ctx context.Context, after string, check bool) (missedRead, error) {
+	r := missedRead{after: after}
+	if check {
+		current, err := cs.currentSerial(ctx)
+		if err != nil {
+			return r, err
+		}
+		r.current, check = current, current > after
+	}
+	cms, err := cs.loadAfter(ctx, after)
+	if err != nil {
+		return r, err
+	}
+	r.cms = cms
+	if check {
+		held, err := cs.serialInLog(ctx, after)
+		if err != nil {
+			return r, err
+		}
+		r.unproven = !held
+	}
+	return r, nil
+}
+
+// currentSerial reads the channel's current serial ("" for a channel
+// with no row).
+func (cs *channelStore) currentSerial(ctx context.Context) (string, error) {
+	var current string
+	err := cs.pool.QueryRow(ctx, `SELECT channel_serial FROM channels WHERE name = $1`, cs.name).Scan(&current)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("storage/postgres: read channel serial %s: %w", cs.name, err)
+	}
+	return current, nil
+}
+
+// serialInLog reports whether the log still holds the cm at serial.
+func (cs *channelStore) serialInLog(ctx context.Context, serial string) (bool, error) {
+	var held bool
+	err := cs.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM channel_messages WHERE channel = $1 AND channel_serial = $2)`, cs.name, serial).Scan(&held)
+	if err != nil {
+		return false, fmt.Errorf("storage/postgres: look up %s %s: %w", cs.name, serial, err)
+	}
+	return held, nil
+}
+
+// signalUnprovenLocked tells the appender of a discontinuity before the
+// cms of a read that could not prove its continuity, unless the mark
+// has moved since the read was taken (then a delivery, which on this
+// bus comes from the same log, already passed the mark). It reports
+// whether it did. Called with hwmMu held.
+func (cs *channelStore) signalUnprovenLocked(r missedRead) bool {
+	if !r.unproven || cs.lastSeen != r.after {
+		return false
+	}
+	cs.signalDiscontinuityLocked(storage.DiscontinuityRetention)
+	return true
+}
+
+// passExpiredLocked moves the mark, after a signalled discontinuity, to
+// the channel's serial as of the read: every cm at or below it was
+// committed before the read, so it was delivered or has aged out, and
+// the next reconcile does not look for the expired ones again. Called
+// with hwmMu held.
+func (cs *channelStore) passExpiredLocked(r missedRead, signalled bool) {
+	if signalled && r.current > cs.lastSeen {
+		cs.lastSeen = r.current
 	}
 }
 
@@ -319,17 +421,25 @@ func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
 		return nil
 	}
 	after := cs.lastSeen
+	check := cs.mustProveLocked(after)
 	cs.hwmMu.Unlock()
 
-	missed, err := cs.loadAfter(ctx, after)
+	missed, err := cs.readMissed(ctx, after, check)
 	if err != nil {
 		return err
 	}
-	for _, cm := range missed {
-		if cs.deliver(cm) {
+	cs.hwmMu.Lock()
+	defer cs.hwmMu.Unlock()
+	if cs.released {
+		return nil
+	}
+	signalled := cs.signalUnprovenLocked(missed)
+	for _, cm := range missed.cms {
+		if cs.deliverLocked(cm) {
 			cs.st().filled.Add(1)
 		}
 	}
+	cs.passExpiredLocked(missed, signalled)
 	return nil
 }
 

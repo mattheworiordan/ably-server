@@ -1,12 +1,16 @@
 package postgres
 
 import (
+	"context"
+	"fmt"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // Unit tests for the chained delivery point (DESIGN.md §7.2). Every
@@ -115,7 +119,7 @@ func TestChainArmsGapFillForAMissingPredecessor(t *testing.T) {
 	// The gap fill's log read returns s1 and s2: both are delivered once
 	// and the held copy of s2 is discarded.
 	cs.hwmMu.Lock()
-	cs.applyRangeLocked([]*protocol.ChannelMessage{ev("s1", "s0").cm, ev("s2", "s1").cm}, "s2")
+	cs.applyRangeLocked(rangeRead{cms: []*protocol.ChannelMessage{ev("s1", "s0").cm, ev("s2", "s1").cm}}, "s2")
 	cs.hwmMu.Unlock()
 	if want := []string{"s1", "s2"}; !slices.Equal(rec.serials, want) {
 		t.Fatalf("delivered %v, want %v", rec.serials, want)
@@ -133,7 +137,7 @@ func TestChainSkipsAGapTheLogNoLongerHolds(t *testing.T) {
 	// The log read comes back empty (the rows are gone): the held bus
 	// copies are delivered in order rather than wedging the chain.
 	cs.hwmMu.Lock()
-	cs.applyRangeLocked(nil, "s3")
+	cs.applyRangeLocked(rangeRead{}, "s3")
 	cs.hwmMu.Unlock()
 	if want := []string{"s2", "s3"}; !slices.Equal(rec.serials, want) {
 		t.Fatalf("delivered %v, want %v", rec.serials, want)
@@ -149,9 +153,14 @@ func TestChainSkipsAGapTheLogNoLongerHolds(t *testing.T) {
 type discontinuityRecorder struct {
 	chainRecorder
 	discontinuities int
+	reasons         []storage.DiscontinuityReason
 }
 
-func (r *discontinuityRecorder) Discontinuity() { r.discontinuities++ }
+func (r *discontinuityRecorder) Discontinuity(reason storage.DiscontinuityReason) {
+	r.discontinuities++
+	r.reasons = append(r.reasons, reason)
+	r.serials = append(r.serials, "|") // where in the delivery order it came
+}
 
 // TestChainSkippedGapSignalsDiscontinuity: a gap the log no longer holds
 // is skipped, and the appender is told, so a node's local presence
@@ -164,20 +173,24 @@ func TestChainSkippedGapSignalsDiscontinuity(t *testing.T) {
 	cs.seed("s0")
 	cs.deliverChained(ev("s2", "s1"))
 	cs.hwmMu.Lock()
-	cs.applyRangeLocked([]*protocol.ChannelMessage{{ChannelSerial: "s1"}, {ChannelSerial: "s2"}}, "s2")
+	cs.applyRangeLocked(rangeRead{cms: []*protocol.ChannelMessage{{ChannelSerial: "s1"}, {ChannelSerial: "s2"}}}, "s2")
 	cs.hwmMu.Unlock()
 	if rec.discontinuities != 0 {
 		t.Fatalf("a filled gap signalled %d discontinuities", rec.discontinuities)
 	}
 	cs.deliverChained(ev("s4", "s3"))
 	cs.hwmMu.Lock()
-	cs.applyRangeLocked(nil, "s4")
+	cs.applyRangeLocked(rangeRead{}, "s4")
 	cs.hwmMu.Unlock()
 	if rec.discontinuities != 1 {
 		t.Errorf("a skipped gap signalled %d discontinuities, want 1", rec.discontinuities)
 	}
-	if want := []string{"s1", "s2", "s4"}; !slices.Equal(rec.serials, want) {
+	// The discontinuity ("|") comes where s3 was skipped, before s4.
+	if want := []string{"s1", "s2", "|", "s4"}; !slices.Equal(rec.serials, want) {
 		t.Errorf("delivered %v, want %v", rec.serials, want)
+	}
+	if want := []storage.DiscontinuityReason{storage.DiscontinuityLogGap}; !slices.Equal(rec.reasons, want) {
+		t.Errorf("reasons %v, want %v", rec.reasons, want)
 	}
 }
 
@@ -264,5 +277,197 @@ func TestChainHoldTimeSpansAReplacedOffer(t *testing.T) {
 	}
 	if hold := cs.stats.stageSnapshot()["hold"]; hold.Count != 1 || hold.Sum < 0.03 {
 		t.Errorf("hold = %d observations, %vs; want 1 of at least the 30 ms since the pointer", hold.Count, hold.Sum)
+	}
+}
+
+// retentionChain is newTestChain with a retention window, so its
+// retention floor (RetainedSince) is a minute before now, and with a
+// discontinuityRecorder appender.
+func retentionChain(t *testing.T) (*channelStore, *discontinuityRecorder) {
+	t.Helper()
+	cs, _ := newTestChain(t)
+	rec := &discontinuityRecorder{}
+	cs.appender = rec
+	cs.retention = time.Minute
+	cs.clock = new(atomic.Int64)
+	return cs, rec
+}
+
+// serialAt is a channelSerial minted d from now.
+func serialAt(d time.Duration, ctr int) string {
+	return fmt.Sprintf("%014d-%03d@test", time.Now().Add(d).UnixMilli(), ctr)
+}
+
+// fakeLog installs a readRangeHook standing in for the database: it
+// returns cms past the mark, and, for a checked read, reports the mark's
+// cm gone from the log and the channel moved on to current (what the
+// database finds after the rows between the mark and cms aged out). It
+// records whether each read was checked.
+func fakeLog(t *testing.T, current string, cms ...*protocol.ChannelMessage) *[]bool {
+	t.Helper()
+	var checks []bool
+	hook := func(_ *channelStore, after, upTo string, check bool) (rangeRead, error) {
+		checks = append(checks, check)
+		r := rangeRead{after: after, upTo: upTo}
+		for _, cm := range cms {
+			if cm.ChannelSerial > after && (upTo == "" || cm.ChannelSerial <= upTo) {
+				r.cms = append(r.cms, cm)
+			}
+		}
+		if check {
+			r.unproven, r.current = true, current
+		}
+		return r, nil
+	}
+	readRangeHook.Store(&hook)
+	t.Cleanup(func() { readRangeHook.Store(nil) })
+	return &checks
+}
+
+// TestCatchUpBelowRetentionFloorSignalsDiscontinuity: a catch-up whose
+// delivery mark is older than the retention floor cannot prove that no
+// cm after the mark aged out of the log (DESIGN.md §7.2), so the
+// appender is told before the cms that survived, once, and the mark
+// moves to the channel's serial so the expired cms are not looked for
+// again. A mark inside the window needs no proof and signals nothing.
+func TestCatchUpBelowRetentionFloorSignalsDiscontinuity(t *testing.T) {
+	t.Run("below the floor", func(t *testing.T) {
+		cs, rec := retentionChain(t)
+		mark := serialAt(-10*time.Minute, 0)
+		survivor := serialAt(-30*time.Second, 0)
+		current := serialAt(-30*time.Second, 1)
+		checks := fakeLog(t, current, &protocol.ChannelMessage{ChannelSerial: survivor})
+		cs.seed(mark)
+		if err := cs.catchUp(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"|", survivor}; !slices.Equal(rec.serials, want) {
+			t.Errorf("delivered %v, want the discontinuity before the survivor: %v", rec.serials, want)
+		}
+		if want := []storage.DiscontinuityReason{storage.DiscontinuityRetention}; !slices.Equal(rec.reasons, want) {
+			t.Errorf("reasons %v, want %v", rec.reasons, want)
+		}
+		if !slices.Equal(*checks, []bool{true}) {
+			t.Errorf("reads checked %v, want one checked read", *checks)
+		}
+		if cs.watermark() != current {
+			t.Errorf("mark = %s, want the channel's serial %s", cs.watermark(), current)
+		}
+		// A second catch-up starts inside the window: nothing more.
+		if err := cs.catchUp(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if rec.discontinuities != 1 {
+			t.Errorf("discontinuities = %d after a second catch-up, want 1", rec.discontinuities)
+		}
+	})
+	t.Run("inside the window", func(t *testing.T) {
+		cs, rec := retentionChain(t)
+		mark := serialAt(-10*time.Second, 0)
+		next := serialAt(-5*time.Second, 0)
+		checks := fakeLog(t, next, &protocol.ChannelMessage{ChannelSerial: next})
+		cs.seed(mark)
+		if err := cs.catchUp(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if rec.discontinuities != 0 || !slices.Equal(rec.serials, []string{next}) {
+			t.Errorf("delivered %v with %d discontinuities, want %s and none", rec.serials, rec.discontinuities, next)
+		}
+		if !slices.Equal(*checks, []bool{false}) {
+			t.Errorf("reads checked %v, want one unchecked read", *checks)
+		}
+	})
+}
+
+// TestGapFillBelowRetentionFloorSignalsDiscontinuity: the gap fill reads
+// the log from the same mark, so when the node was off the bus long
+// enough for the cms after its mark to age out, the first cm the bus
+// brings back is held, and the fill that releases it must say so too.
+func TestGapFillBelowRetentionFloorSignalsDiscontinuity(t *testing.T) {
+	cs, rec := retentionChain(t)
+	mark := serialAt(-10*time.Minute, 0)
+	survivor := serialAt(-30*time.Second, 0)
+	live := serialAt(-time.Second, 0)
+	fakeLog(t, live, &protocol.ChannelMessage{ChannelSerial: survivor}, ev(live, survivor).cm)
+	cs.seed(mark)
+	cs.deliverChained(ev(live, survivor)) // held: survivor never came on the bus
+	cs.fillGap()
+	if want := []string{"|", survivor, live}; !slices.Equal(rec.serials, want) {
+		t.Errorf("delivered %v, want %v", rec.serials, want)
+	}
+	if rec.discontinuities != 1 {
+		t.Errorf("discontinuities = %d, want 1", rec.discontinuities)
+	}
+}
+
+// TestGapFillBelowFloorKeepsCmsPastItsBound: the gap fill's read is
+// bounded by the highest held cm, so after a discontinuity it moves the
+// mark only to that bound, never to the channel's serial: a cm committed
+// after the bound may still be on the bus, and must not be dropped as a
+// duplicate when it arrives.
+func TestGapFillBelowFloorKeepsCmsPastItsBound(t *testing.T) {
+	cs, rec := retentionChain(t)
+	mark := serialAt(-10*time.Minute, 0)
+	survivor := serialAt(-30*time.Second, 0)
+	live := serialAt(-time.Second, 0)
+	next := serialAt(-time.Second, 1) // committed, its bus message in flight
+	fakeLog(t, next, &protocol.ChannelMessage{ChannelSerial: survivor}, ev(live, survivor).cm, ev(next, live).cm)
+	cs.seed(mark)
+	cs.deliverChained(ev(live, survivor))
+	cs.fillGap()
+	if cs.watermark() != live {
+		t.Fatalf("mark = %s after the fill, want its bound %s", cs.watermark(), live)
+	}
+	cs.deliverChained(ev(next, live))
+	if want := []string{"|", survivor, live, next}; !slices.Equal(rec.serials, want) {
+		t.Errorf("delivered %v, want %v", rec.serials, want)
+	}
+}
+
+// TestUnprovenReadsFromOneMarkSignalOnce: two reads taken from the same
+// mark (a gap fill and a catch-up racing) both fail to prove continuity;
+// the first signals and moves the mark, the second finds the mark moved
+// and signals nothing.
+func TestUnprovenReadsFromOneMarkSignalOnce(t *testing.T) {
+	cs, rec := retentionChain(t)
+	mark := serialAt(-10*time.Minute, 0)
+	current := serialAt(-30*time.Second, 0)
+	cs.seed(mark)
+	read := rangeRead{after: mark, unproven: true, current: current}
+	cs.hwmMu.Lock()
+	cs.applyRangeLocked(read, "")
+	cs.applyRangeLocked(read, "")
+	cs.hwmMu.Unlock()
+	if rec.discontinuities != 1 {
+		t.Errorf("discontinuities = %d, want 1", rec.discontinuities)
+	}
+	if cs.watermark() != current {
+		t.Errorf("mark = %s, want %s", cs.watermark(), current)
+	}
+}
+
+// TestCatchUpFromAMarkProvenRecentlyIsNotChecked: a mark below the
+// retention floor needs no proof when the node knew, inside the window,
+// that the channel had nothing past it (a bind's watermark read, or a
+// sweep that found it caught up): every cm after the mark was minted
+// after that, so it is still held. A quiet channel caught up after a
+// short outage is not signalled.
+func TestCatchUpFromAMarkProvenRecentlyIsNotChecked(t *testing.T) {
+	cs, rec := retentionChain(t)
+	mark := serialAt(-10*time.Minute, 0)
+	next := serialAt(-time.Second, 0)
+	checks := fakeLog(t, next, &protocol.ChannelMessage{ChannelSerial: next})
+	cs.seed(mark)
+	cs.hwmMu.Lock()
+	cs.markProvenLocked(serialAt(-5*time.Second, 0)[:14])
+	cs.hwmMu.Unlock()
+	if err := cs.catchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec.discontinuities != 0 || !slices.Equal(rec.serials, []string{next}) {
+		t.Errorf("delivered %v with %d discontinuities, want %s and none", rec.serials, rec.discontinuities, next)
+	}
+	if !slices.Equal(*checks, []bool{false}) {
+		t.Errorf("reads checked %v, want one unchecked read", *checks)
 	}
 }
