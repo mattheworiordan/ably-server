@@ -14,6 +14,15 @@ func (s *Storage) MaintainPartitionsAt(ctx context.Context, skew time.Duration) 
 	return s.maintainPartitions(ctx, skew)
 }
 
+// SetClockSkew makes this node read the database clock skew later than
+// it does from now on (the retention floor, RetainedSince, moves with
+// it), to pair with MaintainPartitionsAt: a test that ages partitions out
+// with a skew also moves the floor the catch-up checks against.
+func (s *Storage) SetClockSkew(d time.Duration) {
+	old := s.clockSkew.Swap(d.Milliseconds())
+	s.clockOffset.Add(d.Milliseconds() - old)
+}
+
 // PartitionsDropped returns this node's ably_storage_partitions_dropped_total
 // for table.
 func (s *Storage) PartitionsDropped(table string) float64 {

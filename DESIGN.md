@@ -1371,7 +1371,10 @@ skewed clock cannot drop a leaf still being written. Then:
    Only one node drops at a time (a session advisory lock, tried rather
    than waited for), and the drop lock is separate from the creation
    lock, so a slow drop never holds up creation. `Open` creates but does
-   not drop.
+   not drop. Leaves are dropped oldest first, and a class's drop stops at
+   the first leaf that will not detach, so the log only ever loses a
+   channel's oldest cms: a catch-up relies on that to prove its
+   continuity (§7.2).
 
 A resume whose cursor was minted before now minus the channel's retention
 is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
@@ -1791,6 +1794,53 @@ The `postgres` and `nats` buses share one delivery point
   database, and catches up any channel still behind the serial the
   previous sweep saw. A cm that old whose bus message has not arrived is
   treated as lost, not late.
+- **Retention.** Every read of the log from a channel's mark (gap fill,
+  catch-up, reconcile, sweep, and on `pgnotify` the reconcile from
+  history) is complete only while the log still holds what came after
+  the mark. Every cm after the mark was minted after the mark's own cm
+  and after the last time the node knew the channel had nothing past
+  its mark (the bind's watermark read, or a bus sweep that found the
+  channel caught up). If either is at or above the retention floor
+  (`RetainedSince`, the resume floor of §4.3, computed locally from the
+  measured database clock offset), every cm the read looks for is still
+  held and the plain read is used. Otherwise the read carries a check,
+  in the same statement as the range on the chaining buses and as two
+  point reads around the history read on `pgnotify`: the channel's
+  current serial and whether the cm at the mark is still in the log.
+  The retention sweep drops a class's leaves oldest first and stops at
+  the first that will not detach (§6.3), so while the cm at the mark is
+  held, so is every later cm of the channel. This holds per class: a
+  namespace moved between classes by a configuration change has rows in
+  both, and is not covered until its older rows have aged out. When the
+  channel has moved past the mark and the cm at the mark is gone, the
+  read cannot prove that nothing aged out between the mark and the
+  oldest cm it returned. The node then signals a **discontinuity** to
+  the channel before the cms that survived (`storage.Discontinuous`, in
+  delivery order under the mark's lock), delivers the survivors, and,
+  once an unbounded read has reached the end of the log, moves the mark
+  to the channel's serial as of the read, so the expired cms are not
+  looked for again. The channel drops its local presence member set,
+  which re-seeds from the store on the next `SYNC` (§12.4), and links a
+  discontinuity marker into its live list. Each attachment that reaches
+  the marker sends its client an `ATTACHED` without `RESUMED`, error
+  80016, at its current `channelSerial`, followed for a
+  `PRESENCE_SUBSCRIBE` attachment by the re-seeded set (`HAS_PRESENCE`
+  and a `SYNC` when it has members). The cms in the gap are not
+  replayed; the client is told so that it can reconcile (§4.3). A gap
+  the bus revealed (a held cm's predecessor) that the log no longer has
+  is signalled the same way, at the point of the skip. The signal can
+  be spurious, never missing: a channel last proven caught up longer
+  than the retention window ago, whose last cm has aged out and which
+  then received a cm while the node was off the bus, is signalled
+  although nothing was lost, because the log does not record what
+  preceded the new cm. On `pgnotify`, which has no sweep, "last proven"
+  is the bind. The proof assumes a publish commits within the one-second
+  clock margin of minting its serial (the mint holds the channel's row
+  lock until commit); a transaction stalled longer than that between the
+  two, and longer than the window, could escape it. A spurious signal costs the client a reconcile, and an
+  SDK re-enters its own presence members on an `ATTACHED` without
+  `RESUMED` (RTP17i). Counted in
+  `ably_channel_discontinuities_total{reason}` (§10).
 - **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
   only bound channels with a subscriber on this node: an open
   attachment, or a presence member the node has seen enter and not leave
@@ -1985,9 +2035,15 @@ outcome is as if the release came second.
 
 #### Can a delivery be lost when the bus send is not transactional?
 
-No; it can be late. On the `postgres` coalesced and `nats` buses the
-message is committed before the bus is told, so the bus message is a hint
-that the log has moved, and every loss below is recovered from the log.
+Not while the log still holds it; it can be late. On the `postgres`
+coalesced and `nats` buses the message is committed before the bus is
+told, so the bus message is a hint that the log has moved, and every
+loss below is recovered from the log, provided the receiver reads it
+within the retention window (`--message-retention`, default 2 minutes;
+`--persisted-retention` for persisted namespaces, §6.3). A receiver off
+the bus for longer than that cannot recover what aged out: it says so
+(the last row, and **Retention** above) rather than carry on as if the
+stream were continuous.
 
 | Failure | pgnotify | postgres, transactional | postgres, coalesced | nats |
 |---|---|---|---|---|
@@ -1997,10 +2053,12 @@ that the log has moved, and every loss below is recovered from the log.
 | Receiver falls behind | the node's one read-back loop lags; nothing is dropped | full queue: drop, then one catch-up read | same | full dispatch queue, NATS slow-consumer drop: predecessor gap or sweep |
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
+| Receiver off the bus for longer than the retention window | the log cannot prove continuity; the node signals a discontinuity on the channel (`ATTACHED` without `RESUMED`, error 80016) and re-seeds its presence set; cms in the gap are not replayed (§4.3, §12.4) | same | same | same |
 
 Worst case for the chained buses is about two sweep intervals late,
 counted from the moment the channel has a subscriber on the receiving
-node (the sweep scope above). The
+node (the sweep scope above), as long as that is inside the retention
+window; past it the cm is reported missing, not delivered. The
 load tests check this rather than assume it: the serial-continuity
 check fails on any gap or duplicate.
 
@@ -2687,12 +2745,15 @@ of the store's set as of a serial:
   presence `SYNC` after a bind, and again on the first one after a sweep
   that found it with no subscribers.
   If the seed read fails, that `SYNC` is read from the store and the next
-  one tries to seed again. If the backend skips cms it cannot deliver (a
-  chaining bus's gap the log no longer holds, §7.2), it tells the channel,
-  which drops the set so the next `SYNC` seeds again; a seed read in
-  flight at that moment is discarded. The memory and disk backends
-  deliver each presence cm under the lock that mints it, so their cms
-  also arrive in serial order.
+  one tries to seed again. If the backend cannot prove it delivered every
+  cm (a gap the log no longer holds, or a catch-up past the retention
+  window after the node was off the bus, on any bus including
+  `pgnotify`; §7.2), it tells the channel, which drops the set so the
+  next `SYNC` seeds again; a seed read in flight at that moment is
+  discarded. Each `PRESENCE_SUBSCRIBE` attachment is then sent the
+  re-seeded set after its channel update, as on attach. The memory and
+  disk backends deliver each presence cm under the lock that mints it,
+  so their cms also arrive in serial order.
 
 In `store` mode every `SYNC` reads `Members` from the store, as before the
 local set existed. Either way the store's set stays authoritative (§12.5):

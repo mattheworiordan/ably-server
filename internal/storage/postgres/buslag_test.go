@@ -90,7 +90,7 @@ func TestChainRecordsDeliveryLagByPath(t *testing.T) {
 
 	old := time.Now().Add(-3 * time.Second).UnixMilli()
 	cs.hwmMu.Lock()
-	cs.applyRangeLocked([]*protocol.ChannelMessage{{ChannelSerial: "s3", Messages: []*protocol.Message{{Data: "x", Timestamp: old}}}}, "")
+	cs.applyRangeLocked(rangeRead{cms: []*protocol.ChannelMessage{{ChannelSerial: "s3", Messages: []*protocol.Message{{Data: "x", Timestamp: old}}}}}, "")
 	cs.hwmMu.Unlock()
 
 	snap := st.lagSnapshot()
