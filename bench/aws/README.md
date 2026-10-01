@@ -533,6 +533,45 @@ scenario's name, class names or channel counts change.) The sampled
 channels that have at least one subscriber are the ones checked; the
 plan and the summary count them separately.
 
+**Old records.** `summary.json` carries a `version` (2 now). When
+`ably-conductor evaluate` reads a version 1 record it notes which newer
+inputs the JSON lacks (`not_recorded`: an absent key, not a zero; kept by
+`evaluate --write`, so a rewritten record reads the same). Against the
+last version 1 conductor, exactly this changes for such a record:
+
+- A row whose input is absent (attach-point results, the tail check's
+  sampled-stream count, node metrics coverage, harness CPU, clock
+  offsets, server flags, presence checks) prints "not recorded in this
+  run", shows `n/a` and never fails; `summary.md` says the record is older
+  than the conductor. A record that has the input is judged on it.
+- "attach-point check coverage" is now "sample coverage (attach)"; the
+  tail check row prints its fraction and skips by reason; a presence-only
+  run's message row reads "not applicable".
+- "reconnect+attach p99" is a new gate (the connect+attach limit) when the
+  record has reconnect samples.
+- A fault without a kind is relaxed exactly as version 1 relaxed any
+  successful fault: node growth and generator steadiness, the attach,
+  tail and presence coverage floors, presence NACKs, retries, unresolved
+  publishes, harness CPU, node metrics coverage, and deliveries against
+  the plan down to 90%. A hook that failed is a plain FAIL, as it was, not
+  INVALID.
+
+Nothing else changes, so a version 1 record keeps its verdict unless it
+has reconnect samples over the limit. A record from before the version 1
+conductor gained its newer gates (an early shape M run, say) is judged by
+those gates on the data it has: its deliveries are held to 99% of the
+plan, not the 90% it was written with, and its negative latency, retries
+and unresolved publishes gate. A run directory without `agents/` is
+judged on the merged result in its `summary.json`; one without node
+samples keeps its node statistics; one without an inventory keeps its
+footprint. Two tests pin this: a real full-scale shape M record of that
+early vintage (`internal/loadgen/testdata/legacy-shape-m`, node samples,
+error lines, host names and registry address removed) keeps every row's
+outcome and its FAIL; a version 1 record with every input and a kind-less
+fault, written and judged by the last version 1 conductor
+(`internal/loadgen/testdata/legacy-fault-all-inputs`), keeps every row and
+its PASS, and fails when its hook fails.
+
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
 the node and shard curves.

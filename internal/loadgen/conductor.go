@@ -658,11 +658,22 @@ func EvaluateRunDir(runDir string, inv *Inventory) (*RunRecord, error) {
 	if sc != nil {
 		spec = sc.Pass.withDefaults()
 	}
-	rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
-	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
-	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
-	rec.ServerConfig = ComputeServerConfig(rec.NodeStats.Samples)
-	rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
+	// A directory without its agent summaries (a record kept for its
+	// numbers alone) is judged on the merged result its summary.json
+	// carries; one without node samples keeps the node statistics, and one
+	// without an inventory (none given, none in plan.json) the footprint,
+	// that it carries.
+	if len(sums) > 0 {
+		rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
+	}
+	if len(rec.NodeStats.Samples) > 0 {
+		rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
+		rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
+		rec.ServerConfig = ComputeServerConfig(rec.NodeStats.Samples)
+	}
+	if inv != nil {
+		rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
+	}
 	Evaluate(&rec, spec)
 	return &rec, nil
 }

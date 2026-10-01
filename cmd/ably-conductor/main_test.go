@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,5 +42,31 @@ func TestServerIdleTimeoutFlag(t *testing.T) {
 	}
 	if o.String() != "" {
 		t.Errorf("unset flag prints %q, want empty", o.String())
+	}
+}
+
+// ably-conductor evaluate on a run record from before the newer checks
+// existed prints them as not recorded and keeps the recorded verdict.
+func TestEvaluateALegacyRunDirectory(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := run(context.Background(), []string{"evaluate", "../../internal/loadgen/testdata/legacy-shape-m"}, &out, &errb)
+	if code != 1 { // the record failed its latency gates when it was run
+		t.Fatalf("exit %d, stderr: %s", code, errb.String())
+	}
+	md := out.String()
+	for _, want := range []string{
+		"# Run run-20261001T141856Z-shape-m: shape M at 5x, scale 1: FAIL",
+		"| sample coverage (attach) | not recorded in this run", "| node metrics coverage | not recorded in this run",
+		"| generator CPU | not recorded in this run", "| generator clock offset | not recorded in this run",
+		"| server configuration | not recorded in this run",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("output lacks %q:\n%s", want, md)
+		}
+	}
+	for _, line := range strings.Split(md, "\n") {
+		if strings.Contains(line, "not recorded in this run") && strings.Contains(line, "FAIL") {
+			t.Errorf("a not-recorded row failed: %s", line)
+		}
 	}
 }

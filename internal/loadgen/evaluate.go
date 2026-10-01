@@ -1,6 +1,7 @@
 package loadgen
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -10,8 +11,11 @@ import (
 	"time"
 )
 
-// RunRecordVersion is bumped when RunRecord changes incompatibly.
-const RunRecordVersion = 1
+// RunRecordVersion is bumped when RunRecord changes incompatibly. Version
+// 2 added the fault kind and NotRecorded; a version 1 record may lack the
+// attach-point, node-coverage, harness-CPU, clock and server-flag data
+// (UnmarshalJSON finds out which).
+const RunRecordVersion = 2
 
 // RunRecord is the conductor's result for one run: results/<run-id>/
 // summary.json. It carries shape names only, never anything that
@@ -66,6 +70,83 @@ type RunRecord struct {
 	Verdict       string   `json:"verdict"`
 	Errors        []string `json:"errors,omitempty"`
 	Jobs          []JobRef `json:"jobs"`
+	// NotRecorded lists the inputs a record written before this version
+	// lacks (Recorded* names), found when it is read. The rows they feed
+	// print "not recorded in this run" and never fail, so an old record
+	// keeps its verdict; the rest is judged by today's criteria.
+	NotRecorded []string `json:"not_recorded,omitempty"`
+}
+
+// Inputs a version 1 record may lack, by their JSON path.
+const (
+	RecordedAttach            = "result.attach"
+	RecordedPresenceChecks    = "result.presence.checks_planned"
+	RecordedSampledStreams    = "plan.sampled_streams"
+	RecordedSampledSubscribed = "plan.sampled_subscribed_channels"
+	RecordedNodeCoverage      = "node_stats.coverage"
+	RecordedAgentCPU          = "agent_cpu"
+	RecordedClocks            = "clocks"
+	RecordedServerConfig      = "server_config"
+	RecordedFaultKind         = "fault.kind"
+)
+
+// notRecordedValue is the value of a row whose input the record lacks.
+const notRecordedValue = "not recorded in this run"
+
+// UnmarshalJSON reads a run record; for one older than RunRecordVersion it
+// also notes, in NotRecorded, which of the newer inputs its JSON lacks
+// (a zero value written by a newer conductor is a measurement, an absent
+// key is not).
+func (rec *RunRecord) UnmarshalJSON(b []byte) error {
+	type plain RunRecord
+	if err := json.Unmarshal(b, (*plain)(rec)); err != nil {
+		return err
+	}
+	if rec.Version < 1 || rec.Version >= RunRecordVersion {
+		return nil
+	}
+	var raw struct {
+		Plan   map[string]json.RawMessage `json:"plan"`
+		Result struct {
+			Attach   json.RawMessage            `json:"attach"`
+			Presence map[string]json.RawMessage `json:"presence"`
+		} `json:"result"`
+		NodeStats    map[string]json.RawMessage `json:"node_stats"`
+		AgentCPU     json.RawMessage            `json:"agent_cpu"`
+		Clocks       json.RawMessage            `json:"clocks"`
+		ServerConfig json.RawMessage            `json:"server_config"`
+		Fault        map[string]json.RawMessage `json:"fault"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	has := func(m map[string]json.RawMessage, k string) bool { _, ok := m[k]; return ok }
+	for key, present := range map[string]bool{
+		RecordedAttach:            raw.Result.Attach != nil,
+		RecordedPresenceChecks:    has(raw.Result.Presence, "checks_planned"),
+		RecordedSampledStreams:    has(raw.Plan, "sampled_streams"),
+		RecordedSampledSubscribed: has(raw.Plan, "sampled_subscribed_channels"),
+		RecordedNodeCoverage:      has(raw.NodeStats, "coverage"),
+		RecordedAgentCPU:          raw.AgentCPU != nil,
+		RecordedClocks:            raw.Clocks != nil,
+		RecordedServerConfig:      raw.ServerConfig != nil,
+		RecordedFaultKind:         raw.Fault == nil || has(raw.Fault, "kind"),
+	} {
+		if !present && !slices.Contains(rec.NotRecorded, key) {
+			rec.NotRecorded = append(rec.NotRecorded, key)
+		}
+	}
+	sort.Strings(rec.NotRecorded)
+	return nil
+}
+
+// notRecorded reports whether the record lacks the input key.
+func (rec *RunRecord) notRecorded(key string) bool { return slices.Contains(rec.NotRecorded, key) }
+
+// notRecordedCheck is the row of a check whose input the record lacks.
+func notRecordedCheck(name string) Check {
+	return Check{Name: name, Value: notRecordedValue, Limit: "n/a", Pass: true, Gating: false,
+		Note: "the record predates this check"}
 }
 
 // ClockRecord is one agent's clock offsets, measured over the agent's
@@ -671,10 +752,36 @@ const VerdictInvalidFault = "INVALID (fault not injected)"
 // faultInjected reports a fault hook that ran and exited 0.
 func (rec *RunRecord) faultInjected() bool { return rec.Fault != nil && rec.Fault.ExitCode == 0 }
 
+// legacyFaultRelaxations is what a successful fault relaxed before fault
+// kinds (run record version 1), for a record that does not say what its
+// fault was, so it keeps its verdict: the steady-state gates, the coverage
+// floors, presence NACKs, retries and unresolved publishes, harness CPU,
+// node metrics coverage, and the deliveries gate down to 90%.
+var legacyFaultRelaxations = []string{
+	"node memory growth over hold", "node goroutine growth over hold", "generator load steady over hold",
+	"sample coverage (attach)", "tail check coverage", "sample coverage (presence)", "presence NACKs",
+	"publish retries", "unresolved publishes", "generator CPU", "publisher CPU", "node metrics coverage", "deliveries vs plan",
+}
+
+// legacyMinDeliveryRatio is the deliveries gate a version 1 record's
+// successful fault run was held to.
+const legacyMinDeliveryRatio = 0.9
+
+// legacyFault reports a version 1 record's fault, which has no kind.
+func (rec *RunRecord) legacyFault() bool {
+	return rec.Fault != nil && rec.Fault.Kind == "" && rec.notRecorded(RecordedFaultKind)
+}
+
 // relaxes reports whether the run's fault ran, succeeded and invalidates
 // the gate named gate (a FaultRelaxations entry).
 func (rec *RunRecord) relaxes(gate string) bool {
-	return rec.faultInjected() && slices.Contains(FaultRelaxations[rec.Fault.Kind], gate)
+	if !rec.faultInjected() {
+		return false
+	}
+	if rec.legacyFault() {
+		return slices.Contains(legacyFaultRelaxations, gate)
+	}
+	return slices.Contains(FaultRelaxations[rec.Fault.Kind], gate)
 }
 
 // pctOf renders a fraction as a percentage without trailing zeros.
@@ -723,7 +830,9 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: "< " + pctOf(spec.MaxNegativeLatency), Pass: frac < spec.MaxNegativeLatency, Gating: true,
 			Note: "latency from the actual send time below zero: the subscriber's clock is behind the publisher's"})
 	}
-	if len(rec.ServerConfig) > 0 {
+	if rec.notRecorded(RecordedServerConfig) {
+		add(notRecordedCheck("server configuration"))
+	} else if len(rec.ServerConfig) > 0 {
 		variants, unreported := ServerConfigVariants(rec.ServerConfig)
 		switch {
 		case len(variants) == 0:
@@ -743,7 +852,9 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			}
 		}
 	}
-	if len(rec.Clocks) > 0 {
+	if rec.notRecorded(RecordedClocks) {
+		add(notRecordedCheck("generator clock offset"))
+	} else if len(rec.Clocks) > 0 {
 		var measured, failed int
 		var worst int64
 		var worstAgent string
@@ -825,13 +936,15 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
 	}
-	if rec.Plan.PublishesPerSec > 0 && rec.Plan.SampledSubscribed == 0 {
+	if rec.Plan.PublishesPerSec > 0 && rec.Plan.SampledSubscribed == 0 && !rec.notRecorded(RecordedSampledSubscribed) {
 		// Publishing with no sampled channel that has a subscriber means no
 		// message was checked at all.
 		add(Check{Name: "sample coverage", Value: "no sampled channel has a subscriber", Limit: "> 0", Pass: false, Gating: true,
 			Note: "raise sample_percent"})
 	}
-	if rec.Plan.PresenceMembers > 0 {
+	if rec.Plan.PresenceMembers > 0 && rec.notRecorded(RecordedPresenceChecks) {
+		add(notRecordedCheck("sample coverage (presence)"))
+	} else if rec.Plan.PresenceMembers > 0 {
 		pr := res.Presence
 		minCompared := spec.MinPresenceCompared
 		cov := 0.0
@@ -843,14 +956,16 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Value: fmt.Sprintf("%d of %d sampled presence channels compared (%d planned, %d fetch failures), %d of %d members settled (%.0f%%), %d indeterminate",
 				pr.ChecksDone, rec.Plan.PresenceSampled, pr.ChecksPlanned, pr.ChecksFailed, pr.MembersCompared, pr.MembersPlanned, cov*100, pr.Indeterminate),
 			Limit: fmt.Sprintf("every sampled channel, >= %.0f%% of members settled", minCompared*100),
-			Pass:  ok && cov >= minCompared, Gating: true})
+			Pass:  ok && (cov >= minCompared || rec.relaxes("sample coverage (presence)")), Gating: true})
 		mism := res.Violations[PresenceSetMismatch.String()]
 		add(Check{Name: "presence correctness",
 			Value: fmt.Sprintf("%d nacks, %d member-set mismatches over %d members compared", pr.Nacks, mism, pr.MembersCompared),
-			Limit: "0 nacks, 0 mismatches", Pass: mism == 0 && pr.Nacks == 0, Gating: true,
+			Limit: "0 nacks, 0 mismatches", Pass: mism == 0 && (pr.Nacks == 0 || rec.relaxes("presence NACKs")), Gating: true,
 			Note: "end-of-hold REST presence set against the members' own enter and leave record"})
 	}
-	if rec.Plan.SampledStreams > 0 {
+	if rec.notRecorded(RecordedSampledStreams) {
+		add(notRecordedCheck("tail check coverage"))
+	} else if rec.Plan.SampledStreams > 0 {
 		// The tail check is the only one that sees a stream an attachment
 		// received nothing from. It skips a stream on a subscriber whose last
 		// acknowledgement is within the margin of that subscriber's latest
@@ -863,10 +978,12 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		add(Check{Name: "tail check coverage",
 			Value: fmt.Sprintf("%d of %d sampled streams checked (%.1f%%); skipped %d for the margin (last acknowledgement within %s of a late attach), %d with no continuous subscriber or no acknowledgement",
 				t.StreamsChecked, rec.Plan.SampledStreams, cov*100, t.StreamsSkippedMargin, t.Margin, other),
-			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinTailCoverage*100), Pass: t.StreamsChecked > 0 && cov >= spec.MinTailCoverage, Gating: true,
+			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinTailCoverage*100), Pass: t.StreamsChecked > 0 && cov >= spec.MinTailCoverage, Gating: !rec.relaxes("tail check coverage"),
 			Note: fmt.Sprintf("%d (subscriber, stream) pairs skipped for the margin", t.SkippedMargin)})
 	}
-	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
+	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 && rec.notRecorded(RecordedAttach) {
+		add(notRecordedCheck("sample coverage (attach)"))
+	} else if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		// The attach-point check settles each attachment's first message
 		// against the publishers' serial logs. If it settled few claims it
 		// proved little, so coverage is gated like the others, in a fault
@@ -881,7 +998,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Value: fmt.Sprintf("%d of %d claims settled (%.0f%%), %d unverifiable, %d dropped; %d messages missed after an attach point",
 				a.Checked, total, cov*100, a.Unverifiable, a.Dropped, a.Missed),
 			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinAttachCoverage*100), Pass: a.Checked > 0 && cov >= spec.MinAttachCoverage,
-			Gating: true,
+			Gating: !rec.relaxes("sample coverage (attach)"),
 			Note:   "claims: each attachment's first message per stream, settled against the publishers' serial logs"})
 	}
 	if p := res.Publishes; p.TargetRate > 0 {
@@ -901,21 +1018,28 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		if p.Sent > 0 {
 			ratio := float64(p.Retries) / float64(p.Sent)
 			add(Check{Name: "publish retries", Value: fmt.Sprintf("%d retries of %d sent (%.3f%%), %d answered 429", p.Retries, p.Sent, ratio*100, p.Throttled),
-				Limit: "< " + pctOf(spec.MaxRetryRatio), Pass: ratio < spec.MaxRetryRatio, Gating: true})
+				Limit: "< " + pctOf(spec.MaxRetryRatio), Pass: ratio < spec.MaxRetryRatio, Gating: !rec.relaxes("publish retries")})
 		}
-		add(Check{Name: "unresolved publishes", Value: fmt.Sprint(p.Unresolved), Limit: "0", Pass: p.Unresolved == 0, Gating: true,
+		add(Check{Name: "unresolved publishes", Value: fmt.Sprint(p.Unresolved), Limit: "0", Pass: p.Unresolved == 0, Gating: !rec.relaxes("unresolved publishes"),
 			Note: "still in flight when the generator stopped waiting"})
 	}
 	// Channels outside the sample have no per-message check: this is the
 	// only thing that would notice loss on them.
 	minDel := spec.MinDeliveryRatio
+	if rec.relaxes("deliveries vs plan") {
+		minDel = min(minDel, legacyMinDeliveryRatio)
+	}
 	rec.UnsampledNote = fmt.Sprintf("Unsampled channels are covered only by the deliveries-vs-plan gate (>= %s of planned deliveries/s); loss below %s there is not detected.",
 		pctOf(minDel), pctOf(1-minDel))
 	if want := rec.Plan.DeliveriesPerSec; want > 0 {
+		sampledNote := fmt.Sprintf("%d of %d channels sampled; the rest are covered only by this gate", rec.Plan.SampledSubscribed, rec.Plan.SubscribedChannels)
+		if rec.notRecorded(RecordedSampledSubscribed) {
+			sampledNote = fmt.Sprintf("sampled channels of %d %s; the unsampled ones are covered only by this gate", rec.Plan.SubscribedChannels, notRecordedValue)
+		}
 		ratio := res.Deliveries.Rate / want
 		add(Check{Name: "deliveries vs plan", Value: fmt.Sprintf("%.0f of %.0f/s (%.2f%%)", res.Deliveries.Rate, want, ratio*100),
 			Limit: ">= " + pctOf(minDel), Pass: ratio >= minDel, Gating: true,
-			Note: fmt.Sprintf("%d of %d channels sampled; the rest are covered only by this gate", rec.Plan.SampledSubscribed, rec.Plan.SubscribedChannels)})
+			Note: sampledNote})
 	}
 	if c := res.Connections; c.Target > 0 {
 		want := float64(c.Target) * (1 - spec.MaxConnectionLoss)
@@ -939,13 +1063,18 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		// and makes the verdict INVALID: the scenario said it would inject
 		// one.
 		kind := f.Kind
-		if kind == "" {
+		switch {
+		case kind == "" && rec.notRecorded(RecordedFaultKind):
+			kind = "kind " + notRecordedValue
+		case kind == "":
 			kind = "kind not given"
 		}
 		add(Check{Name: "fault injection", Value: fmt.Sprintf("%s: hook exited %d", kind, f.ExitCode), Limit: "exit 0", Pass: f.ExitCode == 0, Gating: true,
 			Note: strings.TrimSpace(f.Output)})
 	}
-	if len(ns.Coverage) > 0 {
+	if rec.notRecorded(RecordedNodeCoverage) {
+		add(notRecordedCheck("node metrics coverage"))
+	} else if len(ns.Coverage) > 0 {
 		sampled, endOnly, errs, scrapes := 0, 0, 0, 0
 		for _, c := range ns.Coverage {
 			switch {
@@ -967,7 +1096,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			// still must.
 			limit, pass = "every node at hold start and baseline; all but the killed node at the end", pass || (endOnly == 1 && sampled == len(ns.Coverage)-1)
 		}
-		gate := !rec.UnmeasuredWaived
+		gate := !rec.relaxes("node metrics coverage") && !rec.UnmeasuredWaived
 		if rec.UnmeasuredWaived {
 			note += "; waived with --allow-unmeasured"
 		}
@@ -995,7 +1124,7 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		if n+unmeasured == 0 {
 			return
 		}
-		gate := !rec.UnmeasuredWaived
+		gate := !rec.relaxes(kind+" CPU") && !rec.UnmeasuredWaived
 		if n == 0 {
 			add(Check{Name: kind + " CPU", Value: "not measured", Limit: "< " + pctOf(spec.MaxGeneratorCPU), Pass: false, Gating: gate,
 				Note: fmt.Sprintf("%d boxes could not be read (GET /v1/host)", unmeasured)})
@@ -1005,8 +1134,13 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: "< " + pctOf(spec.MaxGeneratorCPU), Pass: worst < spec.MaxGeneratorCPU && unmeasured == 0, Gating: gate,
 			Note: fmt.Sprintf("busy fraction of the whole box over the hold; %d boxes unmeasured; a saturated box measures itself", unmeasured)})
 	}
-	cpuCheck("generator")
-	cpuCheck("publisher")
+	if rec.notRecorded(RecordedAgentCPU) {
+		add(notRecordedCheck("generator CPU"))
+		add(notRecordedCheck("publisher CPU"))
+	} else {
+		cpuCheck("generator")
+		cpuCheck("publisher")
+	}
 	switch {
 	case ns.Measured && !ns.GrowthMeasured:
 		add(Check{Name: "node memory and goroutines", Value: "not measured", Limit: "flat", Pass: true, Gating: false,
@@ -1047,7 +1181,10 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if !rec.Pass {
 		rec.Verdict = "FAIL"
 	}
-	if rec.Fault != nil && !rec.faultInjected() {
+	// A fault that failed or never ran makes the run INVALID. A version 1
+	// record's failed hook was a plain FAIL (its "fault injection" row
+	// fails it), and it keeps that verdict.
+	if rec.Fault != nil && !rec.faultInjected() && !rec.legacyFault() {
 		rec.Pass = false
 		rec.Verdict = VerdictInvalidFault
 	}
@@ -1074,6 +1211,10 @@ func (rec *RunRecord) Markdown() string {
 		}
 		b.WriteString("\n")
 	}
+	if len(rec.NotRecorded) > 0 {
+		fmt.Fprintf(&b, "This record is version %d, older than the conductor (%d): rows that say %q lack their input and gate nothing; the other rows are judged by today's criteria.\n\n",
+			rec.Version, RunRecordVersion, notRecordedValue)
+	}
 	b.WriteString("| Check | Value | Limit | Result |\n|---|---|---|---|\n")
 	for _, c := range rec.Checks {
 		res := "pass"
@@ -1082,6 +1223,9 @@ func (rec *RunRecord) Markdown() string {
 		}
 		if !c.Gating {
 			res += " (reported)"
+		}
+		if c.Value == notRecordedValue {
+			res = "n/a"
 		}
 		note := ""
 		if c.Note != "" {
