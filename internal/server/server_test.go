@@ -584,3 +584,66 @@ func TestRunPresenceLeaseModeInvalidIsStartupError(t *testing.T) {
 		})
 	}
 }
+
+// TestRunWarnsAboutIgnoredBusSettings (DESIGN.md §9): a bus setting the
+// chosen --bus does not use, given by flag, env or config file, is named
+// in a startup warning rather than dropped silently; a setting the bus
+// uses is not.
+func TestRunWarnsAboutIgnoredBusSettings(t *testing.T) {
+	base := []string{"--keys=app.key:secret", "--mode=cluster", "--postgres-dsn=postgres://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=1"}
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		env        map[string]string
+		file       string
+		warn, keep []string
+	}{
+		{
+			name: "pgnotify",
+			args: []string{"--bus=pgnotify", "--bus-sweep-interval=1s"},
+			env:  map[string]string{natsInlineMaxEnv: "100"},
+			file: `postgres-notify-window = "10ms"`,
+			warn: []string{"--bus-sweep-interval", "--nats-inline-max-bytes", "--postgres-notify-window"},
+		},
+		{
+			name: "postgres",
+			args: []string{"--bus=postgres", "--bus-sweep-interval=1s", "--nats-tls-ca=ca.pem"},
+			warn: []string{"--nats-tls-ca"},
+			keep: []string{"--bus-sweep-interval"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string{}, base...), tc.args...)
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			for _, flag := range tc.warn {
+				if !strings.Contains(out.String(), "bus setting ignored") || !strings.Contains(out.String(), "flag="+flag) {
+					t.Errorf("output lacks a warning naming %s: %q", flag, out.String())
+				}
+			}
+			for _, flag := range tc.keep {
+				if strings.Contains(out.String(), "flag="+flag) {
+					t.Errorf("warned about %s, which --bus=%s uses: %q", flag, tc.name, out.String())
+				}
+			}
+		})
+	}
+}
+
+func TestBusSettingsIgnored(t *testing.T) {
+	given := map[string]bool{"nats-url": true, "bus-sweep-scope": true, "postgres-notify-mode": false}
+	if got := strings.Join(busSettingsIgnored("pgnotify", given), ","); got != "bus-sweep-scope,nats-url" {
+		t.Errorf("pgnotify ignores %q, want bus-sweep-scope,nats-url", got)
+	}
+	if got := busSettingsIgnored("nats", given); len(got) != 0 {
+		t.Errorf("nats ignores %v, want none", got)
+	}
+	for name := range busSettingUsers {
+		if len(busSettingUsers[name]) == 0 {
+			t.Errorf("%s is used by no bus", name)
+		}
+	}
+}

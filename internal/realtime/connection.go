@@ -511,14 +511,16 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	ch, err := c.manager.GetChannel(ctx, name)
 	if err != nil {
 		c.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		info := &protocol.ErrorInfo{Message: "failed to attach to channel", Code: 50000, StatusCode: 500}
+		if errors.Is(err, storage.ErrUnavailable) {
+			// The channel's database is unreachable (a shard that is down,
+			// DESIGN.md §6.4): a retriable 50003.
+			info = &protocol.ErrorInfo{Message: "failed to attach to channel: storage unavailable, retry", Code: 50003, StatusCode: 503}
+		}
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:  protocol.ActionError,
 			Channel: new(name),
-			Error: &protocol.ErrorInfo{
-				Message:    "failed to attach to channel",
-				Code:       50000,
-				StatusCode: 500,
-			},
+			Error:   info,
 		})
 		return
 	}

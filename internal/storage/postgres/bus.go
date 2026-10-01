@@ -115,6 +115,7 @@ type busWrite struct {
 type busStats struct {
 	published, publishErrors, pointers                 atomic.Uint64
 	received, unrouted, malformed                      atomic.Uint64
+	unroutedForeign, malformedSerial, malformedFuture  atomic.Uint64
 	inline, fetched, fastPath, filled                  atomic.Uint64
 	duplicates, held, gapFills, fetchErrors            atomic.Uint64
 	reconcileRuns, reconciles, reconcileNanos          atomic.Uint64
@@ -155,6 +156,9 @@ func (s *Storage) BusStats() storage.BusStats {
 		Received:          c.received.Load(),
 		Unrouted:          c.unrouted.Load(),
 		Malformed:         c.malformed.Load(),
+		UnroutedForeign:   c.unroutedForeign.Load(),
+		MalformedSerial:   c.malformedSerial.Load(),
+		MalformedFuture:   c.malformedFuture.Load(),
 		Inline:            c.inline.Load(),
 		Fetched:           c.fetched.Load(),
 		FastPath:          c.fastPath.Load(),

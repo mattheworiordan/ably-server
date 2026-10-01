@@ -1603,10 +1603,10 @@ does once, a sharded node does once per shard, against that shard only.
 | Bind, release (idle-channel eviction, §5.1) | one channel | routed |
 | Migrations, partition creation, retention drop | account-wide | per shard, at open and in each shard's sweep |
 | Presence lease bump and dead-node reaper | account-wide | per shard, with one node id and a lease row in every shard's `presence_nodes`; a reaped member's LEAVE is published on that shard |
-| Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard |
+| Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard; at most 4 batched catch-up queries in flight per node, over all its shards |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
-| `/readyz` | account-wide | ready only while every shard (and its bus) is |
+| `/readyz` | account-wide | ready while shard 0 and a majority of the shards (each with its bus) are reachable; see "A shard that is down" below |
 | `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
 | `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
 | `GET /stats` stub | account-wide | touches no storage |
@@ -1630,10 +1630,45 @@ this; it only reads, at startup, whether the table exists in its schema.
 Stop single-DSN nodes before first starting a list on their database: a
 node already running checks nothing after it starts.
 
+Each shard's schema also carries its cluster identity row (§11), and
+every shard records shard 0's deployment id, so a shard whose row names
+another cluster is refused like a shard of another list.
+
 What a failed first start records stays: if one shard cannot be reached,
 the shards that opened keep their identity, and a later start must use
 the same list. To start again with another list while no shard holds
 channels yet, drop `shard_identity` in each shard's schema.
+
+**A shard that is down.** A node that cannot reach one shard cannot serve
+that shard's channels, but it can serve the rest, and every node loses the
+same shard at the same moment. If one shard down took a node out of
+rotation, the load balancer would drain the whole fleet and the healthy
+shards' channels would become unreachable too. So `/readyz` (the
+`Sharded` `Ping`) pings every shard at once and reports ready while
+shard 0 and a majority of the shards answer; a node that reaches no more
+than half of them, or not shard 0 (where it checks the list it was given
+at startup), leaves rotation. With two shards a majority is both. Each
+shard's result is `ably_storage_shard_ready{shard}` (1 or 0, as of the
+last readiness check).
+
+The honest consequence: while a shard is down its channels are
+unavailable and the others serve. A publish, an attach or a history read
+on a down shard's channel fails fast with 50003 (`storage.ErrUnavailable`:
+503 over REST, a NACK or channel `ERROR` over the realtime connection),
+which an SDK retries; it does not wait on the dead database. The bound
+comes from the pool: a connection attempt gives up after 5 s and the
+liveness ping of an idle connection on acquire after 2 s, unless the DSN
+sets its own `connect_timeout`, so a call fails in about the time it
+takes to find every idle connection dead and fail one dial (a stopped
+server, which refuses connections, answers at once). A batched publish
+(§6.3) fails after its two commit attempts, each bounded the same way.
+On the `postgres` bus an attach first waits for its LISTEN on the
+shard's LISTEN connection, which is down with the shard; that wait is
+bounded at 10 s. The bound also applies behind the queue of re-LISTENs
+after a LISTEN reconnect on a node holding very many channels, where an
+attach can then fail with 50003 and be retried although nothing is down.
+Nothing is lost: what was acknowledged is in the shard, and its
+subscribers resume from it when it is back.
 
 **Not supported: resharding, migration, rebalancing.** The count cannot
 change without moving data, and there is no tool that moves it. A hot
@@ -1642,7 +1677,8 @@ sharding raises cluster write throughput to the sum of the shards', not a
 single channel's. All nodes must list the same DSNs in the same order.
 
 Series (§10): `ably_storage_shards` (gauge), the number of shards; 1 for
-a single DSN.
+a single DSN; and, with two or more, `ably_storage_shard_ready{shard}`
+(gauge, 1 or 0), each shard's result in the last readiness check.
 
 ## 7. Pub/Sub
 
@@ -1769,8 +1805,19 @@ The `postgres` and `nats` buses share one delivery point
   delivered. The mark's lock is held across `Appender.Append`, so a
   Channel sees every cm once and in serial order whichever path
   delivered it.
-- **Reconcile.** After the bus connection comes back, every bound channel
-  is caught up from its mark, 500 channels per query.
+- **Reconcile.** After the bus connection comes back, the channels in the
+  sweep scope (below: by default the bound channels with a subscriber on
+  this node) are caught up from their mark, 500 channels per query, after
+  a random wait of up to a quarter of the sweep interval (7.5 s at the
+  default). A node runs at most 4 of these batched catch-up queries (the
+  reconcile's and the sweep's) at once, over all its shards. A cluster-wide
+  bus blip reaches every node at the same moment; without the scope, the
+  wait and the bound, every node would read every channel it holds
+  against the same primaries at once. A bound channel with no subscriber
+  is not reconciled: as for a bus message lost while it had none, the next
+  cm's predecessor reveals the gap, and the sweep catches it up within two
+  intervals of it gaining a subscriber. A channel reconcile finds with no
+  subscriber also drops its local presence member set, as the sweep does.
 - **Sweep.** Every sweep interval (`--bus-sweep-interval`, default 30 s
   for both buses) each node reads the committed serial of the channels
   in its sweep scope, 1,000 per query and one query per shard's
@@ -1895,22 +1942,46 @@ channels.
 #### nats
 
 After commit the publishing node publishes one message to the channel's
-subject: `ably.cm.`, a namespace token (the hex of the first 6 bytes of
-SHA-256 of the schema, so deployments sharing a NATS cluster but not a
-schema never hear each other), `.`, then the unpadded URL-safe base64 of
-the channel name (`h.<sha256 hex>` for a name too long to encode). The body is a
-msgpack envelope of channel, serial, predecessor and the cm as stored,
-with annotation summary snapshots. A cm whose encoding exceeds
-`--nats-inline-max-bytes` (default 256 KiB) goes as a pointer, and
-receivers read it by serial. The publish transaction emits no NOTIFY.
+subject: `ably.cm.`, a namespace token, `.`, then the unpadded URL-safe
+base64 of the channel name (`h.<sha256 hex>` for a name too long to
+encode). The namespace token is the hex of the first 8 bytes of SHA-256
+of the cluster's deployment id, a NUL and the schema name. The deployment
+id is a random id the first node to open the schema records in its
+cluster identity row (§11), so two clusters sharing one NATS cluster are
+on different subjects even when their schemas have the same name (the
+default `public` on two Postgres servers, say). The body is a msgpack
+envelope of channel, serial, predecessor, the cm as stored (with
+annotation summary snapshots), the send time and the deployment id. A cm
+whose encoding exceeds `--nats-inline-max-bytes` (default 256 KiB) goes
+as a pointer, and receivers read it by serial. The publish transaction
+emits no NOTIFY.
 
-The namespace is the schema's name only, not the database's identity:
-two deployments on different Postgres servers that use the same schema
-name (the default `public`, say) and share one NATS cluster hear each
-other's channels, and a node could deliver the other deployment's cms.
-Give each deployment its own NATS cluster, or its own schema name. (A
-per-deployment id in the namespace, stored once in the schema, would
-remove the limit; it is not built.)
+**The bus is a trusted network.** A receiver delivers the body an
+envelope carries without reading the log: that is what makes the bus
+fast. So whoever can publish to the NATS subjects can put a message in
+front of every subscriber of a channel. Run NATS on a private network,
+or authenticated and encrypted: `nats://user:pass@host` and `tls://host`
+URLs work, and `--nats-creds` (a credentials file: user JWT and NKey
+seed), `--nats-tls-ca`, `--nats-tls-cert` and `--nats-tls-key` (PEM
+files) configure the connection (§9). What the receiver does check is
+what would otherwise break a channel rather than one message:
+
+- The serial and a non-empty predecessor must be channelSerials in the
+  fixed-width form the database mints (§8), and the predecessor must
+  sort below the serial. Anything else is dropped and counted in
+  `ably_bus_malformed_total{reason="serial"}`; an envelope that does not
+  decode, in `{reason="decode"}`.
+- A serial minted more than 5 minutes ahead of the receiver's clock,
+  corrected by the database clock offset the retention sweep measures,
+  is dropped, counted in `{reason="future"}` and logged once per channel
+  per minute. Without the check such a serial would sort above every
+  serial the channel mints in that time, and the delivery point would
+  drop each of them as a duplicate: the channel would be wedged until it
+  was rebound. Serials are minted from the database clock, so a genuine
+  one is never that far ahead; if one were, the chain or the sweep would
+  still deliver it from the log.
+- An envelope whose deployment id is not the receiver's cluster's is
+  dropped and counted in `ably_bus_unrouted_total{reason="foreign"}`.
 
 **Receive fan-in.** A node holds one NATS subscription per bound channel,
 so it receives only its own channels, but the subscriptions do not each
@@ -2182,6 +2253,9 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --bus {pgnotify|postgres|nats}  cluster mode cross-node bus (§7.2); default: pgnotify
 --nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
+--nats-creds                  --bus=nats: NATS credentials file (user JWT and NKey seed); nats://user:pass@host URLs also work (§7.2)
+--nats-tls-ca                 --bus=nats: PEM CA the NATS server's certificate chains to; tls:// URLs also work
+--nats-tls-cert, --nats-tls-key  --bus=nats: PEM client certificate and key, for a server that verifies clients
 --postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
 --postgres-notify-window 50ms   coalescing window (coalesced mode)
 --postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
@@ -2225,7 +2299,8 @@ reader polling the path never sees a partial address.
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
-`nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
+`nats-inline-max-bytes`, `nats-creds`, `nats-tls-ca`, `nats-tls-cert`,
+`nats-tls-key`, `postgres-notify-mode`, `postgres-notify-window`,
 `postgres-notify-max-pending`, `bus-sweep-interval`, `bus-sweep-scope`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
@@ -2256,6 +2331,13 @@ Every key is optional. Resolution order,
 highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.
+
+A bus setting the chosen `--bus` does not use (a `--nats-*` setting under
+`pgnotify` or `postgres`, a `--postgres-notify-*` setting under `pgnotify`
+or `nats`, `--bus-sweep-*` under `pgnotify`), given by flag, env or file,
+is named in a warning at startup rather than dropped silently. The bus,
+the retentions and the persisted namespaces must be the same on every
+node of a cluster, which the database enforces at startup (§11).
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -2345,7 +2427,9 @@ name = "persisted:presence_fixtures"
     `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
     (gauges). `table` is `channel_messages` or `messages`.
   - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres
-    shards (§6.4); 1 for a single DSN. With two or more shards every
+    shards (§6.4); 1 for a single DSN. With two or more,
+    `ably_storage_shard_ready{shard}` (gauge), 1 while the shard (and its
+    bus) answered the last readiness check, else 0. With two or more shards every
     `ably_storage_*` and `ably_publish_*` series above carries a `shard`
     label (the shard's index in the `--postgres-dsn` list), and the
     `ably_bus_*` series below are summed over shards.
@@ -2390,7 +2474,10 @@ name = "persisted:presence_fixtures"
     waiting in the nats bus's dispatch queues, 0 on the other buses).
   - Traffic: `ably_bus_published_total`, `ably_bus_publish_errors_total`,
     `ably_bus_pointers_total`, `ably_bus_received_total`,
-    `ably_bus_unrouted_total`, `ably_bus_malformed_total`.
+    `ably_bus_unrouted_total{reason}` (`unbound`: no bound store for the
+    channel on this node; `foreign`: a nats bus message of another
+    cluster) and `ably_bus_malformed_total{reason}` (`decode`, `serial`,
+    `future`; §7.2).
   - Delivery paths, one count per cm appended:
     `ably_bus_inline_deliveries_total`, `ably_bus_fetched_deliveries_total`,
     `ably_bus_fast_path_deliveries_total`,
@@ -2458,6 +2545,57 @@ The Postgres backend runs the auto-migrate sweep described in §6.3 —
 a session-scoped advisory lock serialises N concurrently-starting
 nodes so only one applies migrations, the rest observe the
 `schema_migrations` tracker and skip.
+
+**Cluster identity.** Some settings must be the same on every node of a
+cluster, and nodes that differ do not fail on their own. A `pgnotify`
+node and a `nats` node never deliver to each other; the retention sweep
+of whichever node runs it applies that node's retentions and persisted
+namespaces to everybody's log (§6.3). So migration 0005 adds a one-row
+`cluster_identity` table to the schema, and `Open` checks it under the
+shard identity advisory lock (§6.4), so two nodes starting at once on an
+empty schema never both write it. The first node to open the schema
+records:
+
+| Column | What | A later node that differs |
+|---|---|---|
+| `deployment_id` | a random id, minted once; the nats bus mixes it into every subject and carries it in every envelope (§7.2) | n/a (a shard of a list must carry shard 0's) |
+| `bus` | `--bus` | refused |
+| `message_retention`, `persisted_retention` | `--message-retention`, `--persisted-retention` | refused |
+| `persisted_namespaces` | the `[[namespaces]]` ids with `persisted = true`, sorted | refused (compared as a set) |
+| `min_server_version` | the lowest cluster version that may join (1 today) | a server of a lower version is refused |
+| `created_at` | when the row was written | |
+
+A refusal names every difference and the `UPDATE` that records this
+node's settings instead. Each shard of a list has its own row, with shard
+0's deployment id. The row is written before the node connects its bus,
+so a first node that then fails to start (a wrong NATS password, say)
+has still recorded its settings; a later start must match them or change
+them as below.
+
+*Changing a recorded setting* is a deliberate step, not a flag: stop
+every node; run the `UPDATE` the refusal printed, for example
+`UPDATE cluster_identity SET bus = 'nats'`, in the schema (in every
+shard's schema, for a DSN list); then start the nodes with the new
+setting. The deployment id stays. A flag that overwrote the record at
+startup was rejected: left in a config file or an environment, it would
+overwrite the record on every start, and the check would protect
+nothing. Deleting the row instead makes the next node record its own
+settings and a new deployment id.
+
+*Upgrading to this version.* A database without the row records the
+settings of the first upgraded node; nodes of earlier versions do not
+check. On the nats bus the deployment id changes the subjects, so during
+a rolling upgrade upgraded and older nodes do not hear each other's bus
+messages; their cms still reach each other, late, by the next cm's
+predecessor or the sweep (§7.2). Restart the nodes of a nats cluster
+together to avoid the window.
+
+**A shard that is down** (§6.4): the node stays in rotation while shard 0
+and a majority of the shards answer, and the down shard's channels fail
+fast with 50003 until it is back. `ably_storage_shard_ready{shard}` says
+which shard. Nothing needs doing on the nodes when it returns: the pool
+reconnects on the next call, and its channels' subscribers resume from
+the log.
 
 On SIGTERM the server enters a graceful shutdown:
 

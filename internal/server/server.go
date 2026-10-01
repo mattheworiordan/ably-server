@@ -19,6 +19,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +58,10 @@ const (
 	busEnv             = "ABLY_SERVER_BUS"
 	natsURLEnv         = "ABLY_SERVER_NATS_URL"
 	natsInlineMaxEnv   = "ABLY_SERVER_NATS_INLINE_MAX_BYTES"
+	natsCredsEnv       = "ABLY_SERVER_NATS_CREDS"
+	natsTLSCAEnv       = "ABLY_SERVER_NATS_TLS_CA"
+	natsTLSCertEnv     = "ABLY_SERVER_NATS_TLS_CERT"
+	natsTLSKeyEnv      = "ABLY_SERVER_NATS_TLS_KEY"
 	pgNotifyModeEnv    = "ABLY_SERVER_POSTGRES_NOTIFY_MODE"
 	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
 	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
@@ -269,6 +274,10 @@ func Run(ctx context.Context, opts Opts) int {
 	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPGNotify), "cluster-mode cross-node bus: pgnotify (the shipped LISTEN/NOTIFY broker), postgres (per-channel LISTEN, see --postgres-notify-mode) or nats; Postgres stays the store in every case (DESIGN.md §7.2) (env: "+busEnv+")")
 	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted (env: "+natsURLEnv+")")
 	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
+	natsCreds := fs.String("nats-creds", config.Default(opts.Getenv(natsCredsEnv), file.NATSCreds, ""), "--bus=nats: NATS credentials file (user JWT and NKey seed) the bus connects with; nats://user:pass@host URLs work too (DESIGN.md §7.2) (env: "+natsCredsEnv+")")
+	natsTLSCA := fs.String("nats-tls-ca", config.Default(opts.Getenv(natsTLSCAEnv), file.NATSTLSCA, ""), "--bus=nats: PEM CA bundle the NATS server's certificate must chain to; a tls:// URL needs no CA when the system roots suffice (env: "+natsTLSCAEnv+")")
+	natsTLSCert := fs.String("nats-tls-cert", config.Default(opts.Getenv(natsTLSCertEnv), file.NATSTLSCert, ""), "--bus=nats: PEM client certificate for a NATS server that verifies clients; needs --nats-tls-key (env: "+natsTLSCertEnv+")")
+	natsTLSKey := fs.String("nats-tls-key", config.Default(opts.Getenv(natsTLSKeyEnv), file.NATSTLSKey, ""), "--bus=nats: PEM key of --nats-tls-cert (env: "+natsTLSKeyEnv+")")
 	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), file.PostgresNotifyMode, string(postgres.NotifyCoalesced)), "--bus=postgres notify mode: coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) or transactional (one NOTIFY per write, inside its transaction) (env: "+pgNotifyModeEnv+")")
 	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced; under 20ms logs a warning (DESIGN.md §7.2) (env: "+pgNotifyWindowEnv+")")
 	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
@@ -304,6 +313,26 @@ func Run(ctx context.Context, opts Opts) int {
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
+	// The bus settings set anywhere (flag, env or file), so a setting the
+	// chosen bus ignores can be named at startup (busSettingsIgnored).
+	busGiven := map[string]bool{
+		"nats-url":                    opts.Getenv(natsURLEnv) != "" || file.NATSURL != "",
+		"nats-inline-max-bytes":       opts.Getenv(natsInlineMaxEnv) != "" || file.NATSInlineMaxBytes != 0,
+		"nats-creds":                  opts.Getenv(natsCredsEnv) != "" || file.NATSCreds != "",
+		"nats-tls-ca":                 opts.Getenv(natsTLSCAEnv) != "" || file.NATSTLSCA != "",
+		"nats-tls-cert":               opts.Getenv(natsTLSCertEnv) != "" || file.NATSTLSCert != "",
+		"nats-tls-key":                opts.Getenv(natsTLSKeyEnv) != "" || file.NATSTLSKey != "",
+		"postgres-notify-mode":        opts.Getenv(pgNotifyModeEnv) != "" || file.PostgresNotifyMode != "",
+		"postgres-notify-window":      opts.Getenv(pgNotifyWindowEnv) != "" || file.PostgresNotifyWindow != "",
+		"postgres-notify-max-pending": opts.Getenv(pgNotifyMaxPendEnv) != "" || file.PostgresNotifyMaxPending != 0,
+		"bus-sweep-interval":          opts.Getenv(busSweepEnv) != "" || file.BusSweepInterval != "",
+		"bus-sweep-scope":             opts.Getenv(busSweepScopeEnv) != "" || file.BusSweepScope != "",
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if _, ok := busGiven[f.Name]; ok {
+			busGiven[f.Name] = true
+		}
+	})
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
 		return 2
@@ -392,6 +421,11 @@ func Run(ctx context.Context, opts Opts) int {
 		bus:              *bus,
 		natsURL:          *natsURL,
 		natsInlineMax:    *natsInlineMax,
+		natsCreds:        *natsCreds,
+		natsTLSCA:        *natsTLSCA,
+		natsTLSCert:      *natsTLSCert,
+		natsTLSKey:       *natsTLSKey,
+		busGiven:         busGiven,
 		notifyMode:       *pgNotifyMode,
 		notifyWindow:     *pgNotifyWindow,
 		notifyMaxPending: *pgNotifyMaxPending,
@@ -402,8 +436,9 @@ func Run(ctx context.Context, opts Opts) int {
 			Message:   *messageRetention,
 			Persisted: *persistedRetention,
 		},
-		persisted:   persistedNamespaces(file.Namespaces),
-		bindOnWrite: *publishBindOnWrite,
+		persisted:           persistedNamespaces(file.Namespaces),
+		persistedNamespaces: persistedNamespaceIDs(file.Namespaces),
+		bindOnWrite:         *publishBindOnWrite,
 		batching: postgres.Batching{
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
@@ -670,6 +705,19 @@ func persistedNamespaces(namespaces []config.Namespace) func(string) bool {
 	return namespaceResolver(namespaces, func(ns config.Namespace) bool { return ns.Persisted })
 }
 
+// persistedNamespaceIDs lists the [[namespaces]] ids with persisted =
+// true, which cluster mode records in the cluster identity (DESIGN.md
+// §11).
+func persistedNamespaceIDs(namespaces []config.Namespace) []string {
+	var out []string
+	for _, ns := range namespaces {
+		if ns.Persisted && ns.ID != "" {
+			out = append(out, ns.ID)
+		}
+	}
+	return out
+}
+
 // mutableNamespaces returns the resolver for append tracking (DESIGN.md
 // §13.3, §9): a channel is mutable when the namespace its name starts
 // with is a [[namespaces]] entry with mutableMessages = true. An
@@ -888,20 +936,26 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 // clusterOptions carries the cluster-mode storage settings: the Postgres
 // DSN and the cross-node bus (DESIGN.md §7.2).
 type clusterOptions struct {
-	dsn              string
-	bus              string
-	natsURL          string
-	natsInlineMax    int
-	notifyMode       string
-	notifyWindow     time.Duration
-	notifyMaxPending int
-	sweepInterval    time.Duration
-	sweepScope       string
-	logger           *logging.Logger
-	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
-	batching         postgres.Batching         // publish batching (DESIGN.md §6.3)
-	persisted        func(channel string) bool // persisted-namespace resolver
-	bindOnWrite      bool                      // --publish-bind-on-write (DESIGN.md §6.3)
+	dsn                 string
+	bus                 string
+	natsURL             string
+	natsInlineMax       int
+	natsCreds           string
+	natsTLSCA           string
+	natsTLSCert         string
+	natsTLSKey          string
+	busGiven            map[string]bool // bus settings set by flag, env or file
+	notifyMode          string
+	notifyWindow        time.Duration
+	notifyMaxPending    int
+	sweepInterval       time.Duration
+	sweepScope          string
+	logger              *logging.Logger
+	retention           postgres.Retention        // log retention classes (DESIGN.md §6.3)
+	batching            postgres.Batching         // publish batching (DESIGN.md §6.3)
+	persisted           func(channel string) bool // persisted-namespace resolver
+	persistedNamespaces []string                  // the persisted namespace ids (cluster identity, DESIGN.md §11)
+	bindOnWrite         bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 
 	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
 	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
@@ -910,12 +964,14 @@ type clusterOptions struct {
 // options returns the postgres.Options every bus shares.
 func (c clusterOptions) options() postgres.Options {
 	return postgres.Options{
-		DSN:         c.dsn,
-		Logger:      c.logger,
-		Retention:   c.retention,
-		Persisted:   c.persisted,
-		Batching:    c.batching,
-		BindOnWrite: c.bindOnWrite,
+		DSN:       c.dsn,
+		Logger:    c.logger,
+		Retention: c.retention,
+		Persisted: c.persisted,
+		Batching:  c.batching,
+
+		PersistedNamespaces: c.persistedNamespaces,
+		BindOnWrite:         c.bindOnWrite,
 
 		PresenceMaxInflight: c.presenceMaxInflight,
 		PresenceLeaseMode:   c.presenceLeaseMode,
@@ -938,24 +994,29 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		if cluster.dsn == "" {
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
 		}
+		bus, err := postgres.ParseBus(cluster.bus)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --bus: %w", err)
+		}
 		if _, err := postgres.ParseSweepScope(cluster.sweepScope); err != nil {
 			return nil, fmt.Errorf("invalid --bus-sweep-scope: %w", err)
 		}
 		if _, err := postgres.ParsePresenceLeaseMode(cluster.presenceLeaseMode); err != nil {
 			return nil, fmt.Errorf("invalid --presence-lease-mode: %w", err)
 		}
-		switch cluster.bus {
-		case postgres.BusPGNotify:
-			// The default, opened exactly as before the bus seam: no bus
-			// settings apply.
-			return openPostgres(ctx, cluster.options())
+		if cluster.logger != nil {
+			for _, name := range busSettingsIgnored(bus, cluster.busGiven) {
+				cluster.logger.Warn("bus setting ignored: the chosen --bus does not use it", "flag", "--"+name, "bus", bus, "usedBy", strings.Join(busSettingUsers[name], ", "))
+			}
+		}
+		opts := cluster.options()
+		opts.Bus = bus
+		switch bus {
 		case postgres.BusPostgres:
 			mode, err := postgres.ParseNotifyMode(cluster.notifyMode)
 			if err != nil {
 				return nil, fmt.Errorf("invalid --postgres-notify-mode: %w", err)
 			}
-			opts := cluster.options()
-			opts.Bus = postgres.BusPostgres
 			opts.NotifyMode = mode
 			opts.NotifyWindow = cluster.notifyWindow
 			opts.NotifyMaxPending = cluster.notifyMaxPending
@@ -964,24 +1025,53 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 			}
 			opts.SweepInterval = cluster.sweepInterval
 			opts.SweepScope = cluster.sweepScope
-			return openPostgres(ctx, opts)
 		case postgres.BusNATS:
 			if cluster.natsURL == "" {
 				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
 			}
-			opts := cluster.options()
-			opts.Bus = postgres.BusNATS
 			opts.NATSURL = cluster.natsURL
 			opts.NATSInlineMaxBytes = cluster.natsInlineMax
+			opts.NATSCredsFile = cluster.natsCreds
+			opts.NATSTLSCA = cluster.natsTLSCA
+			opts.NATSTLSCert = cluster.natsTLSCert
+			opts.NATSTLSKey = cluster.natsTLSKey
 			opts.SweepInterval = cluster.sweepInterval
 			opts.SweepScope = cluster.sweepScope
-			return openPostgres(ctx, opts)
-		default:
-			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s, %s)", cluster.bus, postgres.BusPGNotify, postgres.BusPostgres, postgres.BusNATS)
 		}
+		return openPostgres(ctx, opts)
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}
+}
+
+// busSettingUsers names, for each bus-specific setting, the buses that
+// use it (DESIGN.md §7.2, §9).
+var busSettingUsers = map[string][]string{
+	"nats-url":                    {postgres.BusNATS},
+	"nats-inline-max-bytes":       {postgres.BusNATS},
+	"nats-creds":                  {postgres.BusNATS},
+	"nats-tls-ca":                 {postgres.BusNATS},
+	"nats-tls-cert":               {postgres.BusNATS},
+	"nats-tls-key":                {postgres.BusNATS},
+	"postgres-notify-mode":        {postgres.BusPostgres},
+	"postgres-notify-window":      {postgres.BusPostgres},
+	"postgres-notify-max-pending": {postgres.BusPostgres},
+	"bus-sweep-interval":          {postgres.BusPostgres, postgres.BusNATS},
+	"bus-sweep-scope":             {postgres.BusPostgres, postgres.BusNATS},
+}
+
+// busSettingsIgnored returns, sorted, the bus settings given (by flag,
+// env or file) that bus does not use, so startup can warn about each
+// rather than drop it silently.
+func busSettingsIgnored(bus string, given map[string]bool) []string {
+	var out []string
+	for name, on := range given {
+		if on && !slices.Contains(busSettingUsers[name], bus) {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // openPostgres opens the cluster-mode store for opts.DSN, the

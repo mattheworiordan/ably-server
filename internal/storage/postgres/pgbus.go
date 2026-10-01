@@ -213,10 +213,18 @@ type pgBus struct {
 	workersMu     sync.Mutex
 	workersClosed bool
 	workerWG      sync.WaitGroup
+
+	bindTimeout time.Duration // pgBindTimeout, snapshotted
 }
 
+// pgBindTimeout bounds how long a bind waits for its LISTEN to become
+// active (pgBus.bind). A LISTEN takes milliseconds while the LISTEN
+// connection is up; the bound matters when it is down. A package var so
+// tests can shrink it.
+var pgBindTimeout = 10 * time.Second
+
 func newPGBus(s *Storage, mode NotifyMode, conn *pgx.Conn, window time.Duration, maxPending int) *pgBus {
-	b := &pgBus{s: s, mode: mode, initialConn: conn, bound: make(map[string]*channelStore)}
+	b := &pgBus{s: s, mode: mode, initialConn: conn, bound: make(map[string]*channelStore), bindTimeout: pgBindTimeout}
 	b.connected.Store(true) // conn is live; listenLoop tracks it from here
 	if mode == NotifyCoalesced {
 		b.notifier = newWakeNotifier(s, window, maxPending)
@@ -240,7 +248,11 @@ func (b *pgBus) chains() bool { return true }
 // waits until the LISTEN is active, so every NOTIFY sent after the
 // watermark read that follows reaches this node. If the LISTEN
 // connection is down, the request is satisfied by the re-LISTEN that
-// follows the reconnect.
+// follows the reconnect, if that comes within pgBindTimeout; otherwise
+// the bind fails with storage.ErrUnavailable (50003), so an attach on a
+// channel whose database is down fails fast rather than waiting for it
+// to come back (DESIGN.md §6.4). The queued LISTEN is undone by the
+// caller's unbind.
 func (b *pgBus) bind(ctx context.Context, cs *channelStore) error {
 	done := make(chan struct{})
 	b.mu.Lock()
@@ -251,6 +263,8 @@ func (b *pgBus) bind(ctx context.Context, cs *channelStore) error {
 	if interrupt != nil {
 		interrupt() // wake WaitForNotification so the loop runs the LISTEN now
 	}
+	timer := time.NewTimer(b.bindTimeout)
+	defer timer.Stop()
 	select {
 	case <-done:
 		return nil
@@ -258,6 +272,8 @@ func (b *pgBus) bind(ctx context.Context, cs *channelStore) error {
 		return ctx.Err()
 	case <-b.s.done:
 		return errStorageClosed
+	case <-timer.C:
+		return fmt.Errorf("%w: LISTEN for %q not active after %s (is the database reachable?)", storage.ErrUnavailable, cs.name, b.bindTimeout)
 	}
 }
 
