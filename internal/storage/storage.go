@@ -482,14 +482,33 @@ func IsServerPresence(ctx context.Context) bool {
 	return v || IsStaticPresence(ctx)
 }
 
-// Discontinuous is implemented by an Appender that keeps state derived
-// from the cms delivered to it (core.Channel's presence member set,
-// DESIGN.md §12.4). A backend calls Discontinuity when it skips cms it
-// could not deliver, so the appender rebuilds that state from the store
-// rather than carry on without them.
+// Discontinuous is implemented by an Appender that can be told the cms
+// it was delivered are not continuous (core.Channel, DESIGN.md §7.2,
+// §12.4). A backend calls Discontinuity, in delivery order with its
+// Appends, when cms between the last one it appended and the next may
+// never be delivered: it skipped a gap the log no longer holds, or it
+// caught up from the log after being off the bus for longer than the
+// retention window, so the log cannot prove nothing was lost. The
+// appender rebuilds any state it derives from the delivered cms (the
+// presence member set) and tells its subscribers (an ATTACHED without
+// RESUMED, error 80016).
 type Discontinuous interface {
-	Discontinuity()
+	Discontinuity(reason DiscontinuityReason)
 }
+
+// DiscontinuityReason says why a backend signalled a discontinuity (the
+// reason label of ably_channel_discontinuities_total, DESIGN.md §10).
+type DiscontinuityReason string
+
+const (
+	// DiscontinuityRetention: a catch-up from the log started below the
+	// channel's retention floor, and the log could not prove that no cm
+	// after the delivery mark had aged out (DESIGN.md §7.2).
+	DiscontinuityRetention DiscontinuityReason = "retention"
+	// DiscontinuityLogGap: a gap the bus revealed (a held cm's
+	// predecessor) was not found in the log and was skipped.
+	DiscontinuityLogGap DiscontinuityReason = "log_gap"
+)
 
 // IsStaticPresence reports whether ctx was marked by WithStaticPresence.
 func IsStaticPresence(ctx context.Context) bool {

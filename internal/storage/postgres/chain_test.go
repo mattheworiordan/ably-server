@@ -7,6 +7,7 @@ import (
 
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // Unit tests for the chained delivery point (DESIGN.md §7.2). Every
@@ -151,7 +152,7 @@ type discontinuityRecorder struct {
 	discontinuities int
 }
 
-func (r *discontinuityRecorder) Discontinuity() { r.discontinuities++ }
+func (r *discontinuityRecorder) Discontinuity(storage.DiscontinuityReason) { r.discontinuities++ }
 
 // TestChainSkippedGapSignalsDiscontinuity: a gap the log no longer holds
 // is skipped, and the appender is told, so a node's local presence

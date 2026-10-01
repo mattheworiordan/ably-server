@@ -487,7 +487,7 @@ func (cs *channelStore) applyRangeLocked(cms []*protocol.ChannelMessage, upTo st
 		cs.logger.Warn("storage/postgres: bus gap not found in the log; skipped past it", "channel", cs.name, "upTo", upTo)
 		cs.lastSeen = upTo
 		if d, ok := cs.appender.(storage.Discontinuous); ok {
-			d.Discontinuity()
+			d.Discontinuity(storage.DiscontinuityLogGap)
 		}
 	}
 	cs.settleLocked()

@@ -627,6 +627,12 @@ Continuity instead lives at the attachment level, driven by the client:
   continuous, because cms between it and the oldest retained one may have
   been dropped. Backends that do not enforce retention (memory, disk)
   never take this path.
+- The same signal can come mid-stream, without a new `ATTACH`: when a
+  cluster node cannot prove from the log that it delivered every cm on a
+  channel (§7.2), each attachment receives an `ATTACHED` at its current
+  `channelSerial` with `RESUMED` clear and error 80016, a
+  server-initiated channel update (RTL12): the SDK emits `update` with
+  `resumed: false`. Nothing is replayed; live delivery carries on.
 
 `rewind` is the only honoured channel param. `rewind=N` (positive integer)
 selects an attach point N messages before the live head; `rewind=<duration>`
@@ -760,10 +766,17 @@ exposes two methods:
   persists. The link onto the live list arrives via the Appender
   callback — synchronously after commit in memory/bbolt;
   asynchronously via the cluster bus in Postgres (§7.2).
-- `Append(cm)` — satisfies the `storage.Appender` contract. It is
-  the **only** writer to the linked list, and it is called only by
-  the storage backend (never directly by publish-path callers, in
-  any mode).
+- `Append(cm)` — satisfies the `storage.Appender` contract. It and
+  `Discontinuity` are the **only** writers to the linked list, and
+  both are called only by the storage backend (never directly by
+  publish-path callers, in any mode).
+- `Discontinuity(reason)` — satisfies `storage.Discontinuous`: the
+  backend could not prove it delivered every cm since the last
+  `Append` (§7.2). Under the same lock as `Append` it drops the local
+  presence member set (§12.4) and links a marker entry, a serial-only
+  cm at the previous tail's serial, so every Stream meets it between
+  the cms before and after it (`Stream.Discontinuity`); its attachment
+  sends the client a channel update (§4.3).
 
 This is the unified flow: every cm that lands on a Channel's live
 list arrives through `storage → Appender.Append`, whether the publish
@@ -1652,8 +1665,9 @@ on every node that has attachments to that channel. The flow is
 unified across deployment modes: publish-path callers call
 `channel.Publish(ctx, msgs)`, the storage backend persists, and the
 Appender callback registered against each ChannelStore delivers the
-committed cm to `channel.Append(cm)`. The Appender is the only
-writer to the linked list in every mode.
+committed cm to `channel.Append(cm)`. The Appender (`Append`, and
+`Discontinuity` for a gap it cannot fill) is the only writer to the
+linked list in every mode.
 
 Presence enter/update/leave ride this exact path: a presence operation
 is a cm like any other (carrying `Presence` rather than `Messages`) and
@@ -2165,7 +2179,8 @@ client-supplied `channelSerial` and the channel's current head, streamed
 after the `ATTACHED` ack. If the requested serial is older than retained
 history the server attaches at the live head, clears
 `ATTACHED.flags.RESUMED`, and populates `ATTACHED.error` so the SDK can
-surface the discontinuity.
+surface the discontinuity. A node that cannot prove continuity on the
+live stream sends the same `ATTACHED` mid-stream (§4.3, §7.2).
 
 ## 9. Configuration
 
@@ -2334,6 +2349,13 @@ name = "persisted:presence_fixtures"
   - `ably_channel_unbound_publishes_total` (counter) — REST publishes that
     took the write-only path: stored on a channel not bound on this node,
     without binding it (§5.1).
+  - `ably_channel_discontinuities_total{reason}` (counter) — discontinuities
+    signalled on a bound channel, each sent to its attachments as an
+    `ATTACHED` without `RESUMED`, error 80016 (§7.2): `retention` (a read
+    of the log from the delivery mark started below the retention floor
+    and could not prove nothing had aged out) or `log_gap` (a gap the bus
+    revealed was not in the log and was skipped). Any increase means some
+    clients were told that cms may be missing.
   - `ably_slow_consumer_disconnects_total{reason}` (counter) — connections
     disconnected for not reading fast enough: `queue_full` (the outbound
     queue stayed at its bound for the write timeout) or `write_timeout` (a

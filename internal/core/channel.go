@@ -52,6 +52,12 @@ type entry struct {
 	// such as its encoded frame in one wire format (Stream.Memo). Nil
 	// until first used.
 	memo atomic.Pointer[sync.Map]
+	// discontinuity marks an entry linked by Channel.Discontinuity
+	// rather than Append: the storage backend could not prove that no
+	// cm is missing between the entry before it and the entry after it
+	// (DESIGN.md §7.2). Its cm is serial-only, carrying the serial of
+	// the entry before it, so Stream.ChannelSerial stays valid.
+	discontinuity bool
 }
 
 // streamsPerWakeSlot is about how many Streams share one wake channel
@@ -547,6 +553,33 @@ func (c *Channel) link(cm *protocol.ChannelMessage) *entry {
 	return prev
 }
 
+// Discontinuity implements storage.Discontinuous: the storage backend
+// could not prove that it delivered every cm between the last one it
+// appended and the next (DESIGN.md §7.2). Under mu, so in order with
+// Append, it drops the local member set, which may miss presence
+// operations (the next SYNC seeds it again from the store, §12.4), and
+// links a discontinuity marker at the tail of the live list, so every
+// Stream sees it between the cms before and after it (Stream.
+// Discontinuity) and its attachment can tell the client. Before
+// Initialize there is no Stream to tell, so only the set is dropped.
+func (c *Channel) Discontinuity(reason storage.DiscontinuityReason) {
+	c.metrics.ChannelDiscontinuity(string(reason))
+	c.mu.Lock()
+	c.dropMemberViewLocked()
+	if c.tail.cm == nil {
+		c.mu.Unlock()
+		return
+	}
+	e := newEntry(&protocol.ChannelMessage{ChannelSerial: c.tail.cm.ChannelSerial}, c.subs.Load())
+	e.discontinuity = true
+	e.at = time.Now()
+	prev := c.tail
+	prev.next = e
+	c.tail = e
+	c.mu.Unlock()
+	prev.wakeAll() // outside mu, as in Append
+}
+
 // trackMembers folds a presence cm into the local member set that
 // holds off eviction (DESIGN.md §5.1): ENTER/UPDATE/PRESENT add the
 // member, LEAVE/ABSENT remove it. Called with mu held.
@@ -627,6 +660,15 @@ func (s *Stream) ChannelSerial() string {
 	return s.cursor.cm.ChannelSerial
 }
 
+// Discontinuity reports whether the entry Next last returned is a
+// discontinuity marker: cms may be missing between the one before it and
+// the one after it, which the backend could not deliver (DESIGN.md
+// §7.2). The realtime layer tells the attachment's client (an ATTACHED
+// without RESUMED, error 80016) and re-sends the presence set.
+func (s *Stream) Discontinuity() bool {
+	return s.cursor.discontinuity
+}
+
 // AppendedAt returns when the cursor's entry was appended: the time the
 // last ChannelMessage Next returned was linked onto the live list. Zero
 // before the first Next.
@@ -655,6 +697,11 @@ func (s *Stream) Memo(key any, build func() any) any {
 // Next blocks until the next ChannelMessage is available, advances
 // the cursor to that entry, and returns the ChannelMessage. Returns
 // ctx.Err() if the context is cancelled.
+//
+// The entry may be a discontinuity marker (Channel.Discontinuity): then
+// Discontinuity reports true and the ChannelMessage is serial-only (no
+// items), carrying the serial of the cm before the marker. A caller that
+// forwards it as a cm forwards nothing.
 func (s *Stream) Next(ctx context.Context) (*protocol.ChannelMessage, error) {
 	select {
 	case <-s.cursor.wait(s.slot):
