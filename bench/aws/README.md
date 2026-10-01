@@ -345,7 +345,8 @@ passes only if every gating check passes; "fault run" below means a
 
 - Zero violations of every kind on the sample, including `attach_gap` and
   `presence_set_mismatch`; at least 90% of attach claims settled
-  (`min_attach_coverage`); the tail check covering at least 50% of the
+  (`min_attach_coverage`, row "sample coverage (attach)"; a run that
+  settled no claim at all fails it, fault or not); the tail check covering at least 50% of the
   sampled streams (`min_tail_coverage`); a run that publishes with no
   sampled channel that has a subscriber fails "sample coverage".
 - A presence run must have compared the end-of-hold REST member set of
@@ -437,7 +438,8 @@ them:
   log (the log ends with the last acknowledgement before the end of the
   hold, so an attachment made after that cannot be settled), or whose
   needed serial is unknown (an ACK that carried none). A run that settles
-  none fails; it never passes on "0 of 0".
+  none fails "sample coverage (attach)" in every run, a fault run too; it
+  never passes on "0 of 0".
 - **Residual blind spots.** A stream an attachment never received a single
   message from is invisible to the per-attachment and attach-point checks;
   only the tail check covers it, and only for streams still publishing at

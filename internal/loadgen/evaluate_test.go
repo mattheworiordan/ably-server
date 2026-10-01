@@ -180,12 +180,12 @@ func TestEvaluateFailures(t *testing.T) {
 			if s != nil {
 				s[0].Correctness.AttachClaims = nil
 			}
-		}, "attach-point check coverage"},
+		}, "sample coverage (attach)"},
 		{"attach-point check cannot settle claims", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 5_000_000} // no serial log
 			}
-		}, "attach-point check coverage"},
+		}, "sample coverage (attach)"},
 		{"tail check skipped every stream on the margin", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				// The last acknowledgement came 0.5 s after the attach (at
@@ -512,19 +512,26 @@ func TestEvaluateAttachGapIsCountedAsAViolation(t *testing.T) {
 	}
 }
 
-func TestEvaluateAttachCoverageStandsDownInAFaultRun(t *testing.T) {
-	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
-		if s != nil {
-			s[0].Correctness.AttachClaims = nil
-		} else {
-			r.Fault = &FaultRecord{Command: "kill", ExitCode: 0}
-		}
-	})
-	for _, n := range failing(rec) {
-		if strings.HasPrefix(n, "attach-point") {
-			t.Fatalf("a successful fault run does not gate attach coverage: %v", failing(rec))
+func TestEvaluateZeroAttachClaimsFailsSampleCoverageAttach(t *testing.T) {
+	// No claim at all: "0 of 0 claims settled" fails, with or without a
+	// fault that ran; it never passes as 0 of 0.
+	for _, fault := range []*FaultRecord{nil, {Command: "kill", ExitCode: 0}} {
+		rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Correctness.AttachClaims = nil
+			} else {
+				r.Fault = fault
+			}
+		})
+		mustFail(t, rec, "sample coverage (attach)")
+		for _, c := range rec.Checks {
+			if c.Name == "sample coverage (attach)" && !strings.HasPrefix(c.Value, "0 of 0 claims settled") {
+				t.Fatalf("%q", c.Value)
+			}
 		}
 	}
+	// 90% of claims settled is the floor: one of one passes.
+	mustNotFail(t, evalFixture(t, nil), "sample coverage (attach)")
 }
 
 func TestEvaluateTailCoverageThresholdAndFault(t *testing.T) {

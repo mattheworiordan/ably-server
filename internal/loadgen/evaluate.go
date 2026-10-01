@@ -805,17 +805,20 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		// The attach-point check settles each attachment's first message
 		// against the publishers' serial logs. If it settled few claims it
-		// proved little, so coverage is gated like the others.
+		// proved little, so coverage is gated like the others; a run that
+		// settled no claim at all fails whatever fault ran.
 		a := res.Attach
 		total := a.Claims + a.Dropped
 		cov := 0.0
 		if total > 0 {
 			cov = float64(a.Checked) / float64(total)
 		}
-		add(Check{Name: "attach-point check coverage",
+		add(Check{Name: "sample coverage (attach)",
 			Value: fmt.Sprintf("%d of %d claims settled (%.0f%%), %d unverifiable, %d dropped; %d messages missed after an attach point",
 				a.Checked, total, cov*100, a.Unverifiable, a.Dropped, a.Missed),
-			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinAttachCoverage*100), Pass: a.Checked > 0 && cov >= spec.MinAttachCoverage, Gating: !faultRelaxed(rec)})
+			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinAttachCoverage*100), Pass: a.Checked > 0 && cov >= spec.MinAttachCoverage,
+			Gating: a.Checked == 0 || !faultRelaxed(rec),
+			Note:   "claims: each attachment's first message per stream, settled against the publishers' serial logs"})
 	}
 	if p := res.Publishes; p.TargetRate > 0 {
 		ratio := 0.0
