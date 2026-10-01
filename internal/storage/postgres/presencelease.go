@@ -83,8 +83,9 @@ SELECT node_id FROM presence_nodes WHERE expires_at < now() - make_interval(secs
 // mode (DESIGN.md §9 "Removed settings") wrote rows with a lease of
 // their own that it keeps ahead of now and no presence_nodes row, so the
 // reaper must not take them while that lease runs. Once such a node is
-// gone and its rows' leases are dead, they are reaped like any other. Rows a presence write holds locked are skipped, as
-// in every lease statement, and reaped by a later chunk or round.
+// gone and its rows' leases are dead, they are reaped like any other.
+// Rows a presence write holds locked are skipped, as in every lease
+// statement, and reaped by a later chunk or round.
 const sqlReapNodeChunk = `
 DELETE FROM presence WHERE (channel, connection_id, client_id) IN (
   SELECT channel, connection_id, client_id FROM presence

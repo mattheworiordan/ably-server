@@ -652,3 +652,16 @@ func TestRunWarnsAboutUnknownConfigKeys(t *testing.T) {
 		t.Errorf("output lacks a warning naming publish-bind-on-write: %q", out.String())
 	}
 }
+
+// TestRunWarnsAboutRemovedEnvVars (DESIGN.md §9 "Removed settings"): the
+// env var of a retired setting is not read, and is named in a startup
+// warning rather than ignored silently.
+func TestRunWarnsAboutRemovedEnvVars(t *testing.T) {
+	for _, name := range removedEnv {
+		var out bytes.Buffer
+		Run(context.Background(), Opts{Args: nil, Getenv: envWith(map[string]string{name: "x"}), Out: &out})
+		if !strings.Contains(out.String(), "removed setting") || !strings.Contains(out.String(), "env="+name) {
+			t.Errorf("%s set: output lacks a warning naming it: %q", name, out.String())
+		}
+	}
+}

@@ -130,7 +130,7 @@ func TestBusResolution(t *testing.T) {
 	}
 }
 
-// TestSettingsReachOptions (audit objection 37): every setting, given a
+// TestSettingsReachOptions: every setting, given a
 // valid non-default value by flag, by env var and by config file key,
 // reaches the options the server builds its storage, core and realtime
 // layers from (postgres.Options, core.Options, realtime limits), through
@@ -210,6 +210,10 @@ func TestSettingsReachOptions(t *testing.T) {
 			got: func(s *settings, _ postgres.Options) any { return s.listen }, want: "127.0.0.1:9999"},
 		{key: "debug-listen", env: debugListenEnv, val: "127.0.0.1:6061", toml: `"127.0.0.1:6061"`,
 			got: func(s *settings, _ postgres.Options) any { return s.debugListen }, want: "127.0.0.1:6061"},
+		{key: "log-level", env: logLevelEnv, val: "debug", toml: `"debug"`,
+			got: func(s *settings, _ postgres.Options) any { return s.logLevel }, want: "debug"},
+		{key: "log-format", env: logFormatEnv, val: "json", toml: `"json"`,
+			got: func(s *settings, _ postgres.Options) any { return s.logFormat }, want: "json"},
 		{key: "data-dir", env: dataDirEnv, val: "/var/lib/x", toml: `"/var/lib/x"`,
 			got: func(s *settings, _ postgres.Options) any { return s.dataDir }, want: "/var/lib/x"},
 	}
@@ -289,5 +293,34 @@ id = "drop"
 	}
 	if o.Persisted == nil || !o.Persisted("keep:room") || o.Persisted("drop:room") {
 		t.Error("Persisted does not resolve keep:room as persisted and drop:room as not")
+	}
+}
+
+// TestSettingsMode: --mode reaches the settings by flag, env var and
+// file key. Apart from TestSettingsReachOptions, whose cases all run in
+// cluster mode by flag, which would win.
+func TestSettingsMode(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		toml string
+	}{
+		{name: "flag", args: []string{"--mode=disk"}},
+		{name: "env", env: map[string]string{modeEnv: "disk"}},
+		{name: "file", toml: `mode = "disk"`},
+	} {
+		args := append([]string{"--keys=app.key:secret"}, c.args...)
+		if c.toml != "" {
+			args = append(args, "--config="+writeConfigFile(t, c.toml))
+		}
+		var out bytes.Buffer
+		s, code := resolveSettings(Opts{Args: args, Getenv: envWith(c.env), Out: &out})
+		if s == nil {
+			t.Fatalf("%s: resolveSettings failed with exit %d: %s", c.name, code, out.String())
+		}
+		if s.mode != "disk" {
+			t.Errorf("mode via %s = %q, want disk", c.name, s.mode)
+		}
 	}
 }

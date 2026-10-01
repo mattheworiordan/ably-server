@@ -800,9 +800,9 @@ func (s *Storage) boundStores() []*channelStore {
 }
 
 // Close stops the background goroutines (the bus and the presence
-// lease-bump and reaper loops), deletes the node's presence lease row (DESIGN.md §12.5), closes the bus and releases the
-// pool. A LISTEN goroutine owns closing its own conn, so Close only
-// cancels and waits.
+// lease-bump and reaper loops), deletes the node's presence lease row
+// (DESIGN.md §12.5), closes the bus and releases the pool. A LISTEN
+// goroutine owns closing its own conn, so Close only cancels and waits.
 func (s *Storage) Close() error { return s.close(true) }
 
 // close is Close; graceful false skips the lease release, leaving the

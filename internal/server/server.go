@@ -86,6 +86,19 @@ const (
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
 )
 
+// removedEnv are the env vars of the settings retired after the scale
+// proof (DESIGN.md §9 "Removed settings"). Nothing reads them; one that
+// is set is named in a startup warning, as a removed TOML key is, rather
+// than ignored silently.
+var removedEnv = []string{
+	"ABLY_SERVER_PUBLISH_BIND_ON_WRITE",
+	"ABLY_SERVER_BUS_SWEEP_SCOPE",
+	"ABLY_SERVER_PUBLISH_LINGER_MIN",
+	"ABLY_SERVER_PRESENCE_SYNC_SOURCE",
+	"ABLY_SERVER_PRESENCE_BATCHING",
+	"ABLY_SERVER_PRESENCE_LEASE_MODE",
+}
+
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
 // keep-alive connection open waiting for the next request (DESIGN.md
 // §2.2). Without it an idle keep-alive connection is held until the
@@ -129,6 +142,7 @@ type settings struct {
 	keys   []auth.APIKey
 
 	mode, dataDir, listen, debugListen, addrFile string
+	logLevel, logFormat                          string
 	enableStatsStub                              bool
 	shutdownGrace, hbInterval, remainPresentFor  time.Duration
 	httpIdleTimeout                              time.Duration
@@ -289,7 +303,7 @@ func resolveSettings(opts Opts) (*settings, int) {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction, outside the publish lanes, at once per database: with --publish-lanes=0 a client's presence write beyond it is refused with 42910; with lanes, a lease-lapse re-entry or a server-synthesised LEAVE written around a full lane waits for a slot; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
+	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction, outside the publish lanes, at once per database: with --publish-lanes=0 a client's presence write beyond it is refused with 42910; with lanes, a lease-lapse re-entry or a server-synthesised LEAVE written around a full lane waits for a slot; 0 means 4 x --publish-lanes, or 16 with --publish-lanes=0; negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -354,6 +368,11 @@ func resolveSettings(opts Opts) (*settings, int) {
 	for _, k := range file.Unknown {
 		logger.Warn("config file key not recognised; ignored (DESIGN.md §9)", "key", k, "file", configPath)
 	}
+	for _, name := range removedEnv {
+		if opts.Getenv(name) != "" {
+			logger.Warn("environment variable of a removed setting; ignored (DESIGN.md §9 \"Removed settings\")", "env", name)
+		}
+	}
 
 	keySpecs := resolveAPIKeys([]string(keysFlags), opts.Getenv(keysEnv), file)
 	if len(keySpecs) == 0 {
@@ -385,6 +404,8 @@ func resolveSettings(opts Opts) (*settings, int) {
 		file:             file,
 		keys:             parsedKeys,
 		mode:             *mode,
+		logLevel:         *logLevel,
+		logFormat:        *logFormat,
 		dataDir:          *dataDir,
 		listen:           *listen,
 		debugListen:      *debugListen,

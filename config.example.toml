@@ -135,7 +135,8 @@
 # the lanes, at once per database: with publish-lanes = 0 a client's
 # presence write beyond it is refused with 42910; with lanes, a
 # lease-lapse re-entry or a server LEAVE written around a full lane waits
-# for a slot (0 reads as unset: 4 x publish-lanes; negative: no bound).
+# for a slot (0 reads as unset: 4 x publish-lanes, 16 with no lanes;
+# negative: no bound).
 # presence-max-inflight = 0
 
 # Window to disconnect existing connections on SIGTERM, as a duration

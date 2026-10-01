@@ -517,8 +517,8 @@ func TestPresenceSyncDiscontinuityDuringWait(t *testing.T) {
 
 // TestChannelWithoutSubscribersDropsMemberSet: the local member set is
 // folded from the delivered cms, and the bus sweep is what repairs one
-// lost on the bus, but the sweep skips a channel with no attachment and no member of its own (DESIGN.md §7.2,
-// §12.4). So such a channel drops its set when the sweep finds it
+// lost on the bus, but the sweep skips a channel with no attachment and
+// no member of its own (DESIGN.md §7.2, §12.4). So such a channel drops its set when the sweep finds it
 // without subscribers, and the next attach's SYNC seeds afresh from the
 // store: an operation lost while nobody was attached is not served
 // stale. While an attachment is open, or a member of this node's
