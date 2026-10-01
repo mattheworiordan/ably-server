@@ -18,17 +18,16 @@ import (
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
-// Per-node presence leases (DESIGN.md §12.5, --presence-lease-mode).
+// Per-node presence leases (DESIGN.md §12.5).
 
-// openLeaseNode opens a Storage in the given lease mode with an
-// optional fixed node id. The caller closes it (after any timing
+// openLeaseNode opens a Storage with an optional fixed node id. The caller closes it (after any timing
 // restore it deferred earlier, so no loop reads the timing vars while
 // they are restored).
-func openLeaseNode(t *testing.T, dsn, mode, nodeID string, batching Batching) *Storage {
+func openLeaseNode(t *testing.T, dsn, nodeID string, batching Batching) *Storage {
 	t.Helper()
-	s, err := Open(context.Background(), Options{DSN: dsn, Batching: batching, PresenceLeaseMode: mode, nodeID: nodeID})
+	s, err := Open(context.Background(), Options{DSN: dsn, Batching: batching, nodeID: nodeID})
 	if err != nil {
-		t.Fatalf("Open (%s): %v", mode, err)
+		t.Fatalf("Open: %v", err)
 	}
 	return s
 }
@@ -99,74 +98,61 @@ func countPresenceRows(t *testing.T, s *Storage, where string, args ...any) int 
 	return n
 }
 
-// TestNodeLeaseBumpLeavesMemberRows: in node lease mode the bump renews
-// the node's one presence_nodes row and never writes a member row (every
-// member row keeps its physical version, xmin and ctid, across many
-// bumps), and the node's members outlive several lease windows while
-// another node's reaper runs. The member lease mode is the control: its
-// bump rewrites every row, so the check would see it.
+// TestNodeLeaseBumpLeavesMemberRows: the bump renews the node's one
+// presence_nodes row and never writes a member row (every member row
+// keeps its physical version, xmin and ctid, across many bumps), and the
+// node's members outlive several lease windows while another node's
+// reaper runs.
 func TestNodeLeaseBumpLeavesMemberRows(t *testing.T) {
-	forEachLeaseMode(t, func(t *testing.T, mode string) {
-		for name, batching := range map[string]Batching{"unbatched": {}, "batched": {Lanes: 4}} {
-			t.Run(name, func(t *testing.T) {
-				defer swapPresenceTimings(1*time.Second, 100*time.Millisecond, 100*time.Millisecond)()
-				dsn := pgtest.Start(t).FreshSchemaDSN(t)
-				sa := openLeaseNode(t, dsn, mode, "", batching)
-				defer func() { _ = sa.Close() }()
-				sb := openLeaseNode(t, dsn, mode, "", batching) // reaps
-				defer func() { _ = sb.Close() }()
+	for name, batching := range map[string]Batching{"unbatched": {}, "batched": {Lanes: 4}} {
+		t.Run(name, func(t *testing.T) {
+			defer swapPresenceTimings(1*time.Second, 100*time.Millisecond, 100*time.Millisecond)()
+			dsn := pgtest.Start(t).FreshSchemaDSN(t)
+			sa := openLeaseNode(t, dsn, "", batching)
+			defer func() { _ = sa.Close() }()
+			sb := openLeaseNode(t, dsn, "", batching) // reaps
+			defer func() { _ = sb.Close() }()
 
-				const n = 40
-				enterMembers(t, sa, []string{"room-1", "room-2", "room-3"}, "m", n)
-				before := memberRowVersions(t, sa, sa.node)
-				if len(before) != n {
-					t.Fatalf("node A owns %d rows, want %d", len(before), n)
-				}
-				lease0, _ := nodeLease(t, sa, sa.node)
+			const n = 40
+			enterMembers(t, sa, []string{"room-1", "room-2", "room-3"}, "m", n)
+			before := memberRowVersions(t, sa, sa.node)
+			if len(before) != n {
+				t.Fatalf("node A owns %d rows, want %d", len(before), n)
+			}
+			lease0, _ := nodeLease(t, sa, sa.node)
 
-				// Several bump intervals and more than two lease windows.
-				time.Sleep(2*presenceLeaseWindow + 5*presenceLeaseBumpInterval)
+			// Several bump intervals and more than two lease windows.
+			time.Sleep(2*presenceLeaseWindow + 5*presenceLeaseBumpInterval)
 
-				after := memberRowVersions(t, sa, sa.node)
-				if len(after) != n {
-					t.Fatalf("node A owns %d rows after %v, want all %d (a live node's members were reaped)",
-						len(after), 2*presenceLeaseWindow, n)
+			after := memberRowVersions(t, sa, sa.node)
+			if len(after) != n {
+				t.Fatalf("node A owns %d rows after %v, want all %d (a live node's members were reaped)",
+					len(after), 2*presenceLeaseWindow, n)
+			}
+			changed := 0
+			for k, v := range before {
+				if after[k] != v {
+					changed++
 				}
-				changed := 0
-				for k, v := range before {
-					if after[k] != v {
-						changed++
-					}
-				}
-				switch mode {
-				case PresenceLeaseNode:
-					if changed != 0 {
-						t.Errorf("node lease bumps rewrote %d of %d member rows, want 0", changed, n)
-					}
-					if got := countPresenceRows(t, sa, `node_id = $1 AND expires_at <> 'infinity'`, sa.node); got != 0 {
-						t.Errorf("%d member rows carry a finite lease in node mode, want 0", got)
-					}
-					lease1, ok := nodeLease(t, sa, sa.node)
-					if !ok || !lease1.After(lease0) {
-						t.Errorf("node lease = %v (row %v), want renewed past %v", lease1, ok, lease0)
-					}
-				case PresenceLeaseMember:
-					if changed != n {
-						t.Errorf("member lease bumps rewrote %d of %d member rows, want all (the control)", changed, n)
-					}
-					if _, ok := nodeLease(t, sa, sa.node); ok {
-						t.Error("member lease mode wrote a presence_nodes row")
-					}
-				}
-			})
-		}
-	})
+			}
+			if changed != 0 {
+				t.Errorf("node lease bumps rewrote %d of %d member rows, want 0", changed, n)
+			}
+			if got := countPresenceRows(t, sa, `node_id = $1 AND expires_at <> 'infinity'`, sa.node); got != 0 {
+				t.Errorf("%d member rows carry a finite lease, want 0", got)
+			}
+			lease1, ok := nodeLease(t, sa, sa.node)
+			if !ok || !lease1.After(lease0) {
+				t.Errorf("node lease = %v (row %v), want renewed past %v", lease1, ok, lease0)
+			}
+		})
+	}
 }
 
-// TestCrashedNodeMembersReapedInChunks: node A (node lease mode) owns
-// members on two channels and crashes; node B's reaper removes all of
-// them, in ten chunks within one reaper round (one chunk per round would
-// take five seconds), within the lease window plus two reaper rounds,
+// TestCrashedNodeMembersReapedInChunks: node A owns members on two
+// channels and crashes; node B's reaper removes all of them, in ten
+// chunks within one reaper round (one chunk per round would take five
+// seconds), within the lease window plus two reaper rounds,
 // publishes exactly one LEAVE for each, and then deletes A's lease row.
 // B's own lease row stays.
 func TestCrashedNodeMembersReapedInChunks(t *testing.T) {
@@ -179,9 +165,9 @@ func TestCrashedNodeMembersReapedInChunks(t *testing.T) {
 
 			ctx := context.Background()
 			dsn := pgtest.Start(t).FreshSchemaDSN(t)
-			sa := openLeaseNode(t, dsn, PresenceLeaseNode, "", batching)
+			sa := openLeaseNode(t, dsn, "", batching)
 			defer func() { _ = sa.Close() }()
-			sb := openLeaseNode(t, dsn, PresenceLeaseNode, "", batching)
+			sb := openLeaseNode(t, dsn, "", batching)
 			defer func() { _ = sb.Close() }()
 			channels := []string{"room-a", "room-b"}
 			recs := map[string]*presenceRecorder{}
@@ -245,9 +231,9 @@ func TestRestartedNodeKeepsMembers(t *testing.T) {
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
 	const id = "node-restart"
 
-	sa := openLeaseNode(t, dsn, PresenceLeaseNode, id, Batching{})
+	sa := openLeaseNode(t, dsn, id, Batching{})
 	defer func() { _ = sa.Close() }()
-	sc := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{}) // the reaper
+	sc := openLeaseNode(t, dsn, "", Batching{}) // the reaper
 	defer func() { _ = sc.Close() }()
 	rec := &presenceRecorder{}
 	if _, err := sc.Channel(ctx, "room", rec); err != nil {
@@ -256,7 +242,7 @@ func TestRestartedNodeKeepsMembers(t *testing.T) {
 	enterMembers(t, sa, []string{"room"}, "alice", 1)
 
 	crash(t, sa)
-	sb := openLeaseNode(t, dsn, PresenceLeaseNode, id, Batching{})
+	sb := openLeaseNode(t, dsn, id, Batching{})
 	defer func() { _ = sb.Close() }()
 
 	time.Sleep(3 * presenceLeaseWindow)
@@ -286,13 +272,13 @@ func TestRestartedNodeKeepsMembers(t *testing.T) {
 	})
 }
 
-// TestGracefulCloseDeletesLease: a node-mode node that owns no member
+// TestGracefulCloseDeletesLease: a node that owns no member
 // when it closes gracefully deletes its lease row at once.
 func TestGracefulCloseDeletesLease(t *testing.T) {
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
-	sa := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{})
+	sa := openLeaseNode(t, dsn, "", Batching{})
 	defer func() { _ = sa.Close() }()
-	sb := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{})
+	sb := openLeaseNode(t, dsn, "", Batching{})
 	defer func() { _ = sb.Close() }()
 	if _, ok := nodeLease(t, sb, sa.node); !ok {
 		t.Fatal("Open took no lease row")
@@ -305,67 +291,79 @@ func TestGracefulCloseDeletesLease(t *testing.T) {
 	}
 }
 
-// TestPresenceLeaseModesMixed: nodes in different lease modes sharing a
-// database (a rolling switch of --presence-lease-mode) never reap each
-// other's live members, and each mode's reaper removes the other mode's
-// members once their node is dead.
-func TestPresenceLeaseModesMixed(t *testing.T) {
+// TestReaperKeepsLegacyMemberLeaseRows: a node of an earlier version that
+// ran the retired member lease mode (DESIGN.md §9 "Removed settings")
+// has no presence_nodes row and keeps a lease on each of its member rows,
+// renewing them while it lives. During a rolling upgrade the reaper must
+// not take those rows while their leases run, and must reap them, with
+// their LEAVEs, once the node is gone and the leases are dead.
+func TestReaperKeepsLegacyMemberLeaseRows(t *testing.T) {
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 	ctx := context.Background()
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
 
-	sn := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{Lanes: 4})
+	sn := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
 	defer func() { _ = sn.Close() }()
-	sm := openLeaseNode(t, dsn, PresenceLeaseMember, "", Batching{Lanes: 4})
-	defer func() { _ = sm.Close() }()
-	enterMembers(t, sn, []string{"room"}, "n", 3)
-	enterMembers(t, sm, []string{"room"}, "m", 3)
-
-	time.Sleep(3 * presenceLeaseWindow)
-	if got := countPresenceRows(t, sn, `channel = 'room'`); got != 6 {
-		t.Fatalf("%d members after %v with both nodes alive, want 6", got, 3*presenceLeaseWindow)
-	}
-
-	// The member-mode node dies: the node-mode reaper takes its rows once
-	// their own leases lapse.
-	crash(t, sm)
-	waitFor(t, 10*time.Second, "the member-mode node's members to be reaped", func() bool {
-		return countPresenceRows(t, sn, `node_id = $1`, sm.node) == 0
-	})
-	if got := countPresenceRows(t, sn, `node_id = $1`, sn.node); got != 3 {
-		t.Fatalf("the live node-mode node owns %d members, want 3", got)
-	}
-
-	// A fresh member-mode node; then the node-mode node dies and the
-	// member-mode reaper takes its 'infinity' rows and its lease row.
-	sm2 := openLeaseNode(t, dsn, PresenceLeaseMember, "", Batching{Lanes: 4})
-	defer func() { _ = sm2.Close() }()
 	rec := &presenceRecorder{}
-	if _, err := sm2.Channel(ctx, "room", rec); err != nil {
+	if _, err := sn.Channel(ctx, "room", rec); err != nil {
 		t.Fatalf("Channel: %v", err)
 	}
-	crash(t, sn)
-	waitFor(t, 10*time.Second, "the node-mode node's members to be reaped", func() bool {
-		return countPresenceRows(t, sm2, `node_id = $1`, sn.node) == 0
+	enterMembers(t, sn, []string{"room"}, "n", 3)
+
+	// The legacy node's rows: written through a node with a fixed id,
+	// which then stops, and turned into member-lease rows (a finite lease
+	// of their own, no presence_nodes row).
+	const legacy = "legacy-member-mode-node"
+	sl := openLeaseNode(t, dsn, legacy, Batching{})
+	enterMembers(t, sl, []string{"room"}, "m", 3)
+	crash(t, sl)
+	renew := func() {
+		t.Helper()
+		if _, err := sn.pool.Exec(ctx, `UPDATE presence SET expires_at = now() + make_interval(secs => $2) WHERE node_id = $1`,
+			legacy, presenceLeaseWindow.Seconds()); err != nil {
+			t.Fatalf("renew legacy leases: %v", err)
+		}
+	}
+	renew()
+	if _, err := sn.pool.Exec(ctx, `DELETE FROM presence_nodes WHERE node_id = $1`, legacy); err != nil {
+		t.Fatalf("drop legacy lease row: %v", err)
+	}
+
+	// While the legacy node lives it renews its rows each bump interval:
+	// over three lease windows the reaper takes none of them.
+	for end := time.Now().Add(3 * presenceLeaseWindow); time.Now().Before(end); {
+		time.Sleep(presenceLeaseBumpInterval)
+		renew()
+	}
+	if got := countPresenceRows(t, sn, `node_id = $1`, legacy); got != 3 {
+		t.Fatalf("%d of the legacy node's 3 members left while their leases ran", got)
+	}
+	if got := rec.totalLeaves(); got != 0 {
+		t.Fatalf("%d LEAVEs published while every node was alive, want 0", got)
+	}
+
+	// The legacy node is gone: its rows are reaped once their leases are
+	// dead, with a LEAVE each, and the live node keeps its members.
+	waitFor(t, 10*time.Second, "the legacy node's members to be reaped", func() bool {
+		return countPresenceRows(t, sn, `node_id = $1`, legacy) == 0
 	})
 	waitFor(t, 10*time.Second, "their LEAVEs", func() bool {
-		return rec.leaveCount("n-0")+rec.leaveCount("n-1")+rec.leaveCount("n-2") == 3
+		return rec.leaveCount("m-0")+rec.leaveCount("m-1")+rec.leaveCount("m-2") == 3
 	})
-	waitFor(t, 10*time.Second, "the dead node's lease row to be deleted", func() bool {
-		_, ok := nodeLease(t, sm2, sn.node)
-		return !ok
-	})
+	if got := countPresenceRows(t, sn, `node_id = $1`, sn.node); got != 3 {
+		t.Fatalf("the live node owns %d members, want 3", got)
+	}
 }
 
 // TestFixtureMembersSurviveNodeModeReaper: a static fixture member is
-// owned by the sentinel, which has no lease row; the node-mode reaper,
+// owned by the sentinel, which has no lease row; the reaper,
 // which treats any owner without a live lease as dead, must still leave
 // it alone (and must not list the sentinel as a dead node).
 func TestFixtureMembersSurviveNodeModeReaper(t *testing.T) {
 	defer swapPresenceTimings(1*time.Second, 100*time.Millisecond, 100*time.Millisecond)()
 	ctx := context.Background()
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
-	s := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{Lanes: 4})
+	s := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
 	defer func() { _ = s.Close() }()
 	ch, err := s.Channel(ctx, "room", nil)
 	if err != nil {
@@ -378,7 +376,7 @@ func TestFixtureMembersSurviveNodeModeReaper(t *testing.T) {
 	}
 	time.Sleep(3 * presenceLeaseWindow)
 	if !memberPresent(t, ctx, ch, "fixture") {
-		t.Fatal("fixture member was reaped by the node-mode reaper")
+		t.Fatal("fixture member was reaped by the reaper")
 	}
 	rows, err := s.pool.Query(ctx, sqlDeadNodes, fixtureNodeID, deadLeaseGrace())
 	if err != nil {
@@ -430,9 +428,9 @@ func TestReapChunkSparesLiveNode(t *testing.T) {
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, time.Hour)() // no reaper round runs
 	ctx := context.Background()
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
-	sa := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{})
+	sa := openLeaseNode(t, dsn, "", Batching{})
 	defer func() { _ = sa.Close() }()
-	sb := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{})
+	sb := openLeaseNode(t, dsn, "", Batching{})
 	defer func() { _ = sb.Close() }()
 	enterMembers(t, sa, []string{"room"}, "m", 5)
 
@@ -452,192 +450,172 @@ func TestReapChunkSparesLiveNode(t *testing.T) {
 
 // TestLeaseBumpDoesNotBlockPresenceBatches holds a lease bump's
 // transaction open and runs batched presence UPDATEs of members the node
-// owns meanwhile. In node lease mode the bump writes only the node's
-// presence_nodes row, so every UPDATE commits at once. In member lease
-// mode (the control) the bump has row-locked every member row the node
-// owns, so the UPDATEs wait for it: the convoy fleet B measured.
+// owns meanwhile. The bump writes only the node's presence_nodes row, so
+// every UPDATE commits at once (the retired member lease mode's bump
+// row-locked every member row the node owned, so the UPDATEs waited for
+// it: the convoy fleet B measured).
 func TestLeaseBumpDoesNotBlockPresenceBatches(t *testing.T) {
-	forEachLeaseMode(t, func(t *testing.T, mode string) {
-		// No background bump or reaper round runs during the test.
-		defer swapPresenceTimings(time.Hour, time.Hour, time.Hour)()
-		ctx := context.Background()
-		dsn := pgtest.Start(t).FreshSchemaDSN(t)
-		s := openLeaseNode(t, dsn, mode, "", Batching{Lanes: 4})
-		defer func() { _ = s.Close() }()
-		enterMembers(t, s, []string{"room"}, "m", 50)
-		ch, err := s.Channel(ctx, "room", nil)
-		if err != nil {
-			t.Fatalf("Channel: %v", err)
-		}
+	// No background bump or reaper round runs during the test.
+	defer swapPresenceTimings(time.Hour, time.Hour, time.Hour)()
+	ctx := context.Background()
+	dsn := pgtest.Start(t).FreshSchemaDSN(t)
+	s := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
+	defer func() { _ = s.Close() }()
+	enterMembers(t, s, []string{"room"}, "m", 50)
+	ch, err := s.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
 
-		tx, err := s.pool.Begin(ctx)
-		if err != nil {
-			t.Fatalf("begin: %v", err)
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		bump, args := sqlTakeNodeLease, []any{s.node, 3600.0}
-		if mode == PresenceLeaseMember {
-			bump = sqlBumpMemberLeases
-		}
-		if _, err := tx.Exec(ctx, bump, args...); err != nil {
-			t.Fatalf("bump: %v", err)
-		}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, sqlTakeNodeLease, s.node, 3600.0); err != nil {
+		t.Fatalf("bump: %v", err)
+	}
 
-		const ops = 10
-		errs := make(chan error, ops)
-		start := time.Now()
-		for i := range ops {
-			go func() {
-				opCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				defer cancel()
-				id := fmt.Sprintf("m-%d", i)
-				_, _, err := ch.StorePresence(opCtx, []*protocol.PresenceMessage{{
-					Action: protocol.PresenceUpdate, ClientID: id, ConnectionID: "conn-" + id, Data: "updated",
-				}})
-				errs <- err
-			}()
+	const ops = 10
+	errs := make(chan error, ops)
+	start := time.Now()
+	for i := range ops {
+		go func() {
+			opCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			id := fmt.Sprintf("m-%d", i)
+			_, _, err := ch.StorePresence(opCtx, []*protocol.PresenceMessage{{
+				Action: protocol.PresenceUpdate, ClientID: id, ConnectionID: "conn-" + id, Data: "updated",
+			}})
+			errs <- err
+		}()
+	}
+	failed := 0
+	for range ops {
+		if err := <-errs; err != nil {
+			failed++
 		}
-		failed := 0
-		for range ops {
-			if err := <-errs; err != nil {
-				failed++
-			}
-		}
-		took := time.Since(start)
-		_ = tx.Rollback(ctx)
-		switch mode {
-		case PresenceLeaseNode:
-			if failed != 0 || took > time.Second {
-				t.Errorf("%d of %d presence UPDATEs failed, all done in %v, with a node lease bump open; want all done well under 1s", failed, ops, took)
-			}
-		case PresenceLeaseMember:
-			if failed != ops {
-				t.Errorf("%d of %d presence UPDATEs completed with a member lease bump open; want all held by its row locks (the control)", ops-failed, ops)
-			}
-		}
-	})
+	}
+	took := time.Since(start)
+	_ = tx.Rollback(ctx)
+	if failed != 0 || took > time.Second {
+		t.Errorf("%d of %d presence UPDATEs failed, all done in %v, with a node lease bump open; want all done well under 1s", failed, ops, took)
+	}
 }
 
 // TestLeaseBumpPresenceLatency measures batched presence UPDATE latency
 // on 5,000 members one node owns, first alone and then with that node's
-// lease bump running back to back. In node lease mode the bump must not
-// add to the p99 (a generous 3x + 25ms, for a noisy test container); in
-// member lease mode the numbers are only logged, as the comparison.
+// lease bump running back to back. The bump must not add to the p99 (a
+// generous 3x + 25ms, for a noisy test container).
 func TestLeaseBumpPresenceLatency(t *testing.T) {
-	forEachLeaseMode(t, func(t *testing.T, mode string) {
-		defer swapPresenceTimings(time.Hour, time.Hour, time.Hour)()
-		ctx := context.Background()
-		dsn := pgtest.Start(t).FreshSchemaDSN(t)
-		s := openLeaseNode(t, dsn, mode, "", Batching{Lanes: 4})
-		defer func() { _ = s.Close() }()
-		const members, rooms = 5000, 10
-		var names []string
-		for i := range rooms {
-			names = append(names, fmt.Sprintf("room-%d", i))
-		}
-		seed := make(chan int)
-		seedErr := make(chan error, 16)
-		for range 16 {
-			go func() {
-				for i := range seed {
-					ch, err := s.Channel(ctx, names[i%rooms], nil)
-					if err == nil {
-						id := fmt.Sprintf("m-%d", i)
-						_, _, err = ch.StorePresence(ctx, []*protocol.PresenceMessage{{
-							Action: protocol.PresenceEnter, ClientID: id, ConnectionID: "conn-" + id,
-						}})
-					}
-					if err != nil {
-						seedErr <- err
-						return
-					}
+	defer swapPresenceTimings(time.Hour, time.Hour, time.Hour)()
+	ctx := context.Background()
+	dsn := pgtest.Start(t).FreshSchemaDSN(t)
+	s := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
+	defer func() { _ = s.Close() }()
+	const members, rooms = 5000, 10
+	var names []string
+	for i := range rooms {
+		names = append(names, fmt.Sprintf("room-%d", i))
+	}
+	seed := make(chan int)
+	seedErr := make(chan error, 16)
+	for range 16 {
+		go func() {
+			for i := range seed {
+				ch, err := s.Channel(ctx, names[i%rooms], nil)
+				if err == nil {
+					id := fmt.Sprintf("m-%d", i)
+					_, _, err = ch.StorePresence(ctx, []*protocol.PresenceMessage{{
+						Action: protocol.PresenceEnter, ClientID: id, ConnectionID: "conn-" + id,
+					}})
 				}
-				seedErr <- nil
+				if err != nil {
+					seedErr <- err
+					return
+				}
+			}
+			seedErr <- nil
+		}()
+	}
+	for i := range members {
+		seed <- i
+	}
+	close(seed)
+	for range 16 {
+		if err := <-seedErr; err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	measure := func(withBump bool) time.Duration {
+		stop := make(chan struct{})
+		bumpDone := make(chan int)
+		if withBump {
+			go func() {
+				n := 0
+				for {
+					select {
+					case <-stop:
+						bumpDone <- n
+						return
+					default:
+					}
+					_, _ = s.takeNodeLease(ctx)
+					n++
+				}
 			}()
 		}
-		for i := range members {
-			seed <- i
-		}
-		close(seed)
-		for range 16 {
-			if err := <-seedErr; err != nil {
-				t.Fatalf("seed: %v", err)
-			}
-		}
-
-		measure := func(withBump bool) time.Duration {
-			stop := make(chan struct{})
-			bumpDone := make(chan int)
-			if withBump {
-				go func() {
-					n := 0
-					for {
-						select {
-						case <-stop:
-							bumpDone <- n
-							return
-						default:
-						}
-						if mode == PresenceLeaseNode {
-							_, _ = s.takeNodeLease(ctx)
-						} else {
-							s.bumpMemberLeases(ctx)
-						}
-						n++
+		var (
+			mu  sync.Mutex
+			all []time.Duration
+		)
+		deadline := time.Now().Add(2 * time.Second)
+		var workers = 16
+		done := make(chan struct{})
+		for w := range workers {
+			go func() {
+				defer func() { done <- struct{}{} }()
+				for k := 0; time.Now().Before(deadline); k++ {
+					i := (w*7919 + k*104729) % members
+					ch, err := s.Channel(ctx, names[i%rooms], nil)
+					if err != nil {
+						return
 					}
-				}()
-			}
-			var (
-				mu  sync.Mutex
-				all []time.Duration
-			)
-			deadline := time.Now().Add(2 * time.Second)
-			var workers = 16
-			done := make(chan struct{})
-			for w := range workers {
-				go func() {
-					defer func() { done <- struct{}{} }()
-					for k := 0; time.Now().Before(deadline); k++ {
-						i := (w*7919 + k*104729) % members
-						ch, err := s.Channel(ctx, names[i%rooms], nil)
-						if err != nil {
-							return
-						}
-						id := fmt.Sprintf("m-%d", i)
-						t0 := time.Now()
-						if _, _, err := ch.StorePresence(ctx, []*protocol.PresenceMessage{{
-							Action: protocol.PresenceUpdate, ClientID: id, ConnectionID: "conn-" + id, Data: k,
-						}}); err != nil {
-							return
-						}
-						d := time.Since(t0)
-						mu.Lock()
-						all = append(all, d)
-						mu.Unlock()
+					id := fmt.Sprintf("m-%d", i)
+					t0 := time.Now()
+					if _, _, err := ch.StorePresence(ctx, []*protocol.PresenceMessage{{
+						Action: protocol.PresenceUpdate, ClientID: id, ConnectionID: "conn-" + id, Data: k,
+					}}); err != nil {
+						return
 					}
-				}()
-			}
-			for range workers {
-				<-done
-			}
-			bumps := 0
-			if withBump {
-				close(stop)
-				bumps = <-bumpDone
-			}
-			if len(all) == 0 {
-				t.Fatal("no presence UPDATE completed")
-			}
-			slices.Sort(all)
-			p50, p99 := all[len(all)/2], all[len(all)*99/100]
-			t.Logf("%s mode, bump running %v (%d bumps): %d UPDATEs, p50 %v, p99 %v, max %v",
-				mode, withBump, bumps, len(all), p50, p99, all[len(all)-1])
-			return p99
+					d := time.Since(t0)
+					mu.Lock()
+					all = append(all, d)
+					mu.Unlock()
+				}
+			}()
 		}
-		alone := measure(false)
-		withBump := measure(true)
-		if mode == PresenceLeaseNode && withBump > 3*alone+25*time.Millisecond {
-			t.Errorf("node lease bump raised presence UPDATE p99 from %v to %v", alone, withBump)
+		for range workers {
+			<-done
 		}
-	})
+		bumps := 0
+		if withBump {
+			close(stop)
+			bumps = <-bumpDone
+		}
+		if len(all) == 0 {
+			t.Fatal("no presence UPDATE completed")
+		}
+		slices.Sort(all)
+		p50, p99 := all[len(all)/2], all[len(all)*99/100]
+		t.Logf("bump running %v (%d bumps): %d UPDATEs, p50 %v, p99 %v, max %v",
+			withBump, bumps, len(all), p50, p99, all[len(all)-1])
+		return p99
+	}
+	alone := measure(false)
+	withBump := measure(true)
+	if withBump > 3*alone+25*time.Millisecond {
+		t.Errorf("node lease bump raised presence UPDATE p99 from %v to %v", alone, withBump)
+	}
 }

@@ -87,8 +87,8 @@ func (cs *channelStore) storePresenceBatched(ctx context.Context, lanes *laneSet
 	}
 	// The lane already holds its bound of server-synthesised presence:
 	// write this one around it (DESIGN.md §6.3). It is not refused:
-	// nothing retries it, and in node lease mode a live node's lost LEAVE
-	// leaves its member behind for as long as the node lives.
+	// nothing retries it, and a live node's lost LEAVE leaves its member
+	// behind for as long as the node lives.
 	cm, idempotent, err = cs.storePresenceAround(ctx, presence, p.after, false)
 	if errors.Is(err, errNotWritten) {
 		// The channel's earlier publishes did not complete (or no slot
@@ -417,7 +417,7 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 
 	// Round trip 2: rows, the presence fold, the bus hook, COMMIT.
 	b = &pgx.Batch{}
-	rows.queue(b, s.node, s.leaseNode)
+	rows.queue(b, s.node)
 	if err := s.bus.beforeCommitBatch(ctx, b, items); err != nil {
 		rollback()
 		return nil, err
@@ -610,9 +610,9 @@ func (r *batchRows) addLog(p *pending, channelSerial string, idx int, id string,
 // that left and one upsert for the rest. Each member appears once. Lock
 // order among the rows does not matter for deadlocks: every writer of a
 // room's presence rows holds the room's channels row lock first, and the
-// lease bump and reaper, which do not, skip locked rows. leaseNode is
-// the node lease mode: member rows get an 'infinity' lease (§12.5).
-func (r *batchRows) queue(b *pgx.Batch, node string, leaseNode bool) {
+// reaper, which does not, skips locked rows. Member rows get an
+// 'infinity' lease: their node's lease is the one that counts (§12.5).
+func (r *batchRows) queue(b *pgx.Batch, node string) {
 	if len(r.channel) > 0 {
 		b.Queue(`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, persisted)
 			SELECT * FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::bytea[], $7::text[], $8::bool[])`,
@@ -634,7 +634,6 @@ func (r *batchRows) queue(b *pgx.Batch, node string, leaseNode bool) {
 		dChannel, dConn, dClient                   []string
 		uChannel, uConn, uClient, uSerial, uNodeID []string
 		uPayload                                   [][]byte
-		uStatic                                    []bool
 	)
 	for _, f := range folds {
 		if f.leave {
@@ -648,7 +647,6 @@ func (r *batchRows) queue(b *pgx.Batch, node string, leaseNode bool) {
 		uClient = append(uClient, f.clientID)
 		uSerial = append(uSerial, f.serial)
 		uPayload = append(uPayload, f.payload)
-		uStatic = append(uStatic, f.static)
 		if f.static {
 			// Static fixture member (DESIGN.md §9, §12.5): the sentinel
 			// owner and an 'infinity' lease, as the unbatched upsert.
@@ -664,14 +662,14 @@ func (r *batchRows) queue(b *pgx.Batch, node string, leaseNode bool) {
 	}
 	if len(uChannel) > 0 {
 		b.Queue(`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
-			SELECT c, k, l, s, p, n, CASE WHEN st OR $9 THEN 'infinity'::timestamptz ELSE now() + make_interval(secs => $8) END
-			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[], $6::text[], $7::bool[]) AS t(c, k, l, s, p, n, st)
+			SELECT c, k, l, s, p, n, 'infinity'::timestamptz
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[], $6::text[]) AS t(c, k, l, s, p, n)
 			ORDER BY c, k, l
 			ON CONFLICT (channel, connection_id, client_id)
 			DO UPDATE SET channel_serial = EXCLUDED.channel_serial,
 			              payload = EXCLUDED.payload,
 			              node_id = EXCLUDED.node_id,
 			              expires_at = EXCLUDED.expires_at`,
-			uChannel, uConn, uClient, uSerial, uPayload, uNodeID, uStatic, presenceLeaseWindow.Seconds(), leaseNode)
+			uChannel, uConn, uClient, uSerial, uPayload, uNodeID)
 	}
 }

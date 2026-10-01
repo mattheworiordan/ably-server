@@ -84,7 +84,6 @@ const (
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
-	presenceLeaseModeEnv   = "ABLY_SERVER_PRESENCE_LEASE_MODE"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -269,7 +268,6 @@ func Run(ctx context.Context, opts Opts) int {
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
 	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction, outside the publish lanes, at once per database: with --publish-lanes=0 a client's presence write beyond it is refused with 42910; with lanes, a lease-lapse re-entry or a server-synthesised LEAVE written around a full lane waits for a slot; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
@@ -418,7 +416,6 @@ func Run(ctx context.Context, opts Opts) int {
 			QueueMax:  *publishQueueMax,
 		},
 		presenceMaxInflight: *presenceMaxInflight,
-		presenceLeaseMode:   *presenceLeaseMode,
 		onPresenceLeaseLapse: func(ctx context.Context) {
 			if rt := rtRef.Load(); rt != nil {
 				rt.ReenterPresence(ctx)
@@ -464,7 +461,7 @@ func Run(ctx context.Context, opts Opts) int {
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
-	logger.Info("presence path", "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
+	logger.Info("presence path", "maxInflight", *presenceMaxInflight)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
@@ -928,8 +925,7 @@ type clusterOptions struct {
 	persisted           func(channel string) bool // persisted-namespace resolver
 	persistedNamespaces []string                  // the persisted namespace ids (cluster identity, DESIGN.md §11)
 
-	presenceMaxInflight int    // presence writes in flight outside the lanes (DESIGN.md §12.5)
-	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
+	presenceMaxInflight int // presence writes in flight outside the lanes (DESIGN.md §12.5)
 
 	// onPresenceLeaseLapse re-enters this node's presence members after
 	// its lease lapsed (postgres.Options.OnPresenceLeaseLapse, §12.5).
@@ -948,7 +944,6 @@ func (c clusterOptions) options() postgres.Options {
 		PersistedNamespaces: c.persistedNamespaces,
 
 		PresenceMaxInflight:  c.presenceMaxInflight,
-		PresenceLeaseMode:    c.presenceLeaseMode,
 		OnPresenceLeaseLapse: c.onPresenceLeaseLapse,
 	}
 }
@@ -972,9 +967,6 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		bus, err := postgres.ParseBus(cluster.bus)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --bus: %w", err)
-		}
-		if _, err := postgres.ParsePresenceLeaseMode(cluster.presenceLeaseMode); err != nil {
-			return nil, fmt.Errorf("invalid --presence-lease-mode: %w", err)
 		}
 		if cluster.logger != nil {
 			for _, name := range busSettingsIgnored(bus, cluster.busGiven) {

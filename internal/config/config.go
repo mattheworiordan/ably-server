@@ -68,11 +68,9 @@ type File struct {
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
-	// The presence path (DESIGN.md §12.5, §9): the bound on presence
-	// writes committed outside the publish lanes (zero means absent), and
-	// the liveness lease mode ("node" or "member").
-	PresenceMaxInflight int    `toml:"presence-max-inflight"`
-	PresenceLeaseMode   string `toml:"presence-lease-mode"`
+	// PresenceMaxInflight bounds the presence writes committed outside
+	// the publish lanes (DESIGN.md §12.5, §9); zero means absent.
+	PresenceMaxInflight int `toml:"presence-max-inflight"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual
