@@ -533,6 +533,12 @@ func (s *Server) Shutdown(ctx context.Context) {
 	// to be disconnected below would otherwise schedule fresh ones, and the
 	// node's presence set departs with the node anyway (DESIGN.md §12.5).
 	s.stopReaper()
+	// A reaper already past its timer is firing LEAVEs through the storage;
+	// wait for it (bounded by ctx) once every connection has finished its
+	// teardown, so no grace LEAVE writes after the caller closes the
+	// storage. Connection teardown is what starts reapers, so none starts
+	// after this wait begins.
+	defer s.waitReapers(ctx)
 
 	s.mu.Lock()
 	s.closing = true
@@ -564,6 +570,20 @@ func (s *Server) Shutdown(ctx context.Context) {
 		}
 	}
 	s.waitConns(ctx)
+}
+
+// waitReapers waits for the in-flight delayed-LEAVE goroutines to finish,
+// or for ctx to end. Each is bounded by teardownLeaveTimeout.
+func (s *Server) waitReapers(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		s.reaperWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // waitConns waits for every connection goroutine to finish its teardown,

@@ -2588,7 +2588,11 @@ On SIGTERM the server enters a graceful shutdown:
    staggered rather than as a thundering herd. Any connection still open
    at the deadline is force-closed immediately.
 3. Concurrently, drain in-flight REST handlers.
-4. Close storage.
+4. Wait, bounded by the same grace window, for any delayed presence `LEAVE`
+   (§12.5) already past its timer to finish writing, so none fires after
+   the storage is closed. Pending ones that have not reached their timer
+   are abandoned: the node's members go with it.
+5. Close storage.
 
 In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection

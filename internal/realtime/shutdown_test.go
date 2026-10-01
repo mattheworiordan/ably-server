@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,5 +169,59 @@ func waitMember(t *testing.T, ch *core.Channel, clientID string, want bool, with
 			return found
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestShutdownWaitsForInFlightReapers: a delayed-LEAVE goroutine that is
+// already firing through the storage must finish before Shutdown returns,
+// so no grace LEAVE writes after the storage is closed; the wait is
+// bounded by the shutdown context.
+func TestShutdownWaitsForInFlightReapers(t *testing.T) {
+	_, rt, _ := newShutdownServer(t, time.Hour)
+
+	release := make(chan struct{})
+	var finished atomic.Bool
+	rt.reaperWG.Go(func() {
+		<-release
+		finished.Store(true)
+	})
+
+	returned := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rt.Shutdown(ctx)
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("Shutdown returned while a reaper was still in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after the reaper finished")
+	}
+	if !finished.Load() {
+		t.Error("Shutdown returned before the reaper finished")
+	}
+}
+
+// A reaper stuck past the shutdown deadline does not hold Shutdown beyond it.
+func TestShutdownReaperWaitIsBoundedByContext(t *testing.T) {
+	_, rt, _ := newShutdownServer(t, time.Hour)
+	stuck := make(chan struct{})
+	defer close(stuck)
+	rt.reaperWG.Go(func() { <-stuck })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rt.Shutdown(ctx)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("Shutdown took %v with a stuck reaper, want it bounded by the 300ms context", took)
 	}
 }
