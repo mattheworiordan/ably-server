@@ -190,7 +190,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		ch, err := s.manager.GetChannel(ctx, name)
 		if err != nil {
 			s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-			s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+			s.writeStorageError(w, r, err, "channel unavailable")
 			return
 		}
 		publish = ch.Publish
@@ -423,13 +423,13 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	page, err := ch.History(r.Context(), q)
 	if err != nil {
 		s.logger.Warn("history failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "history failed")
+		s.writeStorageError(w, r, err, "history failed")
 		return
 	}
 
@@ -526,7 +526,7 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	if !s.authorizeMutation(w, r, principal, clientID, ch, name, &mut) {
@@ -588,7 +588,7 @@ func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	m, err := ch.LatestVersion(r.Context(), serial)
@@ -654,7 +654,7 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	page, err := ch.Versions(r.Context(), serial, q)
@@ -758,7 +758,7 @@ func (s *Server) HandlePublishAnnotation(w http.ResponseWriter, r *http.Request)
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	cm, _, err := ch.PublishAnnotation(r.Context(), annotations)
@@ -829,7 +829,7 @@ func (s *Server) HandleListAnnotations(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	page, err := ch.Annotations(r.Context(), serial, q)
@@ -969,7 +969,7 @@ func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	members, _, err := ch.Members(r.Context())
@@ -1097,13 +1097,13 @@ func (s *Server) HandlePresenceHistory(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+		s.writeStorageError(w, r, err, "channel unavailable")
 		return
 	}
 	page, err := ch.History(r.Context(), q)
 	if err != nil {
 		s.logger.Warn("presence history failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "history failed")
+		s.writeStorageError(w, r, err, "history failed")
 		return
 	}
 
@@ -1402,6 +1402,18 @@ func (s *Server) HandleNotFound(w http.ResponseWriter, r *http.Request) {
 // mirroring the reference implementation's httpapi.errHref.
 func errHref(code int) string {
 	return fmt.Sprintf("https://help.ably.io/error/%d", code)
+}
+
+// writeStorageError answers a failed bind or read: 503 with 50003 when
+// the backend could not reach its database (storage.ErrUnavailable, a
+// shard that is down, DESIGN.md §6.4), so a client retries, else 500
+// with 50000 and msg.
+func (s *Server) writeStorageError(w http.ResponseWriter, r *http.Request, err error, msg string) {
+	if errors.Is(err, storage.ErrUnavailable) {
+		s.writeErrorInfo(w, r, http.StatusServiceUnavailable, 50003, "storage unavailable, retry")
+		return
+	}
+	s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, msg)
 }
 
 // writeErrorInfo writes an Ably error response: the `{"error":{...}}`

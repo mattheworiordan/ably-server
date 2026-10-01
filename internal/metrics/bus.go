@@ -24,11 +24,13 @@ type busMetric struct {
 // postgres bus's coalesced mode, the wake-ups and the overflow policy at
 // work. ably_bus_info carries the bus kind and notify mode as labels.
 type busCollector struct {
-	src     storage.BusStatser
-	info    *prometheus.Desc
-	lag     *prometheus.Desc
-	stages  map[string]*prometheus.Desc // by storage.BusStats.Stages key
-	metrics []busMetric
+	src    storage.BusStatser
+	info   *prometheus.Desc
+	lag    *prometheus.Desc
+	stages map[string]*prometheus.Desc // by storage.BusStats.Stages key
+	// unrouted and malformed carry a reason label (DESIGN.md §7.2, §10).
+	unrouted, malformed *prometheus.Desc
+	metrics             []busMetric
 }
 
 // busStageHelp is the help text of each receive-side stage histogram,
@@ -52,6 +54,12 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 			"Time from a cm's commit to its append on this node, for cms from another node (the publisher fast path is not included), by delivery path (inline, fetched, filled). Measured from the bus message's send time on the nats bus, else the cm's stored timestamp (DESIGN.md §10).",
 			[]string{"path"}, nil),
 		stages: make(map[string]*prometheus.Desc, len(busStageHelp)),
+		unrouted: prometheus.NewDesc("ably_bus_unrouted_total",
+			"Bus messages not delivered to any channel, by reason: unbound (no bound store for the channel on this node) or foreign (a nats bus message of another cluster, DESIGN.md §11).",
+			[]string{"reason"}, nil),
+		malformed: prometheus.NewDesc("ably_bus_malformed_total",
+			"Bus messages dropped as malformed, by reason: decode (the message did not decode), serial (its serial or predecessor is not a well-formed channelSerial) or future (its serial was minted more than 5 minutes ahead of this node's database clock) (DESIGN.md §7.2).",
+			[]string{"reason"}, nil),
 	}
 	for stage, help := range busStageHelp {
 		c.stages[stage] = prometheus.NewDesc("ably_bus_"+stage+"_seconds", help, nil, nil)
@@ -71,8 +79,6 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 	add("publish_errors_total", "NATS publishes that failed after commit (receivers recover the cm from the log).", false, u(func(s storage.BusStats) uint64 { return s.PublishErrors }))
 	add("pointers_total", "cms sent as a (channel, serial) pointer because they were too big to inline.", false, u(func(s storage.BusStats) uint64 { return s.Pointers }))
 	add("received_total", "Bus messages received.", false, u(func(s storage.BusStats) uint64 { return s.Received }))
-	add("unrouted_total", "Bus messages for a channel with no bound store.", false, u(func(s storage.BusStats) uint64 { return s.Unrouted }))
-	add("malformed_total", "Bus messages that did not decode.", false, u(func(s storage.BusStats) uint64 { return s.Malformed }))
 	add("inline_deliveries_total", "cms delivered from a body carried by the bus message.", false, u(func(s storage.BusStats) uint64 { return s.Inline }))
 	add("fetched_deliveries_total", "cms delivered after a read-back by (channel, serial).", false, u(func(s storage.BusStats) uint64 { return s.Fetched }))
 	add("fast_path_deliveries_total", "cms the publishing node delivered to its own subscribers straight after commit.", false, u(func(s storage.BusStats) uint64 { return s.FastPath }))
@@ -104,6 +110,8 @@ func newBusCollector(src storage.BusStatser) *busCollector {
 func (c *busCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.info
 	ch <- c.lag
+	ch <- c.unrouted
+	ch <- c.malformed
 	for _, d := range c.stages {
 		ch <- d
 	}
@@ -123,6 +131,17 @@ func (c *busCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(m.desc, vt, m.get(st))
 	}
+	sub := func(total uint64, parts ...uint64) float64 {
+		for _, p := range parts {
+			total -= min(p, total)
+		}
+		return float64(total)
+	}
+	ch <- prometheus.MustNewConstMetric(c.unrouted, prometheus.CounterValue, sub(st.Unrouted, st.UnroutedForeign), "unbound")
+	ch <- prometheus.MustNewConstMetric(c.unrouted, prometheus.CounterValue, float64(st.UnroutedForeign), "foreign")
+	ch <- prometheus.MustNewConstMetric(c.malformed, prometheus.CounterValue, sub(st.Malformed, st.MalformedSerial, st.MalformedFuture), "decode")
+	ch <- prometheus.MustNewConstMetric(c.malformed, prometheus.CounterValue, float64(st.MalformedSerial), "serial")
+	ch <- prometheus.MustNewConstMetric(c.malformed, prometheus.CounterValue, float64(st.MalformedFuture), "future")
 	paths := make([]string, 0, len(st.DeliveryLag))
 	for path := range st.DeliveryLag {
 		paths = append(paths, path)

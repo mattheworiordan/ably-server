@@ -187,3 +187,35 @@ func TestMessageSerialOrdersWithinBatch(t *testing.T) {
 		prev = got
 	}
 }
+
+func TestParseChannelSerial(t *testing.T) {
+	minted := NewGenerator(NewSeriesID(), fixedClock(1726585978590)).Mint()
+	ts, err := ParseChannelSerial(minted)
+	if err != nil || ts != 1726585978590 {
+		t.Fatalf("ParseChannelSerial(%q) = %d, %v; want 1726585978590, nil", minted, ts, err)
+	}
+	for _, ok := range []string{"00000000000000-000@a", "01726585978590-999@abc_DEF-09"} {
+		if _, err := ParseChannelSerial(ok); err != nil {
+			t.Errorf("ParseChannelSerial(%q): %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"",
+		"zzz",
+		"99999999999999",
+		"01726585978590-000@",               // no seriesId
+		"1726585978590-000@abcdefghij",      // 13-digit timestamp
+		"017265859785901-000@abcdefghij",    // 15-digit timestamp
+		"01726585978590-00@abcdefghij",      // 2-digit counter
+		"01726585978590_000@abcdefghij",     // wrong separator
+		"0172658597859x-000@abcdefghij",     // non-digit timestamp
+		"01726585978590-0x0@abcdefghij",     // non-digit counter
+		"01726585978590-000@abcdefghij:000", // a Message.serial
+		"01726585978590-000@abc def",        // space in seriesId
+		"01726585978590-000@" + strings.Repeat("a", maxSeriesIDLen+1),
+	} {
+		if _, err := ParseChannelSerial(bad); err == nil {
+			t.Errorf("ParseChannelSerial(%q) accepted a malformed serial", bad)
+		}
+	}
+}

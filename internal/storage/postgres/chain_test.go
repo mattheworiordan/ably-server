@@ -204,13 +204,17 @@ func TestNATSEnvelopeRoundTrip(t *testing.T) {
 	}
 	cm.Annotations[0].Summary = protocol.Summary(nil).Apply(cm.Annotations[0])
 
-	data, pointer, err := encodeNATSEnvelope("room", cm, "00000000000000-000@abc", DefaultNATSInlineMaxBytes)
+	data, pointer, err := encodeNATSEnvelope("dep", "room", cm, "00000000000000-000@abc", DefaultNATSInlineMaxBytes)
 	if err != nil || pointer {
 		t.Fatalf("encode: pointer=%v err=%v", pointer, err)
 	}
-	got, channel, err := decodeNATSEnvelope(data)
+	env, err := decodeNATSEnvelope(data)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
+	}
+	got, channel := env.ev, env.channel
+	if env.deployment != "dep" || env.mintedMs != 1 {
+		t.Fatalf("decoded deployment %q minted %d, want dep and 1", env.deployment, env.mintedMs)
 	}
 	if channel != "room" || got.serial != cm.ChannelSerial || got.prev != "00000000000000-000@abc" || got.cm == nil {
 		t.Fatalf("decoded %q %+v", channel, got)
@@ -221,12 +225,13 @@ func TestNATSEnvelopeRoundTrip(t *testing.T) {
 	}
 
 	// Over the threshold: a pointer with no body.
-	data, pointer, err = encodeNATSEnvelope("room", cm, "p", 8)
+	data, pointer, err = encodeNATSEnvelope("dep", "room", cm, "00000000000000-001@abc", 8)
 	if err != nil || !pointer {
 		t.Fatalf("encode over threshold: pointer=%v err=%v", pointer, err)
 	}
-	got, _, err = decodeNATSEnvelope(data)
-	if err != nil || got.cm != nil || got.serial != cm.ChannelSerial || got.prev != "p" {
+	env, err = decodeNATSEnvelope(data)
+	got = env.ev
+	if err != nil || got.cm != nil || got.serial != cm.ChannelSerial || got.prev != "00000000000000-001@abc" {
 		t.Fatalf("pointer decoded as %+v, err=%v", got, err)
 	}
 }

@@ -56,8 +56,10 @@ var ErrOverloaded = errors.New("storage: publish queue full; retry later")
 // a commit of the publish (the Postgres backend retries a failed batch
 // once first, checking every publish's id on the retry, DESIGN.md §6.3),
 // or is shutting down. The publish was most likely not stored; a retry
-// with the same id is deduplicated if it was. Callers map it to Ably
-// 50003 with HTTP 503 (REST) or a NACK (WS).
+// with the same id is deduplicated if it was. The Postgres backend also
+// returns it from Store, Channel (a bind) and History when the channel's
+// database cannot be reached, a shard that is down (§6.4). Callers map it
+// to Ably 50003 with HTTP 503 (REST), a NACK or a channel ERROR (WS).
 var ErrUnavailable = errors.New("storage: publish could not be committed; retry")
 
 // ErrInvalidMessageID is returned by StampMessageIDs (and therefore by
@@ -219,8 +221,16 @@ type BusStats struct {
 	Published, PublishErrors, Pointers uint64
 
 	// Received counts bus messages received; Unrouted those for a
-	// channel with no bound store; Malformed those that did not decode.
+	// channel with no bound store, or of another cluster; Malformed those
+	// that did not decode or were refused for their serials.
 	Received, Unrouted, Malformed uint64
+
+	// The reasons within Unrouted and Malformed (DESIGN.md §7.2):
+	// UnroutedForeign, nats bus messages of another cluster (another
+	// deployment id); MalformedSerial, those whose serial or predecessor
+	// is not a well-formed channelSerial; MalformedFuture, those whose
+	// serial was minted too far ahead of this node's database clock.
+	UnroutedForeign, MalformedSerial, MalformedFuture uint64
 
 	// Delivery paths, one count per cm appended: Inline (body carried by
 	// the bus message), Fetched (read back by serial: a pointer, or every

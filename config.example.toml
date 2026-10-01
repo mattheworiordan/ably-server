@@ -42,11 +42,27 @@
 #   pgnotify  the shipped LISTEN/NOTIFY broker (the default)
 #   postgres  per-channel LISTEN; see postgres-notify-mode
 #   nats      NATS core pub/sub; needs nats-url
+# Every node of a cluster must run the same bus: the first node to open
+# the database records it, and a node on another bus is refused at
+# startup (DESIGN.md §11). A bus setting below that the chosen bus does
+# not use is named in a startup warning.
 # bus = "pgnotify"
 
 # NATS server URL for bus = "nats"; a comma-separated list of the servers
 # of one NATS cluster is accepted (env: ABLY_SERVER_NATS_URL).
 # nats-url = "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
+#
+# The bus trusts what it receives (DESIGN.md §7.2): outside a private
+# network, run NATS authenticated and over TLS. A user and password can go
+# in the URL (nats://user:pass@host:4222) and tls:// URLs work; or give a
+# credentials file (user JWT and NKey seed, env: ABLY_SERVER_NATS_CREDS),
+# the CA the server's certificate chains to (ABLY_SERVER_NATS_TLS_CA),
+# and, for a server that verifies clients, a client certificate and key
+# (ABLY_SERVER_NATS_TLS_CERT, ABLY_SERVER_NATS_TLS_KEY), all PEM files.
+# nats-creds = "/etc/ably/bus.creds"
+# nats-tls-ca = "/etc/ably/nats-ca.pem"
+# nats-tls-cert = "/etc/ably/nats-client.pem"
+# nats-tls-key = "/etc/ably/nats-client-key.pem"
 
 # Largest encoded message the NATS bus carries inline, in bytes; larger
 # ones travel as a pointer that receivers read from Postgres (env:
@@ -89,7 +105,9 @@
 
 # Cluster mode: how long a channel outside any persisted namespace keeps
 # its message log, the continuity window a client can resume across
-# (env: ABLY_SERVER_MESSAGE_RETENTION).
+# (env: ABLY_SERVER_MESSAGE_RETENTION). The retentions and the persisted
+# namespaces must be the same on every node: the database records them
+# on first start and refuses a node that differs (DESIGN.md §11).
 # message-retention = "2m"
 
 # Cluster mode: how long a channel in a persisted namespace (see

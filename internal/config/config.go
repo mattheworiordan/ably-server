@@ -44,9 +44,15 @@ type File struct {
 	// postgres bus; BusSweepInterval and BusSweepScope the chaining
 	// buses' safety-net sweep. Durations are strings, like ShutdownGrace;
 	// a zero int means absent.
-	Bus                      string `toml:"bus"`
-	NATSURL                  string `toml:"nats-url"`
-	NATSInlineMaxBytes       int    `toml:"nats-inline-max-bytes"`
+	Bus                string `toml:"bus"`
+	NATSURL            string `toml:"nats-url"`
+	NATSInlineMaxBytes int    `toml:"nats-inline-max-bytes"`
+	// NATSCreds, NATSTLSCA, NATSTLSCert and NATSTLSKey authenticate and
+	// encrypt the nats bus connection (DESIGN.md §7.2, §9): file paths.
+	NATSCreds                string `toml:"nats-creds"`
+	NATSTLSCA                string `toml:"nats-tls-ca"`
+	NATSTLSCert              string `toml:"nats-tls-cert"`
+	NATSTLSKey               string `toml:"nats-tls-key"`
 	PostgresNotifyMode       string `toml:"postgres-notify-mode"`
 	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
 	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`

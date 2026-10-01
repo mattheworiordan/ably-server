@@ -446,10 +446,10 @@ func TestNATSBusSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
 
 // TestNATSSubjectIsSafe checks the subject scheme: one NATS token per
 // channel whatever characters the name holds, a hashed token for a name
-// too long to encode, and a namespace token that keeps two schemas'
-// channels of the same name apart.
+// too long to encode, and a namespace token that keeps two schemas', or
+// two clusters' (deployment ids), channels of the same name apart.
 func TestNATSSubjectIsSafe(t *testing.T) {
-	prefix := natsNamespacePrefix("public")
+	prefix := natsNamespacePrefix("dep", "public")
 	ns, ok := strings.CutPrefix(prefix, natsSubjectPrefix)
 	if !ok || !strings.HasSuffix(ns, ".") || strings.ContainsAny(strings.TrimSuffix(ns, "."), ".*> \t\r\n") {
 		t.Fatalf("natsNamespacePrefix(public) = %q, want %q plus one literal token and a dot", prefix, natsSubjectPrefix)
@@ -468,8 +468,11 @@ func TestNATSSubjectIsSafe(t *testing.T) {
 	if natsSubject(prefix, "a") == natsSubject(prefix, "b") {
 		t.Error("distinct names share a subject")
 	}
-	if natsSubject(natsNamespacePrefix("s1"), "room") == natsSubject(natsNamespacePrefix("s2"), "room") {
+	if natsSubject(natsNamespacePrefix("dep", "s1"), "room") == natsSubject(natsNamespacePrefix("dep", "s2"), "room") {
 		t.Error("the same channel in two schemas shares a subject")
+	}
+	if natsSubject(natsNamespacePrefix("dep1", "public"), "room") == natsSubject(natsNamespacePrefix("dep2", "public"), "room") {
+		t.Error("the same channel and schema in two clusters shares a subject")
 	}
 }
 
@@ -492,10 +495,12 @@ func openNATSNode(t *testing.T, dsn, natsURL string, opts ...func(*Options)) *St
 
 // openListenNode opens a Storage on the default LISTEN/NOTIFY bus. Its
 // publishes never reach the NATS bus, which is how these tests stand in
-// for a bus message lost after commit.
+// for a bus message lost after commit. A real cluster refuses a node on
+// another bus (DESIGN.md §11), so this one skips the cluster identity
+// check.
 func openListenNode(t *testing.T, dsn string) *Storage {
 	t.Helper()
-	s, err := Open(context.Background(), Options{DSN: dsn})
+	s, err := Open(context.Background(), Options{DSN: dsn, skipClusterIdentity: true})
 	if err != nil {
 		t.Fatalf("Open (LISTEN bus): %v", err)
 	}
@@ -551,12 +556,13 @@ func storeCounters(cs *channelStore) deliveryCounters {
 func swapNATSTimings(t *testing.T, reconnectWait, sweepInterval time.Duration) {
 	t.Helper()
 	origWait, origSweep, origRetry := natsReconnectWait, natsSweepDefault, natsReconcileRetryWait
-	origGap := gapFillDelay
+	origGap, origJitter := gapFillDelay, reconcileJitterMax
 	natsReconnectWait, natsSweepDefault, natsReconcileRetryWait = reconnectWait, sweepInterval, reconnectWait
 	gapFillDelay = 50 * time.Millisecond
+	reconcileJitterMax = reconnectWait // the reconcile's spread is not under test here
 	t.Cleanup(func() {
 		natsReconnectWait, natsSweepDefault, natsReconcileRetryWait = origWait, origSweep, origRetry
-		gapFillDelay = origGap
+		gapFillDelay, reconcileJitterMax = origGap, origJitter
 	})
 }
 

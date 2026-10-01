@@ -66,7 +66,7 @@ func TestNATSBusReorderedEnvelopes(t *testing.T) {
 	subject := natsSubject(bus2.prefix, "room")
 	inject := func(i int) {
 		t.Helper()
-		data, _, err := encodeNATSEnvelope("room", cms[i], prev[i], DefaultNATSInlineMaxBytes)
+		data, _, err := encodeNATSEnvelope(bus2.deployment, "room", cms[i], prev[i], DefaultNATSInlineMaxBytes)
 		if err != nil {
 			t.Fatalf("encode envelope %d: %v", i, err)
 		}

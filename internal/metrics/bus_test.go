@@ -69,6 +69,31 @@ func TestRegisterBusExposesBusStats(t *testing.T) {
 	}
 }
 
+// TestBusRejectionReasons checks the unrouted and malformed counters are
+// split by reason (DESIGN.md §7.2, §10): each reason's series is its own
+// count, and the rest of the total is the original reason.
+func TestBusRejectionReasons(t *testing.T) {
+	m := New()
+	m.RegisterBus(&fakeBus{st: storage.BusStats{
+		Bus: "nats", Unrouted: 5, UnroutedForeign: 2,
+		Malformed: 9, MalformedSerial: 3, MalformedFuture: 4,
+	}})
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body, _ := io.ReadAll(rec.Body)
+	for _, want := range []string{
+		`ably_bus_unrouted_total{reason="unbound"} 3`,
+		`ably_bus_unrouted_total{reason="foreign"} 2`,
+		`ably_bus_malformed_total{reason="decode"} 2`,
+		`ably_bus_malformed_total{reason="serial"} 3`,
+		`ably_bus_malformed_total{reason="future"} 4`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics lacks %q", want)
+		}
+	}
+}
+
 // lagCounts builds cumulative storage.BusLagBuckets counts from the
 // cumulative count at a few bucket bounds (each bound holds until the
 // next one given).

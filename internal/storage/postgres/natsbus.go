@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +16,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 )
 
 // DefaultNATSInlineMaxBytes is the default cap on the encoded size of a
@@ -25,13 +28,15 @@ const DefaultNATSInlineMaxBytes = 256 << 10
 // Subject scheme (DESIGN.md §7.2): one subject per Ably channel,
 // "ably.cm.", a namespace token, ".", then the unpadded URL-safe base64
 // of the channel name, which never contains a NATS token separator or
-// wildcard. The namespace token is the hex of the first 6 bytes of
-// SHA-256 of the schema the Storage works in (current_schema()), so two
-// deployments sharing one NATS cluster but not a schema never hear each
-// other's channels (the postgres bus's LISTEN names do the same). A
-// name whose encoding exceeds natsMaxSubjectToken is hashed instead
+// wildcard. The namespace token is the hex of the first 8 bytes of
+// SHA-256 of the cluster's deployment id (its cluster identity row,
+// DESIGN.md §11), a NUL, and the schema the Storage works in
+// (current_schema()), so two clusters sharing one NATS cluster never
+// hear each other's channels, even with the same schema name. A name
+// whose encoding exceeds natsMaxSubjectToken is hashed instead
 // ("ably.cm.<ns>.h.<sha256 hex>"); the envelope carries the channel
-// name, so a receiver drops anything not addressed to its channel.
+// name and the deployment id, so a receiver drops anything not
+// addressed to its channel of its cluster.
 const (
 	natsSubjectPrefix   = "ably.cm."
 	natsMaxSubjectToken = 200
@@ -76,11 +81,25 @@ var (
 // interval (DESIGN.md §7.2).
 const DefaultNATSSweepInterval = 30 * time.Second
 
+// natsFutureSkew is how far ahead of the receiver's database-corrected
+// clock an envelope's serial may be minted before the receiver drops it
+// (DESIGN.md §7.2). Serials are minted from the database clock, so a
+// genuine one is never more than one commit ahead of it; one far in the
+// future would sort above every serial the channel mints for that long,
+// and the delivery point would then drop them all as duplicates. A
+// dropped genuine cm is recovered from the log by the chain or the sweep.
+// natsFutureWarnEvery rate-limits the warning, per channel. Package vars
+// so tests can shrink them.
+var (
+	natsFutureSkew      = 5 * time.Minute
+	natsFutureWarnEvery = time.Minute
+)
+
 // natsNamespacePrefix is the subject prefix for every channel of one
-// schema: "ably.cm.<ns>.".
-func natsNamespacePrefix(namespace string) string {
-	sum := sha256.Sum256([]byte(namespace))
-	return natsSubjectPrefix + hex.EncodeToString(sum[:6]) + "."
+// cluster and schema: "ably.cm.<ns>.".
+func natsNamespacePrefix(deploymentID, schema string) string {
+	sum := sha256.Sum256([]byte(deploymentID + "\x00" + schema))
+	return natsSubjectPrefix + hex.EncodeToString(sum[:8]) + "."
 }
 
 // natsSubject derives the NATS subject for an Ably channel name under a
@@ -101,20 +120,33 @@ func natsSubject(prefix, channel string) string {
 // snapshots ride alongside, index-aligned with CM.Annotations. SentAt is
 // when the publishing node sent it, straight after the commit (Unix
 // nanoseconds), from which a receiver measures the bus delivery lag.
+// Deployment is the publishing cluster's deployment id (DESIGN.md §11);
+// a receiver drops an envelope of another cluster.
 type natsEnvelope struct {
-	_msgpack  struct{} `msgpack:",as_array"`
-	Channel   string
-	Serial    string
-	Prev      string
-	CM        *protocol.ChannelMessage
-	Summaries [][]byte
-	SentAt    int64
+	_msgpack   struct{} `msgpack:",as_array"`
+	Channel    string
+	Serial     string
+	Prev       string
+	CM         *protocol.ChannelMessage
+	Summaries  [][]byte
+	SentAt     int64
+	Deployment string
 }
+
+// natsEnvelopeError is why decodeNATSEnvelope refused a message: reason
+// is the ably_bus_malformed_total label ("decode" or "serial").
+type natsEnvelopeError struct {
+	reason string
+	err    error
+}
+
+func (e *natsEnvelopeError) Error() string { return e.err.Error() }
+func (e *natsEnvelopeError) Unwrap() error { return e.err }
 
 // encodeNATSEnvelope encodes cm for the bus, inline when the encoding
 // fits within inlineMax and as a pointer otherwise.
-func encodeNATSEnvelope(channel string, cm *protocol.ChannelMessage, prev string, inlineMax int) (data []byte, pointer bool, err error) {
-	env := natsEnvelope{Channel: channel, Serial: cm.ChannelSerial, Prev: prev, CM: cm, SentAt: time.Now().UnixNano()}
+func encodeNATSEnvelope(deployment, channel string, cm *protocol.ChannelMessage, prev string, inlineMax int) (data []byte, pointer bool, err error) {
+	env := natsEnvelope{Channel: channel, Serial: cm.ChannelSerial, Prev: prev, CM: cm, SentAt: time.Now().UnixNano(), Deployment: deployment}
 	if len(cm.Annotations) > 0 {
 		env.Summaries = make([][]byte, len(cm.Annotations))
 		for i, a := range cm.Annotations {
@@ -141,15 +173,38 @@ func encodeNATSEnvelope(channel string, cm *protocol.ChannelMessage, prev string
 	return data, true, nil
 }
 
-// decodeNATSEnvelope decodes a bus message into the event it announces
-// and the channel it is addressed to.
-func decodeNATSEnvelope(data []byte) (busEvent, string, error) {
+// decodedEnvelope is a bus message decodeNATSEnvelope accepted: the
+// event it announces, the channel and cluster it is addressed to, and
+// its serial's mint time (ms since epoch).
+type decodedEnvelope struct {
+	ev         busEvent
+	channel    string
+	deployment string
+	mintedMs   int64
+}
+
+// decodeNATSEnvelope decodes a bus message and checks its serials: the
+// serial and a non-empty predecessor must be channelSerials in the
+// fixed-width form the database mints (serial.ParseChannelSerial,
+// DESIGN.md §8), and the predecessor must sort below the serial. A
+// refusal is a *natsEnvelopeError. The body is not otherwise checked:
+// the bus is a trusted network (DESIGN.md §7.2).
+func decodeNATSEnvelope(data []byte) (decodedEnvelope, error) {
 	var env natsEnvelope
 	if err := msgpack.Unmarshal(data, &env); err != nil {
-		return busEvent{}, "", err
+		return decodedEnvelope{}, &natsEnvelopeError{"decode", err}
 	}
-	if env.Serial == "" {
-		return busEvent{}, "", errors.New("envelope has no serial")
+	minted, err := serial.ParseChannelSerial(env.Serial)
+	if err != nil {
+		return decodedEnvelope{}, &natsEnvelopeError{"serial", err}
+	}
+	if env.Prev != "" {
+		if _, err := serial.ParseChannelSerial(env.Prev); err != nil {
+			return decodedEnvelope{}, &natsEnvelopeError{"serial", fmt.Errorf("predecessor: %w", err)}
+		}
+		if env.Prev >= env.Serial {
+			return decodedEnvelope{}, &natsEnvelopeError{"serial", fmt.Errorf("predecessor %q does not sort below serial %q", env.Prev, env.Serial)}
+		}
 	}
 	if env.CM != nil {
 		env.CM.ChannelSerial = env.Serial
@@ -158,11 +213,16 @@ func decodeNATSEnvelope(data []byte) (busEvent, string, error) {
 				continue
 			}
 			if err := msgpack.Unmarshal(env.Summaries[i], &a.Summary); err != nil {
-				return busEvent{}, "", fmt.Errorf("decode annotation summary %d: %w", i, err)
+				return decodedEnvelope{}, &natsEnvelopeError{"decode", fmt.Errorf("decode annotation summary %d: %w", i, err)}
 			}
 		}
 	}
-	return busEvent{serial: env.Serial, prev: env.Prev, cm: env.CM, sentAt: env.SentAt}, env.Channel, nil
+	return decodedEnvelope{
+		ev:         busEvent{serial: env.Serial, prev: env.Prev, cm: env.CM, sentAt: env.SentAt},
+		channel:    env.Channel,
+		deployment: env.Deployment,
+		mintedMs:   minted,
+	}, nil
 }
 
 // natsBus is the NATS core pub/sub Bus (DESIGN.md §7.2). After a publish
@@ -182,10 +242,18 @@ func decodeNATSEnvelope(data []byte) (busEvent, string, error) {
 // log, because NATS core does not replay what was published while the
 // node was away.
 type natsBus struct {
-	s         *Storage
-	nc        *nats.Conn
-	inlineMax int
-	prefix    string // natsNamespacePrefix(schema)
+	s          *Storage
+	nc         *nats.Conn
+	inlineMax  int
+	deployment string // the cluster's deployment id (DESIGN.md §11)
+	prefix     string // natsNamespacePrefix(deployment, schema)
+
+	// futureSkew and warnEvery are natsFutureSkew and
+	// natsFutureWarnEvery, snapshotted at dial; futureWarned is when each
+	// channel last logged a far-future serial (dispatch workers share it).
+	futureSkew, warnEvery time.Duration
+	futureMu              sync.Mutex
+	futureWarned          map[string]time.Time
 
 	// Tuning snapshotted at dial so goroutines never read the vars.
 	flushTimeout, retryWait time.Duration
@@ -205,7 +273,11 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 	b := &natsBus{
 		s:            s,
 		inlineMax:    opts.NATSInlineMaxBytes,
-		prefix:       natsNamespacePrefix(s.namespace),
+		deployment:   s.deploymentID,
+		prefix:       natsNamespacePrefix(s.deploymentID, s.namespace),
+		futureSkew:   natsFutureSkew,
+		warnEvery:    natsFutureWarnEvery,
+		futureWarned: make(map[string]time.Time),
 		flushTimeout: natsFlushTimeout,
 		retryWait:    natsReconcileRetryWait,
 	}
@@ -217,7 +289,11 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 		b.shards[i] = make(chan *nats.Msg, max(natsDispatchQueueLen, 1))
 	}
 	b.fetches = make(chan struct{}, max(natsPointerFetches, 1))
-	nc, err := nats.Connect(opts.NATSURL,
+	security, err := natsSecurityOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	nc, err := nats.Connect(opts.NATSURL, append(security,
 		nats.Name("ably-server/"+s.node),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(natsReconnectWait),
@@ -252,12 +328,36 @@ func dialNATSBus(s *Storage, opts Options) (*natsBus, error) {
 			}
 			s.logger.Warn("storage/postgres: NATS bus error", "subject", subject, "err", err)
 		}),
-	)
+	)...)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: connect NATS bus: %w", err)
 	}
 	b.nc = nc
 	return b, nil
+}
+
+// natsSecurityOptions returns the connect options for the bus's
+// credentials and TLS settings (DESIGN.md §7.2, §9). A client
+// certificate needs its key and the other way round. Anything given in
+// the URL (nats://user:pass@host, tls://host) applies as well.
+func natsSecurityOptions(opts Options) ([]nats.Option, error) {
+	var out []nats.Option
+	if opts.NATSCredsFile != "" {
+		if _, err := os.Stat(opts.NATSCredsFile); err != nil {
+			return nil, fmt.Errorf("storage/postgres: NATS credentials file: %w", err)
+		}
+		out = append(out, nats.UserCredentials(opts.NATSCredsFile))
+	}
+	if opts.NATSTLSCA != "" {
+		out = append(out, nats.RootCAs(opts.NATSTLSCA))
+	}
+	switch {
+	case opts.NATSTLSCert != "" && opts.NATSTLSKey != "":
+		out = append(out, nats.ClientCert(opts.NATSTLSCert, opts.NATSTLSKey))
+	case opts.NATSTLSCert != "" || opts.NATSTLSKey != "":
+		return nil, errors.New("storage/postgres: a NATS client certificate needs both --nats-tls-cert and --nats-tls-key")
+	}
+	return out, nil
 }
 
 // start runs one dispatch worker per shard and the shared chain loop:
@@ -303,22 +403,34 @@ func (b *natsBus) dispatch(ctx context.Context, q <-chan *nats.Msg) {
 }
 
 // handle routes one bus message to the delivery point of the channel it
-// is addressed to. The envelope names the channel; a message whose
-// subject is not that channel's (a hashed-subject collision), or for a
-// channel no longer bound here (released while the message was queued),
-// is unrouted. A pointer's body is read off the shard worker, bounded by
-// natsPointerFetches; beyond that the gap fill reads it.
+// is addressed to (DESIGN.md §7.2). A message whose envelope does not
+// decode, or whose serials are not well formed, is malformed. One of
+// another cluster (its deployment id is not this cluster's) is unrouted
+// as foreign. The envelope names the channel; a message whose subject is
+// not that channel's (a hashed-subject collision), or for a channel no
+// longer bound here (released while the message was queued), is
+// unrouted. A serial minted more than futureSkew ahead of the database
+// clock is dropped and counted as malformed (future). A pointer's body
+// is read off the shard worker, bounded by natsPointerFetches; beyond
+// that the gap fill reads it.
 func (b *natsBus) handle(m *nats.Msg) {
 	b.s.stats.received.Add(1)
-	ev, channel, err := decodeNATSEnvelope(m.Data)
+	env, err := decodeNATSEnvelope(m.Data)
 	if err != nil {
 		b.s.stats.malformed.Add(1)
-		b.s.logger.Warn("storage/postgres: undecodable NATS bus message", "subject", m.Subject, "err", err)
+		var ee *natsEnvelopeError
+		if errors.As(err, &ee) && ee.reason == "serial" {
+			b.s.stats.malformedSerial.Add(1)
+		}
+		b.s.logger.Warn("storage/postgres: malformed NATS bus message dropped", "subject", m.Subject, "err", err)
 		return
 	}
-	if ev.sentAt > 0 {
-		b.s.stats.observeStage(stageQueueWait, time.Since(time.Unix(0, ev.sentAt)))
+	if env.deployment != b.deployment {
+		b.s.stats.unrouted.Add(1)
+		b.s.stats.unroutedForeign.Add(1)
+		return
 	}
+	ev, channel := env.ev, env.channel
 	var cs *channelStore
 	if m.Subject == natsSubject(b.prefix, channel) {
 		cs = b.s.boundStore(channel)
@@ -326,6 +438,15 @@ func (b *natsBus) handle(m *nats.Msg) {
 	if cs == nil {
 		b.s.stats.unrouted.Add(1)
 		return
+	}
+	if limit := time.Now().UnixMilli() + b.s.clockOffset.Load() + b.futureSkew.Milliseconds(); env.mintedMs > limit {
+		b.s.stats.malformed.Add(1)
+		b.s.stats.malformedFuture.Add(1)
+		b.warnFuture(channel, ev.serial, env.mintedMs-limit+b.futureSkew.Milliseconds())
+		return
+	}
+	if ev.sentAt > 0 {
+		b.s.stats.observeStage(stageQueueWait, time.Since(time.Unix(0, ev.sentAt)))
 	}
 	if ev.cm != nil {
 		cs.deliverChained(ev)
@@ -347,6 +468,29 @@ func (b *natsBus) handle(m *nats.Msg) {
 		defer func() { <-b.fetches }()
 		cs.deliverChained(cs.resolvePointer(ev))
 	}()
+}
+
+// warnFuture logs a far-future serial dropped on channel, at most once
+// per warnEvery per channel.
+func (b *natsBus) warnFuture(channel, cmSerial string, aheadMs int64) {
+	now := time.Now()
+	b.futureMu.Lock()
+	last, ok := b.futureWarned[channel]
+	if ok && now.Sub(last) < b.warnEvery {
+		b.futureMu.Unlock()
+		return
+	}
+	if len(b.futureWarned) >= 1024 {
+		for ch, at := range b.futureWarned {
+			if now.Sub(at) >= b.warnEvery {
+				delete(b.futureWarned, ch)
+			}
+		}
+	}
+	b.futureWarned[channel] = now
+	b.futureMu.Unlock()
+	b.s.logger.Warn("storage/postgres: NATS bus message with a serial minted in the future dropped; the chain or the sweep recovers a genuine cm from the log",
+		"channel", channel, "serial", cmSerial, "ahead", time.Duration(aheadMs)*time.Millisecond)
 }
 
 // queueDepth is the number of bus messages received and waiting in the
@@ -426,7 +570,7 @@ func (b *natsBus) beforeCommit(context.Context, pgx.Tx, *channelStore, *busWrite
 // publish through a transient store (the presence reaper's) still
 // reaches local subscribers.
 func (b *natsBus) afterCommit(cs *channelStore, cm *protocol.ChannelMessage, prev string) {
-	data, pointer, err := encodeNATSEnvelope(cs.name, cm, prev, b.inlineMax)
+	data, pointer, err := encodeNATSEnvelope(b.deployment, cs.name, cm, prev, b.inlineMax)
 	switch {
 	case err != nil:
 		b.s.stats.publishErrors.Add(1)

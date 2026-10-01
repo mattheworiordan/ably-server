@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,7 +61,26 @@ var (
 var rangePageSize = 500
 
 // reconcileChunk caps the channels one batched reconcile query covers.
-const reconcileChunk = 500
+// A package var so tests can force several chunks.
+var reconcileChunk = 500
+
+// reconcileJitterMax caps the random wait before a reconnect reconcile,
+// which is otherwise up to a quarter of the sweep interval (chainLoop),
+// so a long --bus-sweep-interval does not delay recovery for minutes. A
+// package var so tests can shrink it; Open snapshots it.
+var reconcileJitterMax = 10 * time.Second
+
+// catchUpConcurrency caps the batched catch-up queries (catchUpMany: a
+// reconcile chunk, or a sweep's catch-up) one node runs at once, over all
+// its shards (DESIGN.md §7.2): after a cluster-wide bus blip every node
+// reconciles at the same moment, against the same primaries.
+const catchUpConcurrency = 4
+
+// catchUpHook, when set, runs as each batched catch-up query starts, with
+// its channel names, and the func it returns runs when the catch-up ends
+// (tests count what a reconcile reads and how many run at once). Nil in
+// production.
+var catchUpHook atomic.Pointer[func(names []string) (done func())]
 
 // sweepChunk caps the channel names in one watermark sweep query.
 const sweepChunk = 1000
@@ -676,6 +697,16 @@ func (s *Storage) chainLoop(ctx context.Context, sweepInterval, retryWait time.D
 		case <-s.reconcileCh:
 		}
 
+		// Every node sees a cluster-wide bus blip at the same moment; a
+		// random wait of up to a quarter of the sweep interval (at most
+		// reconcileJitterMax) spreads their reconciles over the primaries.
+		// A cm committed while the bus was away reaches a channel that
+		// sees a later one sooner, by its predecessor (DESIGN.md §7.2).
+		if d := min(sweepInterval/4, s.reconcileJitter); d > 0 {
+			if !sleepCtx(ctx, rand.N(d)) {
+				return
+			}
+		}
 		if beforeReconcile != nil {
 			if err := beforeReconcile(ctx); err != nil {
 				if ctx.Err() != nil {
@@ -702,19 +733,37 @@ func (s *Storage) chainLoop(ctx context.Context, sweepInterval, retryWait time.D
 	}
 }
 
-// reconcileBound catches every bound channel up from the log after a bus
-// reconnect (DESIGN.md §7.2), in batches of reconcileChunk channels per
-// query. It returns the number of channels reconciled.
+// reconcileBound catches the channels in the sweep scope (sweepStores:
+// by default the bound channels with a subscriber on this node) up from
+// the log after a bus reconnect (DESIGN.md §7.2), in batches of
+// reconcileChunk channels per query, the batches run at most
+// catchUpConcurrency at once on the node. A bound channel with no
+// subscriber is left to the next cm's predecessor, and to the sweep once
+// it gains a subscriber, exactly as for a bus message lost while it had
+// none. It returns the number of channels reconciled.
 func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
-	stores := s.boundStores()
-	var firstErr error
+	stores := s.sweepStores()
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
 	for start := 0; start < len(stores); start += reconcileChunk {
-		end := min(start+reconcileChunk, len(stores))
-		if err := s.catchUpMany(ctx, stores[start:end]); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		s.stats.reconciles.Add(uint64(end - start))
+		chunk := stores[start:min(start+reconcileChunk, len(stores))]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.catchUpMany(ctx, chunk); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+			s.stats.reconciles.Add(uint64(len(chunk)))
+		}()
 	}
+	wg.Wait()
 	return len(stores), firstErr
 }
 
@@ -817,8 +866,18 @@ func loadRangesChecked(ctx context.Context, pool *pgxpool.Pool, reqs []rangeRequ
 // catchUpMany is catchUp for many channels in one query: each channel's
 // first page past its mark is read together, with the continuity check
 // for the channels whose mark is below the retention floor, and a
-// channel whose page came back full is then caught up on its own.
+// channel whose page came back full is then caught up on its own. It
+// holds one of the node's catchUpSlots throughout, so at most
+// catchUpConcurrency run at once on the node.
 func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error {
+	if s.catchUpSlots != nil {
+		select {
+		case s.catchUpSlots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		defer func() { <-s.catchUpSlots }()
+	}
 	byName := make(map[string]*channelStore, len(stores))
 	reqs := make([]rangeRequest, 0, len(stores))
 	for _, cs := range stores {
@@ -835,6 +894,13 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 	}
 	if len(reqs) == 0 {
 		return nil
+	}
+	if hook := catchUpHook.Load(); hook != nil {
+		names := make([]string, len(reqs))
+		for i, r := range reqs {
+			names[i] = r.name
+		}
+		defer (*hook)(names)()
 	}
 
 	reads, err := loadRangesChecked(ctx, s.pool, reqs)

@@ -64,7 +64,8 @@ var partitionedTables = []string{"channel_messages", "messages"}
 
 // Retention configures the message log's retention (DESIGN.md §6.3).
 // Every node sharing a database must use the same values: whichever node
-// runs the sweep applies its own.
+// runs the sweep applies its own. Open enforces it for Message and
+// Persisted (the cluster identity, DESIGN.md §11).
 type Retention struct {
 	// Message is how long a channel outside any persisted namespace keeps
 	// its log and projection rows: the continuity window. Zero means

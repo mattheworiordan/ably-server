@@ -113,14 +113,15 @@ func TestChainRecordsDeliveryLagByPath(t *testing.T) {
 // TestNATSEnvelopeCarriesSendTime: the envelope's send time survives
 // encoding, inline and as a pointer, and reaches the bus event.
 func TestNATSEnvelopeCarriesSendTime(t *testing.T) {
-	cm := &protocol.ChannelMessage{ChannelSerial: "s1", Messages: []*protocol.Message{{Data: "hi"}}}
+	cm := &protocol.ChannelMessage{ChannelSerial: "00000000000001-000@abc", Messages: []*protocol.Message{{Data: "hi"}}}
 	before := time.Now().UnixNano()
 	for _, inlineMax := range []int{DefaultNATSInlineMaxBytes, 1} {
-		data, pointer, err := encodeNATSEnvelope("room", cm, "s0", inlineMax)
+		data, pointer, err := encodeNATSEnvelope("dep", "room", cm, "00000000000000-000@abc", inlineMax)
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		ev, ch, err := decodeNATSEnvelope(data)
+		env, err := decodeNATSEnvelope(data)
+		ev, ch := env.ev, env.channel
 		if err != nil || ch != "room" {
 			t.Fatalf("decode: channel %q err %v", ch, err)
 		}

@@ -162,6 +162,15 @@ type Options struct {
 	// is BusNATS.
 	NATSURL string
 
+	// NATSCredsFile, NATSTLSCA, NATSTLSCert and NATSTLSKey authenticate
+	// and encrypt the NATS bus connection (DESIGN.md §7.2, §9): a NATS
+	// credentials file (JWT and NKey seed, nats.UserCredentials), a PEM
+	// CA bundle the server's certificate must chain to, and a client
+	// certificate and its key for a server that verifies clients (both
+	// or neither). Empty means unset. Credentials and TLS can also come
+	// from the URL (nats://user:pass@host, tls://host).
+	NATSCredsFile, NATSTLSCA, NATSTLSCert, NATSTLSKey string
+
 	// NATSInlineMaxBytes caps the encoded size of a cm carried inline on
 	// the NATS bus; a larger cm travels as a (channel, serial) pointer
 	// that receivers fetch from the log. Zero means
@@ -205,6 +214,12 @@ type Options struct {
 	// continuity window. Nil means no channel is persisted.
 	Persisted func(channel string) bool
 
+	// PersistedNamespaces are the namespace ids Persisted reports as
+	// persisted. Open records them, sorted, in the cluster identity
+	// (DESIGN.md §11) and refuses a node that lists another set. It does
+	// not change what Persisted reports.
+	PersistedNamespaces []string
+
 	// Batching configures leading-edge publish batching (DESIGN.md
 	// §6.3). The zero value (Lanes 0) commits every publish in its own
 	// transaction; the server enables 4 lanes by default.
@@ -247,7 +262,29 @@ type Options struct {
 	// shard is this Storage's place in a shard list, set by OpenSharded
 	// (DESIGN.md §6.4). The zero value is a lone Storage.
 	shard shardSlot
+
+	// catchUpSlots bounds the batched catch-up queries (reconcile and
+	// sweep, chain.go) in flight on this node; OpenSharded shares one
+	// across its shards. Nil means a fresh one of catchUpConcurrency.
+	catchUpSlots chan struct{}
+
+	// skipClusterIdentity skips the cluster identity check (DESIGN.md
+	// §11). Only tests set it: those that open a pgnotify node beside a
+	// nats or postgres one on purpose, to stand in for a bus message lost
+	// after commit.
+	skipClusterIdentity bool
 }
+
+// Pool timeouts applied when the DSN does not set its own (DESIGN.md
+// §6.4): a connection attempt to an unreachable database gives up after
+// poolConnectTimeout, and the liveness ping of an idle connection on
+// acquire after poolPingTimeout, so a call on a channel whose shard is
+// down fails within about that long instead of waiting on the dial.
+// Package vars so tests can shrink them.
+var (
+	poolConnectTimeout = 5 * time.Second
+	poolPingTimeout    = 2 * time.Second
+)
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
@@ -257,7 +294,11 @@ type Storage struct {
 	node      string // per-process node id, owning presence rows for the liveness lease (§12.5)
 	leaseNode bool   // PresenceLeaseNode: liveness is the node's presence_nodes row (§12.5)
 	namespace string // current_schema(), mixed into every bus channel name (LISTEN names, NATS subjects)
-	logger    *logging.Logger
+	// deploymentID is the cluster's id from its cluster identity row
+	// (DESIGN.md §11), mixed into the NATS subjects and carried in every
+	// NATS envelope; "" only when a test skipped the check.
+	deploymentID string
+	logger       *logging.Logger
 
 	retention Retention                 // resolved retention settings (§6.3)
 	persisted func(channel string) bool // retention class of a channel
@@ -296,6 +337,8 @@ type Storage struct {
 	sweepInterval               time.Duration // chaining buses' watermark sweep
 	sweepAll                    bool          // sweep every bound channel, not only subscribed ones
 	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
+	catchUpSlots                chan struct{} // bounds batched catch-up queries in flight on the node (chain.go)
+	reconcileJitter             time.Duration // cap on the wait before a reconnect reconcile, copied at Open
 
 	mu       sync.RWMutex
 	channels map[string]*channelStore // every store handed out, by Ably channel name
@@ -360,6 +403,12 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 			poolCfg.MaxConns = max(poolCfg.MaxConns, int32(batching.Lanes*maxInflightPerLane+8))
 		}
 	}
+	if poolCfg.ConnConfig.ConnectTimeout == 0 { // no connect_timeout in the DSN or PGCONNECT_TIMEOUT
+		poolCfg.ConnConfig.ConnectTimeout = poolConnectTimeout
+	}
+	if poolCfg.PingTimeout == 0 {
+		poolCfg.PingTimeout = poolPingTimeout
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: connect: %w", err)
@@ -387,6 +436,24 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
+	retention := opts.Retention.resolve()
+	var deploymentID string
+	if !opts.skipClusterIdentity {
+		deploymentID, err = checkClusterIdentity(ctx, pool, slot, clusterSettings{
+			bus:                 busKind,
+			message:             retention.Message,
+			persisted:           retention.Persisted,
+			persistedNamespaces: normalizeNamespaces(opts.PersistedNamespaces),
+		})
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("storage/postgres: %w", err)
+		}
+	}
+	catchUpSlots := opts.catchUpSlots
+	if catchUpSlots == nil {
+		catchUpSlots = make(chan struct{}, catchUpConcurrency)
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -399,31 +466,34 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	}
 	loopCtx, cancel := context.WithCancel(context.Background())
 	s := &Storage{
-		pool:          pool,
-		dsn:           opts.DSN,
-		series:        serial.NewSeriesID(),
-		node:          node,
-		leaseNode:     leaseMode == PresenceLeaseNode,
-		logger:        logger,
-		shard:         slot,
-		ident:         ident,
-		busKind:       busKind,
-		notifyMode:    string(mode),
-		reconnectBase: listenReconnectBaseDelay,
-		reconnectMax:  listenReconnectMaxDelay,
-		sweepInterval: opts.SweepInterval,
-		sweepAll:      sweepScope == SweepBound,
-		timing:        currentChainTiming(),
-		retention:     opts.Retention.resolve(),
-		persisted:     persisted,
-		metrics:       newRetentionMetrics(),
-		wmetrics:      newWriteMetrics(),
-		bindOnWrite:   opts.BindOnWrite,
-		channels:      make(map[string]*channelStore),
-		reconcileCh:   make(chan struct{}, 1),
-		loopCtx:       loopCtx,
-		cancel:        cancel,
-		done:          loopCtx.Done(),
+		pool:            pool,
+		dsn:             opts.DSN,
+		series:          serial.NewSeriesID(),
+		node:            node,
+		leaseNode:       leaseMode == PresenceLeaseNode,
+		logger:          logger,
+		shard:           slot,
+		ident:           ident,
+		busKind:         busKind,
+		notifyMode:      string(mode),
+		reconnectBase:   listenReconnectBaseDelay,
+		reconnectMax:    listenReconnectMaxDelay,
+		sweepInterval:   opts.SweepInterval,
+		sweepAll:        sweepScope == SweepBound,
+		timing:          currentChainTiming(),
+		reconcileJitter: reconcileJitterMax,
+		retention:       retention,
+		deploymentID:    deploymentID,
+		catchUpSlots:    catchUpSlots,
+		persisted:       persisted,
+		metrics:         newRetentionMetrics(),
+		wmetrics:        newWriteMetrics(),
+		bindOnWrite:     opts.BindOnWrite,
+		channels:        make(map[string]*channelStore),
+		reconcileCh:     make(chan struct{}, 1),
+		loopCtx:         loopCtx,
+		cancel:          cancel,
+		done:            loopCtx.Done(),
 	}
 	fail := func(err error) (*Storage, error) {
 		cancel()
@@ -557,7 +627,7 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	}
 
 	if err := s.bus.bind(ctx, cs); err != nil {
-		return fail(err)
+		return fail(unavailable(err))
 	}
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("registered")
@@ -569,7 +639,7 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	cs.hwmMu.Unlock()
 	current, initial, err := s.channelRow(ctx, name)
 	if err != nil {
-		return fail(err)
+		return fail(unavailable(err))
 	}
 	cs.rowEnsured.Store(true)
 	if hook := channelBindHook.Load(); hook != nil {
@@ -787,6 +857,23 @@ func (s *Storage) Ping(ctx context.Context) error {
 		return err
 	}
 	return s.bus.ready()
+}
+
+// unavailable wraps err in storage.ErrUnavailable when it says the
+// database could not be reached: a failed connection attempt (bounded by
+// poolConnectTimeout), a deadline that passed, or an error pgconn reports as safe to
+// retry because nothing reached the server. Callers map ErrUnavailable
+// to 50003 (DESIGN.md §6.4), which is what a channel on a shard that is
+// down answers. Other errors are returned as they are.
+func unavailable(err error) error {
+	if err == nil || errors.Is(err, storage.ErrUnavailable) {
+		return err
+	}
+	var ce *pgconn.ConnectError
+	if errors.As(err, &ce) || pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded) || pgconn.SafeToRetry(err) {
+		return fmt.Errorf("%w: %w", storage.ErrUnavailable, err)
+	}
+	return err
 }
 
 // sleepCtx waits for d or until ctx is done, reporting whether the full
@@ -1252,7 +1339,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", unavailable(err))
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -1340,7 +1427,7 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", unavailable(err))
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -1556,7 +1643,7 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", unavailable(err))
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -1671,7 +1758,7 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", unavailable(err))
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -1933,6 +2020,11 @@ func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessag
 // split across pages, so the head/tail ChannelMessage in a page can
 // be partial.
 func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	page, err := cs.history(ctx, q)
+	return page, unavailable(err)
+}
+
+func (cs *channelStore) history(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
 	}

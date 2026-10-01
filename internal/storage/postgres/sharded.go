@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,6 +35,12 @@ import (
 type Sharded struct {
 	shards []*Storage
 	gauge  prometheus.Collector // ably_storage_shards
+
+	// ready is each shard's result in the last Ping (1 reachable, 0 not),
+	// exported as ably_storage_shard_ready{shard}; every shard starts
+	// ready, since OpenSharded only returns once all of them opened.
+	ready      []atomic.Bool
+	readyGauge prometheus.Collector
 }
 
 var (
@@ -69,10 +76,15 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		// (DESIGN.md §6.4, §12.5).
 		opts.nodeID = serial.NewSeriesID()
 	}
-	open := func(i int, listID string) (*Storage, error) {
+	if opts.catchUpSlots == nil {
+		// One bound on the node's batched catch-up queries, shared by
+		// every shard (chain.go, DESIGN.md §7.2).
+		opts.catchUpSlots = make(chan struct{}, catchUpConcurrency)
+	}
+	open := func(i int, listID, deploymentID string) (*Storage, error) {
 		o := opts
 		o.DSN = dsns[i]
-		o.shard = shardSlot{index: i, count: n, listID: listID}
+		o.shard = shardSlot{index: i, count: n, listID: listID, deploymentID: deploymentID}
 		o.Logger = logger.With("shard", i)
 		s, err := Open(ctx, o)
 		if err != nil {
@@ -89,7 +101,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 			}
 		}
 	}
-	first, err := open(0, "")
+	first, err := open(0, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +112,7 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			shards[i], errs[i] = open(i, first.ident.listID)
+			shards[i], errs[i] = open(i, first.ident.listID, first.deploymentID)
 		}()
 	}
 	wg.Wait()
@@ -116,7 +128,12 @@ func OpenSharded(ctx context.Context, opts Options, dsns []string) (*Sharded, er
 		closeAll()
 		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
-	return &Sharded{shards: shards, gauge: shardsGauge(n)}, nil
+	sh := &Sharded{shards: shards, gauge: shardsGauge(n), ready: make([]atomic.Bool, n)}
+	for i := range sh.ready {
+		sh.ready[i].Store(true)
+	}
+	sh.readyGauge = newShardReadyCollector(sh.ready)
+	return sh, nil
 }
 
 // Shards is the number of shards (the DSN list's length).
@@ -166,21 +183,80 @@ func (s *Sharded) Close() error {
 	return errors.Join(errs...)
 }
 
-// Ping reports ready only while every shard is: a node that cannot reach
-// one shard cannot serve that shard's channels (storage.Pinger, /readyz).
+// Ping pings every shard (its pool and its bus, Storage.Ping) at once and
+// reports ready while shard 0 and a majority of the shards are reachable
+// (storage.Pinger, /readyz; DESIGN.md §6.4). One shard down does not take
+// the node out of rotation: if it did, every node would leave at once
+// and the healthy shards' channels would become unreachable too. The
+// down shard's channels fail fast instead (ErrUnavailable, 50003) while
+// the rest serve. A node that reaches no more than half the shards, or
+// not shard 0, which is where it checks the list it was given, leaves
+// rotation. Each shard's result is ably_storage_shard_ready{shard}.
 func (s *Sharded) Ping(ctx context.Context) error {
+	errs := make([]error, len(s.shards))
+	var wg sync.WaitGroup
 	for i, sh := range s.shards {
-		if err := sh.Ping(ctx); err != nil {
-			return fmt.Errorf("shard %d: %w", i, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = sh.Ping(ctx)
+		}()
+	}
+	wg.Wait()
+	up := 0
+	var down []error
+	for i, err := range errs {
+		s.ready[i].Store(err == nil)
+		if err == nil {
+			up++
+			continue
 		}
+		down = append(down, fmt.Errorf("shard %d: %w", i, err))
+	}
+	switch {
+	case errs[0] != nil:
+		return fmt.Errorf("storage/postgres: shard 0 unreachable (%d of %d shards up): %w", up, len(s.shards), errors.Join(down...))
+	case 2*up <= len(s.shards):
+		return fmt.Errorf("storage/postgres: only %d of %d shards reachable, not a majority: %w", up, len(s.shards), errors.Join(down...))
 	}
 	return nil
 }
 
+// newShardReadyCollector is ably_storage_shard_ready{shard}: 1 while the
+// shard was reachable in the last readiness check, else 0 (DESIGN.md
+// §6.4, §10).
+func newShardReadyCollector(ready []atomic.Bool) prometheus.Collector {
+	vec := &shardReadyCollector{
+		desc: prometheus.NewDesc("ably_storage_shard_ready",
+			"1 while this Postgres shard (and its bus connection) answered the node's last readiness check (/readyz), else 0 (DESIGN.md §6.4).",
+			[]string{"shard"}, nil),
+		ready: ready,
+	}
+	return vec
+}
+
+type shardReadyCollector struct {
+	desc  *prometheus.Desc
+	ready []atomic.Bool
+}
+
+func (c *shardReadyCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *shardReadyCollector) Collect(ch chan<- prometheus.Metric) {
+	for i := range c.ready {
+		v := 0.0
+		if c.ready[i].Load() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, v, strconv.Itoa(i))
+	}
+}
+
 // Collectors returns every shard's ably_storage_* and ably_publish_*
-// series, each labelled shard="<index>", plus ably_storage_shards.
+// series, each labelled shard="<index>", plus ably_storage_shards and
+// ably_storage_shard_ready.
 func (s *Sharded) Collectors() []prometheus.Collector {
-	out := []prometheus.Collector{s.gauge}
+	out := []prometheus.Collector{s.gauge, s.readyGauge}
 	for i, sh := range s.shards {
 		labels := prometheus.Labels{"shard": strconv.Itoa(i)}
 		for _, c := range sh.Collectors() {
@@ -212,6 +288,9 @@ func addBusStats(a, b storage.BusStats) storage.BusStats {
 	a.Received += b.Received
 	a.Unrouted += b.Unrouted
 	a.Malformed += b.Malformed
+	a.UnroutedForeign += b.UnroutedForeign
+	a.MalformedSerial += b.MalformedSerial
+	a.MalformedFuture += b.MalformedFuture
 	a.Inline += b.Inline
 	a.Fetched += b.Fetched
 	a.FastPath += b.FastPath
@@ -280,6 +359,10 @@ func addLag(a, b storage.LagHistogram) storage.LagHistogram {
 type shardSlot struct {
 	index, count int
 	listID       string
+	// deploymentID is shard 0's cluster deployment id (DESIGN.md §11),
+	// which every other shard records; empty for shard 0 and a lone
+	// Storage, which mint or read their own.
+	deploymentID string
 }
 
 func (sl shardSlot) resolve() shardSlot {

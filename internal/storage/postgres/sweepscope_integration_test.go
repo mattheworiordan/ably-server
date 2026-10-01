@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -141,5 +142,104 @@ func TestSweepScopeSubscribedOnly(t *testing.T) {
 				t.Error("the bound scope never read idle-room")
 			}
 		})
+	}
+}
+
+// TestReconcileScopedAndBounded (DESIGN.md §7.2): a bus reconnect
+// reconciles only the bound channels with a subscriber on this node (the
+// sweep scope), not every bound channel, and the node runs at most
+// catchUpConcurrency of its batched catch-up queries at once. Before,
+// every bound channel was reconciled, one query of 500 after another
+// with no jitter, so a cluster-wide bus blip made every node read every
+// channel it held against the same primaries at the same moment.
+func TestReconcileScopedAndBounded(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+	origChunk := reconcileChunk
+	reconcileChunk = 2
+	t.Cleanup(func() { reconcileChunk = origChunk })
+
+	o := pgBusOptions(dsn)
+	o.SweepInterval = time.Hour // no sweep during the test; the reconcile is run directly below, without the jitter
+	s, err := Open(ctx, o)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	const bound, subscribed = 40, 12
+	want := map[string]bool{}
+	for i := range bound {
+		r := &subRecorder{}
+		name := fmt.Sprintf("room-%d", i)
+		if i < subscribed {
+			r.sub.Store(true)
+			want[name] = true
+		}
+		if _, err := s.Channel(ctx, name, r); err != nil {
+			t.Fatalf("bind %s: %v", name, err)
+		}
+	}
+
+	var (
+		mu                sync.Mutex
+		read              = map[string]int{}
+		inFlight, maxSeen int
+	)
+	h := func(names []string) func() {
+		mu.Lock()
+		for _, n := range names {
+			read[n]++
+		}
+		inFlight++
+		maxSeen = max(maxSeen, inFlight)
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond) // hold the query so concurrent ones overlap
+		return func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}
+	}
+	catchUpHook.Store(&h)
+	t.Cleanup(func() { catchUpHook.Store(nil) })
+
+	n, err := s.reconcileBound(ctx)
+	if err != nil {
+		t.Fatalf("reconcileBound: %v", err)
+	}
+	if n != subscribed {
+		t.Errorf("reconciled %d channels, want the %d subscribed of %d bound", n, subscribed, bound)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for name := range read {
+		if !want[name] {
+			t.Errorf("reconcile read %s, which has no subscriber", name)
+		}
+	}
+	for name := range want {
+		if read[name] != 1 {
+			t.Errorf("reconcile read %s %d times, want once", name, read[name])
+		}
+	}
+	if maxSeen > catchUpConcurrency {
+		t.Errorf("%d catch-up queries in flight at once, want at most %d", maxSeen, catchUpConcurrency)
+	}
+	if maxSeen < 2 {
+		t.Errorf("%d catch-up query in flight at most; the %d chunks should overlap", maxSeen, subscribed/reconcileChunk)
+	}
+	if got := s.BusStats().Reconciles; got != subscribed {
+		t.Errorf("ably_bus_reconciled_channels_total = %d, want %d", got, subscribed)
+	}
+}
+
+// TestCatchUpBoundSharedAcrossShards: the catch-up bound is per node, so
+// one sharded node's shards share it.
+func TestCatchUpBoundSharedAcrossShards(t *testing.T) {
+	s := openShardedT(t, Options{Bus: BusPostgres, NotifyMode: NotifyTransactional}, shardDSNs(t, 2))
+	if s.Shard(0).catchUpSlots == nil || s.Shard(0).catchUpSlots != s.Shard(1).catchUpSlots || cap(s.Shard(0).catchUpSlots) != catchUpConcurrency {
+		t.Errorf("shards' catch-up slots are not one shared bound of %d", catchUpConcurrency)
 	}
 }
