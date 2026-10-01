@@ -140,7 +140,10 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, RunID: "c1", RunTag: "c1", Inventory: inv, ResultsDir: dir,
 		LogFile: logFile, StateFile: stateFile, StartDelay: time.Second, Poll: 500 * time.Millisecond,
-		FaultHook: "echo injected", FaultAt: time.Second, Out: &out,
+		FaultHook: "echo injected", FaultKind: loadgen.FaultNodeKill, FaultAt: time.Second, Out: &out,
+		// n2 has no metrics URL and the agents may not read /proc/stat: a
+		// local run waives the node-metrics and CPU gates, and says so.
+		AllowUnmeasured: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,10 +161,15 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 		t.Errorf("footprint %+v", rec.Footprint)
 	}
 	// Node coverage: n1 has a metrics URL and was scraped at the fixed
-	// points; n2 has none and so counts as not sampled. (A fault run does
-	// not gate on it.)
+	// points; n2 has none and so counts as not sampled. The row fails and
+	// is waived (--allow-unmeasured); a node kill does not excuse it.
 	if cov := rec.NodeStats.Coverage; len(cov) != 2 || !cov[0].Sampled(rec.NodeStats.BaselineDue) || cov[1].HasURL || cov[1].Sampled(false) {
 		t.Errorf("node coverage %+v", rec.NodeStats.Coverage)
+	}
+	for _, c := range rec.Checks {
+		if c.Name == "node metrics coverage" && (c.Pass || c.Gating || !strings.Contains(c.Note, "waived with --allow-unmeasured")) {
+			t.Errorf("node metrics coverage row %+v", c)
+		}
 	}
 	if len(rec.AgentCPU) != 2 || rec.AgentCPU[0].Kind != "generator" {
 		t.Errorf("agent CPU records %+v", rec.AgentCPU)
@@ -286,13 +294,13 @@ func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, RunID: "nf", RunTag: "nf", Inventory: inv, ResultsDir: t.TempDir(),
 		StartDelay: time.Second, Poll: 500 * time.Millisecond,
-		FaultHook: "echo never", FaultAt: time.Hour,
+		FaultHook: "echo never", FaultKind: loadgen.FaultNodeKill, FaultAt: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 {
-		t.Fatalf("pass=%v fault=%+v\n%s", rec.Pass, rec.Fault, rec.Markdown())
+	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 || rec.Verdict != loadgen.VerdictInvalidFault || rec.Fault.Kind != loadgen.FaultNodeKill {
+		t.Fatalf("pass=%v verdict=%q fault=%+v\n%s", rec.Pass, rec.Verdict, rec.Fault, rec.Markdown())
 	}
 	found := false
 	for _, c := range rec.Checks {
@@ -300,5 +308,23 @@ func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no failing fault injection check:\n%s", rec.Markdown())
+	}
+}
+
+func TestConductorRefusesAFaultHookWithoutAKind(t *testing.T) {
+	sc, err := loadgen.ParseScenario([]byte(conductorScenario))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"", "node"} {
+		_, err = loadgen.RunConductor(context.Background(), loadgen.ConductorConfig{
+			Scenario: sc, RunID: "nk", RunTag: "nk", ResultsDir: t.TempDir(),
+			Inventory: &loadgen.Inventory{Key: testKey, Nodes: []loadgen.InventoryNode{{Name: "n1", Endpoint: "127.0.0.1:1"}},
+				Agents: []loadgen.InventoryAgent{{Name: "a", URL: "http://127.0.0.1:1", Roles: []string{loadgen.RoleSubscriber, loadgen.RoleREST}}}},
+			FaultHook: "echo x", FaultKind: kind,
+		})
+		if err == nil || !strings.Contains(err.Error(), "--fault-kind") {
+			t.Fatalf("kind %q: err = %v", kind, err)
+		}
 	}
 }

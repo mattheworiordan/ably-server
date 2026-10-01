@@ -251,6 +251,7 @@ is a run. `run` flags:
 | `--start-delay` | 10s | job send to ramp start |
 | `--poll` | 10s | status and node-metrics interval |
 | `--fault-hook CMD`, `--fault-at D` | , 5m | shell command run D into the hold (kill a node, kill a NATS server); `RUN_ID` is in its environment |
+| `--fault-kind K` | | what the hook does: `node-kill`, `bus-kill` or `other`; required with `--fault-hook`; decides which gates a successful fault relaxes (see "Fault runs") |
 | `--time-limit D` | planned length + 5m | hard limit: stops every agent, runs `--on-timeout`, verdict ABORTED |
 | `--on-timeout CMD` | | for instance `bench/aws/90-teardown.sh` |
 | `--env k=v` | | labels for the run record (bus, storage, instance types) |
@@ -321,8 +322,9 @@ check. A configuration that differs between nodes fails the run.
 - `summary.md`: the same as tables.
 
 Pass criteria (plan §8, overridable per scenario in `[pass]`). A run
-passes only if every gating check passes; "fault run" below means a
-`--fault-hook` that ran and exited 0 (see "Fault runs").
+passes only if every gating check passes. A `--fault-hook` that ran and
+exited 0 relaxes only the gates its kind of fault invalidates; one that
+failed or never ran makes the run INVALID (see "Fault runs").
 
 *Latency and rates*
 
@@ -330,14 +332,14 @@ passes only if every gating check passes; "fault run" below means a
   and cross-node where there is such traffic (p99 < 100 ms reported as
   stretch; latency from the actual send time reported).
 - REST ACK p99 <= 100 ms; connect plus attach p99 <= 500 ms at the target
-  churn.
+  churn, and the reconnects among those samples (`reconnect+attach p99`)
+  under the same limit on their own.
 - Achieved publish rate >= 95% of offered; offered >= 95% of target (the
   generator kept up); no rejected publishes; no unresolved publishes and
-  retries under 1% of publishes sent (`max_retry_ratio`), both waived in a
-  fault run (retries, 429s and unresolved are printed either way).
+  retries under 1% of publishes sent (`max_retry_ratio`; retries, 429s
+  and unresolved are printed either way).
 - Connections open at the end of the hold >= 99% of target; deliveries/s
-  >= 99% of the plan's (90% in a fault run), which is the only check on
-  unsampled channels.
+  >= 99% of the plan's, which is the only check on unsampled channels.
 - The generator's own connections and attachments within ±3% from hold
   start to end (else node growth would measure the generator).
 
@@ -345,13 +347,18 @@ passes only if every gating check passes; "fault run" below means a
 
 - Zero violations of every kind on the sample, including `attach_gap` and
   `presence_set_mismatch`; at least 90% of attach claims settled
-  (`min_attach_coverage`); the tail check covering at least 50% of the
+  (`min_attach_coverage`, row "sample coverage (attach)"; a run that
+  settled no claim at all fails it, fault or not); the tail check covering at least 50% of the
   sampled streams (`min_tail_coverage`); a run that publishes with no
-  sampled channel that has a subscriber fails "sample coverage".
+  sampled channel that has a subscriber fails "sample coverage". A
+  presence-only run has no sampled message stream: its "loss, duplicate,
+  reorder on the sample" row reads "not applicable (no sampled message
+  streams)" instead of "0 of 0 checked", and the presence coverage and
+  presence correctness (`presence_set_mismatch`, NACKs) rows are its gates.
 - A presence run must have compared the end-of-hold REST member set of
   every sampled presence channel, with at least 90% of those members
   settled (`min_presence_compared`), no mismatch and no NACK.
-- The coverage checks above are reported, not gated, in a fault run.
+- No fault relaxes any of the correctness or coverage checks above.
 
 *Measurement credibility*
 
@@ -369,13 +376,28 @@ passes only if every gating check passes; "fault run" below means a
   linger, bus, storage shards, read from `/metrics`), and the shard count
   in the record is the nodes'. `summary.md` prints the flags in effect.
 - Node RSS and goroutines grow <= 10% from the growth baseline to the end
-  of the hold (reported, not gated, in a fault run).
+  of the hold.
 
-*Fault runs.* A `--fault-hook` relaxes the growth, load-steadiness,
-coverage, retry, unresolved, CPU and delivery-rate gates only when it ran
-and exited 0 (the surviving nodes take the dead node's load, its metrics
-stop). A hook that failed, or never ran before the run ended, relaxes
-nothing and is itself a failing check ("fault injection").
+*Fault runs.* `--fault-hook` needs `--fault-kind`, which says what the
+hook does. A fault that ran and exited 0 stops gating exactly the checks
+in its row below: they are still computed and printed, as reported rows.
+Every other gate keeps judging the run: loss, duplicates and reordering;
+sample coverage (attach, tail, presence) and presence correctness; publish
+retries and unresolved publishes; deliveries against the plan and
+connections open at the end of the hold; box CPU, clocks and server
+configuration. The table is `loadgen.FaultRelaxations`, and a test keeps
+the code equal to it:
+
+| Fault kind | Stops gating | Why |
+|---|---|---|
+| `node-kill` | node memory growth over hold; node goroutine growth over hold; generator load steady over hold; connect+attach p99; reconnect+attach p99 | The survivors take the killed node's connections, so their memory and goroutines grow and the generator's own connections drop and come back; those clients reconnect and re-attach in one burst. "node metrics coverage" still gates, but the one killed node may miss its end-of-hold sample (every node must still be sampled at hold start and baseline). |
+| `bus-kill` | delivery p99; REST publish ACK p99 | Messages between nodes ride the bus; while it fails over they are late (filled from storage) and publishes wait on it. The record has one histogram per hold, so the whole hold's p99 is reported rather than only the failover window's: quote latency from a fault-free run. |
+| `other` | nothing | |
+
+A hook that failed, or never ran before the run ended, relaxes nothing
+and makes the verdict **INVALID (fault not injected)** instead of a plain
+FAIL: the run did not test what its scenario said it would. Its "fault
+injection" row fails with the hook's exit code and output.
 `--allow-unmeasured` waives the node-metrics and CPU gates for a local run
 and is recorded as `unmeasured_waived`: such a run is not fit to quote.
 
@@ -430,14 +452,15 @@ them:
   was not a resume: an honoured resume keeps it, a declined one starts a
   new one.
 - **What the attach-point check cannot settle** is reported as
-  `unverifiable` and gated by coverage (at least 90% of claims settled
-  outside a fault run, `min_attach_coverage`): a claim whose stream has no
+  `unverifiable` and gated by coverage (at least 90% of claims settled,
+  `min_attach_coverage`, in every run): a claim whose stream has no
   serial log (the publisher is not a generator of that stream, or the
   process reached the 1.5M-entry cap), whose first sequence lies beyond the
   log (the log ends with the last acknowledgement before the end of the
   hold, so an attachment made after that cannot be settled), or whose
   needed serial is unknown (an ACK that carried none). A run that settles
-  none fails; it never passes on "0 of 0".
+  none fails "sample coverage (attach)"; it
+  never passes on "0 of 0".
 - **Residual blind spots.** A stream an attachment never received a single
   message from is invisible to the per-attachment and attach-point checks;
   only the tail check covers it, and only for streams still publishing at
@@ -463,8 +486,8 @@ operation was in flight before or after the fetch is skipped and counted
 (this process does not know their state), only their absence from the
 wrong channel is. The run fails unless every sampled channel was fetched
 and compared, at least 90% of the members on them were settled
-(`min_presence_compared`, waived after a successful fault), there were no
-mismatches and, outside a fault run, no presence NACKs. A presence run
+(`min_presence_compared`), there were no mismatches and no presence
+NACKs, after a fault too. A presence run
 that compared nothing fails "sample coverage (presence)": it never passes
 as 0 of 0. Not checked: SYNC contents received by members, presence event
 ordering, and member sets during the hold (only the end of it).
@@ -475,18 +498,33 @@ process that held a continuous attachment received. It skips a stream on
 a subscriber when the stream's last acknowledgement came less than
 `tail_margin` (1 s, the clock-skew allowance) after that subscriber's
 latest attach, because an attachment made then cannot be held to it. A
-check that skipped most streams proved little, so outside a fault run the
-run fails unless it checked at least one and at least 50%
+check that skipped most streams proved little, so the run fails unless it checked at least one and at least 50%
 (`min_tail_coverage`) of the plan's sampled streams (streams on sampled
-channels that have subscribers). `summary.md` prints the streams checked,
-the planned count and the (subscriber, stream) pairs skipped for the
-margin.
+channels that have subscribers). `summary.md` gives the check its own
+row, "tail check coverage": streams checked of planned with the
+fraction, the streams skipped for the margin, the rest (no continuous
+subscriber, or no acknowledgement), and the (subscriber, stream) pairs
+skipped for the margin.
+
+*Why 50% and not more.* The margin skips streams legitimately. Channel
+churn re-attaches subscribers all through the hold, so a subscriber's
+latest attach is often late; a slow stream (the long tail publishes about
+once per 100 s per channel) then has its last acknowledgement before that
+attach plus the margin and cannot be held to it, although nothing is
+wrong. In the committed shapes most streams are slow, so a high floor
+would fail healthy runs and teach people to loosen it. The floor is there
+to catch a check that covered nothing or almost nothing, not to measure
+loss: where a stream is checked the check is exact, and the two other
+checks (per attachment, and the attach point) do not depend on the
+margin. If a run's fraction sits near the floor, read the row: a large
+margin count is churn, a large "no continuous subscriber" count is
+attachments that never stayed up.
 
 **Unsampled channels.** `sample_percent` of channels (plus the first of
 every class) get the per-message checks; the other 95% in shapes F, M and
 D do not. Their only check is the deliveries-vs-plan gate: measured
-deliveries/s over the plan's, at least **99%** outside a fault run (90%
-in one that ran, `min_delivery_ratio_fault`). Loss on unsampled channels
+deliveries/s over the plan's, at least **99%** in every run, a fault run
+too. Loss on unsampled channels
 below 1% is therefore **not detected**, and `summary.md` says so with the
 gate's actual value. The sample is a hash of scenario name, class name
 and channel index, so it does not change with the run tag: the same
@@ -494,6 +532,45 @@ scenario samples the same channels in every run. (It does change if the
 scenario's name, class names or channel counts change.) The sampled
 channels that have at least one subscriber are the ones checked; the
 plan and the summary count them separately.
+
+**Old records.** `summary.json` carries a `version` (2 now). When
+`ably-conductor evaluate` reads a version 1 record it notes which newer
+inputs the JSON lacks (`not_recorded`: an absent key, not a zero; kept by
+`evaluate --write`, so a rewritten record reads the same). Against the
+last version 1 conductor, exactly this changes for such a record:
+
+- A row whose input is absent (attach-point results, the tail check's
+  sampled-stream count, node metrics coverage, harness CPU, clock
+  offsets, server flags, presence checks) prints "not recorded in this
+  run", shows `n/a` and never fails; `summary.md` says the record is older
+  than the conductor. A record that has the input is judged on it.
+- "attach-point check coverage" is now "sample coverage (attach)"; the
+  tail check row prints its fraction and skips by reason; a presence-only
+  run's message row reads "not applicable".
+- "reconnect+attach p99" is a new gate (the connect+attach limit) when the
+  record has reconnect samples.
+- A fault without a kind is relaxed exactly as version 1 relaxed any
+  successful fault: node growth and generator steadiness, the attach,
+  tail and presence coverage floors, presence NACKs, retries, unresolved
+  publishes, harness CPU, node metrics coverage, and deliveries against
+  the plan down to 90%. A hook that failed is a plain FAIL, as it was, not
+  INVALID.
+
+Nothing else changes, so a version 1 record keeps its verdict unless it
+has reconnect samples over the limit. A record from before the version 1
+conductor gained its newer gates (an early shape M run, say) is judged by
+those gates on the data it has: its deliveries are held to 99% of the
+plan, not the 90% it was written with, and its negative latency, retries
+and unresolved publishes gate. A run directory without `agents/` is
+judged on the merged result in its `summary.json`; one without node
+samples keeps its node statistics; one without an inventory keeps its
+footprint. Two tests pin this: a real full-scale shape M record of that
+early vintage (`internal/loadgen/testdata/legacy-shape-m`, node samples,
+error lines, host names and registry address removed) keeps every row's
+outcome and its FAIL; a version 1 record with every input and a kind-less
+fault, written and judged by the last version 1 conductor
+(`internal/loadgen/testdata/legacy-fault-all-inputs`), keeps every row and
+its PASS, and fails when its hook fails.
 
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
@@ -560,11 +637,10 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_connection_loss = 0.01
     max_negative_latency = 0.001 # in-window deliveries with negative latency from the send (clock skew)
     max_clock_offset = "5ms"     # generator box clock vs NTP, start and end of run (when measured)
-    max_retry_ratio = 0.01       # publish retries over first attempts (not in a fault run)
-    max_generator_cpu = 0.7      # busy CPU of any generator or publisher box over the hold (not in a fault run)
+    max_retry_ratio = 0.01       # publish retries over first attempts
+    max_generator_cpu = 0.7      # busy CPU of any generator or publisher box over the hold
     tail_margin = "1s"
     min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
-    min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded
     min_attach_coverage = 0.9    # share of attach claims the serial logs must settle
     min_tail_coverage = 0.5      # share of the plan's sampled streams the tail check must cover
     min_presence_compared = 0.9  # share of members on sampled presence channels settled when compared

@@ -446,6 +446,23 @@ func TestTailCheck(t *testing.T) {
 	}
 }
 
+func TestTailCheckCountsStreamsSkippedForTheMargin(t *testing.T) {
+	// Two subscriber processes hold ch. Stream p is skipped for the margin
+	// on the one that attached late and checked on the other: it is
+	// checked, not skipped. Stream q is skipped on both: one stream never
+	// checked, two pairs skipped.
+	early := map[string]*ChannelSeen{"ch": {LatestAttachUS: 1_000_000, Attachments: 1, MinMaxSeq: map[string]int64{"p": 9, "q": 3}}}
+	late := map[string]*ChannelSeen{"ch": {LatestAttachUS: 4_000_000, Attachments: 1, MinMaxSeq: map[string]int64{"p": 9, "q": 3}}}
+	pub := map[string]map[string]StreamRecord{"ch": {
+		"p": {LastAckedSeq: 9, LastAckedUS: 3_000_000},
+		"q": {LastAckedSeq: 3, LastAckedUS: 1_500_000},
+	}}
+	res := TailCheck(pub, []map[string]*ChannelSeen{early, late}, time.Second)
+	if res.StreamsChecked != 1 || res.StreamsSkippedMargin != 1 || res.SkippedMargin != 3 || res.Lost != 0 {
+		t.Fatalf("res=%+v, want 1 stream checked, 1 stream and 3 pairs skipped for the margin", res)
+	}
+}
+
 func TestTailCheckMinAcrossAttachmentsWithUnseenStream(t *testing.T) {
 	c := NewChecker()
 	a1 := c.NewAttachment("ch", "")
