@@ -549,3 +549,80 @@ func TestEvaluateTailCoverageThresholdAndFault(t *testing.T) {
 		t.Fatalf("skipped pairs and the reason must be printed:\n%s", rec.Markdown())
 	}
 }
+
+// presenceFixtureRecord is a presence-only run record that passed its
+// member-set check.
+func presenceRecord(mutate func(*RunRecord)) *RunRecord {
+	rec := &RunRecord{Plan: Totals{PresenceMembers: 12, PresenceSampled: 2}}
+	rec.Result.Presence = PresenceStats{
+		Members: 12, Entered: 12, ChecksPlanned: 2, ChecksDone: 2, MembersPlanned: 8, MembersCompared: 8,
+	}
+	rec.Result.Violations = map[string]int64{}
+	if mutate != nil {
+		mutate(rec)
+	}
+	Evaluate(rec, PassSpec{})
+	return rec
+}
+
+func TestEvaluatePresenceRun(t *testing.T) {
+	rec := presenceRecord(nil)
+	if !rec.Pass {
+		t.Fatalf("a presence run that compared its sets must pass: %v\n%s", failing(rec), rec.Markdown())
+	}
+	cases := []struct {
+		name   string
+		mutate func(*RunRecord)
+		want   string
+	}{
+		{"no presence check ran", func(r *RunRecord) {
+			r.Result.Presence.ChecksPlanned, r.Result.Presence.ChecksDone = 0, 0
+			r.Result.Presence.MembersPlanned, r.Result.Presence.MembersCompared = 0, 0
+		}, "sample coverage"},
+		{"a sampled channel was not compared", func(r *RunRecord) { r.Result.Presence.ChecksDone = 1 }, "sample coverage"},
+		{"a set could not be fetched", func(r *RunRecord) { r.Result.Presence.ChecksFailed = 1 }, "sample coverage"},
+		{"most members unsettled", func(r *RunRecord) { r.Result.Presence.MembersCompared = 4 }, "sample coverage"},
+		{"member-set mismatch", func(r *RunRecord) { r.Result.Violations["presence_set_mismatch"] = 1 }, "presence correctness"},
+		{"nack", func(r *RunRecord) { r.Result.Presence.Nacks = 1 }, "presence correctness"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := presenceRecord(c.mutate)
+			if rec.Pass {
+				t.Fatalf("want FAIL on %q\n%s", c.want, rec.Markdown())
+			}
+			found := false
+			for _, n := range failing(rec) {
+				found = found || strings.HasPrefix(n, c.want)
+			}
+			if !found {
+				t.Fatalf("failing %v, want %q", failing(rec), c.want)
+			}
+		})
+	}
+}
+
+func TestEvaluatePresenceNacksAreToleratedOnlyInASuccessfulFaultRun(t *testing.T) {
+	nacked := func(fault *FaultRecord) func(*RunRecord) {
+		return func(r *RunRecord) { r.Result.Presence.Nacks = 3; r.Fault = fault }
+	}
+	if rec := presenceRecord(nacked(&FaultRecord{Command: "kill", ExitCode: 0})); !rec.Pass {
+		t.Fatalf("nacks in a fault run: %v", failing(rec))
+	}
+	if rec := presenceRecord(nacked(&FaultRecord{Command: "kill", ExitCode: 1})); rec.Pass {
+		t.Fatal("a fault hook that failed relaxes nothing")
+	}
+}
+
+func TestEvaluatePublishingWithNoSampledChannelFailsSampleCoverage(t *testing.T) {
+	rec := evalFixture(t, func(_ []*Summary, r *RunRecord) {
+		r.Plan.SampledChannels, r.Plan.SampledSubscribed, r.Plan.SampledStreams = 0, 0, 0
+	})
+	found := false
+	for _, n := range failing(rec) {
+		found = found || n == "sample coverage"
+	}
+	if !found {
+		t.Fatalf("sample_percent = 0 with publishing must not pass as 0 of 0 checked: %v", failing(rec))
+	}
+}

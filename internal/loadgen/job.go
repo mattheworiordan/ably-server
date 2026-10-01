@@ -88,6 +88,8 @@ type counters struct {
 	presEntered, presLeft, presNacks, presReceived                              atomic.Int64
 	openAtEnd, attachedAtEnd, openAtStart, attachedAtStart                      atomic.Int64
 	serialsDropped                                                              atomic.Int64
+	presChecksPlanned, presChecksDone, presChecksFailed                         atomic.Int64
+	presMembersPlanned, presCompared, presIndeterminate                         atomic.Int64
 }
 
 // Job runs one role for one run.
@@ -447,6 +449,8 @@ func (j *Job) buildSummary() *Summary {
 		Presence: PresenceStats{
 			Members: j.presMembers, Entered: j.c.presEntered.Load(), Left: j.c.presLeft.Load(),
 			Nacks: j.c.presNacks.Load(), Received: j.c.presReceived.Load(),
+			ChecksPlanned: j.c.presChecksPlanned.Load(), ChecksDone: j.c.presChecksDone.Load(), ChecksFailed: j.c.presChecksFailed.Load(),
+			MembersPlanned: j.c.presMembersPlanned.Load(), MembersCompared: j.c.presCompared.Load(), Indeterminate: j.c.presIndeterminate.Load(),
 		},
 		Latency:     j.hist,
 		Correctness: j.checker.Summary(),

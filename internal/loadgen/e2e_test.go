@@ -410,6 +410,15 @@ func TestJobsEndToEnd(t *testing.T) {
 		if s.Role == loadgen.RolePresence && (s.Presence.Entered < int64(s.Presence.Members) || s.Presence.Left == 0) {
 			t.Errorf("presence: %+v", s.Presence)
 		}
+		if s.Role == loadgen.RolePresence {
+			// The end-of-hold member-set check ran against the real REST
+			// presence endpoint and found the sets as the members left them.
+			p := s.Presence
+			if p.ChecksPlanned == 0 || p.ChecksDone != p.ChecksPlanned || p.ChecksFailed != 0 || p.MembersCompared == 0 {
+				t.Errorf("presence member-set check: %+v", p)
+			}
+			t.Logf("presence check: %+v", p)
+		}
 	}
 	if received == 0 || acked == 0 || checked == 0 {
 		t.Fatalf("received=%d acked=%d checked=%d", received, acked, checked)

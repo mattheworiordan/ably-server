@@ -43,10 +43,16 @@ const (
 	// that stream. Computed by the conductor from the subscribers' attach
 	// claims and the publishers' serial logs (AttachCheck).
 	AttachGap
+	// PresenceSetMismatch: at the end of the hold, the REST presence set
+	// of a sampled presence channel disagreed with what the presence
+	// role believes it entered and left: a member it entered is missing,
+	// one it left is still there, or a client that is not a member of the
+	// channel is present. Counted by the presence role.
+	PresenceSetMismatch
 	numViolationKinds
 )
 
-var violationNames = [numViolationKinds]string{"duplicate", "gap", "reorder", "serial_regression", "resume_gap", "tail_loss", "attach_gap"}
+var violationNames = [numViolationKinds]string{"duplicate", "gap", "reorder", "serial_regression", "resume_gap", "tail_loss", "attach_gap", "presence_set_mismatch"}
 
 func (k ViolationKind) String() string {
 	if k >= 0 && k < numViolationKinds {
@@ -76,7 +82,10 @@ type Violation struct {
 	Serial     string `json:"serial,omitempty"`
 	LastSerial string `json:"last_serial,omitempty"`
 	Conn       string `json:"conn,omitempty"`
-	AtUS       int64  `json:"at_us"`
+	// Detail says more where the other fields cannot (a presence member
+	// and which way its set disagreed).
+	Detail string `json:"detail,omitempty"`
+	AtUS   int64  `json:"at_us"`
 }
 
 // MaxLoggedViolations is how many violations are kept verbatim.
@@ -642,6 +651,10 @@ func AttachCheck(published map[string]map[string]StreamRecord, claims []AttachCl
 
 // String renders a violation for logs.
 func (v Violation) String() string {
-	return fmt.Sprintf("%s channel=%s pub=%s seq=%d expected=%d count=%d serial=%s last=%s conn=%s",
+	out := fmt.Sprintf("%s channel=%s pub=%s seq=%d expected=%d count=%d serial=%s last=%s conn=%s",
 		v.Kind, v.Channel, v.PubID, v.Seq, v.Expected, v.Count, v.Serial, v.LastSerial, v.Conn)
+	if v.Detail != "" {
+		out += " " + v.Detail
+	}
+	return out
 }

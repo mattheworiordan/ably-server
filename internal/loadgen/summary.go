@@ -118,6 +118,18 @@ type PresenceStats struct {
 	Left     int64 `json:"left"`
 	Nacks    int64 `json:"nacks"`
 	Received int64 `json:"received"`
+	// Member-set check at the end of the hold (see presenceCheck):
+	// ChecksPlanned is the sampled presence channels with a member in
+	// this job (MembersPlanned: those members), ChecksDone those whose set was fetched and compared,
+	// ChecksFailed those that could not be fetched. MembersCompared counts
+	// members whose state was stable and so compared; Indeterminate those
+	// skipped because their connection or an operation was in flight.
+	ChecksPlanned   int64 `json:"checks_planned,omitempty"`
+	ChecksDone      int64 `json:"checks_done,omitempty"`
+	ChecksFailed    int64 `json:"checks_failed,omitempty"`
+	MembersPlanned  int64 `json:"members_planned,omitempty"`
+	MembersCompared int64 `json:"members_compared,omitempty"`
+	Indeterminate   int64 `json:"indeterminate,omitempty"`
 }
 
 // ResourceSample is one sample of the generator's own footprint.

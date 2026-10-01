@@ -211,6 +211,12 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 		pr.Left += s.Presence.Left
 		pr.Nacks += s.Presence.Nacks
 		pr.Received += s.Presence.Received
+		pr.ChecksPlanned += s.Presence.ChecksPlanned
+		pr.ChecksDone += s.Presence.ChecksDone
+		pr.ChecksFailed += s.Presence.ChecksFailed
+		pr.MembersPlanned += s.Presence.MembersPlanned
+		pr.MembersCompared += s.Presence.MembersCompared
+		pr.Indeterminate += s.Presence.Indeterminate
 		for k, v := range s.Correctness.Violations {
 			r.Violations[k] += v
 		}
@@ -468,6 +474,31 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		Note: fmt.Sprintf("tail check covered %d streams, attach-point check %d claims", res.Tail.Checked, res.Attach.Checked)})
 	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
+	}
+	if rec.Plan.PublishesPerSec > 0 && rec.Plan.SampledSubscribed == 0 {
+		// Publishing with no sampled channel that has a subscriber means no
+		// message was checked at all.
+		add(Check{Name: "sample coverage", Value: "no sampled channel has a subscriber", Limit: "> 0", Pass: false, Gating: true,
+			Note: "raise sample_percent"})
+	}
+	if rec.Plan.PresenceMembers > 0 {
+		pr := res.Presence
+		minCompared := spec.MinPresenceCompared
+		cov := 0.0
+		if pr.MembersPlanned > 0 {
+			cov = float64(pr.MembersCompared) / float64(pr.MembersPlanned)
+		}
+		ok := pr.ChecksPlanned > 0 && pr.ChecksDone >= int64(rec.Plan.PresenceSampled) && pr.ChecksFailed == 0 && pr.MembersCompared > 0
+		add(Check{Name: "sample coverage (presence)",
+			Value: fmt.Sprintf("%d of %d sampled presence channels compared (%d planned, %d fetch failures), %d of %d members settled (%.0f%%), %d indeterminate",
+				pr.ChecksDone, rec.Plan.PresenceSampled, pr.ChecksPlanned, pr.ChecksFailed, pr.MembersCompared, pr.MembersPlanned, cov*100, pr.Indeterminate),
+			Limit: fmt.Sprintf("every sampled channel, >= %.0f%% of members settled", minCompared*100),
+			Pass:  ok && (cov >= minCompared || faultRelaxed(rec)), Gating: true})
+		mism := res.Violations[PresenceSetMismatch.String()]
+		add(Check{Name: "presence correctness",
+			Value: fmt.Sprintf("%d nacks, %d member-set mismatches over %d members compared", pr.Nacks, mism, pr.MembersCompared),
+			Limit: "0 nacks, 0 mismatches", Pass: mism == 0 && (pr.Nacks == 0 || faultRelaxed(rec)), Gating: true,
+			Note: "end-of-hold REST presence set against the members' own enter and leave record"})
 	}
 	if rec.Plan.SampledStreams > 0 {
 		// The tail check is the only one that sees a stream an attachment

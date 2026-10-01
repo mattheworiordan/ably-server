@@ -204,6 +204,10 @@ type PassSpec struct {
 	// MinTailCoverage: the share of the plan's sampled streams the tail
 	// check must have covered (default 0.5), outside a fault run.
 	MinTailCoverage float64 `toml:"min_tail_coverage" json:"min_tail_coverage"`
+	// MinPresenceCompared: the share of members on sampled presence
+	// channels that must have been settled (connected, nothing in flight)
+	// when their set was compared (default 0.9), outside a fault run.
+	MinPresenceCompared float64 `toml:"min_presence_compared" json:"min_presence_compared"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -224,6 +228,7 @@ func DefaultPass() PassSpec {
 		MaxLoadDrift:          0.03,
 		MinAttachCoverage:     0.9,
 		MinTailCoverage:       0.5,
+		MinPresenceCompared:   0.9,
 	}
 }
 
@@ -274,6 +279,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinTailCoverage == 0 {
 		p.MinTailCoverage = d.MinTailCoverage
+	}
+	if p.MinPresenceCompared == 0 {
+		p.MinPresenceCompared = d.MinPresenceCompared
 	}
 	return p
 }
@@ -607,6 +615,16 @@ func (p *Plan) Sampled(c *ResolvedClass, j int) bool {
 	return hash64(p.Scenario.Name+"|"+c.Name+"|"+strconv.Itoa(j))%10000 < p.sampleCut
 }
 
+// PresenceSampled reports whether the member-set check covers presence
+// channel c: always the first, plus a deterministic SamplePercent of the
+// rest by hash (of scenario name and index, so not of the run tag).
+func (p *Plan) PresenceSampled(c int) bool {
+	if c == 0 {
+		return true
+	}
+	return hash64(p.Scenario.Name+"|presence|"+strconv.Itoa(c))%10000 < p.sampleCut
+}
+
 // PubID names stream l of a channel. It carries the run tag so two runs
 // never share an idempotency key.
 func (p *Plan) PubID(stream int) string {
@@ -639,6 +657,9 @@ type Totals struct {
 	ConnectsPerSec     float64 `json:"connects_per_sec"`
 	ChannelOpensPerSec float64 `json:"channel_opens_per_sec"`
 	PresenceMembers    int     `json:"presence_members"`
+	// PresenceSampled counts the presence channels whose member set is
+	// checked at the end of the hold.
+	PresenceSampled    int     `json:"presence_sampled_channels"`
 	PresenceEventsPerS float64 `json:"presence_events_per_sec"`
 	InboundBytesPerSec float64 `json:"inbound_bytes_per_sec"`
 }
@@ -669,6 +690,11 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 	}
 	if p.Presence.Enabled {
 		t.PresenceMembers = p.Presence.Channels * p.Presence.MembersPerChannel
+		for c := 0; c < p.Presence.Channels; c++ {
+			if p.PresenceSampled(c) {
+				t.PresenceSampled++
+			}
+		}
 		t.PresenceEventsPerS = p.Presence.EventsPerSec
 	}
 	var cts []ClassTotals

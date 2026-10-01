@@ -68,6 +68,9 @@ func TestScenarioFilesMatchThePlanTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if tot, _ := p.Totals(); tot.PresenceSampled < 2 || !p.PresenceSampled(0) {
+		t.Errorf("presence-m must compare the member sets of the first channel and a sample: %+v", tot)
+	}
 	if tot, _ := p.Totals(); tot.PresenceMembers != 1000000 || tot.PresenceEventsPerS != 1200 {
 		t.Errorf("presence totals %+v", tot)
 	}

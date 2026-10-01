@@ -302,7 +302,11 @@ attach p99 <= 500 ms at the target churn; zero violations of every kind
 on the sample (including `attach_gap`), with at least 90% of attach
 claims settled (`min_attach_coverage`) and the tail check covering at
 least 50% of the sampled streams (`min_tail_coverage`), both reported,
-not gated, in a fault run that succeeded; achieved publish rate >= 95% of offered and offered >=
+not gated, in a fault run that succeeded; a run that publishes with no
+sampled channel that has a subscriber fails "sample coverage"; a presence
+run must have compared the end-of-hold REST member set of every sampled
+presence channel with no mismatch and no NACK (NACKs tolerated after a
+successful fault); achieved publish rate >= 95% of offered and offered >=
 95% of target (the generator kept up); no rejected publishes;
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
@@ -376,6 +380,28 @@ them:
   stretch would not be seen as missing. A message published to a sampled
   channel by someone other than a generator stream is ignored.
 
+**Presence member sets.** The presence role checks its own record at
+the end of the hold. After churn stops and a short settle (up to 1 s of
+the drain) it fetches, for each sampled presence channel that has one of
+its members (the first channel always, plus `sample_percent` of the rest
+by a hash of the scenario name and index), the channel's member set over
+REST (`GET /channels/{name}/presence`, `limit=1000`, following the `Link`
+`rel="next"` pages), and compares it with what its members believe:
+a settled member that entered must be in the set (`missing`), one that is
+not entered must not be (`stale`), and a client that is not a member of
+that channel at all is `stray`. Each disagreement is one
+`presence_set_mismatch` violation. A member whose connection, attach or
+operation was in flight before or after the fetch is skipped and counted
+`indeterminate`; members owned by other presence processes are not judged
+(this process does not know their state), only their absence from the
+wrong channel is. The run fails unless every sampled channel was fetched
+and compared, at least 90% of the members on them were settled
+(`min_presence_compared`, waived after a successful fault), there were no
+mismatches and, outside a fault run, no presence NACKs. A presence run
+that compared nothing fails "sample coverage (presence)": it never passes
+as 0 of 0. Not checked: SYNC contents received by members, presence event
+ordering, and member sets during the hold (only the end of it).
+
 **Tail check coverage.** The tail check compares each publisher's last
 acknowledged message of a sampled stream with what every subscriber
 process that held a continuous attachment received. It skips a stream on
@@ -418,7 +444,8 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     nodes = 10                 # node count (node curve parameter)
     shards = 1                 # Postgres shards (shard curve parameter)
     message_bytes = 470
-    sample_percent = 5         # channels under the per-message checks (the rest: delivery-rate gate only)
+    sample_percent = 5         # channels under the per-message checks (the rest: delivery-rate gate only);
+                               # also the share of presence channels whose member set is compared
     server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline; absent or "0s" = 60s;
                                 # to measure growth from hold start pass --server-idle-timeout 0)
 
@@ -469,6 +496,7 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded
     min_attach_coverage = 0.9    # share of attach claims the serial logs must settle
     min_tail_coverage = 0.5      # share of the plan's sampled streams the tail check must cover
+    min_presence_compared = 0.9  # share of members on sampled presence channels settled when compared
     max_load_drift = 0.03        # generator connections and attachments, hold start to end
 
 `ably-conductor plan` prints the derived connections, attachments,
