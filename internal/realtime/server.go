@@ -140,8 +140,9 @@ type AppendTracking struct {
 	// messages that carry an append delta are recorded. Nil treats every
 	// channel as mutable.
 	Mutable func(channel string) bool
-	// SeenMax caps the serials one attachment records; the oldest are
-	// evicted first. Zero or less means DefaultAttachmentSeenMax.
+	// SeenMax caps the serials one attachment records; the least
+	// recently recorded are evicted first, a generation at a time
+	// (seenSet). Zero or less means DefaultAttachmentSeenMax.
 	SeenMax int
 }
 

@@ -2817,9 +2817,9 @@ delete:
   other channels record nothing, and nothing is recorded under
   `appendMode=full`. The record holds at most `--attachment-seen-max`
   serials (default 4096) per attachment, in two generations of half that
-  size; a serial is evicted when half the cap of other serials has been
-  recorded since it was last delivered, so a message that is still being
-  appended to stays. Eviction is safe by construction: a serial the
+  size; a serial is kept until at least half the cap of other serials has
+  been recorded since it was last recorded, so a message that is still
+  being appended to stays. Eviction is safe by construction: a serial the
   attachment does not hold is treated as not yet seen, so its next
   append is delivered as the full `action: update` aggregate, which is
   always a valid delivery under the conflation rule below. On a channel
