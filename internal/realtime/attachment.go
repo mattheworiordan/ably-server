@@ -787,7 +787,7 @@ func (a *attachment) resync(ctx context.Context) {
 	if !a.hasMode(protocol.FlagPresenceSubscribe) {
 		return
 	}
-	snap, err := a.stream.Channel().PresenceSync(ctx)
+	snap, err := a.stream.Channel().PresenceSyncNow(ctx)
 	if err != nil {
 		a.logger.Warn("presence resync: Members failed; skipping", "err", err)
 		return

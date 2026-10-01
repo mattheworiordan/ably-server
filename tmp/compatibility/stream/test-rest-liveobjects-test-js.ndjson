@@ -1,3 +1,0 @@
-{"event":"start","at":1790813490359}
-{"event":"fail","fullTitle":"rest/liveobjects \"before all\" hook in \"rest/liveobjects\"","duration":37,"err":"post: /channels/rest_liveobjects_fixtures/objects FAILED; http code = 404, error code = 40400, message = requested resource not found; operation = {\"counterCreate\":{}}"}
-{"event":"end","at":1790813490400,"stats":{"suites":1,"tests":0,"passes":0,"pending":0,"failures":1,"start":"2026-10-01T00:11:30.359Z","end":"2026-10-01T00:11:30.400Z","duration":41}}

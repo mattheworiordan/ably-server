@@ -1,6 +1,0 @@
-{"event":"start","at":1790813573530}
-{"event":"pass","fullTitle":"realtime/annotations publish and subscribe annotations","duration":9}
-{"event":"pass","fullTitle":"realtime/annotations annotation data payloads round-trip on an encrypted channel","duration":3}
-{"event":"pass","fullTitle":"realtime/annotations annotation data is encrypted on the wire on an encrypted channel","duration":3}
-{"event":"pass","fullTitle":"realtime/annotations get all annotations rest request","duration":4}
-{"event":"end","at":1790813573588,"stats":{"suites":1,"tests":4,"passes":4,"pending":0,"failures":0,"start":"2026-10-01T00:12:53.530Z","end":"2026-10-01T00:12:53.588Z","duration":58}}

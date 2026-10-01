@@ -1,3 +1,0 @@
-{"event":"start","at":1790813578199}
-{"event":"pass","fullTitle":"incremental backoff and jitter should calculate retry timeouts using incremental backoff and jitter","duration":1}
-{"event":"end","at":1790813578202,"stats":{"suites":1,"tests":1,"passes":1,"pending":0,"failures":0,"start":"2026-10-01T00:12:58.199Z","end":"2026-10-01T00:12:58.202Z","duration":3}}

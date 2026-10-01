@@ -1,3 +1,0 @@
-{"event":"start","at":1790813577092}
-{"event":"pass","fullTitle":"realtime/history history_until_attach","duration":17}
-{"event":"end","at":1790813577144,"stats":{"suites":1,"tests":1,"passes":1,"pending":0,"failures":0,"start":"2026-10-01T00:12:57.092Z","end":"2026-10-01T00:12:57.144Z","duration":52}}

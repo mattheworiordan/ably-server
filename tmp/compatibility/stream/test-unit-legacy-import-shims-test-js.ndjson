@@ -1,6 +1,0 @@
-{"event":"start","at":1790813577784}
-{"event":"pass","fullTitle":"legacy v1 import-path shims 'ably/promises' shim throws naming the v1 entry point, with a remediation pointing at the migration guide","duration":1}
-{"event":"pass","fullTitle":"legacy v1 import-path shims 'ably/callbacks' shim throws naming the v1 callback API, with a remediation pointing at the migration guide","duration":1}
-{"event":"pass","fullTitle":"legacy v1 import-path shims package.json exports map wires the legacy subpaths to the shim files and their types","duration":0}
-{"event":"pass","fullTitle":"legacy v1 import-path shims 'files' array ships the legacy shim files in the published package","duration":1}
-{"event":"end","at":1790813577789,"stats":{"suites":1,"tests":4,"passes":4,"pending":0,"failures":0,"start":"2026-10-01T00:12:57.784Z","end":"2026-10-01T00:12:57.789Z","duration":5}}

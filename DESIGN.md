@@ -2447,12 +2447,16 @@ of the store's set as of a serial:
   (last writer wins, the rule the SDK merge applies).
 - The encoded `SYNC` frame is **cached**: the snapshot is built once and
   encoded once per wire format, then shared by every attach until a
-  presence cm changes the set. It is rebuilt at most once per refresh
-  window (50 ms) while members keep changing: an attach that finds the
-  snapshot out of date but younger than the window waits out the rest of
-  it (at most 50 ms), and one rebuild then serves every attach that
-  waited. The snapshot is built after the attach's stream is opened, so
-  it is at or after the attach point.
+  presence cm changes the set. It is rebuilt at most about once per
+  refresh window (50 ms) while members keep changing: an attach that
+  finds the snapshot out of date but younger than the window waits out
+  the rest of it, then takes any snapshot built since it began (one
+  rebuild serves every attach that waited), or builds one. An attach
+  therefore waits at most one window however fast members change. Any
+  snapshot built after the attach's stream was opened is at or after the
+  attach point. A client-initiated `SYNC` (RTP19) is answered on the
+  connection's read loop, so it never waits: an out-of-date snapshot is
+  rebuilt at once.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
   If the seed read fails, that `SYNC` is read from the store and the next
   one tries to seed again. If the backend skips cms it cannot deliver (a

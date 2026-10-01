@@ -1,4 +1,0 @@
-{"event":"start","at":1790813577390}
-{"event":"pass","fullTitle":"rest/http Should send X-Ably-Version and Ably-Agent headers in get/post requests","duration":7}
-{"event":"pass","fullTitle":"rest/http Should handle no content responses","duration":1}
-{"event":"end","at":1790813577432,"stats":{"suites":1,"tests":2,"passes":2,"pending":0,"failures":0,"start":"2026-10-01T00:12:57.390Z","end":"2026-10-01T00:12:57.432Z","duration":42}}

@@ -445,3 +445,104 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 		t.Errorf("set = %v, want the fresh seed [c2:bob=b]", got)
 	}
 }
+
+// TestPresenceSyncWaitsAtMostOneWindow: members keep changing while an
+// attach waits. It must not wait again because the snapshot went out of
+// date once more: a snapshot built after it began is complete for it.
+func TestPresenceSyncWaitsAtMostOneWindow(t *testing.T) {
+	c, clk := testChannel(t, &membersStore{asOf: "010"}, "010")
+	ctx := context.Background()
+	if _, err := c.PresenceSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
+
+	var sleeps int
+	var other *PresenceSnapshot
+	c.mgr.sleep = func(_ context.Context, d time.Duration) error {
+		sleeps++
+		clk.ns.Add(int64(d))
+		// Meanwhile another attach rebuilds, and then the set changes
+		// again before this one wakes.
+		var err error
+		if other, err = c.PresenceSync(ctx); err != nil {
+			t.Error(err)
+		}
+		c.Append(presCM(fmt.Sprintf("%03d", 11+sleeps), op(protocol.PresenceEnter, fmt.Sprintf("c%d", 1+sleeps), "bob", "b")))
+		return nil
+	}
+	snap, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sleeps != 1 {
+		t.Errorf("waited %d times, want once", sleeps)
+	}
+	if snap != other {
+		t.Error("the waiter did not take the snapshot built while it waited")
+	}
+	if fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
+		t.Errorf("set = %v, want [c1:alice=a] (complete as of the attach)", setOf(snap.Members))
+	}
+}
+
+func TestPresenceSyncNowDoesNotWait(t *testing.T) {
+	c, _ := testChannel(t, &membersStore{asOf: "010"}, "010")
+	c.mgr.sleep = func(context.Context, time.Duration) error {
+		t.Error("PresenceSyncNow waited")
+		return nil
+	}
+	ctx := context.Background()
+	if _, err := c.PresenceSyncNow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
+	snap, err := c.PresenceSyncNow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
+		t.Errorf("set = %v, want a current [c1:alice=a]", setOf(snap.Members))
+	}
+}
+
+func TestPresenceSyncWaitCancelled(t *testing.T) {
+	c, _ := testChannel(t, &membersStore{asOf: "010"}, "010")
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := c.PresenceSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
+	c.mgr.sleep = func(ctx context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	}
+	if _, err := c.PresenceSync(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestPresenceSyncDiscontinuityDuringWait: the set is dropped while an
+// attach waits; it re-seeds and serves the store's set.
+func TestPresenceSyncDiscontinuityDuringWait(t *testing.T) {
+	store := &membersStore{asOf: "010"}
+	c, clk := testChannel(t, store, "010")
+	ctx := context.Background()
+	if _, err := c.PresenceSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
+	c.mgr.sleep = func(_ context.Context, d time.Duration) error {
+		clk.ns.Add(int64(d))
+		store.members, store.asOf = []*protocol.PresenceMessage{pres("012", 0, protocol.PresenceEnter, "c2", "bob", "b")}, "012"
+		c.Discontinuity()
+		return nil
+	}
+	snap, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(setOf(snap.Members)) != "[c2:bob=b]" || store.calls.Load() != 2 {
+		t.Errorf("set = %v after %d store reads, want the re-seeded [c2:bob=b] after 2", setOf(snap.Members), store.calls.Load())
+	}
+}

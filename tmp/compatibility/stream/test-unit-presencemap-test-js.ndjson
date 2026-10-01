@@ -1,5 +1,0 @@
-{"event":"start","at":1790813578092}
-{"event":"pass","fullTitle":"PresenceMap remove() should return false when no matching member present","duration":0}
-{"event":"pass","fullTitle":"PresenceMap remove() should return true when removing an (older) matching member","duration":0}
-{"event":"pass","fullTitle":"PresenceMap remove() should return false when trying to remove a newer matching member","duration":0}
-{"event":"end","at":1790813578094,"stats":{"suites":2,"tests":3,"passes":3,"pending":0,"failures":0,"start":"2026-10-01T00:12:58.092Z","end":"2026-10-01T00:12:58.094Z","duration":2}}

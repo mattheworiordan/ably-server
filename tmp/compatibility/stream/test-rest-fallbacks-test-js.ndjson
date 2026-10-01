@@ -1,6 +1,0 @@
-{"event":"start","at":1790813574047}
-{"event":"pass","fullTitle":"rest/fallbacks Store working fallback","duration":6010}
-{"event":"fail","fullTitle":"rest/fallbacks Should use the primary domain as the first attempted for every connection attempt","duration":3005,"err":"expected 'http://10.255.255.1:55476/time' to equal 'https://10.255.255.1:443/time'"}
-{"event":"pass","fullTitle":"rest/fallbacks Max elapsed time for host retries can timeout after default host","duration":1003}
-{"event":"pass","fullTitle":"rest/fallbacks Max elapsed time for host retries can timeout after fallback host retries","duration":2008}
-{"event":"end","at":1790813586117,"stats":{"suites":2,"tests":4,"passes":3,"pending":0,"failures":1,"start":"2026-10-01T00:12:54.047Z","end":"2026-10-01T00:13:06.117Z","duration":12070}}
