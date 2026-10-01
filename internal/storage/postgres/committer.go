@@ -76,6 +76,7 @@ func (cs *channelStore) storePresenceBatched(ctx context.Context, lanes *laneSet
 	}
 	p := newPending(ctx, cs.name)
 	p.cs, p.presence, p.static = cs, presence, storage.IsStaticPresence(ctx)
+	p.mustAdmit = storage.IsServerPresence(ctx)
 	p.checkIDs = len(p.ids()) > 0
 	return lanes.publish(p)
 }
@@ -568,8 +569,10 @@ func (r *batchRows) addLog(p *pending, channelSerial string, idx int, id string,
 
 // queue queues the batch's row statements on b: the log rows, the
 // projection rows, then the presence fold as one DELETE for the members
-// that left and one upsert for the rest. Each member appears once, and
-// both statements take the members' row locks in key order.
+// that left and one upsert for the rest. Each member appears once. Lock
+// order among the rows does not matter for deadlocks: every writer of a
+// room's presence rows holds the room's channels row lock first, and the
+// lease bump and reaper, which do not, skip locked rows.
 func (r *batchRows) queue(b *pgx.Batch, node string) {
 	if len(r.channel) > 0 {
 		b.Queue(`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, persisted)

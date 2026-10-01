@@ -1106,6 +1106,60 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("PresenceDeliveredInSerialOrder", func(t *testing.T) {
+		// Concurrent presence publishes on one channel reach its appender
+		// once each, in channelSerial order: a node's local member set,
+		// which SYNC is served from, folds them in that order and skips
+		// one that arrives behind a later one (DESIGN.md §12.4).
+		s := f(t)
+		app := newCapturingAppender()
+		ch, err := s.Channel(context.Background(), "room", app)
+		if err != nil {
+			t.Fatalf("Channel: %v", err)
+		}
+		const workers, each = 8, 25
+		var wg sync.WaitGroup
+		for w := range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range each {
+					action := protocol.PresenceEnter
+					if i%2 == 1 {
+						action = protocol.PresenceLeave
+					}
+					if _, _, err := ch.StorePresence(context.Background(), []*protocol.PresenceMessage{{
+						Action: action, ConnectionID: fmt.Sprintf("conn-%d", w), ClientID: fmt.Sprintf("c%d", w),
+					}}); err != nil {
+						t.Errorf("StorePresence: %v", err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			app.mu.Lock()
+			n := len(app.appends)
+			app.mu.Unlock()
+			if n >= workers*each || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		app.mu.Lock()
+		defer app.mu.Unlock()
+		if len(app.appends) != workers*each {
+			t.Fatalf("delivered %d cms, want %d", len(app.appends), workers*each)
+		}
+		for i := 1; i < len(app.appends); i++ {
+			if app.appends[i].ChannelSerial <= app.appends[i-1].ChannelSerial {
+				t.Fatalf("cm %d delivered out of order: %s after %s", i, app.appends[i].ChannelSerial, app.appends[i-1].ChannelSerial)
+			}
+		}
+	})
+
 	t.Run("PresenceAndMessageStreamsAreKindFiltered", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "room")

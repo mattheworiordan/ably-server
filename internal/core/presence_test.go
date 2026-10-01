@@ -369,3 +369,48 @@ func TestParsePresenceSyncSource(t *testing.T) {
 		t.Error("an unknown source was accepted")
 	}
 }
+
+// TestPresenceSyncDiscontinuityReseeds: when the backend skips cms it
+// could not deliver, the local set is dropped and the next SYNC seeds
+// it again from the store, including when the skip lands while a seed
+// read is in flight.
+func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
+	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
+	c, _ := testChannel(t, store, "005")
+	ctx := context.Background()
+	if _, _, err := c.PresenceSync(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// A LEAVE for alice was skipped; the store no longer has her.
+	store.members, store.asOf = nil, "007"
+	c.Discontinuity()
+	snap, _, err := c.PresenceSync(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Members) != 0 || store.calls.Load() != 2 {
+		t.Errorf("after a discontinuity: set %v with %d store reads, want empty after a re-seed", setOf(snap.Members), store.calls.Load())
+	}
+
+	// A discontinuity during the seed read discards that read.
+	c.Discontinuity()
+	store.release, store.entered = make(chan struct{}), make(chan struct{})
+	store.calls.Store(0)
+	done := make(chan *PresenceSnapshot, 1)
+	go func() {
+		snap, _, _ := c.PresenceSync(ctx, "")
+		done <- snap
+	}()
+	<-store.entered
+	c.Discontinuity()
+	store.members, store.asOf = []*protocol.PresenceMessage{pres("009", 0, protocol.PresenceEnter, "c2", "bob", "b")}, "009"
+	close(store.release)
+	snap = <-done
+	if n := store.calls.Load(); n != 2 {
+		t.Errorf("store reads = %d, want 2 (the interrupted seed, then a fresh one)", n)
+	}
+	if got := setOf(snap.Members); fmt.Sprint(got) != "[c2:bob=b]" {
+		t.Errorf("set = %v, want the fresh seed [c2:bob=b]", got)
+	}
+}

@@ -94,6 +94,10 @@ type pending struct {
 	// static marks fixture members, stored with a non-expiring lease.
 	presence []*protocol.PresenceMessage
 	static   bool
+	// mustAdmit exempts a server-synthesised presence publish from the
+	// queue bound: nothing retries it, and a dropped LEAVE leaves its
+	// member behind (DESIGN.md §12.5).
+	mustAdmit bool
 	// checkIDs is true when the ids were supplied by the client, so the
 	// publish must be checked for idempotency; server-generated ids are
 	// unique by construction and skip the lookup. Presence ids are always
@@ -271,7 +275,7 @@ func (l *lane) submit(p *pending) error {
 		// they are taken; reclaim them before refusing a live one.
 		l.reapLocked()
 	}
-	if len(l.queue) >= l.opts.QueueMax {
+	if len(l.queue) >= l.opts.QueueMax && !p.mustAdmit {
 		l.metrics.nacks.WithLabelValues("queue_full").Inc()
 		return storage.ErrOverloaded
 	}
@@ -322,12 +326,14 @@ func (l *lane) armTimerLocked(d time.Duration) {
 
 // takeLocked removes and returns up to BatchMax queued publishes whose
 // channels are not in flight, in queue order. Publishes whose caller has
-// already given up are dropped, whether or not their channel is busy.
+// already given up are dropped, whether or not their channel is busy,
+// except server-synthesised presence (mustAdmit): a LEAVE whose bounded
+// caller stopped waiting must still be stored, or its member stays.
 func (l *lane) takeLocked() []*pending {
 	var batch, rest []*pending
 	for _, p := range l.queue {
 		switch {
-		case p.ctx.Err() != nil:
+		case p.ctx.Err() != nil && !p.mustAdmit:
 			p.finish(pendingResult{err: p.ctx.Err()})
 		case len(batch) >= l.opts.BatchMax, l.busy[p.channel] > 0:
 			rest = append(rest, p)
@@ -344,7 +350,7 @@ func (l *lane) takeLocked() []*pending {
 func (l *lane) reapLocked() {
 	kept := l.queue[:0]
 	for _, p := range l.queue {
-		if p.ctx.Err() != nil {
+		if p.ctx.Err() != nil && !p.mustAdmit {
 			p.finish(pendingResult{err: p.ctx.Err()})
 			continue
 		}

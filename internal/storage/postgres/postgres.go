@@ -770,7 +770,7 @@ func (s *Storage) reapExpiredPresence(ctx context.Context) {
 			ClientID:     o.clientID,
 			ConnectionID: o.connID,
 		}
-		if _, _, err := cs.StorePresence(ctx, []*protocol.PresenceMessage{leave}); err != nil && ctx.Err() == nil {
+		if _, _, err := cs.StorePresence(storage.WithServerPresence(ctx), []*protocol.PresenceMessage{leave}); err != nil && ctx.Err() == nil {
 			s.logger.Warn("storage/postgres: presence reap LEAVE failed", "channel", o.channel, "err", err)
 		} else if err == nil {
 			s.logger.Debug("storage/postgres: reaped orphaned presence member", "channel", o.channel, "clientId", o.clientID, "connectionId", o.connID)
@@ -1498,7 +1498,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	// transaction, including any wait on the room's row lock. Past the
 	// bound it is refused at once rather than queued, so SYNC reads and
 	// publishes always find a connection (DESIGN.md §12.5).
-	if cs.presenceSlots != nil {
+	// Server-synthesised presence (a LEAVE nothing would retry) is exempt.
+	if cs.presenceSlots != nil && !storage.IsServerPresence(ctx) {
 		select {
 		case cs.presenceSlots <- struct{}{}:
 			defer func() { <-cs.presenceSlots }()

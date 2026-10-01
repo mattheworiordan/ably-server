@@ -97,6 +97,9 @@ type memberView struct {
 	seeded  bool
 	seeding chan struct{} // non-nil while a seed read is in flight; closed when it ends
 	buffer  []*protocol.ChannelMessage
+	// gen counts discontinuities; a seed read started under an older gen
+	// is discarded.
+	gen int
 
 	members map[string]*protocol.PresenceMessage // by storage.MemberKey
 	asOf    string                               // the set is the fold of every cm up to here
@@ -273,6 +276,7 @@ func (c *Channel) seedMembers(ctx context.Context) error {
 		}
 		done := make(chan struct{})
 		c.pv.seeding, c.pv.buffer = done, nil
+		gen := c.pv.gen
 		c.mu.Unlock()
 
 		members, asOf, err := c.store.Members(ctx)
@@ -284,6 +288,12 @@ func (c *Channel) seedMembers(ctx context.Context) error {
 			c.pv.buffer = nil
 			c.mu.Unlock()
 			return err
+		}
+		if c.pv.gen != gen {
+			// A discontinuity during the read: the buffer misses cms the
+			// read may not have seen. Seed again.
+			c.pv.buffer = nil
+			continue
 		}
 		c.pv.members = make(map[string]*protocol.PresenceMessage, len(members))
 		for _, p := range members {
@@ -298,4 +308,14 @@ func (c *Channel) seedMembers(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// Discontinuity drops the local member set: the storage backend skipped
+// cms it could not deliver (storage.Discontinuous), so the set may miss
+// presence operations. The next SYNC seeds it again from the store.
+func (c *Channel) Discontinuity() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seeding := c.pv.seeding
+	c.pv = memberView{gen: c.pv.gen + 1, seeding: seeding}
 }

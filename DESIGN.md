@@ -1404,14 +1404,19 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   removes it, a LEAVE then an ENTER keeps it with the ENTER's data. The
   fold is then one `DELETE` for the members that left and one
   `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node and fresh
-  lease, or the fixture sentinel and an `'infinity'` lease, §12.5), both
-  in member-key order. Every writer of a room's `presence` rows holds the
-  room's channels row lock, so two batches never contend on them; the
-  lease bump and the reaper, which do not, skip rows locked by a writer
-  (`FOR UPDATE SKIP LOCKED`), so neither can deadlock with a batch.
-  A retried batch re-checks presence ids like message ids; a synthesised
-  LEAVE, having none, may be stored twice if the first attempt's COMMIT
-  landed, which delivers a second LEAVE for a member already gone.
+  lease, or the fixture sentinel and an `'infinity'` lease, §12.5). Every
+  writer of a room's `presence` rows holds the room's channels row lock
+  first, so two batches never contend on them; the lease bump and the
+  reaper, which do not, skip rows locked by a writer (`FOR UPDATE SKIP
+  LOCKED`), so neither can deadlock with a batch.
+  A retried batch re-checks presence ids like message ids. A synthesised
+  LEAVE or a fixture ENTER has no id, so it may be stored twice if the
+  first attempt's COMMIT landed: a second LEAVE for a member already
+  gone, or a second ENTER that upserts the same row. Presence the server
+  synthesises (a teardown, grace or reaper LEAVE, a fixture member) is
+  queued even past `--publish-queue-max`, and still committed if its
+  bounded caller stops waiting first: nothing retries it, and a dropped
+  LEAVE would leave its member behind.
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -2452,7 +2457,12 @@ of the store's set as of a serial:
   snapshot.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
   If the seed read fails, that `SYNC` is read from the store and the next
-  one tries to seed again.
+  one tries to seed again. If the backend skips cms it cannot deliver (a
+  chaining bus's gap the log no longer holds, §7.2), it tells the channel,
+  which drops the set so the next `SYNC` seeds again; a seed read in
+  flight at that moment is discarded. The memory and disk backends
+  deliver each presence cm under the lock that mints it, so their cms
+  also arrive in serial order.
 
 In `store` mode every `SYNC` reads `Members` from the store, as before the
 local set existed. Either way the store's set stays authoritative (§12.5):
@@ -2487,7 +2497,10 @@ into it transactionally and `Members` reads it (§6). Per backend:
   `--publish-lanes=0`) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
   per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
-  16 when batching is off): one beyond the bound is refused at once with
+  16 when batching is off; server-synthesised LEAVEs are exempt, as in
+  the lanes, §6.3, so a mass disconnect with batching off can still hold
+  many pool connections with LEAVEs, as before the bound existed): one
+  beyond the bound is refused at once with
   Ably error **42910** (a NACK; the client should back off and retry) and
   counted in `ably_publish_nacks_total{reason="presence_inflight"}`, so a
   convoy on one hot room cannot starve the pool that `SYNC` seeds, binds

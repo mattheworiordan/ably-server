@@ -293,6 +293,20 @@ func TestPresenceInflightBoundRefusesPromptly(t *testing.T) {
 				t.Errorf("third ENTER refused after %v, want at once", d)
 			}
 
+			// A server-synthesised LEAVE (a teardown's, say) is exempt: it
+			// waits for the lock like the ENTERs rather than being refused,
+			// since nothing would retry it.
+			leaveErr := make(chan error, 1)
+			go func() {
+				_, _, err := room.StorePresence(storage.WithServerPresence(ctx), []*protocol.PresenceMessage{{Action: protocol.PresenceLeave, ConnectionID: "c0", ClientID: "zed"}})
+				leaveErr <- err
+			}()
+			select {
+			case err := <-leaveErr:
+				t.Fatalf("server LEAVE returned during the stall: %v, want it to wait", err)
+			case <-time.After(300 * time.Millisecond):
+			}
+
 			// Attach-path work is not blocked behind the convoy.
 			opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -315,14 +329,96 @@ func TestPresenceInflightBoundRefusesPromptly(t *testing.T) {
 					t.Errorf("waiting ENTER: %v", err)
 				}
 			}
+			if err := <-leaveErr; err != nil {
+				t.Errorf("server LEAVE: %v", err)
+			}
 			members, _, err := room.Members(ctx)
 			if err != nil {
 				t.Fatalf("Members: %v", err)
 			}
-			if len(members) != 3 {
-				t.Errorf("%d members, want zed, m1 and m2", len(members))
+			if len(members) != 2 {
+				t.Errorf("%d members, want m1 and m2 (zed left)", len(members))
 			}
 		})
+	}
+}
+
+// TestPresenceServerLeaveAdmittedPastQueueBound: with a lane's queue
+// full, a client ENTER is refused with storage.ErrOverloaded, but a
+// server-synthesised LEAVE is still queued, and committed even though
+// its caller (a teardown on a bounded context) gives up waiting first:
+// nothing retries it, and dropping it would leave its member behind
+// (DESIGN.md §12.5).
+func TestPresenceServerLeaveAdmittedPastQueueBound(t *testing.T) {
+	c := pgtest.Start(t)
+	ctx := context.Background()
+	s := openOpts(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 1, QueueMax: 1}})
+	room, err := s.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	enter := func(conn string) []*protocol.PresenceMessage {
+		return []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, ConnectionID: conn, ClientID: conn}}
+	}
+
+	gate := make(chan struct{})
+	var first atomic.Bool
+	SetCommitBatchHook(func() error {
+		if first.CompareAndSwap(false, true) {
+			<-gate
+		}
+		return nil
+	})
+	defer SetCommitBatchHook(nil)
+
+	errs := make(chan error, 3)
+	store := func(ctx context.Context, p []*protocol.PresenceMessage) {
+		_, _, err := room.StorePresence(ctx, p)
+		errs <- err
+	}
+	go store(ctx, enter("c0")) // the held batch
+	waitFor(t, 5*time.Second, "the first batch to start", first.Load)
+	go store(ctx, enter("c1")) // fills the queue
+	lane := s.lanes.laneFor("room")
+	waitFor(t, 5*time.Second, "the queue to fill", func() bool {
+		lane.mu.Lock()
+		defer lane.mu.Unlock()
+		return len(lane.queue) == 1
+	})
+	if _, _, err := room.StorePresence(ctx, enter("c2")); !errors.Is(err, storage.ErrOverloaded) {
+		t.Fatalf("client ENTER on a full queue: err = %v, want storage.ErrOverloaded", err)
+	}
+	leaveCtx, giveUp := context.WithCancel(storage.WithServerPresence(ctx))
+	leaveErr := make(chan error, 1)
+	go func() {
+		_, _, err := room.StorePresence(leaveCtx, []*protocol.PresenceMessage{{Action: protocol.PresenceLeave, ConnectionID: "c0", ClientID: "c0"}})
+		leaveErr <- err
+	}()
+	waitFor(t, 5*time.Second, "the server LEAVE to be queued past the bound", func() bool {
+		lane.mu.Lock()
+		defer lane.mu.Unlock()
+		return len(lane.queue) == 2
+	})
+	giveUp()
+	if err := <-leaveErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("server LEAVE caller: err = %v, want context.Canceled once it gives up", err)
+	}
+	close(gate)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Errorf("StorePresence: %v", err)
+		}
+	}
+	waitFor(t, 5*time.Second, "the abandoned server LEAVE to commit", func() bool {
+		members, _, err := room.Members(ctx)
+		return err == nil && len(members) == 1
+	})
+	members, _, err := room.Members(ctx)
+	if err != nil {
+		t.Fatalf("Members: %v", err)
+	}
+	if len(members) != 1 || members[0].ClientID != "c1" {
+		t.Errorf("members = %v, want only c1", members)
 	}
 }
 

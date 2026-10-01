@@ -7,6 +7,7 @@ import (
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // wildcardClientID is the §3.2 marker meaning "the bearer may assume any
@@ -233,7 +234,7 @@ func (c *connection) publishLeaves(ctx context.Context, channel string, set map[
 			ConnectionID: c.id,
 		})
 	}
-	if _, _, err := ch.PublishPresence(ctx, leaves); err != nil {
+	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leaves); err != nil {
 		c.logger.Warn("teardown leave publish failed", "channel", channel, "err", err)
 	}
 }

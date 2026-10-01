@@ -144,6 +144,43 @@ func TestChainSkipsAGapTheLogNoLongerHolds(t *testing.T) {
 	}
 }
 
+// discontinuityRecorder is a chainRecorder that also counts
+// Discontinuity calls (storage.Discontinuous).
+type discontinuityRecorder struct {
+	chainRecorder
+	discontinuities int
+}
+
+func (r *discontinuityRecorder) Discontinuity() { r.discontinuities++ }
+
+// TestChainSkippedGapSignalsDiscontinuity: a gap the log no longer holds
+// is skipped, and the appender is told, so a node's local presence
+// member set (DESIGN.md §12.4) re-seeds rather than miss the skipped
+// cms for good. A gap that is filled is not a discontinuity.
+func TestChainSkippedGapSignalsDiscontinuity(t *testing.T) {
+	cs, _ := newTestChain(t)
+	rec := &discontinuityRecorder{}
+	cs.appender = rec
+	cs.seed("s0")
+	cs.deliverChained(ev("s2", "s1"))
+	cs.hwmMu.Lock()
+	cs.applyRangeLocked([]*protocol.ChannelMessage{{ChannelSerial: "s1"}, {ChannelSerial: "s2"}}, "s2")
+	cs.hwmMu.Unlock()
+	if rec.discontinuities != 0 {
+		t.Fatalf("a filled gap signalled %d discontinuities", rec.discontinuities)
+	}
+	cs.deliverChained(ev("s4", "s3"))
+	cs.hwmMu.Lock()
+	cs.applyRangeLocked(nil, "s4")
+	cs.hwmMu.Unlock()
+	if rec.discontinuities != 1 {
+		t.Errorf("a skipped gap signalled %d discontinuities, want 1", rec.discontinuities)
+	}
+	if want := []string{"s1", "s2", "s4"}; !slices.Equal(rec.serials, want) {
+		t.Errorf("delivered %v, want %v", rec.serials, want)
+	}
+}
+
 func TestNATSEnvelopeRoundTrip(t *testing.T) {
 	cm := &protocol.ChannelMessage{
 		ChannelSerial: "00000000000001-000@abc",

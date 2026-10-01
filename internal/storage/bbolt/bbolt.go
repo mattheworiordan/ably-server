@@ -851,12 +851,13 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 				cs.members[key] = p
 			}
 		}
-	}
-	cs.mu.Unlock()
-
-	if !idempotent {
+		// Delivered under cs.mu, so concurrent presence publishes reach
+		// the appender in serial order, as the local member set that SYNC
+		// is served from requires (DESIGN.md §12.4). The memory backend
+		// does the same; cs.mu is never taken under the appender's lock.
 		cs.deliver(resultCM)
 	}
+	cs.mu.Unlock()
 	return resultCM, idempotent, nil
 }
 
