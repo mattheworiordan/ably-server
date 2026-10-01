@@ -249,6 +249,45 @@ func TestEvictionHeldOffByPresenceMember(t *testing.T) {
 	}
 }
 
+// TestDiscontinuityReleasesEvictionHold: a member whose ENTER reached
+// the node holds its channel against eviction until its LEAVE arrives
+// (DESIGN.md §5.1). If the storage then signals a discontinuity (the
+// LEAVE may have fallen in the gap), the hold set restarts from the cms
+// delivered after it, so the member no longer pins the channel for ever;
+// a member that enters after the gap holds it again.
+func TestDiscontinuityReleasesEvictionHold(t *testing.T) {
+	st := newTrackingStorage(t)
+	m, clk := newEvictingManager(t, st)
+	ch := mustGetChannel(t, m, "gap")
+	ctx := context.Background()
+	enter := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "c1", ConnectionID: "conn1"}
+	if _, _, err := ch.PublishPresence(ctx, []*protocol.PresenceMessage{enter}); err != nil {
+		t.Fatalf("enter: %v", err)
+	}
+	clk.advance(10 * testIdle)
+	if n := m.sweep(); n != 0 {
+		t.Fatalf("sweep evicted %d channels with a presence member", n)
+	}
+
+	// The member's LEAVE is lost in a gap the storage reports.
+	ch.Discontinuity(storage.DiscontinuityRetention)
+	clk.advance(testIdle)
+	if n := m.sweep(); n != 1 {
+		t.Fatalf("sweep after the discontinuity evicted %d, want 1 (the hold set still pinned it)", n)
+	}
+
+	// A member entering after the gap holds the rebound channel again.
+	ch = mustGetChannel(t, m, "gap")
+	enter2 := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "c2", ConnectionID: "conn2"}
+	if _, _, err := ch.PublishPresence(ctx, []*protocol.PresenceMessage{enter2}); err != nil {
+		t.Fatalf("enter after the gap: %v", err)
+	}
+	clk.advance(10 * testIdle)
+	if n := m.sweep(); n != 0 {
+		t.Fatalf("sweep evicted %d channels with a member entered after the gap", n)
+	}
+}
+
 func TestEvictionStaleChannelRebindsTransparently(t *testing.T) {
 	st := newTrackingStorage(t)
 	m, clk := newEvictingManager(t, st)

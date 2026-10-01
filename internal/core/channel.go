@@ -144,9 +144,9 @@ type Channel struct {
 	// members is the set of presence members this Channel has seen
 	// enter and not yet leave, keyed by storage.MemberKey. It is fed by
 	// Append, so it counts every member whose ENTER reached this node
-	// since the channel was bound, whichever node owns the member. A
-	// channel with members is not evicted (DESIGN.md §5.1). Nil when
-	// empty. Guarded by mu.
+	// since the channel was bound (or since the last discontinuity, which
+	// clears it), whichever node owns the member. A channel with members
+	// is not evicted (DESIGN.md §5.1). Nil when empty. Guarded by mu.
 	members map[string]struct{}
 	// pv is the local member set SYNC is served from (presence.go,
 	// DESIGN.md §12.4). Unlike members it holds the whole set, seeded from
@@ -555,7 +555,10 @@ func (c *Channel) link(cm *protocol.ChannelMessage) *entry {
 // appended and the next (DESIGN.md §7.2). Under mu, so in order with
 // Append, it drops the local member set, which may miss presence
 // operations (the next SYNC seeds it again from the store, §12.4), and
-// links a discontinuity marker at the tail of the live list, so every
+// the eviction hold set (members), which may hold a member whose LEAVE
+// fell in the gap and so would keep the channel bound for ever (§5.1);
+// it restarts from the cms delivered after the gap. It then links a
+// discontinuity marker at the tail of the live list, so every
 // Stream sees it between the cms before and after it (Stream.
 // Discontinuity) and its attachment can tell the client. Before
 // Initialize there is no Stream to tell, so only the set is dropped.
@@ -563,6 +566,7 @@ func (c *Channel) Discontinuity(reason storage.DiscontinuityReason) {
 	c.metrics.ChannelDiscontinuity(string(reason))
 	c.mu.Lock()
 	c.dropMemberViewLocked()
+	c.members = nil
 	if c.tail.cm == nil {
 		c.mu.Unlock()
 		return

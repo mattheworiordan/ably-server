@@ -888,6 +888,13 @@ evicts a Channel once all of these hold:
   members on other nodes whose ENTER reached this node), and
 - it has been in that state for the idle timeout.
 
+A discontinuity (§7.2) clears that member set along with the presence
+view: a member whose LEAVE fell in the gap would otherwise hold the
+channel bound for the life of the process. The set restarts from the
+cms delivered after the gap, so a member that entered before it and is
+still present no longer holds the channel; the cost is at most an
+eviction and a rebind, which seeds from the store.
+
 Eviction drops the Channel (its live list and the storage facet pointer)
 and calls `Storage.Release(ctx, name)`, which unbinds the Appender and
 frees the backend's per-channel state in this process while keeping all
