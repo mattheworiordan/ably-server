@@ -5,4 +5,6 @@
 # Local task-tracking notes, not published
 /backlog/
 results/
+# bench/aws state, log and results: STATE.json holds the database password and the API key
+/bench/aws/state/
 /bin/

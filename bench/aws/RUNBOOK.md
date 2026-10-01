@@ -210,11 +210,11 @@ Optional, with defaults:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PROJECT_TAG` | `ably-server-scale` | Tag value on every resource and prefix of every name. Teardown deletes by it. |
+| `PROJECT_TAG` | `ably-server-scale-<your user name>` | Tag value on every resource and prefix of every name. Teardown deletes by it, so the default carries your user name: two people in one account never delete each other's fleet. Set it explicitly to share one on purpose. |
 | `AZ` | `${AWS_REGION}a` | The one Availability Zone. |
-| `STATE_FILE` | `~/Workshop/work/research/ably-server-scale-proof-2026-10/STATE.json` | Resource ids, image tags, run records, spend estimate. Keep it out of the repository: it holds the database password and the API key. |
-| `LOG_FILE` | `.../LOG.md` next to the state file | One line per completed step. |
-| `RESULTS_DIR` | `.../results` next to the state file | Raw results per run. |
+| `STATE_FILE` | `bench/aws/state/STATE.json` (git-ignored, directory mode 0700) | Resource ids, image tags, run records, spend estimate. **It holds the database password and the API key**: never commit it, paste it or put it where others read it. |
+| `LOG_FILE` | `bench/aws/state/LOG.md` | One line per completed step. |
+| `RESULTS_DIR` | `bench/aws/state/results` | Raw results per run. |
 | `BUDGET_ALARM_USD`, `BUDGET_CAP_USD` | 750, 1500 | Warning and cap. |
 | `BUDGET_METHOD` | `cloudwatch` | `cloudwatch`: CloudWatch billing alarms with an SNS topic (the role can create and read them). `budgets`: an AWS Budget (created, but the role cannot read it back; preflight warns). `auto`: CloudWatch, else Budgets. The local estimate and `FLEET_MAX_UPTIME_H` are the guards that act either way. |
 | `BUDGET_SCOPE` | `account` | Budgets only. `account` counts everything in the account. `tag` counts only spend tagged `Project=$PROJECT_TAG`, but sees nothing until the `Project` cost allocation tag is activated in Billing (up to a day). |
@@ -492,10 +492,12 @@ these settings; change the settings, then run the scenario:
 | 8 shard curve | `SHARDS=3 PG_STORAGE=io2 bench/aws/20-postgres.sh` and `RECONFIGURE=1` with the sharding flag in `ABLY_SERVER_EXTRA_FLAGS` |
 
 Watch a run from your machine through an SSH tunnel (the UIs listen on the
-conductor's loopback only):
+conductor's loopback only). The snippets here and in section 6 read `PROJECT_TAG` and
+`STATE_FILE` from your shell; if you never set them, the scripts used
+`ably-server-scale-$(id -un | tr A-Z a-z)` and `bench/aws/state/STATE.json`:
 
     ssh -i "${SSH_PRIVATE_KEY_PATH:-${SSH_PUBLIC_KEY_PATH%.pub}}" -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 \
-      ec2-user@"$(jq -r ".instances[\"${PROJECT_TAG:-ably-server-scale}-conductor-1\"].public_ip" "$STATE_FILE")"
+      ec2-user@"$(jq -r ".instances[\"${PROJECT_TAG:?set PROJECT_TAG to the value you ran with}-conductor-1\"].public_ip" "$STATE_FILE")"
     # Grafana:    http://localhost:3000  (user admin, password: jq -r .grafana_password "$STATE_FILE")
     # Prometheus: http://localhost:9090
 
@@ -537,14 +539,14 @@ that the fleet is up, what it costs an hour and why. The dead-man switch
 2. If it reports something still present, read the line: a security group that will not delete is usually waiting for a network interface to detach; wait a minute and run it again.
 3. Without the scripts (or to double-check), list everything tagged for the project. `bench/aws/cost-estimate.sh` does this too and warns about instances and volumes STATE does not know. The tagging API is the first attempt:
 
-       aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values="${PROJECT_TAG:-ably-server-scale}" \
+       aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values="${PROJECT_TAG:?set PROJECT_TAG to the value you ran with}" \
          --query 'ResourceTagMappingList[].ResourceARN' --output text
 
    Terminated instances can stay in that list for about an hour. The Operator role is denied `tag:GetResources`
    (AccessDenied); teardown and `cost-estimate.sh` then ask each service, which you can do by hand too
    (add `--region "$AWS_REGION"`; the last two are in `BILLING_REGION`, us-east-1):
 
-       P="${PROJECT_TAG:-ably-server-scale}"
+       P="${PROJECT_TAG:?set PROJECT_TAG to the value you ran with}"
        aws ec2 describe-instances --filters Name=tag:Project,Values=$P Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text
        aws ec2 describe-volumes --filters Name=tag:Project,Values=$P --query 'Volumes[].VolumeId' --output text
        aws ec2 describe-security-groups --filters Name=tag:Project,Values=$P --query 'SecurityGroups[].GroupId' --output text
