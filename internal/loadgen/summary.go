@@ -5,7 +5,8 @@ const SummaryVersion = 1
 
 // Latency histogram names used in summaries.
 const (
-	LatDelivery          = "delivery"            // every generator message, measurement window
+	LatDelivery          = "delivery"            // every generator message, measurement window; from the scheduled send time (gated)
+	LatDeliveryFromSend  = "delivery_from_send"  // the same deliveries from the actual send time (reported)
 	LatDeliveryCrossNode = "delivery_cross_node" // publisher and subscriber on different nodes
 	LatDeliverySameNode  = "delivery_same_node"
 	LatRESTAck           = "rest_ack"     // scheduled send to 201, retries included
@@ -100,15 +101,22 @@ type PublishStats struct {
 	// SerialsDropped counts serials not logged for the attach-point check
 	// because the process had reached MaxSerialLogEntries.
 	SerialsDropped int64 `json:"serials_dropped,omitempty"`
+	// Throttled counts publish attempts answered 429 (retried like any
+	// other failure).
+	Throttled int64 `json:"throttled,omitempty"`
 }
 
 // DeliveryStats counts deliveries.
 type DeliveryStats struct {
-	Received        int64   `json:"received"`
-	InWindow        int64   `json:"in_window"`
-	Rate            float64 `json:"rate"`
-	NegativeLatency int64   `json:"negative_latency"`
-	Foreign         int64   `json:"foreign"`
+	Received int64   `json:"received"`
+	InWindow int64   `json:"in_window"`
+	Rate     float64 `json:"rate"`
+	// NegativeLatency counts in-window deliveries whose latency from the
+	// actual send time was negative: the subscriber's clock behind the
+	// publisher's, or noise at the very low end. A rate above 0.1% means
+	// the clocks are skewed and the latencies cannot be trusted.
+	NegativeLatency int64 `json:"negative_latency"`
+	Foreign         int64 `json:"foreign"`
 }
 
 // PresenceStats counts presence operations.

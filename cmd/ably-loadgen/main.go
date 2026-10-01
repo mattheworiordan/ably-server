@@ -76,6 +76,7 @@ func runAgent(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	metricsListen := fs.String("metrics-listen", envOr("ABLY_LOADGEN_METRICS_LISTEN", ""), "also serve /metrics on this address, for Prometheus (env ABLY_LOADGEN_METRICS_LISTEN)")
 	role := fs.String("role", envOr("ABLY_LOADGEN_ROLE", "all"), "job roles this agent accepts: generator (subscriber, realtime-publisher, presence), publisher (rest-publisher), all, or a comma-separated list of roles (env ABLY_LOADGEN_ROLE)")
 	summaryDir := fs.String("summary-dir", envOr("ABLY_LOADGEN_SUMMARY_DIR", ""), "directory to also write each finished job's summary to (env ABLY_LOADGEN_SUMMARY_DIR)")
+	ntpServer := fs.String("ntp-server", envOr("ABLY_LOADGEN_NTP_SERVER", ""), "NTP server host:port (UDP) that GET /v1/clock measures this box's clock against; on AWS 169.254.169.123:123 (env ABLY_LOADGEN_NTP_SERVER)")
 	addrFile := fs.String("addr-file", "", "write the bound address to this file once listening (for local spawning with --listen 127.0.0.1:0)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -88,6 +89,7 @@ func runAgent(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	a := loadgen.NewAgent(ctx, nil)
 	a.SummaryDir = *summaryDir
 	a.Roles = roles
+	a.NTPServer = *ntpServer
 	if *metricsListen != "" {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", a.M.Handler())

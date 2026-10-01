@@ -199,7 +199,14 @@ func (sc *scheduler) dispatch(r *pubReq) {
 	if r.attempts == 0 {
 		r.firstSent = time.Now()
 		r.node = int(sc.nodeRR.Add(1) % uint64(len(j.Spec.Endpoints)))
-		r.data = EncodePayload(Payload{PubID: r.s.plan.PubID, Seq: r.seq, SentAtUS: r.firstSent.UnixMicro(), Node: r.node}, r.s.msgBytes)
+		// SentAtUS is the scheduled time, so latency measured from it
+		// includes any wait the generator imposed on the publish (one in
+		// flight per stream, a backlog behind a slow server); LagUS lets
+		// the report also show latency from the actual send.
+		r.data = EncodePayload(Payload{
+			PubID: r.s.plan.PubID, Seq: r.seq, SentAtUS: r.intended.UnixMicro(), Node: r.node,
+			LagUS: max(r.firstSent.Sub(r.intended).Microseconds(), 0),
+		}, r.s.msgBytes)
 		j.c.sent.Add(1)
 	}
 	sc.snd.send(sc.sendCtx, r, func(err error) { sc.complete(r, err) })
@@ -212,9 +219,14 @@ func (sc *scheduler) complete(r *pubReq, err error) {
 		r.attempts++
 		j.c.retries.Add(1)
 		j.M.Publishes.WithLabelValues(sc.transport, "retried").Inc()
-		if pe, ok := err.(*restStatusError); ok && pe.permanent() {
-			j.c.rejected.Add(1)
-			j.M.Publishes.WithLabelValues(sc.transport, "rejected").Inc()
+		if pe, ok := err.(*restStatusError); ok {
+			if pe.status == http.StatusTooManyRequests {
+				j.c.throttled.Add(1)
+			}
+			if pe.permanent() {
+				j.c.rejected.Add(1)
+				j.M.Publishes.WithLabelValues(sc.transport, "rejected").Inc()
+			}
 		}
 		if r.attempts <= 3 || r.attempts%100 == 0 {
 			j.logErr("%s publish %s %s seq %d attempt %d: %v", sc.transport, r.s.plan.Channel, r.s.plan.PubID, r.seq, r.attempts, err)

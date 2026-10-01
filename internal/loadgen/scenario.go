@@ -208,6 +208,16 @@ type PassSpec struct {
 	// channels that must have been settled (connected, nothing in flight)
 	// when their set was compared (default 0.9), outside a fault run.
 	MinPresenceCompared float64 `toml:"min_presence_compared" json:"min_presence_compared"`
+	// MaxNegativeLatency: the share of in-window deliveries whose latency
+	// from the actual send time may be negative (default 0.001): more
+	// means the generators' clocks disagree.
+	MaxNegativeLatency float64 `toml:"max_negative_latency" json:"max_negative_latency"`
+	// MaxClockOffset: the largest offset of any generator box from NTP at
+	// the start or end of the run (default 5ms), when measured.
+	MaxClockOffset Duration `toml:"max_clock_offset" json:"max_clock_offset"`
+	// MaxRetryRatio: publish retries over first attempts (default 0.01),
+	// outside a fault run.
+	MaxRetryRatio float64 `toml:"max_retry_ratio" json:"max_retry_ratio"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -229,6 +239,9 @@ func DefaultPass() PassSpec {
 		MinAttachCoverage:     0.9,
 		MinTailCoverage:       0.5,
 		MinPresenceCompared:   0.9,
+		MaxNegativeLatency:    0.001,
+		MaxClockOffset:        Duration{5 * time.Millisecond},
+		MaxRetryRatio:         0.01,
 	}
 }
 
@@ -282,6 +295,15 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinPresenceCompared == 0 {
 		p.MinPresenceCompared = d.MinPresenceCompared
+	}
+	if p.MaxNegativeLatency == 0 {
+		p.MaxNegativeLatency = d.MaxNegativeLatency
+	}
+	if p.MaxClockOffset.Duration == 0 {
+		p.MaxClockOffset = d.MaxClockOffset
+	}
+	if p.MaxRetryRatio == 0 {
+		p.MaxRetryRatio = d.MaxRetryRatio
 	}
 	return p
 }

@@ -626,3 +626,117 @@ func TestEvaluatePublishingWithNoSampledChannelFailsSampleCoverage(t *testing.T)
 		t.Fatalf("sample_percent = 0 with publishing must not pass as 0 of 0 checked: %v", failing(rec))
 	}
 }
+
+func mustFail(t *testing.T, rec *RunRecord, want string) {
+	t.Helper()
+	if rec.Pass {
+		t.Fatalf("want FAIL on %q\n%s", want, rec.Markdown())
+	}
+	for _, n := range failing(rec) {
+		if n == want {
+			return
+		}
+	}
+	t.Fatalf("failing %v, want %q", failing(rec), want)
+}
+
+func mustNotFail(t *testing.T, rec *RunRecord, name string) {
+	t.Helper()
+	for _, n := range failing(rec) {
+		if n == name {
+			t.Fatalf("%q must not gate here: %v", name, failing(rec))
+		}
+	}
+}
+
+func TestEvaluateNegativeLatencyDetectsClockSkew(t *testing.T) {
+	// 0.2% of 900 in-window deliveries: over the 0.1% limit.
+	rec := evalFixture(t, func(s []*Summary, _ *RunRecord) {
+		if s != nil {
+			s[0].Deliveries.NegativeLatency = 2
+		}
+	})
+	mustFail(t, rec, "negative latency (clock skew)")
+	rec = evalFixture(t, func(s []*Summary, _ *RunRecord) {
+		if s != nil {
+			s[0].Deliveries.NegativeLatency = 0
+		}
+	})
+	mustNotFail(t, rec, "negative latency (clock skew)")
+}
+
+func TestEvaluateReportsLatencyFromSendBesideFromSchedule(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, _ *RunRecord) {
+		if s != nil {
+			s[0].Latency[LatDeliveryFromSend] = histOf(1000, 2000, 3000)
+		}
+	})
+	var got *Check
+	for i, c := range rec.Checks {
+		if c.Name == "delivery latency from send (reported)" {
+			got = &rec.Checks[i]
+		}
+	}
+	if got == nil || got.Gating || !strings.Contains(got.Value, "p50") {
+		t.Fatalf("from-send latency must be reported, not gated: %+v", got)
+	}
+	if !rec.Pass {
+		t.Fatalf("%v", failing(rec))
+	}
+}
+
+func clockRecord(startUS, endUS int64) ClockRecord {
+	return ClockRecord{Agent: "gen-1", Start: &ClockOffset{OffsetUS: startUS, RTTUS: 300}, End: &ClockOffset{OffsetUS: endUS, RTTUS: 300}}
+}
+
+func TestEvaluateClockOffset(t *testing.T) {
+	skewed := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Clocks = []ClockRecord{clockRecord(100, -6000)} })
+	mustFail(t, skewed, "generator clock offset")
+	ok := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Clocks = []ClockRecord{clockRecord(100, -900)} })
+	mustNotFail(t, ok, "generator clock offset")
+	unmeasured := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Clocks = []ClockRecord{{Agent: "gen-1", Error: "HTTP 501"}} })
+	mustNotFail(t, unmeasured, "generator clock offset")
+	for _, c := range unmeasured.Checks {
+		if c.Name == "generator clock offset" && (c.Gating || c.Value != "not measured") {
+			t.Fatalf("an unmeasured clock is reported as such: %+v", c)
+		}
+	}
+	if md := skewed.Markdown(); !strings.Contains(md, "-6.00 ms") || !strings.Contains(md, "gen-1") {
+		t.Fatalf("summary.md must carry each box's offset:\n%s", md)
+	}
+}
+
+func TestEvaluatePublishRetriesAndUnresolved(t *testing.T) {
+	retries := func(n int64, fault *FaultRecord) func([]*Summary, *RunRecord) {
+		return func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[1].Publishes.Sent, s[1].Publishes.Retries, s[1].Publishes.Throttled = 1000, n, n
+			} else {
+				r.Fault = fault
+			}
+		}
+	}
+	mustFail(t, evalFixture(t, retries(20, nil)), "publish retries") // 2%
+	mustNotFail(t, evalFixture(t, retries(5, nil)), "publish retries")
+	mustNotFail(t, evalFixture(t, retries(20, &FaultRecord{Command: "kill"})), "publish retries")
+	rec := evalFixture(t, retries(20, nil))
+	for _, c := range rec.Checks {
+		if c.Name == "publish retries" && !strings.Contains(c.Value, "20 answered 429") {
+			t.Fatalf("429s must be printed: %q", c.Value)
+		}
+	}
+	unresolved := func(fault *FaultRecord) func([]*Summary, *RunRecord) {
+		return func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[1].Publishes.Unresolved = 3
+			} else {
+				r.Fault = fault
+			}
+		}
+	}
+	mustFail(t, evalFixture(t, unresolved(nil)), "unresolved publishes")
+	mustNotFail(t, evalFixture(t, unresolved(&FaultRecord{Command: "kill"})), "unresolved publishes")
+	if md := evalFixture(t, unresolved(nil)).Markdown(); !strings.Contains(md, "3 unresolved") {
+		t.Fatalf("unresolved must be printed:\n%s", md)
+	}
+}

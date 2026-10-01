@@ -247,6 +247,35 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 			}
 		}
 	}
+	clocks := make([]ClockRecord, 0, len(jobs))
+	clockIdx := map[string]int{}
+	for _, j := range jobs {
+		if _, ok := clockIdx[j.agent.URL]; !ok {
+			clockIdx[j.agent.URL] = len(clocks)
+			clocks = append(clocks, ClockRecord{Agent: j.agent.Name})
+		}
+	}
+	measureClocks := func(ctx context.Context, end bool) {
+		var wg sync.WaitGroup
+		for url, i := range clockIdx {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var off ClockOffset
+				_, err := agentCall(ctx, cfg.HTTP, http.MethodGet, strings.TrimRight(url, "/")+"/v1/clock", nil, &off)
+				if err != nil {
+					clocks[i].Error = err.Error()
+					return
+				}
+				if end {
+					clocks[i].End = &off
+				} else {
+					clocks[i].Start = &off
+				}
+			}()
+		}
+		wg.Wait()
+	}
 	for _, j := range jobs {
 		// Retry: a lost response to a start that succeeded comes back as
 		// 409 "already running" for the same job id, which is success.
@@ -271,6 +300,10 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 	if time.Now().After(startAt) {
 		cfg.logf("warning: jobs were sent after the ramp start; raise --start-delay")
 	}
+	// The first clock measurement runs beside the start delay, not before
+	// it: an unreachable NTP server must not push the jobs past the ramp.
+	startClocks := make(chan struct{})
+	go func() { defer close(startClocks); measureClocks(runCtx, false) }()
 
 	// Node metrics and progress, until the end of the drain.
 	var samplesMu sync.Mutex
@@ -380,6 +413,11 @@ loop:
 		stopAll()
 	}
 
+	<-startClocks
+	cctx, cc := context.WithTimeout(context.Background(), 20*time.Second)
+	measureClocks(cctx, true)
+	cc()
+
 	// Collect summaries.
 	collectCtx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer ccancel()
@@ -415,7 +453,7 @@ loop:
 		Bus: cfg.Scenario.Bus, Nodes: len(cfg.Inventory.Nodes), Shards: cfg.Scenario.Shards,
 		Environment: cfg.Inventory.Environment,
 		StartUS:     startAt.UnixMicro(), MeasureStartUS: measureStart.UnixMicro(), MeasureEndUS: measureEnd.UnixMicro(), EndUS: time.Now().UnixMicro(),
-		Plan: totals, Fault: fault, Jobs: refs,
+		Plan: totals, Fault: fault, Jobs: refs, Clocks: clocks,
 	}
 	if b := cfg.Inventory.Environment["bus"]; b != "" {
 		rec.Bus = b

@@ -87,7 +87,7 @@ type counters struct {
 	received, inWindow, negLatency, foreign                                     atomic.Int64
 	presEntered, presLeft, presNacks, presReceived                              atomic.Int64
 	openAtEnd, attachedAtEnd, openAtStart, attachedAtStart                      atomic.Int64
-	serialsDropped                                                              atomic.Int64
+	serialsDropped, throttled                                                   atomic.Int64
 	presChecksPlanned, presChecksDone, presChecksFailed                         atomic.Int64
 	presMembersPlanned, presCompared, presIndeterminate                         atomic.Int64
 }
@@ -171,7 +171,7 @@ func NewJob(spec JobSpec, m *Metrics) (*Job, error) {
 		state:   "pending",
 		done:    make(chan struct{}),
 	}
-	for _, name := range []string{LatDelivery, LatDeliveryCrossNode, LatDeliverySameNode, LatRESTAck, LatRESTService, LatRealtimeAck, LatConnectAttach, LatReconnectAttach, LatChannelOpen, LatPresenceAck} {
+	for _, name := range []string{LatDelivery, LatDeliveryFromSend, LatDeliveryCrossNode, LatDeliverySameNode, LatRESTAck, LatRESTService, LatRealtimeAck, LatConnectAttach, LatReconnectAttach, LatChannelOpen, LatPresenceAck} {
 		j.hist[name] = NewHistogram()
 	}
 	j.checker.OnViolation = func(k ViolationKind, n int64) {
@@ -440,7 +440,7 @@ func (j *Job) buildSummary() *Summary {
 			Unresolved:      j.c.unresolved.Load(),
 			OfferedInWindow: j.c.offeredInWindow.Load(), AckedInWindow: j.c.ackedInWindow.Load(),
 			OfferedRate: rate(j.c.offeredInWindow.Load()), AchievedRate: rate(j.c.ackedInWindow.Load()),
-			SerialsDropped: j.c.serialsDropped.Load(),
+			SerialsDropped: j.c.serialsDropped.Load(), Throttled: j.c.throttled.Load(),
 		},
 		Deliveries: DeliveryStats{
 			Received: j.c.received.Load(), InWindow: j.c.inWindow.Load(), Rate: rate(j.c.inWindow.Load()),

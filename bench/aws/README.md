@@ -122,12 +122,22 @@ the agents run on their own boxes and the conductor gets an inventory.
   sees"). The first ten of each process are kept verbatim. A resume the
   server declines (no RESUMED flag, DESIGN.md §4.3) is a signalled
   discontinuity: counted, not a violation.
-- **Latency.** Each message carries its publisher's send time and node;
-  the subscriber records one-way latency into log-linear histograms
-  (within 1.6%, mergeable across processes) split into same-node and
-  cross-node. Clocks must be synced (chrony). REST ACK latency is from
-  the *scheduled* send time, retries included, so a saturated server
-  cannot hide behind a slower schedule.
+- **Latency.** Each message carries the time the schedule called for it
+  (its *scheduled* send time), how long after that the generator handed it
+  to its sender, and the publisher's node. The subscriber records one-way
+  latency into log-linear histograms (within 1.6%, mergeable across
+  processes) split into same-node and cross-node. The gated delivery
+  latency is from the **scheduled** time, so waiting the generator imposed
+  because the server was slow (one publish in flight per stream, a backlog
+  behind it) is in the number rather than hidden by a late clock start;
+  `delivery_from_send` records the same deliveries from the actual send
+  time and is reported beside it. REST and realtime ACK latency is from
+  the scheduled time too, retries included. Clocks must be synced (chrony):
+  each agent can measure its box's offset from NTP (`GET /v1/clock`,
+  `--ntp-server`), the conductor records it at the start and end of the
+  run, and the run fails if one is above 5 ms (`max_clock_offset`) or if
+  more than 0.1% of in-window deliveries have a negative latency from the
+  actual send time (`max_negative_latency`), the direct sign of skew.
 - **Churn is steady state.** Both kinds replace, never add, so after
   the ramp the generator's connections and attachments are flat. A
   connection drop is followed at once by a reconnect of the same
@@ -142,7 +152,7 @@ the agents run on their own boxes and the conductor gets an inventory.
 ### `ably-loadgen`
 
     ably-loadgen serve [--listen :9200] [--metrics-listen :9101] [--role generator|publisher|all]
-                       [--summary-dir DIR] [--addr-file FILE]
+                       [--summary-dir DIR] [--addr-file FILE] [--ntp-server HOST:PORT]
 
 (`agent` is an alias.) On the cloud boxes (host networking; 9100 is
 node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
@@ -156,6 +166,7 @@ node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
 | `POST /v1/jobs` | start a job (body: JobSpec JSON) |
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | status (connections, attached, acked, received, violations) |
 | `GET /v1/jobs/{id}/summary` | the job's summary (202 while running) |
+| `GET /v1/clock` | this box's clock offset from `--ntp-server` (501 without one) |
 | `POST /v1/stop` | stop every running job (summaries are still written) |
 | `DELETE /v1/jobs` | forget finished jobs |
 | `GET /metrics` | Prometheus: `ably_loadgen_*` plus Go and process collectors |
@@ -196,7 +207,7 @@ connect failures, reconnects, churn and unplanned drops), `attachments`,
 unresolved, offered and achieved rates over the hold), `deliveries`
 (received, in window, rate, negative latencies, foreign messages),
 `presence`, `latency` (histograms: `delivery`, `delivery_cross_node`,
-`delivery_same_node`, `rest_ack`, `rest_service`, `realtime_ack`,
+`delivery_same_node`, `delivery_from_send`, `rest_ack`, `rest_service`, `realtime_ack`,
 `connect_attach`, `reconnect_attach`, `channel_open`, `presence_ack`;
 each with count, min, max, mean, p50, p90, p99, p99.9 and the raw
 buckets), `correctness` (checked messages, violations by kind, resumes,
@@ -296,8 +307,9 @@ footprint.
 - `summary.md`: the same as tables.
 
 Pass criteria (plan §8, overridable per scenario in `[pass]`): delivery
-p50 <= 50 ms and p99 <= 250 ms, cross-node where there is such traffic
-(p99 < 100 ms reported as stretch); REST ACK p99 <= 100 ms; connect plus
+p50 <= 50 ms and p99 <= 250 ms, from the scheduled send time and
+cross-node where there is such traffic (p99 < 100 ms reported as
+stretch; latency from the actual send time reported); REST ACK p99 <= 100 ms; connect plus
 attach p99 <= 500 ms at the target churn; zero violations of every kind
 on the sample (including `attach_gap`), with at least 90% of attach
 claims settled (`min_attach_coverage`) and the tail check covering at
@@ -307,7 +319,12 @@ sampled channel that has a subscriber fails "sample coverage"; a presence
 run must have compared the end-of-hold REST member set of every sampled
 presence channel with no mismatch and no NACK (NACKs tolerated after a
 successful fault); achieved publish rate >= 95% of offered and offered >=
-95% of target (the generator kept up); no rejected publishes;
+95% of target (the generator kept up); no rejected publishes, no unresolved publishes and retries under 1% of
+publishes sent (`max_retry_ratio`; both waived after a successful fault,
+and retries, 429s and unresolved are printed either way); negative
+latency under 0.1% of in-window deliveries and, where the agents can
+measure it, every generator box within 5 ms of NTP at the start and end
+of the run;
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
 within ±3% from hold start to end (else node growth would measure the
@@ -491,6 +508,9 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_memory_growth = 0.10
     max_goroutine_growth = 0.10
     max_connection_loss = 0.01
+    max_negative_latency = 0.001 # in-window deliveries with negative latency from the send (clock skew)
+    max_clock_offset = "5ms"     # generator box clock vs NTP, start and end of run (when measured)
+    max_retry_ratio = 0.01       # publish retries over first attempts (not in a fault run)
     tail_margin = "1s"
     min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
     min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded

@@ -565,11 +565,16 @@ The defaults match the load generator's flags:
 
 | Variable | Default |
 |---|---|
-| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=generator` |
-| `PUBLISHER_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=publisher` |
+| `LOADGEN_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=generator --ntp-server=169.254.169.123:123` |
+| `PUBLISHER_CMD` | `ably-loadgen serve --listen=:9200 --metrics-listen=:9101 --role=publisher --ntp-server=169.254.169.123:123` |
 | `CONDUCTOR_CMD` | `ably-conductor run --scenario /run-input/{SCENARIO} --inventory /run-input/inventory.json --results /results --run-id {RUN_ID} --node-vcpu $NODE_VCPU --node-memory-gb $NODE_MEMORY_GB` |
 
-`--role` is `generator`, `publisher` or `all`. The conductor also takes
+`--role` is `generator`, `publisher` or `all`. `--ntp-server` (set it with
+`LOADGEN_NTP_SERVER`; the default is the Amazon Time Sync address chrony uses)
+lets the conductor read each box's clock offset at the start and end of a run
+(`GET /v1/clock`); the run record prints them and the run fails if one is above
+5 ms. A box that cannot measure is recorded as "not measured" and only the
+negative-latency check guards against skew on it. The conductor also takes
 `--fault-hook CMD --fault-at D --time-limit D --log --state`; add them by
 setting `CONDUCTOR_CMD` (the tokens `{SCENARIO}` and `{RUN_ID}` are replaced).
 `NODE_VCPU` and `NODE_MEMORY_GB` default from `NODE_INSTANCE_TYPE` (vCPUs from

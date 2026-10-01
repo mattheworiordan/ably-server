@@ -2,7 +2,9 @@ package loadgen_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -64,6 +66,40 @@ max_memory_growth = 10.0
 max_goroutine_growth = 10.0
 `
 
+// startFakeNTP serves SNTP on loopback from a clock 2 ms ahead of this one.
+func startFakeNTP(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 48 {
+				continue
+			}
+			now := time.Now().Add(2 * time.Millisecond)
+			sec := uint32(now.Unix() + 2208988800)
+			frac := uint32(uint64(now.Nanosecond()) << 32 / 1_000_000_000)
+			var resp [48]byte
+			resp[0], resp[1] = 0x24, 2
+			copy(resp[24:32], buf[40:48])
+			for _, off := range []int{32, 40} {
+				binary.BigEndian.PutUint32(resp[off:], sec)
+				binary.BigEndian.PutUint32(resp[off+4:], frac)
+			}
+			_, _ = pc.WriteTo(resp[:], addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
 func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	addr, metricsURL := startServerWithMetrics(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -74,6 +110,9 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 		{loadgen.RoleSubscriber, loadgen.RoleREST},
 	} {
 		a := loadgen.NewAgent(ctx, nil)
+		if i == 0 {
+			a.NTPServer = startFakeNTP(t) // the second agent has none: recorded as not measured
+		}
 		srv := httptest.NewServer(a.Handler())
 		t.Cleanup(srv.Close)
 		agents = append(agents, loadgen.InventoryAgent{Name: "a" + string(rune('1'+i)), URL: srv.URL, Roles: roles, Workers: 8})
@@ -117,6 +156,24 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	}
 	if rec.Footprint.VCPU != 4 {
 		t.Errorf("footprint %+v", rec.Footprint)
+	}
+	if len(rec.Clocks) != 2 {
+		t.Fatalf("clock records %+v", rec.Clocks)
+	}
+	for _, c := range rec.Clocks {
+		switch c.Agent {
+		case "a1":
+			if c.Start == nil || c.End == nil || c.Start.OffsetUS > -1000 || c.Start.OffsetUS < -4000 {
+				t.Errorf("a1 clock %+v, want offsets of about -2000 us at start and end", c)
+			}
+		case "a2":
+			if c.Start != nil || c.End != nil || c.Error == "" {
+				t.Errorf("a2 has no NTP server and must be recorded as not measured: %+v", c)
+			}
+		}
+	}
+	if !strings.Contains(rec.Markdown(), "Generator box") {
+		t.Error("summary.md lacks the clock table")
 	}
 	if rec.Result.CheckedMessages == 0 || rec.Result.Tail.Checked == 0 {
 		t.Errorf("correctness not exercised: checked=%d tail=%+v", rec.Result.CheckedMessages, rec.Result.Tail)

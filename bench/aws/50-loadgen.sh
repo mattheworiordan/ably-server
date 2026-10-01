@@ -10,6 +10,9 @@
 #
 # LOADGEN_CMD and PUBLISHER_CMD are the commands run inside the ably-loadgen
 # image on each box (--role generator or publisher). Override in the environment.
+# --ntp-server is the Amazon Time Sync address chrony uses: the agent measures
+# its box's clock offset from it (GET /v1/clock), the conductor records it at
+# the start and end of every run and fails a run whose offset is above 5 ms.
 SCRIPT_NAME=50-loadgen
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -20,8 +23,9 @@ require_env AWS_REGION
 state_init
 require_preflight
 require_network_state
-: "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=generator}"
-: "${PUBLISHER_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=publisher}"
+: "${LOADGEN_NTP_SERVER:=169.254.169.123:123}"
+: "${LOADGEN_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=generator --ntp-server=${LOADGEN_NTP_SERVER}}"
+: "${PUBLISHER_CMD:=ably-loadgen serve --listen=:${LOADGEN_AGENT_PORT} --metrics-listen=:${LOADGEN_METRICS_PORT} --role=publisher --ntp-server=${LOADGEN_NTP_SERVER}}"
 
 require_registry
 tag=$(image_tag ably-loadgen "${LOADGEN_TAG:-}")

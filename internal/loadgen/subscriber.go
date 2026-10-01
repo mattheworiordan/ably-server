@@ -490,12 +490,16 @@ func (s *subSession) onMessage(pm *protocol.ProtocolMessage) {
 		}
 		j.c.received.Add(1)
 		j.M.Deliveries.Inc()
-		lat := now - p.SentAtUS
-		if lat < 0 {
-			j.c.negLatency.Add(1)
-		}
+		lat := now - p.SentAtUS // from the scheduled send time: gated
 		if j.inWindow(p.SentAtUS) {
 			j.c.inWindow.Add(1)
+			// From the actual send time: reported beside it, and the
+			// skew detector (it is the smaller of the two).
+			fromSend := now - p.ActualSendUS()
+			if fromSend < 0 {
+				j.c.negLatency.Add(1)
+			}
+			j.hist[LatDeliveryFromSend].RecordMicros(fromSend)
 			j.hist[LatDelivery].RecordMicros(lat)
 			path := "cross_node"
 			if p.Node == s.endpoint {

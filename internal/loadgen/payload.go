@@ -14,26 +14,37 @@ import (
 // Wire form (a plain string, so it survives both the JSON and msgpack
 // encodings unchanged, DESIGN.md §8):
 //
-//	lg1|<pubID>|<seq>|<sentAtUnixMicro>|<node>|<padding>
+//	lg2|<pubID>|<seq>|<scheduledUnixMicro>|<node>|<lagMicro>|<padding>
 //
 // pubID names one sequential publish stream on a channel: the pair
 // (channel, pubID) is the unit whose seq increases by exactly one per
 // message. node is the index of the server node the publish was sent to,
 // or -1 when unknown.
+//
+// SentAtUS is the time the schedule called for the publish, not the time
+// it left the generator: a publisher held back by a slow server (one
+// publish in flight per stream, a backlog behind it) must not look fast
+// because the generator started its clock late. LagUS is how long after
+// that the generator handed the publish to its sender, so SentAtUS+LagUS
+// is the actual send time and latency can be reported both ways.
 type Payload struct {
 	PubID    string
 	Seq      int64
 	SentAtUS int64
 	Node     int
+	LagUS    int64
 }
 
-const payloadPrefix = "lg1|"
+// ActualSendUS is when the generator handed the publish to its sender.
+func (p Payload) ActualSendUS() int64 { return p.SentAtUS + p.LagUS }
+
+const payloadPrefix = "lg2|"
 
 // EncodePayload renders p padded with 'x' up to size bytes. A size smaller
 // than the header yields the header alone.
 func EncodePayload(p Payload, size int) string {
 	var b strings.Builder
-	b.Grow(max(size, 48))
+	b.Grow(max(size, 56))
 	b.WriteString(payloadPrefix)
 	b.WriteString(p.PubID)
 	b.WriteByte('|')
@@ -42,6 +53,8 @@ func EncodePayload(p Payload, size int) string {
 	b.WriteString(strconv.FormatInt(p.SentAtUS, 10))
 	b.WriteByte('|')
 	b.WriteString(strconv.Itoa(p.Node))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(p.LagUS, 10))
 	b.WriteByte('|')
 	if pad := size - b.Len(); pad > 0 {
 		for range pad {
@@ -59,7 +72,7 @@ func DecodePayload(s string) (Payload, bool) {
 		return Payload{}, false
 	}
 	rest := s[len(payloadPrefix):]
-	var fields [4]string
+	var fields [5]string
 	for i := range fields {
 		j := strings.IndexByte(rest, '|')
 		if j < 0 {
@@ -83,7 +96,11 @@ func DecodePayload(s string) (Payload, bool) {
 	if err != nil {
 		return Payload{}, false
 	}
-	return Payload{PubID: fields[0], Seq: seq, SentAtUS: sent, Node: node}, true
+	lag, err := strconv.ParseInt(fields[4], 10, 64)
+	if err != nil {
+		return Payload{}, false
+	}
+	return Payload{PubID: fields[0], Seq: seq, SentAtUS: sent, Node: node, LagUS: lag}, true
 }
 
 // PayloadFromData extracts a Payload from a decoded Message.Data, which is

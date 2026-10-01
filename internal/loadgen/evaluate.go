@@ -46,12 +46,25 @@ type RunRecord struct {
 	// generator attachments at the end of the hold.
 	ServerBoundPerAttachment float64 `json:"server_channels_bound_per_generator_attachment,omitempty"`
 	Checks                   []Check `json:"checks"`
+	// Clocks is each generator box's clock offset from NTP at the start
+	// and end of the run (one-way latency is only as good as these).
+	Clocks []ClockRecord `json:"clocks,omitempty"`
 	// UnsampledNote says what covers the channels outside the sample.
 	UnsampledNote string   `json:"unsampled_note,omitempty"`
 	Pass          bool     `json:"pass"`
 	Verdict       string   `json:"verdict"`
 	Errors        []string `json:"errors,omitempty"`
 	Jobs          []JobRef `json:"jobs"`
+}
+
+// ClockRecord is one agent's clock offsets, measured over the agent's
+// GET /v1/clock before the jobs started and after the drain. Error is set
+// when the agent could not measure (no --ntp-server, NTP unreachable).
+type ClockRecord struct {
+	Agent string       `json:"agent"`
+	Start *ClockOffset `json:"start,omitempty"`
+	End   *ClockOffset `json:"end,omitempty"`
+	Error string       `json:"error,omitempty"`
 }
 
 // JobRef names one generator job of the run.
@@ -195,6 +208,8 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 		p.Retries += s.Publishes.Retries
 		p.Rejected += s.Publishes.Rejected
 		p.Unresolved += s.Publishes.Unresolved
+		p.Throttled += s.Publishes.Throttled
+		p.SerialsDropped += s.Publishes.SerialsDropped
 		p.OfferedInWindow += s.Publishes.OfferedInWindow
 		p.AckedInWindow += s.Publishes.AckedInWindow
 		p.OfferedRate += s.Publishes.OfferedRate
@@ -377,6 +392,13 @@ func relChange(from, to int64) float64 {
 	return float64(to-from) / float64(from)
 }
 
+func absInt64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 func abs(x float64) float64 {
 	if x < 0 {
 		return -x
@@ -439,6 +461,47 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Pass: time.Duration(p99)*time.Microsecond < spec.DeliveryP99Str.Duration, Gating: false})
 	} else if rec.Plan.DeliveriesPerSec > 0 {
 		add(Check{Name: "delivery latency", Value: "no deliveries in window", Limit: "deliveries expected", Pass: false, Gating: true})
+	}
+	if h := res.Latency[LatDeliveryFromSend]; h != nil && h.Count() > 0 {
+		add(Check{Name: "delivery latency from send (reported)", Value: fmt.Sprintf("p50 %s, p99 %s", msOf(h.Quantile(0.50)), msOf(h.Quantile(0.99))),
+			Limit: "reported", Pass: true, Gating: false,
+			Note: "from the moment the generator handed the publish to its sender; the gated figures above are from the scheduled time, so they include any wait the generator imposed"})
+	}
+	if d := res.Deliveries; d.InWindow > 0 {
+		frac := float64(d.NegativeLatency) / float64(d.InWindow)
+		add(Check{Name: "negative latency (clock skew)", Value: fmt.Sprintf("%d of %d in-window deliveries (%.3f%%)", d.NegativeLatency, d.InWindow, frac*100),
+			Limit: "< " + pctOf(spec.MaxNegativeLatency), Pass: frac < spec.MaxNegativeLatency, Gating: true,
+			Note: "latency from the actual send time below zero: the subscriber's clock is behind the publisher's"})
+	}
+	if len(rec.Clocks) > 0 {
+		var measured, failed int
+		var worst int64
+		var worstAgent string
+		for _, c := range rec.Clocks {
+			got := false
+			for _, o := range []*ClockOffset{c.Start, c.End} {
+				if o == nil {
+					continue
+				}
+				got = true
+				if a := absInt64(o.OffsetUS); a >= worst {
+					worst, worstAgent = a, c.Agent
+				}
+			}
+			if got {
+				measured++
+			} else {
+				failed++
+			}
+		}
+		if measured == 0 {
+			add(Check{Name: "generator clock offset", Value: "not measured", Limit: "reported", Pass: true, Gating: false,
+				Note: fmt.Sprintf("%d agents could not measure (no --ntp-server, or NTP unreachable); only the negative-latency check guards against skew", failed)})
+		} else {
+			add(Check{Name: "generator clock offset", Value: fmt.Sprintf("worst %.2f ms (%s) over %d of %d boxes, start and end of run", float64(worst)/1000, worstAgent, measured, measured+failed),
+				Limit: "<= " + spec.MaxClockOffset.String(), Pass: time.Duration(worst)*time.Microsecond <= spec.MaxClockOffset.Duration, Gating: true,
+				Note: fmt.Sprintf("%d boxes unmeasured", failed)})
+		}
 	}
 	if h := res.Latency[LatRESTAck]; h != nil && h.Count() > 0 {
 		p99 := h.Quantile(0.99)
@@ -538,6 +601,16 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 			Limit: fmt.Sprintf(">= %.0f%% (generator kept up)", spec.MinAchievedRatio*100), Pass: p.OfferedRate >= spec.MinAchievedRatio*p.TargetRate, Gating: true,
 			Note: fmt.Sprintf("generator dropped %d scheduled publishes", p.Dropped)})
 		add(Check{Name: "rejected publishes", Value: fmt.Sprint(p.Rejected), Limit: "0", Pass: p.Rejected == 0, Gating: true})
+		// A publish that is retried or never resolved is a stream held back
+		// by the server; the achieved-rate gate alone would let a few
+		// percent of them through unremarked.
+		if p.Sent > 0 {
+			ratio := float64(p.Retries) / float64(p.Sent)
+			add(Check{Name: "publish retries", Value: fmt.Sprintf("%d retries of %d sent (%.3f%%), %d answered 429", p.Retries, p.Sent, ratio*100, p.Throttled),
+				Limit: "< " + pctOf(spec.MaxRetryRatio), Pass: ratio < spec.MaxRetryRatio, Gating: !faultRelaxed(rec)})
+		}
+		add(Check{Name: "unresolved publishes", Value: fmt.Sprint(p.Unresolved), Limit: "0", Pass: p.Unresolved == 0, Gating: !faultRelaxed(rec),
+			Note: "still in flight when the generator stopped waiting"})
 	}
 	// Channels outside the sample have no per-message check: this is the
 	// only thing that would notice loss on them.
@@ -656,6 +729,29 @@ func (rec *RunRecord) Markdown() string {
 	fmt.Fprintf(&b, "| Channel opens/s (churn) | %.0f | %d opens |\n", rec.Plan.ChannelOpensPerSec, r.Attachments.ChannelOpens)
 	if rec.Plan.PresenceMembers > 0 {
 		fmt.Fprintf(&b, "| Presence members | %d | %d entered, %d left, %d nacks |\n", rec.Plan.PresenceMembers, r.Presence.Entered, r.Presence.Left, r.Presence.Nacks)
+	}
+	if p := r.Publishes; p.Offered > 0 {
+		fmt.Fprintf(&b, "\nPublishes: %d offered, %d dropped by the generator, %d sent, %d acked, %d retries, %d answered 429, %d rejected, %d unresolved at the end.\n",
+			p.Offered, p.Dropped, p.Sent, p.Acked, p.Retries, p.Throttled, p.Rejected, p.Unresolved)
+	}
+	if d := r.Deliveries; d.InWindow > 0 {
+		fmt.Fprintf(&b, "\nDeliveries in the hold: %d; %d with negative latency from the send (clock skew detector).\n", d.InWindow, d.NegativeLatency)
+	}
+	if len(rec.Clocks) > 0 {
+		b.WriteString("\n| Generator box | Clock offset from NTP at start | at end |\n|---|---|---|\n")
+		off := func(o *ClockOffset) string {
+			if o == nil {
+				return "not measured"
+			}
+			return fmt.Sprintf("%+.2f ms (rtt %.1f ms)", float64(o.OffsetUS)/1000, float64(o.RTTUS)/1000)
+		}
+		for _, c := range rec.Clocks {
+			end := off(c.End)
+			if c.Error != "" && c.Start == nil && c.End == nil {
+				end = c.Error
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", c.Agent, off(c.Start), end)
+		}
 	}
 	ns := rec.NodeStats
 	b.WriteString("\n| Over the hold | Start | End |\n|---|---|---|\n")
