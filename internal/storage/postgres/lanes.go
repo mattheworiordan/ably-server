@@ -537,6 +537,39 @@ func (l *lane) run(key *[]*pending, batch []*pending) {
 	}
 }
 
+// health reports an error naming the first lane that looks stuck
+// (Storage.Ping, /readyz, DESIGN.md §11): its oldest queued publish has
+// waited longer than commitAttemptTimeout, or a batch has been in flight
+// longer than two attempts (a commit and its retry). A healthy lane
+// commits within one attempt, so either means publishes on this node are
+// not completing.
+func (ls *laneSet) health(now time.Time) error {
+	for _, l := range ls.lanes {
+		if err := l.health(now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *lane) health(now time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.queue) > 0 {
+		if waited := now.Sub(l.queue[0].enqueued); waited > commitAttemptTimeout {
+			return fmt.Errorf("publish lane %d: the oldest of %d queued publishes has waited %v (over %v)",
+				l.idx, len(l.queue), waited.Round(time.Millisecond), commitAttemptTimeout)
+		}
+	}
+	for _, started := range l.running {
+		if took := now.Sub(started); took > 2*commitAttemptTimeout {
+			return fmt.Errorf("publish lane %d: a batch has been committing for %v (over %v)",
+				l.idx, took.Round(time.Millisecond), 2*commitAttemptTimeout)
+		}
+	}
+	return nil
+}
+
 // commitAttemptTimeout bounds one commit attempt of a batch, so a stuck
 // connection or statement cannot keep the batch's channels busy, and its
 // lane stalled, indefinitely. The retry that follows finds anything the

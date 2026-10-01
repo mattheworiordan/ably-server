@@ -806,14 +806,22 @@ func (s *Storage) Collectors() []prometheus.Collector {
 }
 
 // Ping reports whether the node can serve cluster traffic: the Postgres
-// pool is reachable and the bus is ready (the nats bus is not ready
-// while disconnected from NATS). It satisfies storage.Pinger, backing
-// the /readyz check in cluster mode (DESIGN.md §2.2, §7.2).
+// pool is reachable, the bus is ready (the nats bus is not ready while
+// disconnected from NATS, the postgres bus while its LISTEN connection
+// is down), and every publish lane is completing its batches
+// (laneSet.health). It satisfies storage.Pinger, backing the /readyz
+// check in cluster mode (DESIGN.md §2.2, §7.2, §11).
 func (s *Storage) Ping(ctx context.Context) error {
 	if err := s.pool.Ping(ctx); err != nil {
 		return err
 	}
-	return s.bus.ready()
+	if err := s.bus.ready(); err != nil {
+		return err
+	}
+	if s.lanes != nil {
+		return s.lanes.health(time.Now())
+	}
+	return nil
 }
 
 // sleepCtx waits for d or until ctx is done, reporting whether the full

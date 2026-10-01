@@ -132,7 +132,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable, and also while the bus connection is down with `--bus=nats` (NATS) or `--bus=postgres` (LISTEN) (§7.2) |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -1630,7 +1630,7 @@ does once, a sharded node does once per shard, against that shard only.
 | Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
-| `/readyz` | account-wide | ready only while every shard (and its bus) is |
+| `/readyz` | account-wide | ready only while every shard is (its pool, its bus and its publish lanes, §11); the error names the shard |
 | `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
 | `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
 | `GET /stats` stub | account-wide | touches no storage |
@@ -2506,6 +2506,29 @@ On SIGTERM the server enters a graceful shutdown:
    at the deadline is force-closed immediately.
 3. Concurrently, drain in-flight REST handlers.
 4. Close storage.
+
+**Readiness.** `/readyz` (§2.2) is what an orchestrator or load balancer
+should route on. In `memory` and `disk` mode it is always 200. In
+`cluster` mode it returns 503, and logs the reason at Warn, unless all of
+these hold, each within the probe's 2 s:
+
+- the Postgres pool answers a ping;
+- the bus is connected: the LISTEN connection for `--bus=postgres`, the
+  NATS connection for `--bus=nats` (§7.2); `pgnotify` does not gate
+  readiness on its LISTEN connection, which re-dials and reconciles on
+  its own;
+- every publish lane is completing its commits: no lane's oldest queued
+  publish has waited longer than one commit attempt (15 s), and no batch
+  has been committing for longer than two (a commit and its retry). A
+  node whose lanes are wedged (a stuck connection, starved goroutines)
+  still pings, but cannot ACK a publish; this takes it out of rotation.
+  The error names the lane.
+
+With several Postgres shards (§6.4) each condition must hold on every
+shard, and the error names the shard. Readiness is independent of the
+presence lease (§12.5): the lease bump runs on its own timer whatever the
+traffic, so an idle node never lapses, and a lapsed lease is repaired by
+re-entry rather than by leaving rotation.
 
 In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection
