@@ -350,8 +350,17 @@ func TestBusPublisherReceivesOwnPublishOnce(t *testing.T) {
 			t.Fatalf("cm[%d] = %s, want %s", i, got[i], want[i])
 		}
 	}
-	if st := a.BusStats(); st.FastPath != n || st.Inline != 0 || st.Fetched != 0 {
-		t.Fatalf("delivery paths fastPath=%d inline=%d fetched=%d, want %d, 0, 0", st.FastPath, st.Inline, st.Fetched, n)
+	// Each cm reached the appender by exactly one of the two paths, and
+	// never by a log read. Which path won is a scheduling race: the commit
+	// reply that wakes the publisher and the NOTIFY that wakes the LISTEN
+	// worker are two independent wake-ups, so on a loaded or single-CPU
+	// machine the NOTIFY's inline delivery can run first (this was 14 to 19
+	// fast-path deliveries of 20 in 25 runs with GOMAXPROCS=1, on the
+	// unmodified tree as well). Either order is correct; the high-water
+	// mark drops whichever comes second, which the exactly-once checks
+	// above and the duplicate count already assert.
+	if st := a.BusStats(); st.FastPath+st.Inline != n || st.Fetched != 0 {
+		t.Fatalf("delivery paths fastPath=%d inline=%d fetched=%d, want fastPath+inline = %d and fetched 0", st.FastPath, st.Inline, st.Fetched, n)
 	}
 }
 
