@@ -242,7 +242,7 @@ Optional, with defaults:
 | `DB_POOL_SIZE`, `MAX_NODES` | 50, 20 | Size `max_connections` (`MAX_NODES x DB_POOL_SIZE + 300`). |
 | `SHARDS` | 1 | Run 8: number of Postgres instances per storage type. |
 | `ACTIVE_STORAGE` | first created | Which storage type the nodes use (`io2` or `gp3`). |
-| `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag, for the shipped image in run 1a). |
+| `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag: the shipped image in run 1a runs `pgnotify`; this branch infers `postgres`, as `none` passes no NATS URL, DESIGN.md §7.2). |
 | `SERVER_TAG`, `LOADGEN_TAG` | from STATE | Image tags in the registry. |
 | `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). The proof ran with `--publish-lanes=2`: set `ABLY_SERVER_EXTRA_FLAGS="--publish-lanes=2"` to reproduce it. Empty means the code default, which differs (4 on this branch, DESIGN.md §6.3): with 10 to 20 nodes each lane finds little queued, so fewer lanes per node give deeper batches at the same write rate, while a smaller fleet may prefer the default. The run's `summary.md` prints the lane count the nodes reported (`ably_publish_lanes`); quote that, not this table. |
 | `NODE_GOMAXPROCS`, `NODE_GOMEMLIMIT` | unset, `13GiB` | Go runtime settings on the nodes. |

@@ -13,10 +13,11 @@
 //
 //	go test -tags=integration ./...
 //
-// Cluster mode runs on the default bus (pgnotify). Set
-// ABLY_INTEGRATION_BUS to postgres (coalesced), postgres-transactional
-// or nats to run the same suite on another bus (DESIGN.md §7.2); CI runs
-// it once per bus.
+// Cluster mode runs on the bus the server infers with no --bus and no
+// NATS URL: postgres, coalesced (DESIGN.md §7.2). Set
+// ABLY_INTEGRATION_BUS to pgnotify, postgres, postgres-transactional or
+// nats to run the same suite on a bus given explicitly; CI runs it once
+// per bus.
 package integrationtest
 
 import (
@@ -128,12 +129,15 @@ func startNodeOnBus(t *testing.T, dsn string, bus []string, extraArgs ...string)
 }
 
 // busArgs returns the --bus flags for the cluster bus under test, chosen
-// by ABLY_INTEGRATION_BUS (empty or pgnotify: the default bus, no flags).
+// by ABLY_INTEGRATION_BUS (empty: no flags, so the server infers the
+// postgres bus).
 func busArgs(t *testing.T) []string {
 	t.Helper()
 	switch bus := os.Getenv("ABLY_INTEGRATION_BUS"); bus {
-	case "", "pgnotify":
+	case "":
 		return nil
+	case "pgnotify":
+		return []string{"--bus=pgnotify"}
 	case "postgres":
 		return []string{"--bus=postgres", "--postgres-notify-mode=coalesced"}
 	case "postgres-transactional":

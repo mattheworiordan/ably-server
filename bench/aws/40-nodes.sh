@@ -9,7 +9,8 @@
 #   BUS=nats bench/aws/40-nodes.sh
 #   BUS=none SERVER_TAG=<main sha> bench/aws/40-nodes.sh      # run 1a: the shipped bus (no --bus flag on main)
 #
-# BUS: nats | postgres | pgnotify | none (none omits --bus).
+# BUS: nats | postgres | pgnotify | none (none omits --bus: main runs
+# pgnotify, this branch infers postgres; DESIGN.md §7.2).
 # Optional: SERVER_TAG, NODE_COUNT, ABLY_SERVER_EXTRA_FLAGS, NODE_GOMAXPROCS,
 #           NODE_GOMEMLIMIT (13GiB), RECONFIGURE, SCALE_DOWN.
 SCRIPT_NAME=40-nodes

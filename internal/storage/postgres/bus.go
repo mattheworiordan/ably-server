@@ -15,9 +15,11 @@ import (
 
 // Bus kinds accepted by Options.Bus (DESIGN.md §7.2).
 const (
-	// BusPGNotify is the shipped bus and the default: one global
-	// LISTEN channel, a NOTIFY inside every publish transaction, and one
-	// read-back per notification on one goroutine per node.
+	// BusPGNotify is the first-shipped bus: one global LISTEN channel,
+	// a NOTIFY inside every publish transaction, and one read-back per
+	// notification on one goroutine per node. The zero value of
+	// Options.Bus, for this package's callers; the server never infers
+	// it (DESIGN.md §7.2).
 	BusPGNotify = "pgnotify"
 	// BusPostgres is the rebuilt Postgres bus: per-channel LISTEN,
 	// inline payloads, one ordered worker per channel, and (by default)
@@ -28,8 +30,8 @@ const (
 	BusNATS = "nats"
 )
 
-// ParseBus validates a bus name. The empty string is the default,
-// BusPGNotify.
+// ParseBus validates a bus name. The empty string is Options.Bus's zero
+// value, BusPGNotify; the server resolves an unset --bus itself.
 func ParseBus(s string) (string, error) {
 	switch s {
 	case "", BusPGNotify:

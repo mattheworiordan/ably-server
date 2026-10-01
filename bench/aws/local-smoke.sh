@@ -37,7 +37,9 @@ hold="${HOLD:-60s}"
 drain="${DRAIN:-10s}"
 results="${RESULTS:-$root/results/smoke}"
 log="${LOG:-}"
-bus_label="${BUS:-pgnotify}"
+# Unset BUS lets the nodes infer it: nats, as the smoke stack sets a NATS
+# URL (DESIGN.md §7.2).
+bus_label="${BUS:-nats}"
 # Agents reach the nodes by service name; the conductor reaches metrics
 # and agents through the published ports.
 endpoints="node1:8080,node2:8080,node3:8080"

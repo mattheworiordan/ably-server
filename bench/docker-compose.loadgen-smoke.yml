@@ -13,8 +13,10 @@
 # run side by side.
 #
 # SMOKE_IMAGE picks the server image (default: built from this tree) and
-# BUS its bus (ABLY_SERVER_BUS; empty keeps the image's default). NATS is
-# always started so an image with --bus=nats can use it. Nodes do not
+# BUS its bus (ABLY_SERVER_BUS). Empty lets the server infer it: nats,
+# since ABLY_SERVER_NATS_URL is always set (an image from before the bus
+# was inferred runs pgnotify instead, DESIGN.md §7.2). NATS is always
+# started so a nats node can use it. Nodes do not
 # restart: a killed node stays down, which is what the fault run needs.
 
 name: ablylgsmoke

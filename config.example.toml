@@ -38,15 +38,19 @@
 
 # Cluster-mode cross-node bus (env: ABLY_SERVER_BUS). Postgres stays the
 # store with every bus; the bus only decides how a committed message
-# reaches the other nodes. See DESIGN.md §7.2.
-#   pgnotify  the shipped LISTEN/NOTIFY broker (the default)
+# reaches the other nodes. Start with one Postgres; add NATS when you need
+# it: unset, the bus is "nats" when nats-url is set and "postgres"
+# otherwise. See DESIGN.md §7.2.
 #   postgres  per-channel LISTEN; see postgres-notify-mode
 #   nats      NATS core pub/sub; needs nats-url
+#   pgnotify  one LISTEN/NOTIFY channel; never a default, and logs its
+#             ceiling at startup (about 1.7k to 1.9k publishes a second
+#             across the whole cluster)
 # Every node of a cluster must run the same bus: the first node to open
 # the database records it, and a node on another bus is refused at
 # startup (DESIGN.md §11). A bus setting below that the chosen bus does
 # not use is named in a startup warning.
-# bus = "pgnotify"
+# bus = "postgres"
 
 # NATS server URL for bus = "nats"; a comma-separated list of the servers
 # of one NATS cluster is accepted (env: ABLY_SERVER_NATS_URL).

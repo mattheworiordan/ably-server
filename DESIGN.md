@@ -1822,18 +1822,38 @@ In cluster mode Postgres is always the store: it mints each channel's
 serials under the `channels` row lock, holds the log that serves resume
 and history, and commits every publish before the ACK. The **bus** is
 only how a committed cm reaches the other nodes that hold its channel.
-`--bus` selects it; the rest of the server does not change. The bus sits
+`--bus` selects it (or, unset, the rule below infers it); the rest of the
+server does not change. The bus sits
 behind a small seam inside the postgres backend
 (`internal/storage/postgres/bus.go`).
 
 | `--bus` | How a committed cm reaches other nodes | Extra infrastructure | What bounds it |
 |---|---|---|---|
-| `pgnotify` (default) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
-| `postgres` | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
-| `nats` | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel, fanned into a fixed set of dispatch workers | a NATS core server or cluster | One primary's commit rate |
+| `pgnotify` (only when asked for) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
+| `postgres` (default with only `--postgres-dsn`) | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
+| `nats` (default when `--nats-url` is set) | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel, fanned into a fixed set of dispatch workers | a NATS core server or cluster | One primary's commit rate |
 
-`pgnotify` is the default so the shipped behaviour stays the default
-until the deployment sizes are written from measured numbers.
+**Choosing the bus: start with one Postgres; add NATS when you need
+it.** When nothing sets `--bus` (flag, env or file), cluster mode infers
+it from what is configured: with only `--postgres-dsn` the bus is
+`postgres`, coalesced, which needs no other infrastructure; with
+`--nats-url` set it is `nats`. An explicit `--bus` overrides the
+inference. `pgnotify` is never inferred. It must be asked for, and a node
+that runs it logs a warning at startup naming its measured ceiling:
+about 1,700 to 1,900 publishes a second across the whole cluster in the
+scale runs, however many nodes, set by the notify commit lock and the
+single read-back loop (below). `--bus=nats` without `--nats-url` is a
+startup error whose message says what the NATS bus is for and how to
+run on Postgres alone; `--nats-url` with `--bus=postgres` or
+`--bus=pgnotify` is allowed, and the unused URL is named in a startup
+warning (§9).
+
+The `postgres` bus is now the default, and it is the least
+fleet-measured of the three on this code: the scale runs measured it in
+one run, on the earlier ("night one") code at 0.25x scale, and not since
+the continuity, presence and bounds fixes on this branch. Its integration
+and contract suites run in CI on every change; its capacity at scale is
+not yet shown.
 
 **The publish path, common to every bus.** The publish transaction mints
 the serial under the channels-row lock and writes the rows. The bus then
@@ -1847,7 +1867,8 @@ trip before `COMMIT`.
 
 #### pgnotify
 
-The bus as shipped. The publish transaction emits
+The bus as first shipped, and the default until the bus was inferred
+(above). The publish transaction emits
 `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`. Every
 node's LISTEN goroutine, including the publisher's, receives every
 notification, looks up the local `ChannelStore` for that channel, reads
@@ -2410,7 +2431,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only; a comma-separated list of URL DSNs shards channels (§6.4)
---bus {pgnotify|postgres|nats}  cluster mode cross-node bus (§7.2); default: pgnotify
+--bus {postgres|nats|pgnotify}  cluster mode cross-node bus (§7.2); default: nats with --nats-url, else postgres
 --nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
 --nats-creds                  --bus=nats: NATS credentials file (user JWT and NKey seed); nats://user:pass@host URLs also work (§7.2)
@@ -2485,6 +2506,13 @@ Every key is optional. Resolution order,
 highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.
+
+**The bus default: start with one Postgres; add NATS when you need it.**
+In cluster mode an unset `--bus` is `postgres` with only `--postgres-dsn`
+and `nats` when `--nats-url` is set; an explicit `--bus` wins.
+`pgnotify` is never a default: it runs only when asked for, and then
+logs its measured ceiling at startup. `--bus=nats` with no `--nats-url`
+is a startup error (§7.2 "Choosing the bus").
 
 A bus setting the chosen `--bus` does not use (a `--nats-*` setting under
 `pgnotify` or `postgres`, a `--postgres-notify-*` setting under `pgnotify`
@@ -2786,6 +2814,13 @@ startup was rejected: left in a config file or an environment, it would
 overwrite the record on every start, and the check would protect
 nothing. Deleting the row instead makes the next node record its own
 settings and a new deployment id.
+
+*Upgrading past the bus default.* Before the bus was inferred (§7.2), a
+node started without `--bus` ran `pgnotify`, and its database records
+`pgnotify`. A node of this version started the same way infers
+`postgres` and is refused, the refusal naming the difference. Set
+`--bus=pgnotify` to keep the old bus, or move to `postgres` with the
+steps above.
 
 *Upgrading to this version.* A database without the row records the
 settings of the first upgraded node; nodes of earlier versions do not
@@ -3757,7 +3792,8 @@ runs under `go run`).
 **Cluster-mode children.** With `--child-postgres-dsn` the provisioner
 runs every child in cluster mode instead (`--mode cluster
 --postgres-dsn <dsn with search_path=<schema>> --bus <--child-bus>`, plus
-`--nats-url <--child-nats-url>` for `--child-bus=nats`). Each app gets a
+`--nats-url <--child-nats-url>` for `--child-bus=nats`; `--child-bus`
+defaults to `postgres`). Each app gets a
 fresh schema in that database, created on `POST /apps` and dropped when
 the child is terminated. A schema per app keeps apps apart in Postgres
 and, because the bus hashes the schema into its channel names (§7.2),

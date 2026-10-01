@@ -17,7 +17,7 @@
 // Cross-node delivery sits behind a Bus (bus.go, DESIGN.md §7.2),
 // selected by Options.Bus:
 //
-//   - pgnotify (the default, pgnotify.go): the publish transaction
+//   - pgnotify (Options.Bus's zero value, pgnotify.go): the publish transaction
 //     NOTIFYs the one global channel "ably_channel"; a LISTEN goroutine
 //     on every node reads each cm back by (channel, serial) and delivers
 //     it to the channel's appender.
@@ -149,10 +149,11 @@ type Options struct {
 	Logger *logging.Logger
 
 	// Bus selects the cross-node delivery mechanism (DESIGN.md §7.2):
-	// BusPGNotify (the default; the shipped LISTEN/NOTIFY broker),
-	// BusPostgres (per-channel LISTEN, transactional or coalesced) or
-	// BusNATS (NATS core pub/sub). Empty means BusPGNotify. Postgres is
-	// the store whichever bus is chosen.
+	// BusPGNotify (the first-shipped LISTEN/NOTIFY broker), BusPostgres
+	// (per-channel LISTEN, transactional or coalesced) or BusNATS (NATS
+	// core pub/sub). Empty means BusPGNotify, for this package's callers;
+	// the server always sets it, inferring postgres or nats when --bus is
+	// unset. Postgres is the store whichever bus is chosen.
 	Bus string
 
 	// NATSURL is the NATS server URL for BusNATS; a comma-separated list

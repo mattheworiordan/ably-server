@@ -31,13 +31,15 @@ One Go binary, three storage modes selected by `--mode`:
 |-----------|----------------|--------------|-----------------------------------|
 | `memory`  | in-process     | in-process   | tests, local dev, ephemeral       |
 | `disk`    | embedded KV    | in-process   | single-node with persistence      |
-| `cluster` | Postgres       | `LISTEN/NOTIFY` on one channel (`--bus=pgnotify`, the default) | N stateless nodes, shared DB   |
-| `cluster` + `--bus=postgres` | Postgres | per-channel `LISTEN`, coalesced wake-ups by default | N stateless nodes, shared DB, no other dependency |
-| `cluster` + `--bus=nats` | Postgres | NATS core pub/sub | N stateless nodes, shared DB, a NATS server or cluster carries cross-node delivery |
+| `cluster` | Postgres       | per-channel `LISTEN`, coalesced wake-ups (`--bus=postgres`, the default with only `--postgres-dsn`) | N stateless nodes, shared DB, no other dependency |
+| `cluster` + `--nats-url` | Postgres | NATS core pub/sub (`--bus=nats`, the default when `--nats-url` is set) | N stateless nodes, shared DB, a NATS server or cluster carries cross-node delivery |
+| `cluster` + `--bus=pgnotify` | Postgres | `LISTEN/NOTIFY` on one channel; only when asked for, capped at about 1.7k to 1.9k publishes a second cluster-wide | N stateless nodes, shared DB, low write rates |
 | `cluster` + a `--postgres-dsn` list | Postgres, sharded by channel | any of the three buses | N stateless nodes over several databases, each channel stored in one |
 
 In every cluster mode Postgres is the store and orders each channel;
-`--bus` only chooses how a committed message reaches the other nodes
+`--bus` only chooses how a committed message reaches the other nodes.
+Start with one Postgres; add NATS when you need it: an unset `--bus` is
+`postgres`, or `nats` once `--nats-url` is set
 ([DESIGN.md §7.2](DESIGN.md#72-cluster-bus)).
 
 Server processes are stateless: any node can serve any connection.
@@ -100,15 +102,17 @@ ably-server --mode memory
 # On-disk (bbolt) persistence
 ably-server --mode disk --data-dir ./data
 
-# Clustered against Postgres
+# Clustered against Postgres: the postgres bus, no extra dependency
 export ABLY_SERVER_POSTGRES_DSN='postgres://user:pw@host:5432/db?sslmode=disable'
 ably-server --mode cluster
 
-# Clustered, with the rebuilt Postgres bus (no extra dependency)
-ably-server --mode cluster --bus postgres
+# Clustered, with NATS as the cross-node bus (Postgres stays the store);
+# setting --nats-url selects it
+ably-server --mode cluster --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
 
-# Clustered, with NATS as the cross-node bus (Postgres stays the store)
-ably-server --mode cluster --bus nats --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
+# The first-shipped LISTEN/NOTIFY bus, only when asked for; it logs its
+# ceiling (about 1.7k to 1.9k publishes a second cluster-wide) at startup
+ably-server --mode cluster --bus pgnotify
 ```
 
 **Sharding.** When one Postgres primary's write rate is the limit, give
