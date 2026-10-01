@@ -144,18 +144,17 @@ type Channel struct {
 	// members is the set of presence members this Channel has seen
 	// enter and not yet leave, keyed by storage.MemberKey. It is fed by
 	// Append, so it counts every member whose ENTER reached this node
-	// since the channel was bound, whichever node owns the member. A
-	// channel with members is not evicted (DESIGN.md §5.1). Nil when
-	// empty. Guarded by mu.
+	// since the channel was bound (or since the last discontinuity, which
+	// clears it), whichever node owns the member. A channel with members
+	// is not evicted (DESIGN.md §5.1). Nil when empty. Guarded by mu.
 	members map[string]struct{}
 	// pv is the local member set SYNC is served from (presence.go,
 	// DESIGN.md §12.4). Unlike members it holds the whole set, seeded from
 	// the store on first use. Guarded by mu.
 	pv memberView
 
-	// syncSource and syncRefresh configure SYNC (PresenceSync); metrics
-	// receives its series (nil-safe). Set before the Channel is shared.
-	syncSource  string
+	// syncRefresh configures SYNC (PresenceSync); metrics receives its
+	// series (nil-safe). Set before the Channel is shared.
 	syncRefresh time.Duration
 	metrics     *metrics.Metrics
 
@@ -193,7 +192,6 @@ func newChannel(name string) *Channel {
 		tail:        newEntry(nil, 0),
 		bound:       make(chan struct{}),
 		released:    make(chan struct{}),
-		syncSource:  PresenceSyncLocal,
 		syncRefresh: DefaultPresenceSyncRefresh,
 	}
 }
@@ -305,9 +303,8 @@ func (c *Channel) idle(now int64, timeout time.Duration) bool {
 // this node has seen enter and not leave, whose LEAVE must still arrive
 // for eviction to proceed. A channel bound only for a REST operation or
 // kept bound after its last detach has none. Implements
-// storage.SubscriberReporter; with --bus-sweep-scope=subscribed the
-// cluster bus's watermark sweep reads only channels that have
-// subscribers (DESIGN.md §7.2).
+// storage.SubscriberReporter: the cluster bus's watermark sweep reads
+// only channels that have subscribers (DESIGN.md §7.2).
 //
 // A channel found with none also drops its local presence member set
 // (presence.go, DESIGN.md §12.4), so the next attach's SYNC seeds it
@@ -558,7 +555,10 @@ func (c *Channel) link(cm *protocol.ChannelMessage) *entry {
 // appended and the next (DESIGN.md §7.2). Under mu, so in order with
 // Append, it drops the local member set, which may miss presence
 // operations (the next SYNC seeds it again from the store, §12.4), and
-// links a discontinuity marker at the tail of the live list, so every
+// the eviction hold set (members), which may hold a member whose LEAVE
+// fell in the gap and so would keep the channel bound for ever (§5.1);
+// it restarts from the cms delivered after the gap. It then links a
+// discontinuity marker at the tail of the live list, so every
 // Stream sees it between the cms before and after it (Stream.
 // Discontinuity) and its attachment can tell the client. Before
 // Initialize there is no Stream to tell, so only the set is dropped.
@@ -566,6 +566,7 @@ func (c *Channel) Discontinuity(reason storage.DiscontinuityReason) {
 	c.metrics.ChannelDiscontinuity(string(reason))
 	c.mu.Lock()
 	c.dropMemberViewLocked()
+	c.members = nil
 	if c.tail.cm == nil {
 		c.mu.Unlock()
 		return

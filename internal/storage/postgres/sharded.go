@@ -193,14 +193,16 @@ func (s *Sharded) Close() error {
 }
 
 // Ping pings every shard (its pool and its bus, Storage.Ping) at once and
-// reports ready while shard 0 and a majority of the shards are reachable
-// (storage.Pinger, /readyz; DESIGN.md §6.4). One shard down does not take
-// the node out of rotation: if it did, every node would leave at once
-// and the healthy shards' channels would become unreachable too. The
-// down shard's channels fail fast instead (ErrUnavailable, 50003) while
-// the rest serve. A node that reaches no more than half the shards, or
-// not shard 0, which is where it checks the list it was given, leaves
-// rotation. Each shard's result is ably_storage_shard_ready{shard}.
+// reports ready while a majority of the shards are reachable
+// (storage.Pinger, /readyz; DESIGN.md §6.4; shardReadiness). One shard
+// down does not take the node out of rotation: if it did, every node
+// would leave at once and the healthy shards' channels would become
+// unreachable too. The down shard's channels fail fast instead
+// (ErrUnavailable, 50003) while the rest serve. A node that reaches no
+// more than half the shards leaves rotation; with two shards a majority
+// is both. Shard 0 has no special place here: it matters only at
+// startup, where Open checks the shard list's identity against it. Each
+// shard's result is ably_storage_shard_ready{shard}.
 func (s *Sharded) Ping(ctx context.Context) error {
 	errs := make([]error, len(s.shards))
 	var wg sync.WaitGroup
@@ -212,21 +214,27 @@ func (s *Sharded) Ping(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
+	for i, err := range errs {
+		s.ready[i].Store(err == nil)
+	}
+	return shardReadiness(errs)
+}
+
+// shardReadiness is Ping's rule over each shard's ping result: ready
+// while more than half the shards answered, else an error naming every
+// shard that did not.
+func shardReadiness(errs []error) error {
 	up := 0
 	var down []error
 	for i, err := range errs {
-		s.ready[i].Store(err == nil)
 		if err == nil {
 			up++
 			continue
 		}
 		down = append(down, fmt.Errorf("shard %d: %w", i, err))
 	}
-	switch {
-	case errs[0] != nil:
-		return fmt.Errorf("storage/postgres: shard 0 unreachable (%d of %d shards up): %w", up, len(s.shards), errors.Join(down...))
-	case 2*up <= len(s.shards):
-		return fmt.Errorf("storage/postgres: only %d of %d shards reachable, not a majority: %w", up, len(s.shards), errors.Join(down...))
+	if 2*up <= len(errs) {
+		return fmt.Errorf("storage/postgres: only %d of %d shards reachable, not a majority: %w", up, len(errs), errors.Join(down...))
 	}
 	return nil
 }

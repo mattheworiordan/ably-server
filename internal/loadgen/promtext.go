@@ -105,7 +105,6 @@ func ParseMetricLabels(r io.Reader, name string) ([]map[string]string, error) {
 const (
 	metricPublishLanes     = "ably_publish_lanes"
 	metricLingerMax        = "ably_publish_linger_max_seconds"
-	metricLingerMin        = "ably_publish_linger_min_seconds"
 	metricStorageShards    = "ably_storage_shards"
 	metricBusInfo          = "ably_bus_info"
 	metricBusSweepInterval = "ably_bus_sweep_interval_seconds"
@@ -124,7 +123,6 @@ var nodeMetricNames = []string{
 	"ably_messages_delivered_total",
 	metricPublishLanes,
 	metricLingerMax,
-	metricLingerMin,
 	metricStorageShards,
 	metricBusSweepInterval,
 }

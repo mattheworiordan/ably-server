@@ -65,7 +65,7 @@ func run(ctx context.Context, opts runOpts) int {
 	logDir := fs.String("log-dir", opts.Getenv(logDirEnv), "directory for per-app child configs and logs; a temp dir is created if empty (env: "+logDirEnv+")")
 	logLevel := fs.String("log-level", def(opts.Getenv(logLevelEnv), "info"), "log level: "+logging.LevelNames+" (env: "+logLevelEnv+")")
 	childDSN := fs.String("child-postgres-dsn", opts.Getenv(childDSNEnv), "run children in cluster mode against this Postgres database, one schema per app; a comma-separated list of URL-form DSNs gives sharded children, with each app's schema in every database (DESIGN.md §6.4); empty runs memory-mode children (env: "+childDSNEnv+")")
-	childBus := fs.String("child-bus", def(opts.Getenv(childBusEnv), "pgnotify"), "cluster bus for cluster-mode children: pgnotify, postgres or nats (env: "+childBusEnv+")")
+	childBus := fs.String("child-bus", def(opts.Getenv(childBusEnv), "postgres"), "cluster bus for cluster-mode children: postgres, nats or pgnotify (env: "+childBusEnv+")")
 	childNATS := fs.String("child-nats-url", opts.Getenv(childNATSEnv), "NATS URL for cluster-mode children with --child-bus=nats (env: "+childNATSEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2

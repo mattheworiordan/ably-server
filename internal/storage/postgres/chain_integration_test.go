@@ -161,6 +161,29 @@ func TestReleaseRacingBindLeavesAWorkingBinding(t *testing.T) {
 	}
 }
 
+// TestPGNotifyReadyzReflectsListenConnection is
+// TestPGBusReadyzReflectsListenConnection on the pgnotify bus: a node
+// whose one LISTEN connection is down is not ready (DESIGN.md §7.2), and
+// is ready again once it has redialled.
+func TestPGNotifyReadyzReflectsListenConnection(t *testing.T) {
+	defer swapReconnectDelays(750*time.Millisecond, time.Second)()
+
+	c := pgtest.Start(t)
+	appName := fmt.Sprintf("pgnotify_readyz_%d", time.Now().UnixNano())
+	ctx := context.Background()
+	s, err := Open(ctx, Options{DSN: withApplicationName(t, c.FreshSchemaDSN(t), appName), Bus: BusPGNotify})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Ping(ctx); err != nil {
+		t.Fatalf("Ping while connected: %v", err)
+	}
+	terminateListenBackend(t, c.BaseDSN(), appName)
+	waitFor(t, 5*time.Second, "Ping to report the LISTEN connection down", func() bool { return s.Ping(ctx) != nil })
+	waitFor(t, 10*time.Second, "Ping to recover after the redial", func() bool { return s.Ping(ctx) == nil })
+}
+
 // TestPGBusReadyzReflectsListenConnection: on the postgres bus a node
 // whose LISTEN connection is down is not ready (DESIGN.md §7.2), and is
 // ready again once it has redialled.

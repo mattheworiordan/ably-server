@@ -49,7 +49,7 @@ func (s *unboundStorage) unboundCount(name string) int {
 func TestWriteOnlyStoreDoesNotBind(t *testing.T) {
 	ctx := context.Background()
 	st := newUnboundStorage(t)
-	m := newManager(st, Options{WriteOnlyPublish: true}, func() int64 { return 0 })
+	m := newManager(st, Options{}, func() int64 { return 0 })
 
 	ws := m.WriteOnlyStore("cold")
 	if ws == nil {
@@ -93,7 +93,7 @@ func TestWriteOnlyStoreDoesNotBind(t *testing.T) {
 func TestWriteOnlyStoreDuringBindAndEviction(t *testing.T) {
 	st := newUnboundStorage(t)
 	clk := &fakeClock{}
-	m := newManager(st, Options{IdleTimeout: testIdle, SweepInterval: time.Hour, WriteOnlyPublish: true}, clk.now)
+	m := newManager(st, Options{IdleTimeout: testIdle, SweepInterval: time.Hour}, clk.now)
 	t.Cleanup(m.Close)
 
 	// Binding: GetChannel has put the Channel in the map but not finished.
@@ -136,15 +136,11 @@ func TestWriteOnlyStoreDuringBindAndEviction(t *testing.T) {
 	}
 }
 
-// TestWriteOnlyStoreOff: with the option off, or a backend with no
-// unbound stores, every publish goes through GetChannel.
+// TestWriteOnlyStoreOff: a backend with no unbound stores sends every
+// publish through GetChannel.
 func TestWriteOnlyStoreOff(t *testing.T) {
-	m := newManager(newUnboundStorage(t), Options{}, func() int64 { return 0 })
+	m := newManager(newTrackingStorage(t), Options{}, func() int64 { return 0 })
 	if ws := m.WriteOnlyStore("cold"); ws != nil {
-		t.Fatal("WriteOnlyStore with WriteOnlyPublish off returned a store")
-	}
-	m2 := newManager(newTrackingStorage(t), Options{WriteOnlyPublish: true}, func() int64 { return 0 })
-	if ws := m2.WriteOnlyStore("cold"); ws != nil {
 		t.Fatal("WriteOnlyStore on a backend without unbound stores returned a store")
 	}
 }

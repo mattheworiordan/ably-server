@@ -1,6 +1,7 @@
 # Local cluster-mode topology: one PostgreSQL instance plus three
 # stateless ably-server nodes sharing it for both state and pub/sub
-# (LISTEN/NOTIFY). See DESIGN.md §6.2 / §7.2.
+# (the postgres bus, inferred with no --bus and no NATS URL). See
+# DESIGN.md §6.3 / §7.2.
 #
 #   docker compose up --build
 #

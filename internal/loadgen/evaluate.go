@@ -171,14 +171,13 @@ type NodeConfig struct {
 const (
 	FlagPublishLanes     = "publish-lanes"
 	FlagLingerMax        = "publish-linger-max"
-	FlagLingerMin        = "publish-linger-min"
 	FlagStorageShards    = "storage-shards"
 	FlagBus              = "bus"
 	FlagBusNotifyMode    = "bus-notify-mode"
 	FlagBusSweepInterval = "bus-sweep-interval"
 )
 
-var serverFlagOrder = []string{FlagPublishLanes, FlagLingerMax, FlagLingerMin, FlagBus, FlagBusNotifyMode, FlagBusSweepInterval, FlagStorageShards}
+var serverFlagOrder = []string{FlagPublishLanes, FlagLingerMax, FlagBus, FlagBusNotifyMode, FlagBusSweepInterval, FlagStorageShards}
 
 // ComputeServerConfig reads each node's configuration from its last good
 // scrape. Nodes appear in name order; one that never exported any of the
@@ -209,9 +208,6 @@ func ComputeServerConfig(samples []NodeSample) []NodeConfig {
 		}
 		if v, ok := s.Values[metricLingerMax]; ok {
 			f[FlagLingerMax] = secs(v)
-		}
-		if v, ok := s.Values[metricLingerMin]; ok {
-			f[FlagLingerMin] = secs(v)
 		}
 		if v, ok := s.Values[metricStorageShards]; ok {
 			f[FlagStorageShards] = strconv.FormatFloat(v, 'f', -1, 64)

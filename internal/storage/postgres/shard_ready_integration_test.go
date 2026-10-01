@@ -193,9 +193,11 @@ func TestShardedReadinessSurvivesOneShardDown(t *testing.T) {
 	}
 }
 
-// TestShardedPingNeedsShardZero: shard 0 down takes the node out of
-// rotation even though the other shards are a majority.
-func TestShardedPingNeedsShardZero(t *testing.T) {
+// TestShardedPingShardZeroIsNotSpecial: with shard 0 down and the other
+// two of three shards up the node stays ready, like any one shard down
+// (DESIGN.md §6.4); shard 0 matters only at startup, for the identity
+// check.
+func TestShardedPingShardZeroIsNotSpecial(t *testing.T) {
 	const n = 3
 	schema := pgtest.NewSchemaName()
 	proxies := make([]*pgtest.Proxy, n)
@@ -205,8 +207,8 @@ func TestShardedPingNeedsShardZero(t *testing.T) {
 	}
 	s := openShardedT(t, Options{}, dsns)
 	proxies[0].Cut()
-	if err := s.Ping(context.Background()); err == nil {
-		t.Error("Ping ready with shard 0 down")
+	if err := s.Ping(context.Background()); err != nil {
+		t.Errorf("Ping with shard 0 down and 2 of 3 shards up: %v, want ready", err)
 	}
 	if g := shardReadyGauge(t, s); g["0"] != 0 || g["1"] != 1 || g["2"] != 1 {
 		t.Errorf("ably_storage_shard_ready = %v, want 0, 1, 1", g)

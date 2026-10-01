@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -15,9 +16,11 @@ import (
 
 // Bus kinds accepted by Options.Bus (DESIGN.md §7.2).
 const (
-	// BusPGNotify is the shipped bus and the default: one global
-	// LISTEN channel, a NOTIFY inside every publish transaction, and one
-	// read-back per notification on one goroutine per node.
+	// BusPGNotify is the first-shipped bus: one global LISTEN channel,
+	// a NOTIFY inside every publish transaction, and one read-back per
+	// notification on one goroutine per node. The zero value of
+	// Options.Bus, for this package's callers; the server never infers
+	// it (DESIGN.md §7.2).
 	BusPGNotify = "pgnotify"
 	// BusPostgres is the rebuilt Postgres bus: per-channel LISTEN,
 	// inline payloads, one ordered worker per channel, and (by default)
@@ -28,8 +31,8 @@ const (
 	BusNATS = "nats"
 )
 
-// ParseBus validates a bus name. The empty string is the default,
-// BusPGNotify.
+// ParseBus validates a bus name. The empty string is Options.Bus's zero
+// value, BusPGNotify; the server resolves an unset --bus itself.
 func ParseBus(s string) (string, error) {
 	switch s {
 	case "", BusPGNotify:
@@ -270,9 +273,20 @@ func (b *pgNotifyBus) beforeCommit(ctx context.Context, tx pgx.Tx, cs *channelSt
 // subscribers, arrives via the NOTIFY round-trip (DESIGN.md §7.2).
 func (b *pgNotifyBus) afterCommit(*channelStore, *protocol.ChannelMessage, string) {}
 
-// ready is always nil: as before the bus seam, readiness is the pool
-// ping alone (a dropped LISTEN connection redials in the background).
-func (b *pgNotifyBus) ready() error { return nil }
+// errPGNotifyListenDown is ready's answer while the pgnotify bus's
+// LISTEN connection is down (between a drop and its redial), when this
+// node receives no other node's publishes.
+var errPGNotifyListenDown = errors.New("storage/postgres: pgnotify bus LISTEN connection down")
+
+// ready reports the LISTEN connection (DESIGN.md §7.2): not ready while
+// it is down, so /readyz takes the node out of rotation until listenLoop
+// has redialled, as on the postgres bus.
+func (b *pgNotifyBus) ready() error {
+	if !b.connected.Load() {
+		return errPGNotifyListenDown
+	}
+	return nil
+}
 
 func (b *pgNotifyBus) close() {}
 

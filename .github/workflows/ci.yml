@@ -46,17 +46,20 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Default bus (pgnotify) for the SDK suite; the storage package's
-      # contract suite runs on every bus mode in this job too.
+      # The SDK suite on the bus the server infers with no --bus and no
+      # NATS URL (postgres, coalesced; DESIGN.md §7.2); the storage
+      # package's contract suite runs on every bus mode in this job too.
       - name: go test (integration, race)
         # The postgres package alone runs past go test's 10m default on a CI
-        # runner since the batching and retention suites landed, and past
-        # 30m since the write-only, sweep-scope and one-lane contract suites
-        # (about 20m before them).
+        # runner since the batching and retention suites landed. The
+        # contract suites that existed only for the retired A/B switches
+        # (DESIGN.md §9 "Removed settings") are gone.
         run: go test -tags=integration -race -timeout 45m ./...
 
   # One cell per cluster bus (DESIGN.md §7.2): the storage contract suite
   # for that bus, then the SDK integration suite with the servers on it.
+  # The postgres cell skips the SDK suite: the integration job above runs
+  # it on postgres, the inferred default.
   bus:
     name: Cluster bus ${{ matrix.bus }}
     runs-on: ubuntu-latest
@@ -86,6 +89,7 @@ jobs:
         run: go test -tags=integration -race -count=1 -run '^${{ matrix.contract }}$' -v ./internal/storage/postgres/
 
       - name: SDK integration suite
+        if: matrix.bus != 'postgres'
         env:
           ABLY_INTEGRATION_BUS: ${{ matrix.bus }}
         run: go test -tags=integration -race -count=1 ./internal/server/integrationtest/

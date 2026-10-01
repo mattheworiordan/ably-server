@@ -3,7 +3,6 @@ package core
 import (
 	"cmp"
 	"context"
-	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -13,30 +12,6 @@ import (
 	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
 )
-
-// Presence sync sources (DESIGN.md §12.4): where an attach's SYNC
-// snapshot comes from.
-const (
-	// PresenceSyncLocal serves SYNC from the node's own member set:
-	// seeded from the store once per channel bind, then folded from
-	// every presence cm the node delivers on the channel. The default.
-	PresenceSyncLocal = "local"
-	// PresenceSyncStore reads the store's member set on every SYNC, as
-	// before the local set existed.
-	PresenceSyncStore = "store"
-)
-
-// ParsePresenceSyncSource validates a --presence-sync-source value. The
-// empty string means PresenceSyncLocal.
-func ParsePresenceSyncSource(s string) (string, error) {
-	switch s {
-	case "", PresenceSyncLocal:
-		return PresenceSyncLocal, nil
-	case PresenceSyncStore:
-		return PresenceSyncStore, nil
-	}
-	return "", errors.New(`presence sync source must be "local" or "store"`)
-}
 
 // DefaultPresenceSyncRefresh bounds how often a channel's SYNC snapshot
 // is rebuilt while its members keep changing: an attach that finds the
@@ -205,8 +180,8 @@ func (v *memberView) build(asOf string) *PresenceSnapshot {
 // began, it is complete for the attach) or builds one. So an attach
 // waits at most one window, however fast the members change.
 //
-// In store mode, or when the local set cannot be seeded, the snapshot is
-// read from the store.
+// When the local set cannot be seeded, the snapshot is read from the
+// store.
 func (c *Channel) PresenceSync(ctx context.Context) (*PresenceSnapshot, error) {
 	return c.presenceSync(ctx, true)
 }
@@ -219,10 +194,6 @@ func (c *Channel) PresenceSyncNow(ctx context.Context) (*PresenceSnapshot, error
 }
 
 func (c *Channel) presenceSync(ctx context.Context, mayWait bool) (*PresenceSnapshot, error) {
-	if c.syncSource == PresenceSyncStore {
-		c.metrics.PresenceSync("store")
-		return c.storeSnapshot(ctx)
-	}
 	builds := -1 // the build count when this call began, once seeded
 	waited := false
 	for {

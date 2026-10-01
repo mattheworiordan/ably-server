@@ -18,20 +18,6 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
-func TestParsePresenceLeaseMode(t *testing.T) {
-	for in, want := range map[string]string{"": PresenceLeaseNode, "node": PresenceLeaseNode, "member": PresenceLeaseMember} {
-		got, err := ParsePresenceLeaseMode(in)
-		if err != nil || got != want {
-			t.Errorf("ParsePresenceLeaseMode(%q) = %q, %v; want %q", in, got, err, want)
-		}
-	}
-	for _, in := range []string{"row", "Node", "members"} {
-		if _, err := ParsePresenceLeaseMode(in); err == nil {
-			t.Errorf("ParsePresenceLeaseMode(%q) succeeded, want an error", in)
-		}
-	}
-}
-
 // TestReaperGuardAfterOpen: a node reaps nothing until it has held its
 // own lease without a break for one lease window, and a failed renewal
 // restarts that wait.

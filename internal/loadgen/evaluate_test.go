@@ -960,7 +960,6 @@ const nodeMetricsText = `# HELP ably_publish_lanes Publish batching lanes
 # TYPE ably_publish_lanes gauge
 ably_publish_lanes 2
 ably_publish_linger_max_seconds 0.005
-ably_publish_linger_min_seconds 0
 ably_storage_shards 1
 ably_bus_info{bus="nats",mode="notify"} 1
 process_resident_memory_bytes 1.5e+09
@@ -985,7 +984,7 @@ func TestScrapeNodeReadsServerConfiguration(t *testing.T) {
 		t.Fatalf("%+v", s)
 	}
 	cfgs := ComputeServerConfig([]NodeSample{s})
-	if len(cfgs) != 1 || flagString(cfgs[0].Flags) != "publish-lanes=2 publish-linger-max=5ms publish-linger-min=0s bus=nats bus-notify-mode=notify storage-shards=1" {
+	if len(cfgs) != 1 || flagString(cfgs[0].Flags) != "publish-lanes=2 publish-linger-max=5ms bus=nats bus-notify-mode=notify storage-shards=1" {
 		t.Fatalf("%+v: %q", cfgs, flagString(cfgs[0].Flags))
 	}
 }

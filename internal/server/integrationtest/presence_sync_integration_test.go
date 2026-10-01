@@ -25,67 +25,51 @@ import (
 // TestIntegrationClusterPresenceSyncMatchesStore: a client attaching on
 // node B after members entered on node A receives a SYNC equal to the
 // store's member set (DESIGN.md §12.4), and a member that leaves on A is
-// gone from B's next SYNC once its LEAVE has reached B. In local mode
-// (the default) B serves SYNC from its own member set, seeded once when
-// the first presence subscriber attached (before any member entered)
-// and then kept current from the presence events B delivered over the
-// bus; in store mode B reads the store per attach. Run on every bus via
+// gone from B's next SYNC once its LEAVE has reached B. B serves SYNC
+// from its own member set, seeded once when the first presence
+// subscriber attached (before any member entered) and then kept current
+// from the presence events B delivered over the bus. Run on every bus via
 // ABLY_INTEGRATION_BUS.
 func TestIntegrationClusterPresenceSyncMatchesStore(t *testing.T) {
 	pgc := pgtest.Start(t)
-	for _, source := range []string{"local", "store"} {
-		t.Run(source, func(t *testing.T) {
-			dsn := pgc.FreshSchemaDSN(t)
-			flag := "--presence-sync-source=" + source
-			addrA, _ := startNode(t, dsn, flag)
-			addrB, debugB := startNode(t, dsn, flag)
-			const room = "sync-room"
+	dsn := pgc.FreshSchemaDSN(t)
+	addrA, _ := startNode(t, dsn)
+	addrB, debugB := startNode(t, dsn)
+	const room = "sync-room"
 
-			// An observer on B binds the room there and, in local mode,
-			// seeds B's member set while it is still empty.
-			observer := dialRawAs(t, addrB, "")
-			if got := rawAttach(t, observer, room, protocol.FlagPresenceSubscribe); len(got) != 0 {
-				t.Fatalf("observer SYNC = %v, want none on an empty room", got)
-			}
+	// An observer on B binds the room there and seeds B's member set
+	// while it is still empty.
+	observer := dialRawAs(t, addrB, "")
+	if got := rawAttach(t, observer, room, protocol.FlagPresenceSubscribe); len(got) != 0 {
+		t.Fatalf("observer SYNC = %v, want none on an empty room", got)
+	}
 
-			// Twelve members enter on A.
-			const n = 12
-			members := make([]*websocket.Conn, n)
-			for i := range members {
-				members[i] = dialRawAs(t, addrA, fmt.Sprintf("m%02d", i))
-				rawAttach(t, members[i], room, protocol.FlagPresence)
-				rawPresence(t, members[i], room, protocol.PresenceEnter, fmt.Sprintf("d%02d", i))
-			}
-			rawAwaitPresence(t, observer, n) // B has delivered every ENTER
+	// Twelve members enter on A.
+	const n = 12
+	members := make([]*websocket.Conn, n)
+	for i := range members {
+		members[i] = dialRawAs(t, addrA, fmt.Sprintf("m%02d", i))
+		rawAttach(t, members[i], room, protocol.FlagPresence)
+		rawPresence(t, members[i], room, protocol.PresenceEnter, fmt.Sprintf("d%02d", i))
+	}
+	rawAwaitPresence(t, observer, n) // B has delivered every ENTER
 
-			assertSyncMatchesStore(t, addrB, addrA, room, n)
+	assertSyncMatchesStore(t, addrB, addrA, room, n)
 
-			// m03 leaves on A; once B has delivered the LEAVE, B's SYNC no
-			// longer holds it.
-			rawPresence(t, members[3], room, protocol.PresenceLeave, "")
-			rawAwaitPresence(t, observer, 1)
-			assertSyncMatchesStore(t, addrB, addrA, room, n-1)
+	// m03 leaves on A; once B has delivered the LEAVE, B's SYNC no
+	// longer holds it.
+	rawPresence(t, members[3], room, protocol.PresenceLeave, "")
+	rawAwaitPresence(t, observer, 1)
+	assertSyncMatchesStore(t, addrB, addrA, room, n-1)
 
-			syncs := scrapeCounters(t, debugB, "ably_presence_syncs_total")
-			seeds := scrapeCounters(t, debugB, "ably_presence_sync_seeds_total")[""]
-			t.Logf("node B: syncs %v, seeds %v", syncs, seeds)
-			switch source {
-			case "local":
-				if seeds != 1 {
-					t.Errorf("node B seeded its member set %v times, want once for the one bind", seeds)
-				}
-				if syncs[`snapshot="store"`] != 0 || syncs[`snapshot="fallback"`] != 0 {
-					t.Errorf("local mode read the store for SYNC: %v", syncs)
-				}
-			case "store":
-				if seeds != 0 {
-					t.Errorf("store mode seeded a local member set (%v)", seeds)
-				}
-				if syncs[`snapshot="store"`] < 3 {
-					t.Errorf("store mode served %v store SYNCs, want one per attach (3)", syncs[`snapshot="store"`])
-				}
-			}
-		})
+	syncs := scrapeCounters(t, debugB, "ably_presence_syncs_total")
+	seeds := scrapeCounters(t, debugB, "ably_presence_sync_seeds_total")[""]
+	t.Logf("node B: syncs %v, seeds %v", syncs, seeds)
+	if seeds != 1 {
+		t.Errorf("node B seeded its member set %v times, want once for the one bind", seeds)
+	}
+	if syncs[`snapshot="fallback"`] != 0 {
+		t.Errorf("node B read the store for SYNC: %v", syncs)
 	}
 }
 

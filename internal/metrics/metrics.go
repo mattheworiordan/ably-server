@@ -137,7 +137,7 @@ func New() *Metrics {
 		}, []string{"reason"}),
 		presenceSyncs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ably_presence_syncs_total",
-			Help: "Presence SYNC snapshots served on attach or client SYNC, by how the snapshot was obtained (DESIGN.md §12.4): cached (the channel's current snapshot), waited (rebuilt by another attach after waiting out the refresh window), built (rebuilt from the local member set), store (read from the store: --presence-sync-source=store), fallback (read from the store because seeding the local set failed).",
+			Help: "Presence SYNC snapshots served on attach or client SYNC, by how the snapshot was obtained (DESIGN.md §12.4): cached (the channel's current snapshot), waited (rebuilt by another attach after waiting out the refresh window), built (rebuilt from the local member set), fallback (read from the store because seeding the local set failed).",
 		}, []string{"snapshot"}),
 		presenceSeeds: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ably_presence_sync_seeds_total",
