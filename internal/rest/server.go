@@ -65,7 +65,7 @@ type Server struct {
 // HandleReadyz on every request (see DESIGN.md §2.2); callers pass nil
 // for backends with no external dependency to check (memory, bbolt).
 // conns resolves a publish's connectionKey for publish-on-behalf
-// (DESIGN.md §13); callers pass the realtime Server, or nil when no
+// (DESIGN.md §3.2, §8); callers pass the realtime Server, or nil when no
 // realtime endpoint is mounted.
 func NewServer(keys []auth.APIKey, manager *core.Manager, logger *logging.Logger, ready storage.Pinger, m *metrics.Metrics, tracer trace.Tracer, conns ConnectionResolver) *Server {
 	return &Server{
@@ -112,9 +112,8 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readBody(r)
-	if err != nil {
-		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
+	body, ok := s.readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	msgs, err := parseMessages(body, format)
@@ -124,6 +123,9 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(msgs) == 0 {
 		s.writeErrorInfo(w, r, http.StatusBadRequest, 40001, "no messages")
+		return
+	}
+	if !s.checkPublishSize(w, r, msgs) {
 		return
 	}
 	// POST creates messages only. A mutation (update/delete/append)
@@ -287,11 +289,19 @@ func publishSerials(cm *protocol.ChannelMessage) []string {
 // allocation.
 const maxBodyPrealloc = 1 << 20
 
-// readBody reads the request body. With a declared Content-Length (every
-// SDK sends one) it reads into one exactly-sized buffer instead of
-// io.ReadAll's growing ones (DESIGN.md §2.2).
-func readBody(r *http.Request) ([]byte, error) {
+// readBody reads the request body, capped at protocol.MaxRequestBodyBytes
+// (DESIGN.md §2.2): the body is wrapped in http.MaxBytesReader, so a chunked
+// or lying-Content-Length body cannot grow past the cap, and a declared
+// Content-Length over the cap is refused before any byte is read. An
+// oversize body returns an error satisfying errors.As(*http.MaxBytesError).
+// With a declared Content-Length (every SDK sends one) it reads into one
+// exactly-sized buffer instead of io.ReadAll's growing ones.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	n := r.ContentLength
+	if n > protocol.MaxRequestBodyBytes {
+		return nil, &http.MaxBytesError{Limit: protocol.MaxRequestBodyBytes}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, protocol.MaxRequestBodyBytes)
 	if n <= 0 || n > maxBodyPrealloc {
 		return io.ReadAll(r.Body)
 	}
@@ -310,6 +320,35 @@ func readBody(r *http.Request) ([]byte, error) {
 		return append(append(buf, one[0]), rest...), nil
 	}
 	return buf, nil
+}
+
+// readBodyOrFail reads the capped request body; on failure it writes the
+// error response itself and returns ok=false. An over-cap body is 413 with
+// Ably code 40009; any other read error is 400/40000.
+func (s *Server) readBodyOrFail(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := readBody(w, r)
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			s.writeErrorInfo(w, r, http.StatusRequestEntityTooLarge, 40009,
+				fmt.Sprintf("request body too large (limit %d bytes)", protocol.MaxRequestBodyBytes))
+			return nil, false
+		}
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
+		return nil, false
+	}
+	return body, true
+}
+
+// checkPublishSize rejects a publish whose messages exceed the advertised
+// maxMessageSize with 400/40009, before anything is queued (DESIGN.md §2.2).
+func (s *Server) checkPublishSize(w http.ResponseWriter, r *http.Request, msgs []*protocol.Message) bool {
+	if size := protocol.PublishSize(msgs); size > protocol.MaxMessageSize {
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40009,
+			fmt.Sprintf("maximum message length exceeded (%d > %d bytes)", size, protocol.MaxMessageSize))
+		return false
+	}
+	return true
 }
 
 // encodePublishResponse encodes the publish response. For JSON whose
@@ -478,9 +517,8 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorInfo(w, r, http.StatusUnsupportedMediaType, 40004, err.Error())
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
+	body, ok := s.readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	if len(body) == 0 {
@@ -494,6 +532,9 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !mut.Action.IsMutation() {
 		s.writeErrorInfo(w, r, http.StatusBadRequest, 40001, fmt.Sprintf("action %s is not a mutation; PATCH requires update/delete/append", mut.Action))
+		return
+	}
+	if !s.checkPublishSize(w, r, []*protocol.Message{&mut}) {
 		return
 	}
 	// The target serial comes from the path — it is authoritative.
@@ -712,9 +753,8 @@ func (s *Server) HandlePublishAnnotation(w http.ResponseWriter, r *http.Request)
 		s.writeErrorInfo(w, r, http.StatusUnsupportedMediaType, 40004, err.Error())
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
+	body, ok := s.readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	annotations, err := parseAnnotations(body, format)
@@ -1187,7 +1227,7 @@ func (s *Server) HandlePostStats(w http.ResponseWriter, r *http.Request) {
 	}
 	// Drain and discard the posted stats: reading the request body to
 	// completion keeps the connection clean for the SDK's follow-up reads.
-	_, _ = io.Copy(io.Discard, r.Body)
+	_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, protocol.MaxRequestBodyBytes))
 	format, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {
 		s.writeErrorInfo(w, r, http.StatusNotAcceptable, 40004, err.Error())
@@ -1248,9 +1288,8 @@ func (s *Server) HandleRequestToken(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorInfo(w, r, http.StatusUnsupportedMediaType, 40004, err.Error())
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.writeErrorInfo(w, r, http.StatusBadRequest, 40000, err.Error())
+	body, ok := s.readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	var tr auth.TokenRequest

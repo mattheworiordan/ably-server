@@ -254,6 +254,11 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the inbound frame size: gorilla/websocket has no default limit,
+	// so without this a client could send a frame of any size
+	// (DESIGN.md §2.2). An oversize frame closes the connection with 1009.
+	ws.SetReadLimit(protocol.MaxRequestBodyBytes)
+
 	if authErr != nil {
 		s.rejectWithError(ws, format, authErr)
 		return

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -51,7 +52,7 @@ func TestReadBody(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(tc.body)))
 			r.ContentLength = tc.length
-			got, err := readBody(r)
+			got, err := readBody(httptest.NewRecorder(), r)
 			if err != nil {
 				t.Fatalf("readBody: %v", err)
 			}
@@ -62,7 +63,7 @@ func TestReadBody(t *testing.T) {
 	}
 	r, _ := http.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader("abc")))
 	r.ContentLength = 10
-	if _, err := readBody(r); err == nil {
+	if _, err := readBody(httptest.NewRecorder(), r); err == nil {
 		t.Fatal("readBody of a body shorter than its Content-Length returned no error")
 	}
 }

@@ -73,9 +73,10 @@ limits to adopt for the connection:
   resume is a non-goal (§1, §11), so it is the process-local
   `connectionId` and is not recoverable.
 - `maxMessageSize` — `65536` (64 KiB), the largest payload of a single
-  publish; SDKs reject oversize publishes client-side.
-- `maxFrameSize` — `524288` (512 KiB), the largest WebSocket frame / POST
-  body.
+  publish; SDKs reject oversize publishes client-side and the server
+  rejects them with `40009` (§2.2).
+- `maxFrameSize` — `524288` (512 KiB), the advertised largest WebSocket
+  frame / POST body. The server's hard cap on both is 2 MiB (§2.2).
 - `maxInboundRate` — `1000`, the advisory per-connection publish ceiling
   in messages/second.
 - `connectionStateTtl` — `120000` ms, how long an SDK treats the
@@ -84,8 +85,8 @@ limits to adopt for the connection:
   longest the server leaves the server→client direction idle before
   emitting `HEARTBEAT`).
 
-The limits are advisory: the server publishes them for SDK consumption but
-does not itself enforce them yet.
+`maxMessageSize` is enforced (§2.2); the others are advisory: the server
+publishes them for SDK consumption but does not itself enforce them.
 
 Supported `Action` values:
 
@@ -143,6 +144,22 @@ message, in batch order, each the message's stable identity `serial` (§8)
 — the value a client uses to address the message via `PATCH` / `GET
 .../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
 surfaces.
+
+**Request and message size limits.** Every REST request body is read
+through `http.MaxBytesReader` with one cap, `protocol.MaxRequestBodyBytes`
+(2 MiB): publish, mutation, annotation, `requestToken` and the discarded
+`POST /stats` body. A declared `Content-Length` over the cap is refused
+before any byte is read; a chunked or under-declared body is cut off by
+the reader. Both return `413` with Ably code `40009` ("request body too
+large"). The same 2 MiB bounds an inbound WebSocket frame (the connection
+closes with 1009). The cap is a transport guard well above the message
+limit; it is not the limit SDKs see. The message limit is
+`maxMessageSize` (64 KiB, §2.1): the sum over the messages of one publish
+of the name, `clientId`, decoded data and extras lengths in bytes (Ably's
+TM6 size). A REST publish or mutation over it returns `400` with `40009`
+and a realtime `MESSAGE` over it is NACKed `40009`, in both cases before
+anything is queued or stored, so the lane queues (§6.3) only ever hold
+messages within the limit.
 
 **Keep-alive and the publish fast path.** REST publishers are expected
 to reuse connections: the HTTP server keeps an idle keep-alive connection

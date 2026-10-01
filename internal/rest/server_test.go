@@ -69,6 +69,7 @@ func newTestServerWithResolver(t *testing.T, conns ConnectionResolver, keys ...a
 	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	mux.HandleFunc("GET /stats", rs.HandleStats)
 	mux.HandleFunc("POST /stats", rs.HandlePostStats)
+	mux.HandleFunc("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)

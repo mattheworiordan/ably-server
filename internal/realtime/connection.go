@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -143,12 +144,13 @@ type connection struct {
 }
 
 // Connection limits advertised in ConnectionDetails on CONNECTED
-// (DESIGN.md §2.1, §8). They are advisory today — the server does not
-// enforce them yet — but SDKs adopt them (e.g. rejecting oversize
-// publishes client-side against maxMessageSize).
+// (DESIGN.md §2.1, §8). SDKs adopt them (e.g. rejecting oversize publishes
+// client-side against maxMessageSize). maxMessageSize is also enforced
+// server-side on every publish (NACK 40009, DESIGN.md §2.2) and inbound
+// frames are capped at protocol.MaxRequestBodyBytes; the rest are advisory.
 const (
 	// defaultMaxMessageSize is Ably's 64 KiB single-publish payload cap.
-	defaultMaxMessageSize int64 = 65536
+	defaultMaxMessageSize = protocol.MaxMessageSize
 	// defaultMaxFrameSize is Ably's 512 KiB frame / POST-body cap.
 	defaultMaxFrameSize int64 = 524288
 	// defaultMaxInboundRate is the advisory per-connection publish rate
@@ -675,6 +677,18 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	if len(msg.Messages) == 0 {
 		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msgSerial)
 		c.enqueueNack(ctx, msgSerial, nil)
+		return
+	}
+	// A publish over the advertised maxMessageSize is NACKed 40009 before
+	// anything is queued (DESIGN.md §2.2); mutations are held to the same
+	// limit.
+	if size := protocol.PublishSize(msg.Messages); size > defaultMaxMessageSize {
+		c.logger.Warn("MESSAGE over maxMessageSize; rejecting", "channel", msg.GetChannel(), "msgSerial", msgSerial, "size", size)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
+			Message:    fmt.Sprintf("maximum message length exceeded (%d > %d bytes)", size, defaultMaxMessageSize),
+			Code:       40009,
+			StatusCode: 400,
+		})
 		return
 	}
 	// Mutations (update/delete/append) reuse the MESSAGE frame,
