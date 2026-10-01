@@ -69,6 +69,13 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 // bound listener and debug "host:port".
 func startNode(t *testing.T, dsn string, extraArgs ...string) (addr, debugAddr string) {
 	t.Helper()
+	return startNodeOnBus(t, dsn, busArgs(t), extraArgs...)
+}
+
+// startNodeOnBus is startNode with the bus flags given rather than taken
+// from ABLY_INTEGRATION_BUS.
+func startNodeOnBus(t *testing.T, dsn string, bus []string, extraArgs ...string) (addr, debugAddr string) {
+	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -79,7 +86,7 @@ func startNode(t *testing.T, dsn string, extraArgs ...string) (addr, debugAddr s
 		"--listen=127.0.0.1:0",
 		"--debug-listen=127.0.0.1:0",
 		"--log-level=error",
-	}, busArgs(t)...)
+	}, bus...)
 	args = append(args, extraArgs...)
 
 	ready := make(chan net.Addr, 1)
