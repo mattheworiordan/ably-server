@@ -189,10 +189,6 @@ type PassSpec struct {
 	// the only check on channels outside the sample, so loss on them
 	// below 1 - MinDeliveryRatio is not detected.
 	MinDeliveryRatio float64 `toml:"min_delivery_ratio" json:"min_delivery_ratio"`
-	// MinDeliveryRatioFault is the same for a run whose fault injection
-	// ran (default 0.9): a killed node's clients are away while they
-	// reconnect.
-	MinDeliveryRatioFault float64 `toml:"min_delivery_ratio_fault" json:"min_delivery_ratio_fault"`
 	// MaxLoadDrift: allowed change of the generator's own connections
 	// and attachments from the start to the end of the hold (default
 	// 0.03). Beyond it the run is invalid: node growth would measure the
@@ -227,26 +223,25 @@ type PassSpec struct {
 // DefaultPass returns plan §8's criteria.
 func DefaultPass() PassSpec {
 	return PassSpec{
-		DeliveryP50:           Duration{50 * time.Millisecond},
-		DeliveryP99:           Duration{250 * time.Millisecond},
-		DeliveryP99Str:        Duration{100 * time.Millisecond},
-		RestAckP99:            Duration{100 * time.Millisecond},
-		ConnectAttachP99:      Duration{500 * time.Millisecond},
-		MinAchievedRatio:      0.95,
-		MaxMemoryGrowth:       0.10,
-		MaxGoroutineGrowth:    0.10,
-		MaxConnectionLoss:     0.01,
-		TailMargin:            Duration{time.Second},
-		MinDeliveryRatio:      0.99,
-		MinDeliveryRatioFault: 0.9,
-		MaxLoadDrift:          0.03,
-		MinAttachCoverage:     0.9,
-		MinTailCoverage:       0.5,
-		MinPresenceCompared:   0.9,
-		MaxNegativeLatency:    0.001,
-		MaxClockOffset:        Duration{5 * time.Millisecond},
-		MaxRetryRatio:         0.01,
-		MaxGeneratorCPU:       0.7,
+		DeliveryP50:         Duration{50 * time.Millisecond},
+		DeliveryP99:         Duration{250 * time.Millisecond},
+		DeliveryP99Str:      Duration{100 * time.Millisecond},
+		RestAckP99:          Duration{100 * time.Millisecond},
+		ConnectAttachP99:    Duration{500 * time.Millisecond},
+		MinAchievedRatio:    0.95,
+		MaxMemoryGrowth:     0.10,
+		MaxGoroutineGrowth:  0.10,
+		MaxConnectionLoss:   0.01,
+		TailMargin:          Duration{time.Second},
+		MinDeliveryRatio:    0.99,
+		MaxLoadDrift:        0.03,
+		MinAttachCoverage:   0.9,
+		MinTailCoverage:     0.5,
+		MinPresenceCompared: 0.9,
+		MaxNegativeLatency:  0.001,
+		MaxClockOffset:      Duration{5 * time.Millisecond},
+		MaxRetryRatio:       0.01,
+		MaxGeneratorCPU:     0.7,
 	}
 }
 
@@ -285,9 +280,6 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinDeliveryRatio == 0 {
 		p.MinDeliveryRatio = d.MinDeliveryRatio
-	}
-	if p.MinDeliveryRatioFault == 0 {
-		p.MinDeliveryRatioFault = d.MinDeliveryRatioFault
 	}
 	if p.MaxLoadDrift == 0 {
 		p.MaxLoadDrift = d.MaxLoadDrift

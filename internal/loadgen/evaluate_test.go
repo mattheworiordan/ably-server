@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -180,12 +182,12 @@ func TestEvaluateFailures(t *testing.T) {
 			if s != nil {
 				s[0].Correctness.AttachClaims = nil
 			}
-		}, "attach-point check coverage"},
+		}, "sample coverage (attach)"},
 		{"attach-point check cannot settle claims", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 5_000_000} // no serial log
 			}
-		}, "attach-point check coverage"},
+		}, "sample coverage (attach)"},
 		{"tail check skipped every stream on the margin", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				// The last acknowledgement came 0.5 s after the attach (at
@@ -463,11 +465,19 @@ func TestReportGroupsRepeatsAndCurves(t *testing.T) {
 	}
 }
 
-func TestEvaluateFaultRunReportsGrowthWithoutGating(t *testing.T) {
+// Fault records: a node kill and a bus kill that ran and succeeded, and a
+// hook that failed.
+func nodeKill() *FaultRecord { return &FaultRecord{Command: "kill node2", Kind: FaultNodeKill} }
+func busKill() *FaultRecord  { return &FaultRecord{Command: "kill nats2", Kind: FaultBusKill} }
+func failedKill() *FaultRecord {
+	return &FaultRecord{Command: "kill node2", Kind: FaultNodeKill, ExitCode: 3, Output: "no such node"}
+}
+
+func TestEvaluateNodeKillReportsGrowthWithoutGating(t *testing.T) {
 	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
 		if s == nil {
 			r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, MemoryGrowth: 1.4, GoroutineGrowth: 1.1}
-			r.Fault = &FaultRecord{Command: "kill node2"}
+			r.Fault = nodeKill()
 		}
 	})
 	if !rec.Pass {
@@ -512,17 +522,31 @@ func TestEvaluateAttachGapIsCountedAsAViolation(t *testing.T) {
 	}
 }
 
-func TestEvaluateAttachCoverageStandsDownInAFaultRun(t *testing.T) {
-	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+func TestEvaluateAttachCoverageStaysGatedInAFaultRun(t *testing.T) {
+	// A run with no claim at all, or too few settled, fails "sample coverage
+	// (attach)" whatever fault ran: no kind of fault relaxes it.
+	for _, kind := range []*FaultRecord{nil, nodeKill(), busKill()} {
+		rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Correctness.AttachClaims = nil
+			} else {
+				r.Fault = kind
+			}
+		})
+		mustFail(t, rec, "sample coverage (attach)")
+	}
+}
+
+func TestEvaluateZeroAttachClaimsFailsSampleCoverageAttach(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, _ *RunRecord) {
 		if s != nil {
 			s[0].Correctness.AttachClaims = nil
-		} else {
-			r.Fault = &FaultRecord{Command: "kill", ExitCode: 0}
 		}
 	})
-	for _, n := range failing(rec) {
-		if strings.HasPrefix(n, "attach-point") {
-			t.Fatalf("a successful fault run does not gate attach coverage: %v", failing(rec))
+	mustFail(t, rec, "sample coverage (attach)")
+	for _, c := range rec.Checks {
+		if c.Name == "sample coverage (attach)" && !strings.Contains(c.Value, "0 of 0 claims settled") {
+			t.Fatalf("%q", c.Value)
 		}
 	}
 }
@@ -535,21 +559,38 @@ func TestEvaluateTailCoverageThresholdAndFault(t *testing.T) {
 			t.Fatalf("half coverage passes: %v", failing(rec))
 		}
 	}
-	// A run whose fault ran reports it without gating.
+	// Skipped for the margin on its one subscriber: not checked, and no fault
+	// excuses that.
 	rec = evalFixture(t, func(s []*Summary, r *RunRecord) {
 		if s != nil {
 			s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 1_500_000, Serials: fixtureSerials(10)}
 		} else {
-			r.Fault = &FaultRecord{Command: "kill", ExitCode: 0}
+			r.Fault = nodeKill()
 		}
 	})
-	for _, n := range failing(rec) {
-		if n == "tail check coverage" {
-			t.Fatalf("a successful fault run does not gate tail coverage: %v", failing(rec))
+	mustFail(t, rec, "tail check coverage")
+	md := rec.Markdown()
+	if !strings.Contains(md, "0 of 1 sampled streams checked (0.0%)") || !strings.Contains(md, "skipped 1 for the margin") ||
+		!strings.Contains(md, "1 (subscriber, stream) pairs skipped for the margin") {
+		t.Fatalf("the fraction and the skips by reason must be printed:\n%s", md)
+	}
+}
+
+func TestTailCoverageRowSplitsSkipsByReason(t *testing.T) {
+	// Of four planned streams: one checked, one skipped for the margin, two
+	// never seen by a continuous subscriber.
+	rec := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Plan.SampledStreams = 4 })
+	var row Check
+	for _, c := range rec.Checks {
+		if c.Name == "tail check coverage" {
+			row = c
 		}
 	}
-	if !strings.Contains(rec.Markdown(), "1 (subscriber, stream) pairs skipped") {
-		t.Fatalf("skipped pairs and the reason must be printed:\n%s", rec.Markdown())
+	if !strings.Contains(row.Value, "1 of 4 sampled streams checked (25.0%)") || !strings.Contains(row.Value, "skipped 0 for the margin") || !strings.Contains(row.Value, "3 with no continuous subscriber or no acknowledgement") {
+		t.Fatalf("%q", row.Value)
+	}
+	if row.Pass || !row.Gating {
+		t.Fatalf("25%% is under the 50%% floor: %+v", row)
 	}
 }
 
@@ -605,14 +646,17 @@ func TestEvaluatePresenceRun(t *testing.T) {
 	}
 }
 
-func TestEvaluatePresenceNacksAreToleratedOnlyInASuccessfulFaultRun(t *testing.T) {
+func TestEvaluatePresenceNacksAreToleratedOnlyAfterANodeKill(t *testing.T) {
 	nacked := func(fault *FaultRecord) func(*RunRecord) {
 		return func(r *RunRecord) { r.Result.Presence.Nacks = 3; r.Fault = fault }
 	}
-	if rec := presenceRecord(nacked(&FaultRecord{Command: "kill", ExitCode: 0})); !rec.Pass {
-		t.Fatalf("nacks in a fault run: %v", failing(rec))
+	if rec := presenceRecord(nacked(nodeKill())); !rec.Pass {
+		t.Fatalf("nacks after a node kill: %v", failing(rec))
 	}
-	if rec := presenceRecord(nacked(&FaultRecord{Command: "kill", ExitCode: 1})); rec.Pass {
+	if rec := presenceRecord(nacked(busKill())); rec.Pass {
+		t.Fatal("a bus kill does not NACK presence operations: nothing excuses them")
+	}
+	if rec := presenceRecord(nacked(failedKill())); rec.Pass {
 		t.Fatal("a fault hook that failed relaxes nothing")
 	}
 }
@@ -721,7 +765,8 @@ func TestEvaluatePublishRetriesAndUnresolved(t *testing.T) {
 	}
 	mustFail(t, evalFixture(t, retries(20, nil)), "publish retries") // 2%
 	mustNotFail(t, evalFixture(t, retries(5, nil)), "publish retries")
-	mustNotFail(t, evalFixture(t, retries(20, &FaultRecord{Command: "kill"})), "publish retries")
+	mustNotFail(t, evalFixture(t, retries(20, nodeKill())), "publish retries") // REST publishes aimed at the dead node retry
+	mustFail(t, evalFixture(t, retries(20, busKill())), "publish retries")
 	rec := evalFixture(t, retries(20, nil))
 	for _, c := range rec.Checks {
 		if c.Name == "publish retries" && !strings.Contains(c.Value, "20 answered 429") {
@@ -738,7 +783,7 @@ func TestEvaluatePublishRetriesAndUnresolved(t *testing.T) {
 		}
 	}
 	mustFail(t, evalFixture(t, unresolved(nil)), "unresolved publishes")
-	mustNotFail(t, evalFixture(t, unresolved(&FaultRecord{Command: "kill"})), "unresolved publishes")
+	mustFail(t, evalFixture(t, unresolved(nodeKill())), "unresolved publishes") // a publish is retried until it succeeds: none may be left
 	if md := evalFixture(t, unresolved(nil)).Markdown(); !strings.Contains(md, "3 unresolved") {
 		t.Fatalf("unresolved must be printed:\n%s", md)
 	}
@@ -784,10 +829,13 @@ func TestEvaluateNodeMetricsCoverage(t *testing.T) {
 		}), "node metrics coverage")
 	})
 	t.Run("a successful fault run does not gate it", func(t *testing.T) {
-		mustNotFail(t, nodeCovRecord(t, &FaultRecord{Command: "kill"}, func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false }), "node metrics coverage")
+		mustNotFail(t, nodeCovRecord(t, nodeKill(), func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false }), "node metrics coverage")
+	})
+	t.Run("a bus kill does not stop a node's metrics", func(t *testing.T) {
+		mustFail(t, nodeCovRecord(t, busKill(), func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false }), "node metrics coverage")
 	})
 	t.Run("a failed fault hook relaxes nothing and fails the run", func(t *testing.T) {
-		rec := nodeCovRecord(t, &FaultRecord{Command: "kill", ExitCode: 1, Output: "no such node"}, func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false })
+		rec := nodeCovRecord(t, failedKill(), func(r *RunRecord) { r.NodeStats.Coverage[1].AtEnd = false })
 		mustFail(t, rec, "node metrics coverage")
 		mustFail(t, rec, "fault injection")
 	})
@@ -813,9 +861,9 @@ func TestEvaluateFailedFaultHookDoesNotRelaxGrowthOrSteadiness(t *testing.T) {
 			}
 		})
 	}
-	mustFail(t, growing(&FaultRecord{Command: "kill", ExitCode: 3}), "node memory growth over hold")
-	mustFail(t, growing(&FaultRecord{Command: "kill", ExitCode: 3}), "generator load steady over hold")
-	rec := growing(&FaultRecord{Command: "kill"})
+	mustFail(t, growing(failedKill()), "node memory growth over hold")
+	mustFail(t, growing(failedKill()), "generator load steady over hold")
+	rec := growing(nodeKill())
 	mustNotFail(t, rec, "node memory growth over hold")
 	mustNotFail(t, rec, "generator load steady over hold")
 }
@@ -872,8 +920,8 @@ func TestEvaluateGeneratorCPU(t *testing.T) {
 	}
 	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[1].BusyFraction = 0.85 }), "generator CPU")
 	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[2].BusyFraction = 0.71 }), "publisher CPU")
-	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[0].Measured = false }), "generator CPU") // one box unread: not a pass
-	mustNotFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[1].BusyFraction = 0.85; r.Fault = &FaultRecord{Command: "kill"} }), "generator CPU")
+	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[0].Measured = false }), "generator CPU")                          // one box unread: not a pass
+	mustFail(t, agentCPURecord(t, func(r *RunRecord) { r.AgentCPU[1].BusyFraction = 0.85; r.Fault = nodeKill() }), "generator CPU") // no fault excuses a saturated box
 	mustNotFail(t, agentCPURecord(t, func(r *RunRecord) {
 		for i := range r.AgentCPU {
 			r.AgentCPU[i].Measured = false
@@ -972,5 +1020,175 @@ func TestEvaluateServerConfiguration(t *testing.T) {
 	mustNotFail(t, rec, "server configuration")
 	if !strings.Contains(rec.Markdown(), "none reported") {
 		t.Fatal(rec.Markdown())
+	}
+}
+
+func TestEvaluateDeliveryGateIs99PercentEvenInAFaultRun(t *testing.T) {
+	// 94% of the plan's 90/s: the old 90% gate passed this. No fault relaxes
+	// the gate.
+	short := func(fault *FaultRecord) func([]*Summary, *RunRecord) {
+		return func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Deliveries.Rate = 84.6
+			} else {
+				r.Fault = fault
+			}
+		}
+	}
+	for _, fault := range []*FaultRecord{nil, nodeKill(), busKill()} {
+		mustFail(t, evalFixture(t, short(fault)), "deliveries vs plan")
+	}
+}
+
+func TestEvaluateStatesWhatCoversUnsampledChannels(t *testing.T) {
+	rec := evalFixture(t, nil)
+	want := "Unsampled channels are covered only by the deliveries-vs-plan gate (>= 99% of planned deliveries/s); loss below 1% there is not detected."
+	if !strings.Contains(rec.Markdown(), want) {
+		t.Fatalf("summary.md lacks the unsampled-channel statement:\n%s", rec.Markdown())
+	}
+}
+
+func TestEvaluateFaultRelaxationTable(t *testing.T) {
+	// For each kind of fault, each gate it invalidates is relaxed (reported,
+	// not gating) and every other stays gating: the run is built to fail
+	// every gate in the table at once.
+	breakAll := func(kind *FaultRecord) *RunRecord {
+		return evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Latency[LatDeliveryCrossNode] = histOf(append(make([]int64, 98), 300000, 300000)...) // delivery p99
+				s[0].Latency[LatConnectAttach] = histOf(900000)
+				s[0].Connections.OpenAtMeasureStart, s[0].Attachments.AttachedAtMeasureStart, s[0].Attachments.AttachedAtMeasureEnd = 100, 150, 180
+				s[1].Publishes.Sent, s[1].Publishes.Retries = 1000, 50
+				s[1].Publishes.Unresolved = 2
+			} else {
+				r.NodeStats = NodeStats{Measured: true, GrowthMeasured: true, MemoryGrowth: 0.5, GoroutineGrowth: 0.5, BaselineDue: true,
+					Coverage: []NodeCoverage{{Node: "n1", HasURL: true, AtStart: true, AtBaseline: true}}}
+				r.Fault = kind
+			}
+		})
+	}
+	gated := func(rec *RunRecord) map[string]bool {
+		out := map[string]bool{}
+		for _, c := range rec.Checks {
+			if !c.Pass && c.Gating {
+				out[c.Name] = true
+			}
+		}
+		return out
+	}
+	names := []string{"delivery p99 (cross-node)", "connect+attach p99", "generator load steady over hold", "node memory growth over hold",
+		"node goroutine growth over hold", "node metrics coverage", "publish retries",
+		"unresolved publishes"} // the last is relaxed by no kind
+	for _, c := range []struct {
+		fault   *FaultRecord
+		relaxed []string
+	}{
+		{nil, nil},
+		{nodeKill(), []string{"connect+attach p99", "generator load steady over hold", "node memory growth over hold", "node goroutine growth over hold", "node metrics coverage", "publish retries"}},
+		{busKill(), []string{"delivery p99 (cross-node)"}},
+		{&FaultRecord{Command: "x", Kind: FaultOther}, nil},
+	} {
+		name := "no fault"
+		if c.fault != nil {
+			name = c.fault.Kind
+		}
+		t.Run(name, func(t *testing.T) {
+			got := gated(breakAll(c.fault))
+			for _, n := range names {
+				want := !slices.Contains(c.relaxed, n)
+				if got[n] != want {
+					t.Errorf("%q: gating=%v, want %v (relaxed set %v)", n, got[n], want, c.relaxed)
+				}
+			}
+		})
+	}
+}
+
+func TestFaultRelaxationsAreWhatTheREADMEsTableSays(t *testing.T) {
+	b, err := os.ReadFile("../../bench/aws/README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]string{}
+	for _, line := range strings.Split(string(b), "\n") {
+		for _, kind := range FaultKinds() {
+			if strings.HasPrefix(line, "| `"+kind+"` |") {
+				rows[kind] = line
+			}
+		}
+	}
+	for _, kind := range FaultKinds() {
+		row, ok := rows[kind]
+		if !ok {
+			t.Errorf("README.md has no relaxation table row for fault kind %q", kind)
+			continue
+		}
+		for key, check := range RelaxationCheck {
+			has := strings.Contains(row, check)
+			want := slices.Contains(FaultRelaxations[kind], key)
+			if has != want {
+				t.Errorf("README row for %s: mentions %q = %v, code relaxes it = %v\n%s", kind, check, has, want, row)
+			}
+		}
+	}
+}
+
+func TestFailedOrMissingFaultMakesTheVerdictInvalid(t *testing.T) {
+	for _, f := range []*FaultRecord{failedKill(), {Command: "kill", Kind: FaultNodeKill, ExitCode: -1, Output: "the fault hook did not run before the end of the run"}} {
+		// Gates failing too (slow p50): the verdict is still INVALID, not FAIL.
+		rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+			if s != nil {
+				s[0].Latency[LatDeliveryCrossNode] = histOf(60000, 70000, 80000)
+			} else {
+				r.Fault = f
+			}
+		})
+		if rec.Verdict != VerdictInvalidFault || rec.Pass {
+			t.Fatalf("verdict %q pass %v for %+v", rec.Verdict, rec.Pass, f)
+		}
+		mustFail(t, rec, "fault injection")
+		if !strings.Contains(rec.Markdown(), "INVALID (fault not injected)") {
+			t.Fatal("the verdict must be in the title of summary.md")
+		}
+	}
+	if rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s == nil {
+			r.Fault = nodeKill()
+		}
+	}); rec.Verdict != "PASS" {
+		t.Fatalf("a fault that ran and passed every gate that still applies: %q (%v)", rec.Verdict, failing(rec))
+	}
+}
+
+func TestPresenceOnlyRunSaysTheMessageRowIsNotApplicable(t *testing.T) {
+	rec := presenceRecord(nil)
+	var row *Check
+	for i, c := range rec.Checks {
+		if c.Name == "loss, duplicate, reorder on the sample" {
+			row = &rec.Checks[i]
+		}
+	}
+	if row == nil || row.Value != "not applicable (no sampled message streams)" || row.Gating {
+		t.Fatalf("row %+v", row)
+	}
+	if strings.Contains(rec.Markdown(), "0 of 0 checked") {
+		t.Fatalf("a presence run must not print '0 of 0 checked':\n%s", rec.Markdown())
+	}
+	// Its correctness gates are the presence rows.
+	for _, want := range []string{"sample coverage (presence)", "presence correctness"} {
+		found := false
+		for _, c := range rec.Checks {
+			found = found || (c.Name == want && c.Gating)
+		}
+		if !found {
+			t.Fatalf("no gating %q row", want)
+		}
+	}
+	// A message plan with sampled streams keeps the real row.
+	rec = evalFixture(t, nil)
+	for _, c := range rec.Checks {
+		if c.Name == "loss, duplicate, reorder on the sample" && (!c.Gating || strings.HasPrefix(c.Value, "not applicable")) {
+			t.Fatalf("%+v", c)
+		}
 	}
 }

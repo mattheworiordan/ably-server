@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,7 +43,11 @@ type ConductorConfig struct {
 	// Poll is the status and node-metrics interval (default 10s).
 	Poll time.Duration
 	// FaultHook, if set, is run with sh -c at FaultAt into the hold.
+	// FaultKind says what it does (FaultNodeKill, FaultBusKill, FaultOther),
+	// which decides the gates a successful fault relaxes (FaultRelaxations);
+	// it is required with a hook.
 	FaultHook string
+	FaultKind string
 	FaultAt   time.Duration
 	// TimeLimit caps the whole run (default: its planned length plus 5
 	// minutes). On expiry every agent is stopped and OnTimeout runs.
@@ -202,6 +207,9 @@ func RunConductor(ctx context.Context, cfg ConductorConfig) (*RunRecord, error) 
 	}
 	if cfg.HTTP == nil {
 		cfg.HTTP = &http.Client{Timeout: 20 * time.Second}
+	}
+	if cfg.FaultHook != "" && !slices.Contains(FaultKinds(), cfg.FaultKind) {
+		return nil, fmt.Errorf("a fault hook needs --fault-kind (%s): it says which gates the fault invalidates, so only those are relaxed", strings.Join(FaultKinds(), ", "))
 	}
 	plan, err := cfg.Scenario.Resolve(cfg.Multiplier, cfg.Scale, cfg.RunTag)
 	if err != nil {
@@ -434,7 +442,7 @@ loop:
 			at := time.Now()
 			cfg.logf("fault: running %q", cfg.FaultHook)
 			code, out := runHook(runCtx, cfg.FaultHook, []string{"RUN_ID=" + cfg.RunID})
-			fault = &FaultRecord{Command: cfg.FaultHook, AtUS: at.UnixMicro(), ExitCode: code, Output: out}
+			fault = &FaultRecord{Command: cfg.FaultHook, Kind: cfg.FaultKind, AtUS: at.UnixMicro(), ExitCode: code, Output: out}
 			cfg.logf("fault: exit %d", code)
 		}
 	}
@@ -495,7 +503,7 @@ loop:
 	if cfg.FaultHook != "" && fault == nil {
 		// The scenario said a fault would be injected and the run ended
 		// first: that must not read as a fault-free pass or a relaxed one.
-		rec.Fault = &FaultRecord{Command: cfg.FaultHook, ExitCode: -1, Output: "the fault hook did not run before the end of the run"}
+		rec.Fault = &FaultRecord{Command: cfg.FaultHook, Kind: cfg.FaultKind, ExitCode: -1, Output: "the fault hook did not run before the end of the run"}
 	}
 	for url, i := range clockIdx {
 		c := AgentCPU{Agent: clocks[i].Agent, Kind: "generator", Error: hostErrs[i]}
@@ -640,11 +648,22 @@ func EvaluateRunDir(runDir string, inv *Inventory) (*RunRecord, error) {
 	if sc != nil {
 		spec = sc.Pass.withDefaults()
 	}
-	rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
-	rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
-	rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
-	rec.ServerConfig = ComputeServerConfig(rec.NodeStats.Samples)
-	rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
+	// A directory without its agent summaries (a record kept for the numbers
+	// alone) is judged on the merged result its summary.json carries; one
+	// without node samples keeps the node statistics it carries.
+	if len(sums) > 0 {
+		rec.Result = MergeSummaries(sums, spec.TailMargin.Duration)
+	}
+	if len(rec.NodeStats.Samples) > 0 {
+		rec.NodeStats = ComputeNodeStats(rec.NodeStats.Samples, rec.MeasureStartUS, rec.MeasureEndUS, rec.GrowthBaselineUS)
+		if !rec.legacyRecord() {
+			rec.NodeStats.Coverage, rec.NodeStats.BaselineDue = ComputeNodeCoverage(inv, rec.NodeStats.Samples, rec.MeasureEndUS, rec.GrowthBaselineUS)
+			rec.ServerConfig = ComputeServerConfig(rec.NodeStats.Samples)
+		}
+	}
+	if inv != nil || rec.Footprint.VCPU == 0 {
+		rec.Footprint = ComputeFootprint(inv, rec.Result, rec.NodeStats)
+	}
 	Evaluate(&rec, spec)
 	return &rec, nil
 }

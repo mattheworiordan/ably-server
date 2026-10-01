@@ -64,6 +64,7 @@ connect_attach_p99 = "20s"
 min_achieved_ratio = 0.5
 max_memory_growth = 10.0
 max_goroutine_growth = 10.0
+max_generator_cpu = 1.01
 `
 
 // startFakeNTP serves SNTP on loopback from a clock 2 ms ahead of this one.
@@ -137,10 +138,13 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out strings.Builder
+	_, procErr := loadgen.ReadHostCPU()
+	noProcStat := procErr != nil
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, RunID: "c1", RunTag: "c1", Inventory: inv, ResultsDir: dir,
 		LogFile: logFile, StateFile: stateFile, StartDelay: time.Second, Poll: 500 * time.Millisecond,
-		FaultHook: "echo injected", FaultAt: time.Second, Out: &out,
+		FaultHook: "echo injected", FaultKind: loadgen.FaultNodeKill, FaultAt: time.Second, Out: &out,
+		AllowUnmeasured: noProcStat, // boxes off Linux cannot read their CPU
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -286,13 +290,13 @@ func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, RunID: "nf", RunTag: "nf", Inventory: inv, ResultsDir: t.TempDir(),
 		StartDelay: time.Second, Poll: 500 * time.Millisecond,
-		FaultHook: "echo never", FaultAt: time.Hour,
+		FaultHook: "echo never", FaultKind: loadgen.FaultNodeKill, FaultAt: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 {
-		t.Fatalf("pass=%v fault=%+v\n%s", rec.Pass, rec.Fault, rec.Markdown())
+	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 || rec.Verdict != loadgen.VerdictInvalidFault {
+		t.Fatalf("pass=%v verdict=%q fault=%+v\n%s", rec.Pass, rec.Verdict, rec.Fault, rec.Markdown())
 	}
 	found := false
 	for _, c := range rec.Checks {
@@ -300,5 +304,21 @@ func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no failing fault injection check:\n%s", rec.Markdown())
+	}
+}
+
+func TestConductorRefusesAFaultHookWithoutAKind(t *testing.T) {
+	sc, err := loadgen.ParseScenario([]byte(conductorScenario))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = loadgen.RunConductor(context.Background(), loadgen.ConductorConfig{
+		Scenario: sc, RunID: "nk", RunTag: "nk", ResultsDir: t.TempDir(),
+		Inventory: &loadgen.Inventory{Key: testKey, Nodes: []loadgen.InventoryNode{{Name: "n1", Endpoint: "127.0.0.1:1"}},
+			Agents: []loadgen.InventoryAgent{{Name: "a", URL: "http://127.0.0.1:1", Roles: []string{loadgen.RoleSubscriber, loadgen.RoleREST}}}},
+		FaultHook: "echo x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--fault-kind") {
+		t.Fatalf("err = %v", err)
 	}
 }

@@ -112,7 +112,7 @@ for sc in $scenarios; do
 done
 if [ "${FAULT:-1}" = "1" ]; then
   up
-  run bench/scenarios/shape-m.toml "smoke-m-nodekill-$stamp" --scale "$scale" --fault-hook "${compose[*]} kill node2" --fault-at 20s
+  run bench/scenarios/shape-m.toml "smoke-m-nodekill-$stamp" --scale "$scale" --fault-hook "${compose[*]} kill node2" --fault-kind node-kill --fault-at 20s
 fi
 bin/ably-conductor report "$results"/smoke-*-"$stamp"/summary.json > "$results/report-$stamp.md" || true
 echo "results: $results (report-$stamp.md)"

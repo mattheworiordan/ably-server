@@ -521,6 +521,10 @@ type TailResult struct {
 	// than the margin after the latest continuous attach, so a subscriber
 	// attached then could not be held to it.
 	SkippedMargin int64 `json:"skipped_margin"`
+	// StreamsSkippedMargin counts distinct streams that were skipped for
+	// the margin on every subscriber that held them, so were never
+	// checked.
+	StreamsSkippedMargin int64 `json:"streams_skipped_margin"`
 	// Margin is the margin used.
 	Margin   time.Duration `json:"margin_ns"`
 	Examples []Violation   `json:"examples,omitempty"`
@@ -538,12 +542,14 @@ func TailCheck(published map[string]map[string]StreamRecord, seen []map[string]*
 	res := TailResult{Margin: margin}
 	type streamKey struct{ ch, pub string }
 	checkedStreams := map[streamKey]bool{}
+	skippedStreams := map[streamKey]bool{}
 	for _, bySub := range seen {
 		for ch, cs := range bySub {
 			streams := published[ch]
 			for pub, rec := range streams {
 				if rec.LastAckedUS < cs.LatestAttachUS+margin.Microseconds() {
 					res.SkippedMargin++
+					skippedStreams[streamKey{ch, pub}] = true
 					continue
 				}
 				res.Checked++
@@ -575,6 +581,11 @@ func TailCheck(published map[string]map[string]StreamRecord, seen []map[string]*
 		}
 	}
 	res.StreamsChecked = int64(len(checkedStreams))
+	for k := range skippedStreams {
+		if !checkedStreams[k] {
+			res.StreamsSkippedMargin++
+		}
+	}
 	return res
 }
 

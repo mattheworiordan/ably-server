@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,5 +42,25 @@ func TestServerIdleTimeoutFlag(t *testing.T) {
 	}
 	if o.String() != "" {
 		t.Errorf("unset flag prints %q, want empty", o.String())
+	}
+}
+
+// A run record from before the newer checks existed re-evaluates with
+// "not recorded in this run" rows and the verdict it had.
+func TestEvaluateALegacyRunDirectory(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := run(context.Background(), []string{"evaluate", "../../internal/loadgen/testdata/legacy-shape-m"}, &out, &errb)
+	if code != 1 { // the record failed its latency gates when it was run
+		t.Fatalf("exit %d, stderr: %s", code, errb.String())
+	}
+	md := out.String()
+	for _, want := range []string{"# Run run-20261001T141856Z-shape-m: shape M at 5x, scale 1: FAIL", "| sample coverage (attach) | not recorded in this run", "| node metrics coverage | not recorded in this run",
+		"| generator CPU | not recorded in this run", "| generator clock offset | not recorded in this run", "| server configuration | not recorded in this run"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("output lacks %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "| FAIL |") && strings.Contains(md, "not recorded in this run | n/a | FAIL") {
+		t.Error("a not-recorded row failed")
 	}
 }
