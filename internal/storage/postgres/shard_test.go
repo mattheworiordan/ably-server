@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -213,5 +214,37 @@ func TestAddBusStats(t *testing.T) {
 	}
 	if both := addBusStats(storage.BusStats{Connected: true}, storage.BusStats{Connected: true}); !both.Connected {
 		t.Error("two connected shards should report connected")
+	}
+}
+
+// TestShardReadiness: a node is ready while more than half its shards
+// answer, whichever they are (DESIGN.md §6.4): with two shards that is
+// both, with three any two, and shard 0 down is no different from any
+// other one shard down.
+func TestShardReadiness(t *testing.T) {
+	down := errors.New("unreachable")
+	for _, c := range []struct {
+		errs  []error
+		ready bool
+	}{
+		{[]error{nil}, true},
+		{[]error{down}, false},
+		{[]error{nil, nil}, true},
+		{[]error{nil, down}, false},
+		{[]error{down, nil}, false},
+		{[]error{nil, nil, nil}, true},
+		{[]error{down, nil, nil}, true},
+		{[]error{nil, down, nil}, true},
+		{[]error{down, down, nil}, false},
+		{[]error{nil, nil, down, down}, false},
+		{[]error{down, nil, nil, nil}, true},
+	} {
+		err := shardReadiness(c.errs)
+		if (err == nil) != c.ready {
+			t.Errorf("shardReadiness(%v) = %v, want ready %v", c.errs, err, c.ready)
+		}
+		if err != nil && !strings.Contains(err.Error(), "not a majority") {
+			t.Errorf("shardReadiness(%v) = %v, want a not-a-majority error", c.errs, err)
+		}
 	}
 }

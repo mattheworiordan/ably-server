@@ -1725,7 +1725,7 @@ does once, a sharded node does once per shard, against that shard only.
 | Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard; at most 4 batched catch-up queries in flight per node, over all its shards |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
-| `/readyz` | account-wide | ready while shard 0 and a majority of the shards are reachable, each with its pool, its bus and its publish lanes (§11); the error names the shard; see "A shard that is down" below |
+| `/readyz` | account-wide | ready while a majority of the shards are reachable (with two shards, both), each with its pool, its bus and its publish lanes (§11); the error names the shard; see "A shard that is down" below |
 | `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
 | `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
 | `GET /stats` stub | account-wide | touches no storage |
@@ -1763,10 +1763,14 @@ that shard's channels, but it can serve the rest, and every node loses the
 same shard at the same moment. If one shard down took a node out of
 rotation, the load balancer would drain the whole fleet and the healthy
 shards' channels would become unreachable too. So `/readyz` (the
-`Sharded` `Ping`) pings every shard at once and reports ready while
-shard 0 and a majority of the shards answer; a node that reaches no more
-than half of them, or not shard 0 (where it checks the list it was given
-at startup), leaves rotation. With two shards a majority is both. Each
+`Sharded` `Ping`) pings every shard at once and reports ready while a
+majority of the shards answer; a node that reaches no more than half of
+them leaves rotation. With two shards a majority is both, so either
+shard down takes the node out of rotation; three or more shards are what
+keep one down shard from draining the fleet. Shard 0 has no special
+place in readiness: it matters only at startup, where `Open` checks the
+shard list's identity against it (above), and a node already running
+does not need it to serve the other shards' channels. Each
 shard's result is `ably_storage_shard_ready{shard}` (1 or 0, as of the
 last readiness check).
 
@@ -2857,8 +2861,8 @@ messages; their cms still reach each other, late, by the next cm's
 predecessor or the sweep (§7.2). Restart the nodes of a nats cluster
 together to avoid the window.
 
-**A shard that is down** (§6.4): the node stays in rotation while shard 0
-and a majority of the shards answer, and the down shard's channels fail
+**A shard that is down** (§6.4): the node stays in rotation while a
+majority of the shards answer (with two shards, both), and the down shard's channels fail
 fast with 50003 until it is back. `ably_storage_shard_ready{shard}` says
 which shard. Nothing needs doing on the nodes when it returns: the pool
 reconnects on the next call, and its channels' subscribers resume from
@@ -2902,8 +2906,9 @@ these hold, each within the probe's 2 s:
   still pings, but cannot ACK a publish; this takes it out of rotation.
   The error names the lane.
 
-With several Postgres shards (§6.4) each condition must hold on every
-shard, and the error names the shard. Readiness is independent of the
+With several Postgres shards (§6.4) the conditions are checked on every
+shard, and the node is ready while they hold on a majority of them
+("A shard that is down" below); the error names each failing shard. Readiness is independent of the
 presence lease (§12.5): the lease bump runs on its own timer whatever the
 traffic, so an idle node never lapses, and a lapsed lease is repaired by
 re-entry rather than by leaving rotation.
