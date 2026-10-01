@@ -217,7 +217,9 @@ discontinuities, first violations, per sampled channel records),
 of every acknowledged sequence, per sampled stream; the serial log feeds
 the attach-point check and is capped at 1.5M entries per process),
 `correctness.attach_claims` (subscriber: each stream's first sequence
-number on each attachment, with the attach point),
+number on each attachment, with the attach point; identical claims, such
+as thousands of attachments of one hot channel made at about the same
+time, are kept once with a count, up to 500k distinct claims per process),
 `resources` (the generator's own heap, stacks, RSS and goroutines every
 10 s, and bytes per connection at the end of the ramp) and `errors`.
 

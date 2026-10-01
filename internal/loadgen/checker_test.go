@@ -173,7 +173,7 @@ func TestCheckerSeedFollowsDiscontinuityNotResume(t *testing.T) {
 	for _, cl := range c.Summary().AttachClaims {
 		attach = append(attach, cl.PubID+"@"+cl.Attach)
 	}
-	want := []string{"p@" + serialAt(0), "q@" + serialAt(0), "p@" + serialAt(50)}
+	want := []string{"p@" + serialAt(0), "p@" + serialAt(50), "q@" + serialAt(0)} // claims come out sorted
 	if fmt.Sprint(attach) != fmt.Sprint(want) {
 		t.Fatalf("claims %v, want %v", attach, want)
 	}
@@ -181,12 +181,36 @@ func TestCheckerSeedFollowsDiscontinuityNotResume(t *testing.T) {
 
 func TestCheckerAttachClaimsAreCapped(t *testing.T) {
 	c := NewChecker()
-	for range MaxAttachClaims + 3 {
-		c.addClaim(AttachClaim{Channel: "ch"})
+	for i := range MaxAttachClaims + 3 {
+		c.addClaim(AttachClaim{Channel: "ch", FirstSeq: int64(i)})
 	}
+	c.addClaim(AttachClaim{Channel: "ch", FirstSeq: 0}) // a repeat of one kept: not dropped
 	s := c.Summary()
 	if len(s.AttachClaims) != MaxAttachClaims || s.AttachClaimsDropped != 3 {
 		t.Fatalf("%d kept, %d dropped", len(s.AttachClaims), s.AttachClaimsDropped)
+	}
+}
+
+func TestCheckerIdenticalClaimsAreCountedOnce(t *testing.T) {
+	// 1000 attachments of one hot channel at the same attach point, all
+	// starting at seq 7, are one claim with N=1000, and weigh 1000 in the
+	// check.
+	c := NewChecker()
+	for range 1000 {
+		c.addClaim(AttachClaim{Channel: "hot", PubID: "p", Attach: serialAt(10), FirstSeq: 7})
+	}
+	c.addClaim(AttachClaim{Channel: "hot", PubID: "p", Attach: serialAt(11), FirstSeq: 7})
+	claims := c.Summary().AttachClaims
+	if len(claims) != 2 || claims[0].N != 1000 || claims[1].N != 1 {
+		t.Fatalf("claims %+v", claims)
+	}
+	log := publishedLog("hot", "p", 7, 8, 11, 11, 11, 11, 11, 11, 11, 11)
+	res := AttachCheck(log, claims)
+	// Attach point 10: first seq after it is 2, claimed 7: five missed by
+	// each of 1000 attachments; attach point 11 (serials equal it at 2..):
+	// every later serial is 11 which is not after 11, so none is after it.
+	if res.Claims != 1001 || res.Checked != 1001 || res.Missed != 5000 {
+		t.Fatalf("res %+v", res)
 	}
 }
 

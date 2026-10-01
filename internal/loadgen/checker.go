@@ -110,8 +110,9 @@ type Checker struct {
 	mu     sync.Mutex
 	logged []Violation
 	// claims are the attach-point claims of every attachment (see
-	// AttachClaim), capped at MaxAttachClaims.
-	claims        []AttachClaim
+	// AttachClaim), identical ones counted once with their multiplicity,
+	// capped at MaxAttachClaims distinct claims.
+	claims        map[AttachClaim]int64
 	claimsDropped int64
 	// seen is per channel: the latest attach time of any attachment that
 	// finished continuous, and per stream the lowest maxSeen across those
@@ -125,8 +126,8 @@ type Checker struct {
 	now func() time.Time
 }
 
-// MaxAttachClaims caps the attach claims one process keeps. Past it
-// claims are counted, not kept, and the coverage gate reports them.
+// MaxAttachClaims caps the distinct attach claims one process keeps. Past
+// it claims are counted, not kept, and the coverage gate reports them.
 const MaxAttachClaims = 500_000
 
 // AttachClaim is one stream's first observation on one attachment: the
@@ -134,17 +135,27 @@ const MaxAttachClaims = 500_000
 // of the stream the attachment received. The conductor compares it with
 // the publisher's serial log: the first seq whose serial is after the
 // attach point must be FirstSeq, or the messages in between were lost.
+//
+// Thousands of attachments of one hot channel made at much the same time
+// share an attach point and a first seq, so identical claims are kept once
+// with N, how many attachments made it (0 means one when read from a
+// summary).
 type AttachClaim struct {
 	Channel  string `json:"c"`
 	PubID    string `json:"p"`
 	Attach   string `json:"a"`
 	FirstSeq int64  `json:"s"`
+	N        int64  `json:"n,omitempty"`
 }
 
 func (c *Checker) addClaim(cl AttachClaim) {
+	cl.N = 0
 	c.mu.Lock()
-	if len(c.claims) < MaxAttachClaims {
-		c.claims = append(c.claims, cl)
+	if _, ok := c.claims[cl]; ok || len(c.claims) < MaxAttachClaims {
+		if c.claims == nil {
+			c.claims = make(map[AttachClaim]int64)
+		}
+		c.claims[cl]++
 	} else {
 		c.claimsDropped++
 	}
@@ -227,7 +238,23 @@ func (c *Checker) Summary() CorrectnessSummary {
 	}
 	c.mu.Lock()
 	s.FirstViolations = append([]Violation(nil), c.logged...)
-	s.AttachClaims = append([]AttachClaim(nil), c.claims...)
+	for cl, n := range c.claims {
+		cl.N = n
+		s.AttachClaims = append(s.AttachClaims, cl)
+	}
+	sort.Slice(s.AttachClaims, func(i, j int) bool {
+		a, b := s.AttachClaims[i], s.AttachClaims[j]
+		if a.Channel != b.Channel {
+			return a.Channel < b.Channel
+		}
+		if a.PubID != b.PubID {
+			return a.PubID < b.PubID
+		}
+		if a.Attach != b.Attach {
+			return a.Attach < b.Attach
+		}
+		return a.FirstSeq < b.FirstSeq
+	})
 	s.AttachClaimsDropped = c.claimsDropped
 	s.Channels = make(map[string]*ChannelSeen, len(c.seen))
 	for ch, cs := range c.seen {
@@ -589,11 +616,12 @@ func AttachCheck(published map[string]map[string]StreamRecord, claims []AttachCl
 	type streamKey struct{ ch, pub string }
 	hasHole := map[streamKey]bool{}
 	for _, cl := range claims {
-		res.Claims++
+		w := max(cl.N, 1)
+		res.Claims += w
 		rec, ok := published[cl.Channel][cl.PubID]
 		n := len(rec.Serials)
 		if !ok || n == 0 {
-			res.Unverifiable++
+			res.Unverifiable += w
 			continue
 		}
 		// First index with a serial after the attach point.
@@ -622,20 +650,20 @@ func AttachCheck(published map[string]map[string]StreamRecord, claims []AttachCl
 		}
 		switch {
 		case first == -2:
-			res.Unverifiable++
+			res.Unverifiable += w
 		case first < 0:
 			// Every logged serial is at or before the attach point: the
 			// attachment started at or after the log's end. FirstSeq <= n
 			// is consistent with that; beyond it the log cannot say.
 			if cl.FirstSeq <= int64(n) {
-				res.Checked++
+				res.Checked += w
 			} else {
-				res.Unverifiable++
+				res.Unverifiable += w
 			}
 		default:
-			res.Checked++
+			res.Checked += w
 			if cl.FirstSeq > int64(first) {
-				lost := cl.FirstSeq - int64(first)
+				lost := (cl.FirstSeq - int64(first)) * w
 				res.Missed += lost
 				if len(res.Examples) < MaxLoggedViolations {
 					res.Examples = append(res.Examples, Violation{
