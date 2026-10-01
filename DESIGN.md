@@ -1185,8 +1185,8 @@ CREATE TABLE messages (
 -- Materialised current PRESENCE state: one row per live member, keyed by
 -- connectionId:clientId. ENTER/UPDATE upsert, LEAVE deletes — maintained
 -- in the same transaction as the presence cm's INSERT into channel_messages,
--- so the set stays consistent with the log. node_id + expires_at drive the
--- crashed-node reaper (§12.5).
+-- so the set stays consistent with the log. node_id names the owning node,
+-- whose liveness lease drives the dead-node reaper (§12.5).
 CREATE TABLE presence (
   channel        TEXT        NOT NULL,
   connection_id  TEXT        NOT NULL,
@@ -1194,8 +1194,19 @@ CREATE TABLE presence (
   channel_serial TEXT        NOT NULL,  -- serial of the latest ENTER/UPDATE
   payload        BYTEA       NOT NULL,  -- msgpack-encoded protocol.PresenceMessage
   node_id        TEXT        NOT NULL,  -- owning node, for lease bump + reap
-  expires_at     TIMESTAMPTZ NOT NULL,  -- liveness lease; reaper deletes once past
+  expires_at     TIMESTAMPTZ NOT NULL,  -- member lease mode: the row's lease; node mode and fixtures: 'infinity'
   PRIMARY KEY (channel, connection_id, client_id)
+);
+-- The reaper's skip scan over member owners and its per-node deletes,
+-- and the member-mode bump's per-node select (§12.5).
+CREATE INDEX presence_node_idx ON presence (node_id);
+
+-- One liveness lease per node (node lease mode, §12.5): the node renews
+-- its row on the bump cadence; the reaper removes the members of a node
+-- with no unexpired row, then the row.
+CREATE TABLE presence_nodes (
+  node_id    TEXT        PRIMARY KEY,
+  expires_at TIMESTAMPTZ NOT NULL
 );
 ```
 
@@ -1439,8 +1450,9 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   writer wins: an ENTER then a LEAVE of one member in the same batch
   removes it, a LEAVE then an ENTER keeps it with the ENTER's data. The
   fold is then one `DELETE` for the members that left and one
-  `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node and fresh
-  lease, or the fixture sentinel and an `'infinity'` lease, §12.5). Every
+  `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node and, in
+  member lease mode, a fresh lease, else `'infinity'`; or the fixture
+  sentinel and an `'infinity'` lease, §12.5). Every
   writer of a room's `presence` rows holds the room's channels row lock
   first, so two batches never contend on them; the lease bump and the
   reaper, which do not, skip rows locked by a writer (`FOR UPDATE SKIP
@@ -1546,7 +1558,7 @@ does once, a sharded node does once per shard, against that shard only.
 | Serial minting, idempotency lookup | one channel | routed (the `channels` row lock and the id index are in the shard) |
 | Bind, release (idle-channel eviction, §5.1) | one channel | routed |
 | Migrations, partition creation, retention drop | account-wide | per shard, at open and in each shard's sweep |
-| Presence lease bump and crashed-node reaper | account-wide | per shard; a reaped member's LEAVE is published on that shard |
+| Presence lease bump and dead-node reaper | account-wide | per shard, with one node id and a lease row in every shard's `presence_nodes`; a reaped member's LEAVE is published on that shard |
 | Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
@@ -2155,6 +2167,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --presence-sync-source local  where an attach's presence SYNC comes from: local (the node's member set) or store (§12.4)
 --presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
 --presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
+--presence-lease-mode node    cluster mode: presence liveness lease per node (node) or per member row (member) (§12.5)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2175,7 +2188,7 @@ Configuration may also be supplied via an optional TOML config file
 `message-retention`, `persisted-retention`, `publish-lanes`,
 `publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
 `publish-queue-max`, `publish-bind-on-write`, `presence-sync-source`,
-`presence-batching`, `presence-max-inflight` —
+`presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
 retentions, `publish-linger-max` and `publish-linger-min` as duration strings, e.g. `"10s"`,
@@ -2670,22 +2683,88 @@ afresh.
 leaves orphaned rows in the `presence` table — the one case the LEAVE
 path cannot cover, and a cluster-only one (a single-process crash takes
 the whole set down with it). Each `presence` row therefore records its
-owning `node_id` and an `expires_at` lease, stamped by `StorePresence`
-on ENTER/UPDATE. The storage backend runs two background loops on fixed
-cadences (constants; operator config is a follow-up): a **lease-bump**
-loop refreshes `expires_at` for every row the node owns in one
-`UPDATE … WHERE node_id = $node`, at an interval comfortably shorter
-than the lease window, so a live node's members never lapse; and a
-**reaper** loop runs `DELETE FROM presence WHERE expires_at < now()
-RETURNING …` — Postgres row locking means exactly one node's `RETURNING`
-yields a given row, and that node synthesises the LEAVE for it through
-the normal publish path (a fresh presence publish → NOTIFY → every
-node's appender). This bounds orphan visibility to one lease window.
+owning `node_id`, stamped by `StorePresence` on ENTER/UPDATE, and the
+owner holds a liveness lease. The storage backend runs two background
+loops on fixed cadences (constants; operator config is a follow-up): a
+**lease-bump** loop renews the lease every 10s, well inside the 30s
+lease window, and a **reaper** loop runs every 5s on every node and
+removes the members of dead nodes, synthesising a LEAVE for each through
+the normal publish path (a fresh presence publish, announced on the bus
+to every node's appender). Postgres row locking means exactly one
+node's `DELETE ... RETURNING` yields a given row, so each LEAVE is
+published once. `--presence-lease-mode` selects where the lease lives:
+
+- **node** (the default): one lease per node, a row in `presence_nodes
+  (node_id, expires_at)`. The bump is one upsert of that row, so its cost
+  does not grow with the node's members and it never writes or locks a
+  member row; a member row's own `expires_at` is `'infinity'`. A node is
+  **alive** while its row exists with `expires_at >= now()`, and dead
+  otherwise. The reaper lists the node ids that own members (a skip scan
+  over `presence_node_idx`, one index probe per distinct owner) with no
+  live lease, plus the expired lease rows, and for each deletes the
+  node's members in chunks of 1000, re-checking the lease in every chunk
+  so a node that renews part way stops being reaped; once every chunk is
+  deleted it publishes their LEAVEs (32 at a time when presence is
+  batched), then deletes the node's lease row once it owns no member.
+- **member**: the behaviour before node leases; every member row carries
+  its own `expires_at`, renewed by one `UPDATE ... WHERE node_id = $node`
+  of all of the node's rows per bump, and the reaper deletes every row
+  with `expires_at < now()`. At 100k members per node that bump rewrites
+  and row-locks 100k rows every 10s, which convoys with presence batches
+  writing the same rows (§6.3). Kept for A/B comparison.
+
+*Node identity.* A node id is random per process (40 bits, minted at
+`postgres.Open`; a sharded node uses one id on every shard and keeps a
+lease row in each shard's `presence_nodes`, beside the members it owns
+there, §6.4). A restart is therefore a new node: no connection survives
+a restart (§4.3), so no member of the old process can still be live, and
+the old id's leftover rows are reaped. `Open` takes the lease before any
+presence write can run, so a node's members never exist without its
+lease. A graceful shutdown (§11) ends the lease after its connections'
+LEAVEs: it deletes the row, or, if the node still owns members (delayed
+LEAVEs the shutdown abandoned), marks it expired, so the next reaper round
+on any node removes them within one reaper interval rather than a lease
+window. If an id were reused (tests set it), `Open` re-takes the lease
+with an upsert before serving, so the reaper fires on the old process's
+members only if the gap between the two processes exceeded the lease
+window.
+
+*Bound.* A member is never reaped while its node is alive: the reaper
+deletes only rows whose node has no unexpired lease, checked in the
+deleting statement. A dead node's members are deleted within the lease
+window after its last renewal plus one reaper interval (30s + 5s, the
+same bound as member mode) plus the chunked deletes themselves (about
+0.7s for 100k members in a local test on a 1M-row table), then their
+LEAVEs follow at publish throughput. Several reaping nodes take
+different chunks of one dead node at once (`SKIP LOCKED`); each deletes
+and announces only its own. As in member mode, a reaper that stops after
+deleting rows and before publishing their LEAVEs loses those LEAVEs. A
+live node that cannot renew for longer than the lease window (a stall or
+a partition from Postgres) is treated as dead: its members may be
+reaped, and its next bump renews (or re-creates) the row and logs a
+warning.
+
+*Mixing modes.* Every node sharing a database should run the same mode,
+but each mode's reaper leaves the other mode's live members alone and
+removes them once their node is dead, so a rolling switch is safe: the
+node-mode reaper takes a member-mode row only once its own lease has
+expired, and the member-mode reaper reaps the members of node-mode nodes
+whose lease row has expired. During a rolling switch a node-mode reaper
+also reads each live member-mode node's rows every round. One case is not
+covered once every node runs member mode: `'infinity'` rows of a node-mode
+node that has no lease row at all (it lost the row in a stall longer than
+the lease window and died before its next bump re-created it, or a write
+committed during its graceful close after the row was deleted). Finding
+them would take a scan of the whole table each round; they need a manual
+`DELETE`.
+
 Both loops skip rows a presence write holds locked (`FOR UPDATE SKIP
 LOCKED`): that write is renewing or removing the row anyway, a row
 skipped once is handled on the next round, well inside the lease window,
 and a loop that waited could deadlock with a batched write holding
-several members' rows (§6.3).
+several members' rows (§6.3). Static fixture members (above) are owned
+by a sentinel that has no lease row and carry an `'infinity'` lease;
+both reapers skip that owner.
 
 ### 12.6 REST
 

@@ -509,3 +509,32 @@ func TestRunPublishBatchingMalformedIsStartupError(t *testing.T) {
 		})
 	}
 }
+
+// TestRunPresenceLeaseModeInvalidIsStartupError: an unknown
+// --presence-lease-mode, from the flag, the env or the config file, stops
+// a cluster-mode node before it dials Postgres (DESIGN.md §12.5).
+func TestRunPresenceLeaseModeInvalidIsStartupError(t *testing.T) {
+	base := []string{"--keys=app.key:secret", "--mode=cluster", "--postgres-dsn=postgres://u:p@127.0.0.1:1/db?sslmode=disable"}
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		file string
+	}{
+		{name: "flag", args: []string{"--presence-lease-mode=row"}},
+		{name: "env", env: map[string]string{presenceLeaseModeEnv: "row"}},
+		{name: "file", file: `presence-lease-mode = "row"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string{}, base...), tc.args...)
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != 1 || !strings.Contains(out.String(), "invalid --presence-lease-mode") {
+				t.Errorf("exit = %d, output %q; want 1 and an invalid --presence-lease-mode error", code, out.String())
+			}
+		})
+	}
+}
