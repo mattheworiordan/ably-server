@@ -192,6 +192,9 @@ type PassSpec struct {
 	// 0.03). Beyond it the run is invalid: node growth would measure the
 	// generator, not the server.
 	MaxLoadDrift float64 `toml:"max_load_drift" json:"max_load_drift"`
+	// MinAttachCoverage: the share of attach claims the publishers'
+	// serial logs must settle (default 0.9), outside a fault run.
+	MinAttachCoverage float64 `toml:"min_attach_coverage" json:"min_attach_coverage"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -209,6 +212,7 @@ func DefaultPass() PassSpec {
 		TailMargin:         Duration{time.Second},
 		MinDeliveryRatio:   0.9,
 		MaxLoadDrift:       0.03,
+		MinAttachCoverage:  0.9,
 	}
 }
 
@@ -250,6 +254,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MaxLoadDrift == 0 {
 		p.MaxLoadDrift = d.MaxLoadDrift
+	}
+	if p.MinAttachCoverage == 0 {
+		p.MinAttachCoverage = d.MinAttachCoverage
 	}
 	return p
 }

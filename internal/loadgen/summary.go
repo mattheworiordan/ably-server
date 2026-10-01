@@ -97,6 +97,9 @@ type PublishStats struct {
 	AckedInWindow   int64   `json:"acked_in_window"`
 	OfferedRate     float64 `json:"offered_rate"`
 	AchievedRate    float64 `json:"achieved_rate"`
+	// SerialsDropped counts serials not logged for the attach-point check
+	// because the process had reached MaxSerialLogEntries.
+	SerialsDropped int64 `json:"serials_dropped,omitempty"`
 }
 
 // DeliveryStats counts deliveries.

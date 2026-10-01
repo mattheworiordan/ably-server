@@ -366,7 +366,9 @@ func TestJobsEndToEnd(t *testing.T) {
 	published := map[string]map[string]loadgen.StreamRecord{}
 	var seen []map[string]*loadgen.ChannelSeen
 	var received, acked, resumes, checked, opens int64
+	var claims []loadgen.AttachClaim
 	for _, s := range summaries {
+		claims = append(claims, s.Correctness.AttachClaims...)
 		for k, n := range s.Correctness.Violations {
 			if n != 0 {
 				t.Errorf("%s: %s = %d; first: %+v; errors: %v", s.Role, k, n, s.Correctness.FirstViolations, s.Errors)
@@ -422,7 +424,17 @@ func TestJobsEndToEnd(t *testing.T) {
 	if tail.Checked == 0 {
 		t.Errorf("tail check covered nothing")
 	}
-	t.Logf("received=%d acked=%d checked=%d resumes=%d opens=%d tail=%+v", received, acked, checked, resumes, opens, tail)
+	// The publishers' serial logs (REST response and realtime ACK) must be
+	// enough to settle the subscribers' attach claims against the real
+	// server, with nothing between an attach point and a first message lost.
+	attach := loadgen.AttachCheck(published, claims)
+	if attach.Missed != 0 {
+		t.Errorf("attach-point check found loss: %+v", attach)
+	}
+	if attach.Checked == 0 || attach.Checked < attach.Claims/2 {
+		t.Errorf("attach-point check settled %d of %d claims", attach.Checked, attach.Claims)
+	}
+	t.Logf("received=%d acked=%d checked=%d resumes=%d opens=%d tail=%+v attach=%+v", received, acked, checked, resumes, opens, tail, attach)
 }
 
 // fakeServer speaks just enough of the protocol to deliver a scripted

@@ -2,6 +2,8 @@ package loadgen
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,10 +37,16 @@ const (
 	// subscriber attached throughout never received. Computed by the
 	// conductor from publisher and subscriber stream records.
 	TailLoss
+	// AttachGap: a message published after an attachment's attach point
+	// (its ATTACHED channelSerial) that the attachment never received,
+	// between the attach point and the first message it did receive from
+	// that stream. Computed by the conductor from the subscribers' attach
+	// claims and the publishers' serial logs (AttachCheck).
+	AttachGap
 	numViolationKinds
 )
 
-var violationNames = [numViolationKinds]string{"duplicate", "gap", "reorder", "serial_regression", "resume_gap", "tail_loss"}
+var violationNames = [numViolationKinds]string{"duplicate", "gap", "reorder", "serial_regression", "resume_gap", "tail_loss", "attach_gap"}
 
 func (k ViolationKind) String() string {
 	if k >= 0 && k < numViolationKinds {
@@ -92,6 +100,10 @@ type Checker struct {
 
 	mu     sync.Mutex
 	logged []Violation
+	// claims are the attach-point claims of every attachment (see
+	// AttachClaim), capped at MaxAttachClaims.
+	claims        []AttachClaim
+	claimsDropped int64
 	// seen is per channel: the latest attach time of any attachment that
 	// finished continuous, and per stream the lowest maxSeen across those
 	// attachments (-1 for one that saw nothing from the stream).
@@ -102,6 +114,32 @@ type Checker struct {
 	OnViolation func(kind ViolationKind, n int64)
 
 	now func() time.Time
+}
+
+// MaxAttachClaims caps the attach claims one process keeps. Past it
+// claims are counted, not kept, and the coverage gate reports them.
+const MaxAttachClaims = 500_000
+
+// AttachClaim is one stream's first observation on one attachment: the
+// attach point the server gave (ATTACHED.channelSerial) and the first seq
+// of the stream the attachment received. The conductor compares it with
+// the publisher's serial log: the first seq whose serial is after the
+// attach point must be FirstSeq, or the messages in between were lost.
+type AttachClaim struct {
+	Channel  string `json:"c"`
+	PubID    string `json:"p"`
+	Attach   string `json:"a"`
+	FirstSeq int64  `json:"s"`
+}
+
+func (c *Checker) addClaim(cl AttachClaim) {
+	c.mu.Lock()
+	if len(c.claims) < MaxAttachClaims {
+		c.claims = append(c.claims, cl)
+	} else {
+		c.claimsDropped++
+	}
+	c.mu.Unlock()
 }
 
 // ChannelSeen is a subscriber process's record of one sampled channel,
@@ -160,6 +198,10 @@ type CorrectnessSummary struct {
 	Resumes         int64                   `json:"resumes"`
 	FirstViolations []Violation             `json:"first_violations,omitempty"`
 	Channels        map[string]*ChannelSeen `json:"channels,omitempty"`
+	// AttachClaims are the attach-point claims (see AttachClaim);
+	// AttachClaimsDropped counts those past MaxAttachClaims.
+	AttachClaims        []AttachClaim `json:"attach_claims,omitempty"`
+	AttachClaimsDropped int64         `json:"attach_claims_dropped,omitempty"`
 }
 
 // Summary snapshots the checker. Call it after every attachment has
@@ -176,6 +218,8 @@ func (c *Checker) Summary() CorrectnessSummary {
 	}
 	c.mu.Lock()
 	s.FirstViolations = append([]Violation(nil), c.logged...)
+	s.AttachClaims = append([]AttachClaim(nil), c.claims...)
+	s.AttachClaimsDropped = c.claimsDropped
 	s.Channels = make(map[string]*ChannelSeen, len(c.seen))
 	for ch, cs := range c.seen {
 		cp := *cs
@@ -247,6 +291,11 @@ type AttachmentCheck struct {
 	channel    string
 	conn       string
 	lastSerial string
+	// seed is the attach point from which this attachment's continuity
+	// began: ATTACHED.channelSerial of the last attach that was not a
+	// resume (a resume keeps the earlier seed, a declined resume starts a
+	// new one). A stream's first message is claimed against it.
+	seed       string
 	streams    map[string]*streamState
 	attachedUS int64
 	continuous bool
@@ -273,6 +322,7 @@ func (a *AttachmentCheck) Attached(attachSerial string, resumeRequested, resumed
 	if !resumeRequested {
 		a.attachedUS = now
 		a.lastSerial = attachSerial
+		a.seed = attachSerial
 		return
 	}
 	a.c.resumes.Add(1)
@@ -293,6 +343,7 @@ func (a *AttachmentCheck) Attached(attachSerial string, resumeRequested, resumed
 	a.finalizeGaps()
 	a.streams = make(map[string]*streamState)
 	a.lastSerial = attachSerial
+	a.seed = attachSerial
 }
 
 // Frame checks one delivered MESSAGE frame: its channelSerial and the
@@ -315,6 +366,12 @@ func (a *AttachmentCheck) observe(p Payload, serial string) {
 	s := a.streams[p.PubID]
 	if s == nil {
 		a.streams[p.PubID] = &streamState{next: p.Seq + 1, max: p.Seq}
+		// Nothing in this attachment can tell whether seqs before p.Seq
+		// were published after the attach point: that is the attach
+		// claim's job (AttachCheck).
+		if a.seed != "" {
+			a.c.addClaim(AttachClaim{Channel: a.channel, PubID: p.PubID, Attach: a.seed, FirstSeq: p.Seq})
+		}
 		return
 	}
 	across := s.acrossResume
@@ -401,10 +458,15 @@ func (a *AttachmentCheck) Finish(endedContinuous bool) {
 }
 
 // StreamRecord is a publisher's record of one stream on a sampled
-// channel: the highest seq it saw acknowledged and when.
+// channel: the highest seq it saw acknowledged and when, and the
+// channelSerial the server assigned to each acknowledged seq.
 type StreamRecord struct {
 	LastAckedSeq int64 `json:"last_acked_seq"`
 	LastAckedUS  int64 `json:"last_acked_us"`
+	// Serials[seq] is the channelSerial of that seq's message ("" when
+	// the ACK carried none). Streams never skip a seq, so the index is
+	// the seq. It ends at the last ACK before the end of the hold.
+	Serials []string `json:"serials,omitempty"`
 }
 
 // TailResult is the outcome of TailCheck.
@@ -457,6 +519,104 @@ func TailCheck(published map[string]map[string]StreamRecord, seen []map[string]*
 						Kind: TailLoss.String(), Channel: ch, PubID: pub,
 						Seq: got + 1, Expected: rec.LastAckedSeq, Count: n,
 						AtUS: rec.LastAckedUS,
+					})
+				}
+			}
+		}
+	}
+	return res
+}
+
+// AttachResult is the outcome of AttachCheck.
+type AttachResult struct {
+	// Claims counts the attach claims examined.
+	Claims int64 `json:"claims"`
+	// Checked counts the claims the publisher's serial log could settle.
+	Checked int64 `json:"checked"`
+	// Unverifiable counts claims it could not settle: no publisher log
+	// for the stream, a log that ends before the attach point is passed,
+	// or an unknown serial in the way.
+	Unverifiable int64 `json:"unverifiable"`
+	// Dropped counts claims the subscribers did not keep (cap).
+	Dropped int64 `json:"dropped,omitempty"`
+	// Missed counts messages published after an attach point and never
+	// delivered before the stream's first delivered message.
+	Missed   int64       `json:"missed"`
+	Examples []Violation `json:"examples,omitempty"`
+}
+
+// AttachCheck closes the first-message blind spot of the per-attachment
+// checks. An attachment learns a stream's seq only from its first
+// delivery, so anything between the attach point (ATTACHED.channelSerial)
+// and that first delivery is invisible to it. The publisher knows every
+// message's channelSerial (from the REST response or the realtime ACK),
+// so for each claim the first seq with a serial after the attach point is
+// the seq the attachment must have started at; a later FirstSeq means the
+// messages in between, published after the attach point, were lost.
+// A FirstSeq at or before it (a replay from before the attach point) is
+// not a violation.
+//
+// published is keyed channel then pubID. The check is exact where the log
+// covers the claim and silent about the rest (Unverifiable): serials are
+// compared as strings, the order the server itself uses (DESIGN.md §8),
+// so no clock is involved.
+func AttachCheck(published map[string]map[string]StreamRecord, claims []AttachClaim) AttachResult {
+	var res AttachResult
+	type streamKey struct{ ch, pub string }
+	hasHole := map[streamKey]bool{}
+	for _, cl := range claims {
+		res.Claims++
+		rec, ok := published[cl.Channel][cl.PubID]
+		n := len(rec.Serials)
+		if !ok || n == 0 {
+			res.Unverifiable++
+			continue
+		}
+		// First index with a serial after the attach point.
+		first := -1
+		sk := streamKey{cl.Channel, cl.PubID}
+		holes, seen := hasHole[sk]
+		if !seen {
+			holes = slices.Contains(rec.Serials, "")
+			hasHole[sk] = holes
+		}
+		if !holes {
+			if i := sort.Search(n, func(i int) bool { return rec.Serials[i] > cl.Attach }); i < n {
+				first = i
+			}
+		} else {
+			for i, sr := range rec.Serials {
+				if sr == "" {
+					first = -2 // an unknown serial before any later one
+					break
+				}
+				if sr > cl.Attach {
+					first = i
+					break
+				}
+			}
+		}
+		switch {
+		case first == -2:
+			res.Unverifiable++
+		case first < 0:
+			// Every logged serial is at or before the attach point: the
+			// attachment started at or after the log's end. FirstSeq <= n
+			// is consistent with that; beyond it the log cannot say.
+			if cl.FirstSeq <= int64(n) {
+				res.Checked++
+			} else {
+				res.Unverifiable++
+			}
+		default:
+			res.Checked++
+			if cl.FirstSeq > int64(first) {
+				lost := cl.FirstSeq - int64(first)
+				res.Missed += lost
+				if len(res.Examples) < MaxLoggedViolations {
+					res.Examples = append(res.Examples, Violation{
+						Kind: AttachGap.String(), Channel: cl.Channel, PubID: cl.PubID,
+						Seq: int64(first), Expected: cl.FirstSeq - 1, Count: lost, Serial: cl.Attach,
 					})
 				}
 			}

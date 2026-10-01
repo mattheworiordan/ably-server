@@ -68,6 +68,7 @@ type RunResult struct {
 	Violations       map[string]int64      `json:"violations"`
 	CheckedMessages  int64                 `json:"checked_messages"`
 	Tail             TailResult            `json:"tail"`
+	Attach           AttachResult          `json:"attach"`
 	FirstViolations  []Violation           `json:"first_violations,omitempty"`
 	Latency          map[string]*Histogram `json:"latency"`
 	GeneratorBytesPC float64               `json:"generator_bytes_per_connection,omitempty"`
@@ -154,6 +155,8 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 	r := RunResult{Violations: make(map[string]int64), Latency: make(map[string]*Histogram)}
 	published := map[string]map[string]StreamRecord{}
 	var seen []map[string]*ChannelSeen
+	var claims []AttachClaim
+	var claimsDropped int64
 	var pubTarget float64
 	var bpcSum float64
 	var bpcN int
@@ -208,6 +211,8 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 			r.Violations[k] += v
 		}
 		r.CheckedMessages += s.Correctness.CheckedMessages
+		claims = append(claims, s.Correctness.AttachClaims...)
+		claimsDropped += s.Correctness.AttachClaimsDropped
 		for _, v := range s.Correctness.FirstViolations {
 			if len(r.FirstViolations) < MaxLoggedViolations {
 				r.FirstViolations = append(r.FirstViolations, v)
@@ -246,6 +251,14 @@ func MergeSummaries(sums []*Summary, tailMargin time.Duration) RunResult {
 	r.Tail = TailCheck(published, seen, tailMargin)
 	r.Violations[TailLoss.String()] += r.Tail.Lost
 	for _, v := range r.Tail.Examples {
+		if len(r.FirstViolations) < MaxLoggedViolations {
+			r.FirstViolations = append(r.FirstViolations, v)
+		}
+	}
+	r.Attach = AttachCheck(published, claims)
+	r.Attach.Dropped = claimsDropped
+	r.Violations[AttachGap.String()] += r.Attach.Missed
+	for _, v := range r.Attach.Examples {
 		if len(r.FirstViolations) < MaxLoggedViolations {
 			r.FirstViolations = append(r.FirstViolations, v)
 		}
@@ -374,6 +387,14 @@ func (rec *RunRecord) BoundRatio() float64 {
 	return rec.NodeStats.ChannelsBoundAtEnd / float64(a)
 }
 
+// faultRelaxed reports whether the run's fault injection ran and
+// succeeded: only then do the steady-state gates (growth, load drift,
+// coverage) stand down. A fault hook that failed relaxes nothing, and
+// Evaluate fails the run for it.
+func faultRelaxed(rec *RunRecord) bool {
+	return rec.Fault != nil && rec.Fault.ExitCode == 0
+}
+
 func msOf(us uint64) string { return fmt.Sprintf("%.1f ms", float64(us)/1000) }
 
 // Evaluate applies the pass criteria (plan §8) to a run record, filling
@@ -435,9 +456,24 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 		value = strings.Join(parts, " ")
 	}
 	add(Check{Name: "loss, duplicate, reorder on the sample", Value: value, Limit: "0", Pass: bad == 0, Gating: true,
-		Note: fmt.Sprintf("tail check covered %d streams", res.Tail.Checked)})
+		Note: fmt.Sprintf("tail check covered %d streams, attach-point check %d claims", res.Tail.Checked, res.Attach.Checked)})
 	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
+	}
+	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
+		// The attach-point check settles each attachment's first message
+		// against the publishers' serial logs. If it settled few claims it
+		// proved little, so coverage is gated like the others.
+		a := res.Attach
+		total := a.Claims + a.Dropped
+		cov := 0.0
+		if total > 0 {
+			cov = float64(a.Checked) / float64(total)
+		}
+		add(Check{Name: "attach-point check coverage",
+			Value: fmt.Sprintf("%d of %d claims settled (%.0f%%), %d unverifiable, %d dropped; %d messages missed after an attach point",
+				a.Checked, total, cov*100, a.Unverifiable, a.Dropped, a.Missed),
+			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinAttachCoverage*100), Pass: a.Checked > 0 && cov >= spec.MinAttachCoverage, Gating: !faultRelaxed(rec)})
 	}
 	if p := res.Publishes; p.TargetRate > 0 {
 		ratio := 0.0

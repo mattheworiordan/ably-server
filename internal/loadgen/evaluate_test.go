@@ -14,6 +14,16 @@ func histOf(vals ...int64) *Histogram {
 	return h
 }
 
+// fixtureSerials is a publisher serial log of n messages all committed
+// after serialAt(0).
+func fixtureSerials(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = serialAt(1 + i)
+	}
+	return out
+}
+
 // fixtureSummaries is a small passing run: one subscriber, one REST
 // publisher, fast deliveries, full connections.
 func fixtureSummaries() []*Summary {
@@ -33,13 +43,16 @@ func fixtureSummaries() []*Summary {
 			Channels: map[string]*ChannelSeen{
 				"ch": {LatestAttachUS: 1_000_000, Attachments: 1, MinMaxSeq: map[string]int64{"p": 9}},
 			},
+			// The attachment attached at serialAt(0) and its first seq
+			// was 0.
+			AttachClaims: []AttachClaim{{Channel: "ch", PubID: "p", Attach: serialAt(0), FirstSeq: 0}},
 		},
 	}
 	pub := &Summary{
 		Role: RoleREST, Index: 0, Count: 1,
 		Publishes: PublishStats{TargetRate: 100, OfferedRate: 100, AchievedRate: 99, Offered: 1000, Acked: 990},
 		Latency:   map[string]*Histogram{LatRESTAck: histOf(5000, 6000, 7000)},
-		Streams:   map[string]map[string]StreamRecord{"ch": {"p": {LastAckedSeq: 9, LastAckedUS: 5_000_000}}},
+		Streams:   map[string]map[string]StreamRecord{"ch": {"p": {LastAckedSeq: 9, LastAckedUS: 5_000_000, Serials: fixtureSerials(10)}}},
 	}
 	return []*Summary{sub, pub}
 }
@@ -153,6 +166,23 @@ func TestEvaluateFailures(t *testing.T) {
 				s[0].Deliveries.Rate = 15
 			}
 		}, "deliveries vs plan"},
+		{"messages lost between the attach point and the first delivery", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				// The attachment's first delivery was seq 3, but seqs 0-2
+				// were published after its attach point.
+				s[0].Correctness.AttachClaims[0].FirstSeq = 3
+			}
+		}, "loss, duplicate, reorder"},
+		{"attach-point check settles nothing", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				s[0].Correctness.AttachClaims = nil
+			}
+		}, "attach-point check coverage"},
+		{"attach-point check cannot settle claims", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 5_000_000} // no serial log
+			}
+		}, "attach-point check coverage"},
 		{"nothing checked", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[0].Correctness.CheckedMessages = 0
@@ -451,6 +481,35 @@ func TestEvaluateSteadyLoadAndBoundRatio(t *testing.T) {
 	for _, want := range []string{"| Generator attachments | 151 | 150", "| Server channels bound (sum of nodes) | 140 | 165 |", "generator attachments at the end of the hold: 1.100"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown lacks %q\n%s", want, md)
+		}
+	}
+}
+
+func TestEvaluateAttachGapIsCountedAsAViolation(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, _ *RunRecord) {
+		if s != nil {
+			s[0].Correctness.AttachClaims[0].FirstSeq = 3
+		}
+	})
+	if rec.Result.Violations["attach_gap"] != 3 || rec.Result.Attach.Missed != 3 {
+		t.Fatalf("violations %v attach %+v", rec.Result.Violations, rec.Result.Attach)
+	}
+	if len(rec.Result.FirstViolations) == 0 || rec.Result.FirstViolations[0].Kind != "attach_gap" {
+		t.Fatalf("first violations %+v", rec.Result.FirstViolations)
+	}
+}
+
+func TestEvaluateAttachCoverageStandsDownInAFaultRun(t *testing.T) {
+	rec := evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s != nil {
+			s[0].Correctness.AttachClaims = nil
+		} else {
+			r.Fault = &FaultRecord{Command: "kill", ExitCode: 0}
+		}
+	})
+	for _, n := range failing(rec) {
+		if strings.HasPrefix(n, "attach-point") {
+			t.Fatalf("a successful fault run does not gate attach coverage: %v", failing(rec))
 		}
 	}
 }

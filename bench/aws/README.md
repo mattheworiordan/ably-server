@@ -113,12 +113,15 @@ the agents run on their own boxes and the conductor gets an inventory.
   point) and that each stream's sequence numbers arrive once, in order,
   with no gap. Counted kinds: `duplicate`, `gap`, `reorder`,
   `serial_regression`, `resume_gap` (a gap across a re-attach the server
-  reported as RESUMED) and `tail_loss` (a message a publisher saw
+  reported as RESUMED), `tail_loss` (a message a publisher saw
   acknowledged by the end of the hold that an attachment present
-  throughout never received; the conductor computes it). The first ten
-  of each process are kept verbatim. A resume the server declines (no
-  RESUMED flag, DESIGN.md §4.3) is a signalled discontinuity: counted,
-  not a violation.
+  throughout never received; the conductor computes it) and `attach_gap`
+  (a message published after an attachment's attach point that never
+  arrived before the first message the attachment did receive from that
+  stream; the conductor computes it, see "What the correctness check
+  sees"). The first ten of each process are kept verbatim. A resume the
+  server declines (no RESUMED flag, DESIGN.md §4.3) is a signalled
+  discontinuity: counted, not a violation.
 - **Latency.** Each message carries its publisher's send time and node;
   the subscriber records one-way latency into log-linear histograms
   (within 1.6%, mergeable across processes) split into same-node and
@@ -198,7 +201,11 @@ unresolved, offered and achieved rates over the hold), `deliveries`
 each with count, min, max, mean, p50, p90, p99, p99.9 and the raw
 buckets), `correctness` (checked messages, violations by kind, resumes,
 discontinuities, first violations, per sampled channel records),
-`streams` (publisher: last acknowledged sequence per sampled stream),
+`streams` (publisher: last acknowledged sequence and the channelSerial
+of every acknowledged sequence, per sampled stream; the serial log feeds
+the attach-point check and is capped at 1.5M entries per process),
+`correctness.attach_claims` (subscriber: each stream's first sequence
+number on each attachment, with the attach point),
 `resources` (the generator's own heap, stacks, RSS and goroutines every
 10 s, and bytes per connection at the end of the ramp) and `errors`.
 
@@ -292,7 +299,9 @@ Pass criteria (plan §8, overridable per scenario in `[pass]`): delivery
 p50 <= 50 ms and p99 <= 250 ms, cross-node where there is such traffic
 (p99 < 100 ms reported as stretch); REST ACK p99 <= 100 ms; connect plus
 attach p99 <= 500 ms at the target churn; zero violations of every kind
-on the sample; achieved publish rate >= 95% of offered and offered >=
+on the sample (including `attach_gap`), with at least 90% of attach
+claims settled (`min_attach_coverage`; reported, not gated, in a fault
+run that succeeded); achieved publish rate >= 95% of offered and offered >=
 95% of target (the generator kept up); no rejected publishes;
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 90% of the plan's; the generator's own connections and attachments
@@ -324,6 +333,47 @@ the plateau is visible. A hold not longer than the idle timeout has no
 growth window: growth is reported as not measured and not gated, so a
 run that must judge memory needs a hold of several idle timeouts (the
 15-minute holds of plan §8 give fourteen minutes).
+
+#### What the correctness check sees
+
+"0 violations in N checked" is narrower than it reads. The check covers
+the *sampled* channels only (the next section lists the rest), and within
+them:
+
+- **From the first message on.** An attachment learns a stream's sequence
+  number from the first message it receives, so the per-attachment checks
+  (gap, reorder, duplicate, serial regression) start there. Anything
+  between the attach point and that first message used to be invisible.
+  It is now settled by the **attach-point check**: each subscriber records
+  `(channel, pubID, ATTACHED.channelSerial, first seq)` for every stream it
+  sees on an attachment, each publisher records the channelSerial the
+  server assigned to every acknowledged message of a sampled stream (from
+  the REST response `serials` or the realtime ACK `res`), and the conductor
+  finds the first sequence whose serial sorts after the attach point. An
+  attachment whose first message is a later sequence lost the messages in
+  between (`attach_gap`, counted per message). An earlier first sequence
+  (a replay from before the attach point) is not a violation. Serials are
+  compared as strings, the order the server uses (DESIGN.md §8), so no
+  clock is involved. The attach point is the one from the last attach that
+  was not a resume: an honoured resume keeps it, a declined one starts a
+  new one.
+- **What the attach-point check cannot settle** is reported as
+  `unverifiable` and gated by coverage (at least 90% of claims settled
+  outside a fault run, `min_attach_coverage`): a claim whose stream has no
+  serial log (the publisher is not a generator of that stream, or the
+  process reached the 1.5M-entry cap), whose first sequence lies beyond the
+  log (the log ends with the last acknowledgement before the end of the
+  hold, so an attachment made after that cannot be settled), or whose
+  needed serial is unknown (an ACK that carried none). A run that settles
+  none fails; it never passes on "0 of 0".
+- **Residual blind spots.** A stream an attachment never received a single
+  message from is invisible to the per-attachment and attach-point checks;
+  only the tail check covers it, and only for streams still publishing at
+  least `tail_margin` after the attachment. Messages are checked against
+  the attach point the server reports: if the server reported an attach
+  point later than where it really started delivering, messages in that
+  stretch would not be seen as missing. A message published to a sampled
+  channel by someone other than a generator stream is ignored.
 
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
