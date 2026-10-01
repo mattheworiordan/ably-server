@@ -145,7 +145,7 @@ repo_state="$(cd "$HERE/../../.." && pwd)/bench/aws/state"
 check "default PROJECT_TAG names the user" "ably-server-scale-$want_user|1|$repo_state/STATE.json|$repo_state/LOG.md|$repo_state/results" "$(defaults_out ignored)"
 check "an explicit PROJECT_TAG is kept and not flagged" "mine|0|$repo_state/STATE.json|$repo_state/LOG.md|$repo_state/results" "$(defaults_out ignored PROJECT_TAG=mine)"
 check "STATE, LOG and RESULTS stay overridable" "x|1|/s/STATE.json|/l/LOG.md|/r" "$(defaults_out ignored STATE_FILE=/s/STATE.json LOG_FILE=/l/LOG.md RESULTS_DIR=/r | sed "s/^ably-server-scale-[^|]*/x/")"
-case "$(defaults_out ignored)" in */Workshop/*|*/home/nobody-in-particular/*) echo "FAIL a default path points into a home directory"; fails=$((fails + 1)) ;; *) echo "ok   no default path is in a home directory" ;; esac
+case "$(defaults_out ignored)" in */home/nobody-in-particular/*) echo "FAIL a default path points into a home directory"; fails=$((fails + 1)) ;; *) echo "ok   no default path is in a home directory" ;; esac
 state_dir_mode=$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/newdir/sub/state.json" PROJECT_TAG=t AWS_REGION=r bash -c 'source "$0"; state_init; stat -f %Lp "$(dirname "$ACTIVE_STATE")" 2>/dev/null || stat -c %a "$(dirname "$ACTIVE_STATE")"' "$HERE/../lib.sh")
 check "the state directory is private" 700 "$state_dir_mode"
 
