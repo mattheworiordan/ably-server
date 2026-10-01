@@ -34,8 +34,17 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 fs.file-max = 2097152
 fs.nr_open = 2097152
+# Connection tracking: the default table (262,144) capped a load generator at
+# 262k connections per box ("nf_conntrack: table full, dropping packet").
+# Sized for 1M+ connections per box; the hashsize follows below.
+net.netfilter.nf_conntrack_max = 4194304
 SYSCTL
 sysctl --system
+# nf_conntrack is loaded lazily; load it so the sysctl applies and size its
+# hash table (otherwise the default 16k buckets make lookups slow at 4M).
+modprobe nf_conntrack 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_max=4194304 >/dev/null 2>&1 || true
+echo 524288 >/sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
 
 # File descriptors: shells, systemd services and containers.
 cat >/etc/security/limits.d/90-bench.conf <<'LIMITS'
