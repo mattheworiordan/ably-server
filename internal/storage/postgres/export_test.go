@@ -51,6 +51,32 @@ func (s *Storage) LoadRangeAfter(ctx context.Context, channel, after string) (in
 	return len(cms), err
 }
 
+// ApplyMigrationForTest applies sql as migration version through the
+// retrying runner, on one pooled connection.
+func (s *Storage) ApplyMigrationForTest(ctx context.Context, version, sql string) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	return applyMigrationWithRetry(ctx, conn, migration{version: version, sql: sql})
+}
+
+// MigrationLockTimeouts returns how many migration attempts lost a lock
+// wait (55P03) in this process.
+func MigrationLockTimeouts() int64 { return migrationLockTimeouts.Load() }
+
+// SetMigrationTimings overrides the migration lock timeout and the pause
+// between attempts and returns a restore func.
+func SetMigrationTimings(lock, delay time.Duration) func() {
+	origLock, origDelay := migrationLockTimeout, migrationRetryDelay
+	migrationLockTimeout, migrationRetryDelay = lock, delay
+	return func() { migrationLockTimeout, migrationRetryDelay = origLock, origDelay }
+}
+
+// MigrationAttempts is the number of attempts the runner makes.
+const MigrationAttempts = migrationAttempts
+
 // ChannelRowsDropped returns this node's
 // ably_storage_channel_rows_dropped_total.
 func (s *Storage) ChannelRowsDropped() float64 {

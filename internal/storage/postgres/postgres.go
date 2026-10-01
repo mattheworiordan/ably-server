@@ -996,18 +996,34 @@ func listMigrations() ([]migration, error) {
 	return out, nil
 }
 
-// migrationRetryDelay is the pause between attempts of a migration that
-// lost a deadlock or a lock wait.
-var migrationRetryDelay = 250 * time.Millisecond
+// Migration lock handling (DESIGN.md §6.3, §11). Every migration runs in
+// one transaction under lock_timeout = migrationLockTimeout, so a lock
+// held by a node still serving traffic makes the attempt fail with 55P03
+// after that long instead of waiting indefinitely (and, behind it, queuing
+// every other statement on the table). A failed attempt rolls back whole;
+// applyMigrationWithRetry makes up to migrationAttempts attempts,
+// migrationRetryDelay apart, so Open fails after about
+// attempts x (lock timeout + delay) = 5 x (5 s + 250 ms), roughly 26 s,
+// when the lock never frees. The vars exist so tests can shorten them.
+const migrationAttempts = 5
+
+var (
+	migrationLockTimeout = 5 * time.Second
+	migrationRetryDelay  = 250 * time.Millisecond
+)
+
+// migrationLockTimeouts counts attempts that lost a lock wait (55P03),
+// for tests.
+var migrationLockTimeouts atomic.Int64
 
 // applyMigrationWithRetry retries a migration that failed on a deadlock
 // or a lock timeout: a migration that restructures tables in use by
 // nodes still running the old version can lose the deadlock detector's
-// choice, and the whole transaction rolls back, so a retry is safe.
+// choice or wait out the lock timeout, and the whole transaction rolls
+// back, so a retry is safe.
 func applyMigrationWithRetry(ctx context.Context, conn *pgxpool.Conn, m migration) error {
-	const attempts = 5
 	var err error
-	for i := range attempts {
+	for i := range migrationAttempts {
 		if err = applyMigration(ctx, conn, m); err == nil {
 			return nil
 		}
@@ -1015,7 +1031,10 @@ func applyMigrationWithRetry(ctx context.Context, conn *pgxpool.Conn, m migratio
 		if !errors.As(err, &pgErr) || (pgErr.Code != "40P01" && pgErr.Code != "55P03") {
 			return err
 		}
-		if i < attempts-1 {
+		if pgErr.Code == "55P03" {
+			migrationLockTimeouts.Add(1)
+		}
+		if i < migrationAttempts-1 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1035,6 +1054,11 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// SET LOCAL does not take a bind parameter; the value is a constant
+	// duration rendered as milliseconds.
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = %d`, migrationLockTimeout.Milliseconds())); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
 	if _, err := tx.Exec(ctx, m.sql); err != nil {
 		return fmt.Errorf("exec migration sql: %w", err)
 	}

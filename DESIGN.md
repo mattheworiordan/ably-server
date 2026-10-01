@@ -1310,18 +1310,34 @@ and is applied at `postgres.Open` by an auto-migrate sweep:
 The mechanism is forward-only, hand-rolled (no migration library),
 and matches what a load balancer rolling-restart of N nodes against
 the same Postgres needs: every restart is a no-op except the one
-that introduces a new migration file. A migration that loses a
-deadlock or a lock wait against nodes still on the old version is
-retried (up to five attempts).
+that introduces a new migration file.
 
-`0002_partitioned_log` is the exception to a cheap rolling upgrade. It
-locks both tables, attaches the existing log as one leaf (a scan and a
-primary-key build in proportion to its size), and changes what the
-old version writes to: until every node runs the new version, old nodes
-write channels of persisted namespaces into the live class, where those
-rows age out on the continuity window. Rows written before the upgrade
-also land in the live class, so a persisted namespace's history from
-before the upgrade is kept only for the continuity window.
+Every migration runs under `SET LOCAL lock_timeout = '5s'`, so a lock
+held by a node still serving traffic ends the attempt with `55P03` after
+5 seconds instead of waiting without limit (a waiting `ACCESS EXCLUSIVE`
+request also queues every later statement on the table behind it). The
+attempt rolls back whole, and the runner retries a `55P03` or a deadlock
+(`40P01`) up to 5 attempts in all, 250 ms apart. A migration whose lock
+never frees therefore fails `Open` after about 26 seconds and changes
+nothing; the timeout bounds the wait for a lock, not the time a
+migration holds the locks it did get.
+
+**`0002_partitioned_log` is the one migration that cannot run under
+traffic**, and the only one that needs an offline step; the others
+(`0001`, `0003`, `0004`) take brief locks or only add objects. It takes
+`ACCESS EXCLUSIVE` on both log tables for the whole transaction, so every
+node, old or new, blocks on every publish until it ends. On a populated
+log it attaches the old table as one leaf, which validates every row
+against the partition bound and builds the new primary key on it, and
+does the same for the `messages` projection: time in proportion to the
+number of rows. The rate (rows per second) depends on hardware, row size
+and the existing indexes, and has not been measured; see §11 "Upgrading
+across 0002" for the procedure and how to estimate it. It also changes
+what the old version writes to: until every node runs the new version,
+old nodes write channels of persisted namespaces into the live class,
+where those rows age out on the continuity window. Rows written before
+the upgrade also land in the live class, so a persisted namespace's
+history from before the upgrade is kept only for the continuity window.
 
 Per-publish writes run inside one transaction that first locks the
 channel's row in `channels` (`advance_channel_serial` mints the next
@@ -2578,6 +2594,49 @@ In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection
 and, on each `ATTACH`, replays missed messages from Postgres using the
 client-supplied `channelSerial`. No connection state crosses nodes.
+
+**Upgrading across `0002_partitioned_log`** (once, for a database created
+before it; a fresh database, or one already past it, takes ordinary
+rolling restarts). This is an offline step, not a rolling one (§6.3):
+
+1. Take a snapshot or backup of the database.
+2. Optional, to shorten step 5: delete log rows older than the
+   continuity window, in batches, while the old version still runs
+   (`DELETE FROM channel_messages WHERE ctid IN (SELECT ctid FROM
+   channel_messages WHERE channel_serial < '<14-digit ms time two minutes
+   ago>' LIMIT 10000)`, repeated until it deletes nothing; the same on
+   `messages` by `message_serial`; then `VACUUM`). Every
+   pre-upgrade row lands in the live class and is dropped within a few
+   minutes of the upgrade, so older rows are only migration cost. This
+   also drops pre-upgrade persisted history, which the upgrade keeps for
+   the continuity window only (§6.3).
+3. Estimate the downtime. Rows per second is unknown for your hardware.
+   Restore the snapshot into a scratch database and run the new binary
+   against it once, timing `Open`; that is the downtime to plan for.
+   Failing that, `SELECT count(*), pg_size_pretty(pg_total_relation_size(
+   'channel_messages')) FROM channel_messages` and
+   `pg_total_relation_size('messages')` give the work the attach does:
+   it reads each row once and builds one index.
+4. Stop every node of the old version (or take them out of the load
+   balancer and wait for their connections to drain, then stop them). Do
+   not leave any running: the migration cannot take its lock while one
+   holds a transaction on the tables, and gives up after about 26
+   seconds (§6.3).
+5. Start one node of the new version and wait for it to report ready
+   (`/readyz` is 200). `Open` does not return, so `/readyz` does not
+   answer, until the migration commits. Confirm
+   `SELECT version FROM schema_migrations` lists
+   `0002_partitioned_log`. If `Open` failed, nothing was applied (the
+   transaction rolled back): fix the cause and start again, or start the
+   old version.
+6. Start the rest of the fleet. Their `Open` finds every migration
+   applied and takes no table lock. Starting them before step 5 ends is
+   safe (they wait on the migration advisory lock) but their readiness
+   checks fail until it ends.
+
+Do not run old and new versions together across this migration: an old
+node would write persisted-namespace rows into the live class, and a
+resume across the resulting hole would be accepted as continuous.
 
 ## 12. Presence
 
