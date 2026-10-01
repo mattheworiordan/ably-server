@@ -14,6 +14,53 @@ func (s *Storage) MaintainPartitionsAt(ctx context.Context, skew time.Duration) 
 	return s.maintainPartitions(ctx, skew)
 }
 
+// MaintainCreateAt and MaintainDropAt run the two halves of a sweep on
+// their own, as the retention loop's alternating ticks do.
+func (s *Storage) MaintainCreateAt(ctx context.Context, skew time.Duration) error {
+	return s.maintainCreate(ctx, skew)
+}
+
+func (s *Storage) MaintainDropAt(ctx context.Context, skew time.Duration) error {
+	return s.maintainDrop(ctx, skew)
+}
+
+// DropLockTimeouts returns this node's
+// ably_storage_partition_drop_lock_timeouts_total.
+func (s *Storage) DropLockTimeouts() float64 {
+	var m dto.Metric
+	if err := s.metrics.dropTimeouts.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
+// SetDropLockTimeout overrides the lock_timeout of one leaf DROP and
+// returns a restore func.
+func SetDropLockTimeout(d time.Duration) func() {
+	orig := dropLockTimeout
+	dropLockTimeout = d
+	return func() { dropLockTimeout = orig }
+}
+
+// LoadRangeAfter runs the chain's single-channel log range read for the
+// channel's own retention floor.
+func (s *Storage) LoadRangeAfter(ctx context.Context, channel, after string) (int, error) {
+	cs := &channelStore{name: channel}
+	s.setRetention(cs)
+	cms, err := loadChannelMessagesAfter(ctx, s.pool, channel, after, "", cs.rangeFloor(), rangePageSize)
+	return len(cms), err
+}
+
+// ChannelRowsDropped returns this node's
+// ably_storage_channel_rows_dropped_total.
+func (s *Storage) ChannelRowsDropped() float64 {
+	var m dto.Metric
+	if err := s.metrics.channelRowsDropped.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
 // PartitionsDropped returns this node's ably_storage_partitions_dropped_total
 // for table.
 func (s *Storage) PartitionsDropped(table string) float64 {

@@ -103,11 +103,11 @@ func TestRetentionResolve(t *testing.T) {
 	if r.LivePartition != time.Minute || r.PersistedPartition != time.Hour {
 		t.Errorf("derived widths = %v / %v, want 1m / 1h", r.LivePartition, r.PersistedPartition)
 	}
-	if r.SweepInterval != 30*time.Second {
-		t.Errorf("derived sweep = %v, want 30s", r.SweepInterval)
+	if r.MaintenanceInterval != 30*time.Second {
+		t.Errorf("derived sweep = %v, want 30s", r.MaintenanceInterval)
 	}
-	r = Retention{Message: 10 * time.Minute, Persisted: 72 * time.Hour, SweepInterval: 5 * time.Second}.resolve()
-	if r.LivePartition != 5*time.Minute || r.PersistedPartition != time.Hour || r.SweepInterval != 5*time.Second {
+	r = Retention{Message: 10 * time.Minute, Persisted: 72 * time.Hour, MaintenanceInterval: 5 * time.Second}.resolve()
+	if r.LivePartition != 5*time.Minute || r.PersistedPartition != time.Hour || r.MaintenanceInterval != 5*time.Second {
 		t.Errorf("resolve = %+v", r)
 	}
 }

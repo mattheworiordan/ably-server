@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ably/ably-server/internal/protocol"
@@ -416,7 +417,7 @@ func (cs *channelStore) fillGap() {
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, rangePageSize)
+		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, cs.rangeFloor(), rangePageSize)
 		cancel()
 
 		cs.hwmMu.Lock()
@@ -463,7 +464,7 @@ func (cs *channelStore) catchUp(ctx context.Context) error {
 		after := cs.lastSeen
 		cs.hwmMu.Unlock()
 
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, "", rangePageSize)
+		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, "", cs.rangeFloor(), rangePageSize)
 		if err != nil {
 			cs.st().fetchErrors.Add(1)
 			return err
@@ -629,19 +630,29 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 	return len(stores), firstErr
 }
 
-// sqlLoadRangeMany reads, for each (channel, after) pair, up to $3 cms
-// past after, every kind, ascending: one round trip for many channels.
+// sqlLoadRangeMany reads, for each (channel, after, floor) triple, up to
+// $4 cms past after and at or above floor, every kind, ascending: one
+// round trip for many channels. The floor is the channel's retention
+// floor (rangeFloor) and is what lets the planner prune leaves older than
+// retention, so the read does not take locks on them, where a leaf drop
+// is waiting (DESIGN.md §6.3).
+//
+// Both range queries run with pgx.QueryExecModeExec (an unnamed
+// statement, planned for the actual parameters on every call). A named,
+// cached statement switches to a generic plan after five executions, and
+// a generic plan locks every leaf whether or not runtime pruning skips
+// it, which would defeat the floor.
 const sqlLoadRangeMany = `
 SELECT t.name, m.channel_serial, m.idx, m.kind, m.payload, m.summary
-FROM unnest($1::text[], $2::text[]) AS t(name, after)
+FROM unnest($1::text[], $2::text[], $3::text[]) AS t(name, after, floor)
 CROSS JOIN LATERAL (
 	SELECT cm.channel_serial, cm.idx, cm.kind, cm.payload, cm.summary
 	FROM channel_messages cm
-	WHERE cm.channel = t.name AND cm.channel_serial IN (
+	WHERE cm.channel = t.name AND cm.channel_serial >= t.floor AND cm.channel_serial IN (
 		SELECT DISTINCT channel_serial FROM channel_messages
-		WHERE channel = t.name AND channel_serial > t.after
+		WHERE channel = t.name AND channel_serial > t.after AND channel_serial >= t.floor
 		ORDER BY channel_serial
-		LIMIT $3)
+		LIMIT $4)
 ) m
 ORDER BY t.name, m.channel_serial, m.idx
 `
@@ -653,6 +664,7 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 	byName := make(map[string]*channelStore, len(stores))
 	names := make([]string, 0, len(stores))
 	afters := make([]string, 0, len(stores))
+	floors := make([]string, 0, len(stores))
 	for _, cs := range stores {
 		cs.hwmMu.Lock()
 		ok := cs.seeded && !cs.released
@@ -664,12 +676,13 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 		byName[cs.name] = cs
 		names = append(names, cs.name)
 		afters = append(afters, after)
+		floors = append(floors, cs.rangeFloor())
 	}
 	if len(names) == 0 {
 		return nil
 	}
 
-	rows, err := s.pool.Query(ctx, sqlLoadRangeMany, names, afters, rangePageSize)
+	rows, err := s.pool.Query(ctx, sqlLoadRangeMany, pgx.QueryExecModeExec, names, afters, floors, rangePageSize)
 	if err != nil {
 		s.stats.fetchErrors.Add(1)
 		return fmt.Errorf("storage/postgres: batched range read: %w", err)
@@ -803,25 +816,29 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 }
 
 // sqlLoadRange reads the cms on one channel in (after, upTo] ($3 = ""
-// means unbounded), up to $4 of them, every kind, ascending.
+// means unbounded) at or above the retention floor $4, up to $5 of them,
+// every kind, ascending. The floor is what lets the planner prune leaves
+// older than retention (see sqlLoadRangeMany).
 const sqlLoadRange = `
 SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
-WHERE channel = $1 AND channel_serial IN (
+WHERE channel = $1 AND channel_serial >= $4::text AND channel_serial IN (
 	SELECT DISTINCT channel_serial FROM channel_messages
-	WHERE channel = $1 AND channel_serial > $2 AND ($3 = '' OR channel_serial <= $3)
+	WHERE channel = $1 AND channel_serial > $2::text AND ($3::text = '' OR channel_serial <= $3::text)
+	  AND channel_serial >= $4::text
 	ORDER BY channel_serial
-	LIMIT $4)
+	LIMIT $5)
 ORDER BY channel_serial, idx
 `
 
 // loadChannelMessagesAfter reads up to limit cms on channel with a
-// serial in (after, upTo] (upTo "" means unbounded), of every kind,
+// serial in (after, upTo] (upTo "" means unbounded) and at or above floor
+// (the channel's retention floor, rangeFloor), of every kind,
 // ascending, with annotation summary snapshots. The chained buses' gap
 // fill and catch-up read the log through it; unlike the History-based
 // reconcile of the pgnotify bus it includes annotation cms, which a
 // chain must see to stay unbroken.
-func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo string, limit int) ([]*protocol.ChannelMessage, error) {
-	rows, err := pool.Query(ctx, sqlLoadRange, channel, after, upTo, limit)
+func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo, floor string, limit int) ([]*protocol.ChannelMessage, error) {
+	rows, err := pool.Query(ctx, sqlLoadRange, pgx.QueryExecModeExec, channel, after, upTo, floor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: load range %s (%s, %s]: %w", channel, after, upTo, err)
 	}

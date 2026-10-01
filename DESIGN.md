@@ -1354,12 +1354,20 @@ partition drop, not a row-by-row DELETE:
   Each leaf covers one width: half the class's retention, clamped to
   between 1 minute and 1 hour (1 minute for the continuity window, 1 hour
   for 24 hours). While sweeps succeed, a row lives for at most its
-  retention plus one width plus one sweep interval.
+  retention plus one width plus two maintenance ticks (drops run on every
+  second tick).
 
 Every node runs a maintenance sweep at `Open` (before it serves) and then
-every half leaf width (30 s by default). It reads the time from the
+a tick every half leaf width (30 s by default). It reads the time from the
 database's clock, the same clock that mints serials, so a node with a
-skewed clock cannot drop a leaf still being written. Then:
+skewed clock cannot drop a leaf still being written. Ticks alternate:
+even ticks run step 1 and odd ticks run step 2, never both in one tick
+(`Open` runs step 1 only). A detach can wait up to 30 seconds holding the
+parent's `SHARE UPDATE EXCLUSIVE` lock, which creation's `ATTACH` also
+needs, under a 10 second lock timeout; back to back, a slow detach could
+fail the creation that publishes depend on. With the hour of lookahead,
+creating on every second tick (a minute by default) loses nothing, and a
+leaf lives one more tick at most.
 
 1. **Create ahead.** Under a transaction-scoped advisory lock, it creates
    every missing leaf from the current slot to at least an hour (and at
@@ -1378,8 +1386,23 @@ skewed clock cannot drop a leaf still being written. Then:
    detached leaf whose `DROP` failed is found again by name and dropped.
    Only one node drops at a time (a session advisory lock, tried rather
    than waited for), and the drop lock is separate from the creation
-   lock, so a slow drop never holds up creation. `Open` creates but does
-   not drop.
+   lock, so a slow drop never holds up creation.
+
+   The `DROP TABLE` needs `ACCESS EXCLUSIVE` on the detached leaf, which
+   queues behind any reader still holding it and makes every later reader
+   queue behind the drop. It therefore runs in its own transaction under
+   `lock_timeout = 1s`. On timeout the leaf stays as a detached orphan
+   (counted in `ably_storage_partition_drop_lock_timeouts_total`, not
+   retried in the same sweep) and the next drop tick's by-name pass drops
+   it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
+   are bounded below by the channel's retention floor (the same bound a
+   resume is checked against), and run as unnamed statements planned for
+   the actual parameters, so the planner prunes the leaves older than
+   retention and the reads never lock a leaf a drop is waiting on. A
+   cached statement would switch to a generic plan after five executions,
+   and a generic plan locks every leaf. A cm older than the floor is
+   outside the retention the channel promises; a gap fill that would have
+   reached below it does not.
 
 A resume whose cursor was minted before now minus the channel's retention
 is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
@@ -1399,7 +1422,8 @@ whose target has aged out finds no row and gets `ErrTargetNotFound` (§13.2):
 the projection row goes with the leaf that holds the message's create
 serial. The `presence` table and the `channels` table are not partitioned:
 presence rows are bounded by live membership (§12.5), and a `channels` row
-is one small row per channel ever used.
+is one small row per channel name, pruned once the channel has been idle
+past every retention (see "Channel rows" below).
 
 Every node must run with the same retention settings, since whichever node
 sweeps applies its own. Changing a channel's class (editing a namespace's
@@ -1413,7 +1437,8 @@ continuity window.
 
 Series (§10): `ably_storage_partitions_created_total{table}`,
 `ably_storage_partitions_dropped_total{table}`,
-`ably_storage_retention_errors_total`, and the gauges
+`ably_storage_retention_errors_total`,
+`ably_storage_partition_drop_lock_timeouts_total`, and the gauges
 `ably_storage_log_bytes{table}` (heap, indexes and TOAST of every leaf) and
 `ably_storage_log_partitions{table}`, as of the node's last sweep.
 
@@ -1543,15 +1568,60 @@ bind. The insert can wait on another transaction that is inserting the
 same new name uncommitted (two nodes' first publishes to one channel at
 the same instant): at most one commit, and never a deadlock, since every
 transaction inserts new rows in sorted order and waits for nothing else
-after them. Rows are never deleted, so each node keeps a bounded set of
-names it knows have a row (65,536 per database, oldest forgotten first):
-a bind of a known name reads the row with a plain `SELECT` instead of
-`ensure_channel`, which writes a new row version and waits for the row
-lock of a channel another node is publishing on. Either read comes after
+after them. Each node keeps a bounded set of names it knows have a row
+(65,536 per database, oldest forgotten first): a bind of a known name
+reads the row with a plain `SELECT` instead of `ensure_channel`, which
+writes a new row version and waits for the row lock of a channel another
+node is publishing on. A known name whose row has since been pruned (see
+below) reads no row, and the bind falls back to `ensure_channel`, which
+creates it. Either read comes after
 the bus subscription, so the bind misses nothing (§7.2). With
 `--publish-bind-on-write=true` the earlier behaviour returns: every bind
 runs `ensure_channel`, and a batched publish (message or presence)
 creates a missing row in a statement of its own before it is queued.
+
+**Pruning `channels` rows.** One row per channel name ever used is
+unbounded: a workload that touches millions of distinct names an hour
+(the 1x shape in `bench/aws` touches 2.2 million) would leave that many
+rows behind, each probed by the primary key on every batch. Each drop tick
+of the retention sweep (§6.3 "Retention", step 2), under the drop lock,
+deletes one chunk of up to 1,000 rows whose `channel_serial` was minted
+longer ago than the longest retention (`--persisted-retention`, default 24
+hours; the larger of the two if configured the other way round) and that
+have no `presence` row, using `FOR UPDATE SKIP LOCKED` so a publish in
+flight keeps its row. It counts them in
+`ably_storage_channel_rows_dropped_total`. At most one chunk per node per
+drop tick bounds the load the step adds, and also bounds the pruning rate:
+with the default 30 s maintenance interval a node's drop ticks are a minute
+apart, so one node prunes at most 1,000 rows a minute, 60,000 an hour. The
+drop lock is held by one node at a time, so the fleet prunes at most one
+chunk per drop tick of any node. A workload that creates more than that
+many new names an hour grows the table until the fleet is large enough or
+the maintenance interval short enough to keep up; the growth rate is the
+difference. There is no index on `channels.channel_serial` (building one
+is a blocking operation on a hot table), so a tick that finds nothing to
+prune scans the table once.
+
+Consequences of deleting a row, none of which loses a message, since by
+the predicate no cm of the channel is older than the longest retention
+and so none survives:
+
+- A later publish recreates the row through `publish_batch_lock` (or
+  `ensure_channel`) with a fresh time-based seed serial. That serial is
+  above every old serial of the channel, because the old row's serial was
+  already older than the retention floor when it was deleted.
+- `initial_channel_serial`, the seed a rewind to the channel's beginning
+  attaches at, is lost: after the row is recreated the beginning of the
+  channel is the new seed (§4.3). The old beginning could not be served
+  anyway, as every cm after it has aged out.
+- A node that has the channel bound keeps its delivery mark at the old
+  serial. The first publish after the idle period announces the new seed
+  as its predecessor, which is ahead of the mark, so the delivery point
+  holds it and the gap fill reads it from the log about 100 ms later
+  (§7.2); that one cm is delivered late, none is lost, and no
+  discontinuity is signalled because the log read returns the cm.
+- A resume with a `channelSerial` from before the idle period is already
+  refused as a discontinuity by the retention floor (§4.3).
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -1571,7 +1641,9 @@ Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
 `ably_publish_batch_retries_total` and
 `ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`, and
 `presence_inflight` for an unbatched presence write refused over its
-in-flight bound, §12.5).
+in-flight bound, §12.5), `ably_storage_channel_rows_dropped_total` and
+`ably_storage_channel_binds_total{source}` (`ensure`: a bind that ran
+`ensure_channel`; `read`: a bind that read a row the node knew existed).
 
 ### 6.4 Channel sharding
 
@@ -2369,7 +2441,8 @@ name = "persisted:presence_fixtures"
   - Cluster mode only, from the retention sweep (§6.3):
     `ably_storage_partitions_created_total{table}`,
     `ably_storage_partitions_dropped_total{table}`,
-    `ably_storage_retention_errors_total` (counters) and
+    `ably_storage_retention_errors_total`,
+    `ably_storage_partition_drop_lock_timeouts_total` (counters) and
     `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
     (gauges). `table` is `channel_messages` or `messages`.
   - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres

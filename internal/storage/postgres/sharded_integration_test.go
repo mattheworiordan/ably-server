@@ -281,7 +281,7 @@ func TestShardedDataLandsOnItsShard(t *testing.T) {
 func TestShardedRetentionRunsOnEveryShard(t *testing.T) {
 	ctx := context.Background()
 	dsns := shardDSNs(t, 2)
-	s := openShardedT(t, Options{Retention: Retention{SweepInterval: 100 * time.Millisecond}}, dsns)
+	s := openShardedT(t, Options{Retention: Retention{MaintenanceInterval: 100 * time.Millisecond}}, dsns)
 
 	// Detach and drop the newest live leaf of the log on every shard; each
 	// shard's retention loop must create it again.
@@ -329,8 +329,15 @@ func TestShardedRetentionRunsOnEveryShard(t *testing.T) {
 		}
 	}
 	for i := range dsns {
-		if err := s.Shard(i).MaintainPartitionsAt(ctx, 10*time.Minute); err != nil {
-			t.Fatalf("shard %d sweep: %v", i, err)
+		// The shard's own loop runs drop ticks every 200 ms and holds the
+		// per-database drop lock while it does (a drop sweep that finds the
+		// lock taken skips, by design), so a sweep that lands on one of
+		// those ticks drops nothing; the next one does.
+		for attempt := 0; attempt < 5 && s.Shard(i).PartitionsDropped("channel_messages") < 1; attempt++ {
+			if err := s.Shard(i).MaintainPartitionsAt(ctx, 10*time.Minute); err != nil {
+				t.Fatalf("shard %d sweep: %v", i, err)
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 		if got := s.Shard(i).PartitionsDropped("channel_messages"); got < 1 {
 			t.Errorf("shard %d dropped %v channel_messages leaves, want >= 1", i, got)

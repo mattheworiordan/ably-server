@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -45,6 +47,14 @@ const (
 // left "detach pending" and finished with FINALIZE on a later sweep.
 // It is a var so tests can shrink it.
 var detachTimeout = 30 * time.Second
+
+// dropLockTimeout bounds how long one DROP TABLE of an expired leaf waits
+// for its ACCESS EXCLUSIVE lock. A reader still holding the leaf (or a
+// statement queued behind one) would otherwise stall the drop, and every
+// new reader of the leaf behind it. A drop that times out leaves the
+// detached leaf as an orphan the next drop sweep removes by name. It is
+// a var so tests can shrink it.
+var dropLockTimeout = time.Second
 
 // clockMargin is added to the retention floor a resume is checked
 // against (RetainedSince), on top of the measured offset between this
@@ -82,10 +92,12 @@ type Retention struct {
 	LivePartition      time.Duration
 	PersistedPartition time.Duration
 
-	// SweepInterval is how often each node runs partition maintenance.
+	// MaintenanceInterval is how often each node runs a retention
+	// maintenance tick (alternately creating and dropping leaves, see
+	// retentionLoop). It is not the bus watermark sweep (Options.SweepInterval).
 	// Zero derives half the narrower partition width, clamped to
 	// [1s, 1m].
-	SweepInterval time.Duration
+	MaintenanceInterval time.Duration
 }
 
 // retentionClass is one level-1 partition: the live class (persisted =
@@ -127,8 +139,8 @@ func (r Retention) resolve() Retention {
 	if r.PersistedPartition <= 0 {
 		r.PersistedPartition = derivePartitionWidth(r.Persisted)
 	}
-	if r.SweepInterval <= 0 {
-		r.SweepInterval = min(max(min(r.LivePartition, r.PersistedPartition)/2, time.Second), time.Minute)
+	if r.MaintenanceInterval <= 0 {
+		r.MaintenanceInterval = min(max(min(r.LivePartition, r.PersistedPartition)/2, time.Second), time.Minute)
 	}
 	return r
 }
@@ -189,11 +201,16 @@ type partition struct {
 
 // retentionMetrics are the ably_storage_* series the sweep maintains.
 type retentionMetrics struct {
-	created  *prometheus.CounterVec
-	dropped  *prometheus.CounterVec
-	errors   prometheus.Counter
-	logBytes *prometheus.GaugeVec
-	leaves   *prometheus.GaugeVec
+	created *prometheus.CounterVec
+	dropped *prometheus.CounterVec
+	errors  prometheus.Counter
+	// dropTimeouts counts DROP TABLE of a leaf given up after
+	// dropLockTimeout (retried next drop sweep).
+	dropTimeouts prometheus.Counter
+	// channelRowsDropped counts channels rows deleted by the prune step.
+	channelRowsDropped prometheus.Counter
+	logBytes           *prometheus.GaugeVec
+	leaves             *prometheus.GaugeVec
 }
 
 func newRetentionMetrics() *retentionMetrics {
@@ -210,6 +227,14 @@ func newRetentionMetrics() *retentionMetrics {
 			Name: "ably_storage_retention_errors_total",
 			Help: "Retention sweep steps that failed on this node (retried on the next sweep).",
 		}),
+		dropTimeouts: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_storage_partition_drop_lock_timeouts_total",
+			Help: "Drops of an expired leaf partition abandoned after waiting the lock timeout for the leaf (a reader held it); the leaf is dropped by a later sweep.",
+		}),
+		channelRowsDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_storage_channel_rows_dropped_total",
+			Help: "channels rows deleted by this node's retention sweep: idle for longer than the longest retention and with no presence member.",
+		}),
 		logBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "ably_storage_log_bytes",
 			Help: "Total on-disk size of the partitioned tables (heap, indexes, TOAST), by table, as of this node's last sweep.",
@@ -222,49 +247,80 @@ func newRetentionMetrics() *retentionMetrics {
 }
 
 func (m *retentionMetrics) collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.created, m.dropped, m.errors, m.logBytes, m.leaves}
+	return []prometheus.Collector{m.created, m.dropped, m.errors, m.dropTimeouts, m.channelRowsDropped, m.logBytes, m.leaves}
 }
 
-// retentionLoop runs partition maintenance every SweepInterval until the
-// storage is closed.
+// retentionLoop runs partition maintenance every MaintenanceInterval until the
+// storage is closed. Ticks alternate between creating leaves ahead and
+// dropping expired ones, never both in one tick: a drop's detach can wait
+// up to detachTimeout for old snapshots and holds the parent's
+// SHARE UPDATE EXCLUSIVE lock while it does, and creation (ATTACH) needs
+// the same lock under a shorter lock timeout, so running them back to
+// back lets a slow detach fail the creation that publishes depend on. The
+// lookahead (at least an hour) is many ticks long, so creating on every
+// second tick loses nothing (DESIGN.md §6.3).
 func (s *Storage) retentionLoop(ctx context.Context) {
 	defer s.wg.Done()
-	t := time.NewTicker(s.retention.SweepInterval)
+	t := time.NewTicker(s.retention.MaintenanceInterval)
 	defer t.Stop()
-	for {
+	for tick := 0; ; tick++ {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := s.maintainPartitions(ctx, 0); err != nil && ctx.Err() == nil {
+			var err error
+			if tick%2 == 0 {
+				err = s.maintainCreate(ctx, 0)
+			} else {
+				err = s.maintainDrop(ctx, 0)
+			}
+			if err != nil && ctx.Err() == nil {
 				s.logger.Warn("storage/postgres: retention sweep failed", "err", err)
 			}
 		}
 	}
 }
 
-// maintainPartitions creates the leaf partitions each class needs from
-// now to now plus its lookahead, then detaches and drops every leaf whose
-// whole range is older than the class's retention (DESIGN.md §6.3). Time
-// is the database's clock, the same clock that mints serials, so a node
-// with a skewed clock cannot drop a partition still being written. skew
-// shifts that clock and exists for tests.
-//
-// A creation failure is returned: without partitions ahead, publishes
-// fail. A drop failure is logged and counted and retried on the next
-// sweep.
+// maintainPartitions runs a full sweep, creation then drop. The loop never
+// does this (see retentionLoop); tests use it to age the log in one call.
 func (s *Storage) maintainPartitions(ctx context.Context, skew time.Duration) error {
+	if err := s.maintainCreate(ctx, skew); err != nil {
+		return err
+	}
+	return s.maintainDrop(ctx, skew)
+}
+
+// maintainCreate creates the leaf partitions each class needs from now to
+// now plus its lookahead (DESIGN.md §6.3). Time is the database's clock,
+// the same clock that mints serials, so a node with a skewed clock cannot
+// create the wrong leaves. skew shifts that clock and exists for tests. A
+// failure is returned: without partitions ahead, publishes fail.
+func (s *Storage) maintainCreate(ctx context.Context, skew time.Duration) error {
 	nowMs, err := s.databaseNow(ctx)
 	if err != nil {
 		s.metrics.errors.Inc()
 		return err
 	}
 	nowMs += skew.Milliseconds()
-
 	if err := s.ensurePartitions(ctx, nowMs); err != nil {
 		s.metrics.errors.Inc()
 		return err
 	}
+	s.observeLogSize(ctx)
+	return nil
+}
+
+// maintainDrop detaches and drops every leaf whose whole range is older
+// than the class's retention, then prunes the channels table (DESIGN.md
+// §6.3). A drop failure is logged and counted and retried on the next
+// drop sweep; it is not returned.
+func (s *Storage) maintainDrop(ctx context.Context, skew time.Duration) error {
+	nowMs, err := s.databaseNow(ctx)
+	if err != nil {
+		s.metrics.errors.Inc()
+		return err
+	}
+	nowMs += skew.Milliseconds()
 	if err := s.dropExpired(ctx, nowMs); err != nil {
 		s.metrics.errors.Inc()
 		if ctx.Err() != nil {
@@ -272,7 +328,6 @@ func (s *Storage) maintainPartitions(ctx context.Context, skew time.Duration) er
 		}
 		s.logger.Warn("storage/postgres: retention drop failed; retrying next sweep", "err", err)
 	}
-	s.observeLogSize(ctx)
 	return nil
 }
 
@@ -379,6 +434,9 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 	}()
 
 	var errs []error
+	// timedOut records leaves whose DROP gave up on its lock this sweep, so
+	// the by-name pass below does not wait on them a second time.
+	timedOut := map[string]bool{}
 	for _, table := range partitionedTables {
 		for _, c := range s.retention.classes() {
 			parent := table + c.suffix()
@@ -401,7 +459,11 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 					errs = append(errs, fmt.Errorf("detach %s: %w", p.name, err))
 					continue
 				}
-				if _, err := conn.Exec(ctx, `DROP TABLE `+pgx.Identifier{p.name}.Sanitize()); err != nil {
+				if err := s.dropLeaf(ctx, conn, p.name); err != nil {
+					if errors.Is(err, errDropLockTimeout) {
+						timedOut[p.name] = true
+						continue
+					}
 					errs = append(errs, fmt.Errorf("drop %s: %w", p.name, err))
 					continue
 				}
@@ -409,6 +471,10 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 				s.logger.Debug("storage/postgres: dropped expired log partition", "partition", p.name)
 			}
 		}
+	}
+
+	if err := s.pruneChannels(ctx, conn, nowMs); err != nil {
+		errs = append(errs, err)
 	}
 
 	// Leaves detached on an earlier sweep whose DROP failed.
@@ -426,13 +492,91 @@ func (s *Storage) dropExpired(ctx context.Context, nowMs int64) error {
 		return errors.Join(errs...)
 	}
 	for _, name := range orphans {
-		if _, err := conn.Exec(ctx, `DROP TABLE `+pgx.Identifier{name}.Sanitize()); err != nil {
-			errs = append(errs, fmt.Errorf("drop detached %s: %w", name, err))
+		if timedOut[name] {
+			continue
+		}
+		if err := s.dropLeaf(ctx, conn, name); err != nil {
+			if !errors.Is(err, errDropLockTimeout) {
+				errs = append(errs, fmt.Errorf("drop detached %s: %w", name, err))
+			}
 			continue
 		}
 		s.metrics.dropped.WithLabelValues(tableOfLeaf(name)).Inc()
 	}
 	return errors.Join(errs...)
+}
+
+// channelPruneChunk is the most channels rows one prune step deletes.
+const channelPruneChunk = 1000
+
+// sqlPruneChannels deletes up to $2 channels rows whose channel_serial
+// (the serial of the channel's last publish, or the seed of a row never
+// published on) was minted before the floor $1, a 14-digit mint-time
+// prefix, and that have no presence row. FOR UPDATE SKIP LOCKED leaves a
+// row another transaction holds (a publish in flight) alone, and a row
+// advanced after the scan reads fails the predicate when re-checked under
+// the lock. There is no index on channel_serial (adding one is a blocking
+// build on a hot table), so a step that finds nothing scans the table.
+const sqlPruneChannels = `
+WITH victims AS (
+	SELECT c.name FROM channels c
+	WHERE c.channel_serial < $1
+	  AND NOT EXISTS (SELECT 1 FROM presence p WHERE p.channel = c.name)
+	LIMIT $2
+	FOR UPDATE OF c SKIP LOCKED
+)
+DELETE FROM channels c USING victims v WHERE c.name = v.name`
+
+// pruneChannels runs one chunk of the channels-table prune on the
+// sweep's connection, so it runs under the retention drop lock
+// (DESIGN.md §6.3). A channels row costs a few hundred bytes for every
+// channel name ever used; once a channel has been idle for longer than
+// the longest retention no cm of it survives, and the row, which only
+// holds the serial the next publish continues from, is deleted. It runs
+// at most one chunk per drop tick per node, bounding the load it adds.
+func (s *Storage) pruneChannels(ctx context.Context, conn *pgxpool.Conn, nowMs int64) error {
+	floor := fmt.Sprintf("%014d", nowMs-max(s.retention.Message, s.retention.Persisted).Milliseconds())
+	tag, err := conn.Exec(ctx, sqlPruneChannels, floor, channelPruneChunk)
+	if err != nil {
+		return fmt.Errorf("prune channels: %w", err)
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		s.metrics.channelRowsDropped.Add(float64(n))
+		s.logger.Debug("storage/postgres: pruned idle channels rows", "count", n)
+	}
+	return nil
+}
+
+// errDropLockTimeout reports a DROP TABLE abandoned on dropLockTimeout.
+var errDropLockTimeout = errors.New("drop lock timeout")
+
+// dropLeaf drops one detached leaf under lock_timeout = dropLockTimeout.
+// The DROP needs ACCESS EXCLUSIVE, which queues behind any reader of the
+// leaf and makes every later reader queue behind it; bounding the wait
+// keeps a stuck reader from stalling the leaf's other readers. On timeout
+// it returns errDropLockTimeout and leaves the leaf, now a detached
+// orphan, for the next sweep's by-name pass.
+func (s *Storage) dropLeaf(ctx context.Context, conn interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}, name string) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = %d`, dropLockTimeout.Milliseconds())); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DROP TABLE `+pgx.Identifier{name}.Sanitize()); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			s.metrics.dropTimeouts.Inc()
+			s.logger.Debug("storage/postgres: drop of expired leaf timed out on its lock; leaving it for the next sweep", "partition", name)
+			return errDropLockTimeout
+		}
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // tableOfLeaf returns the partitioned table a leaf name belongs to.
@@ -482,13 +626,20 @@ func listPartitions(ctx context.Context, q querier, parent string) ([]partition,
 	var out []partition
 	for rows.Next() {
 		var (
-			name, bound string
-			pending     bool
+			name    string
+			bound   *string // NULL for a relation with no partition bound
+			pending bool
 		)
 		if err := rows.Scan(&name, &bound, &pending); err != nil {
 			return nil, fmt.Errorf("scan partition of %s: %w", parent, err)
 		}
-		lo, hi, err := parseRangeBound(bound)
+		if bound == nil {
+			// pg_get_expr is NULL for a relation that has no bound
+			// expression (for example one caught mid-attach or mid-detach).
+			// It has no range to plan against or to drop, so skip it.
+			continue
+		}
+		lo, hi, err := parseRangeBound(*bound)
 		if err != nil {
 			return nil, fmt.Errorf("partition %s: %w", name, err)
 		}
@@ -598,6 +749,22 @@ func (cs *channelStore) RetainedSince(now time.Time) string {
 		return cs.floorMin
 	}
 	return floor
+}
+
+// rangeFloor is the lower serial bound of the chain's log range reads (gap
+// fill, catch-up, reconcile): the channel's retention floor, as
+// RetainedSince reports it. Serials older than it are outside the
+// retention the channel promises, so a read need not see them, and the
+// bound lets the planner prune the leaves holding them: a read that
+// scanned every leaf would hold ACCESS SHARE on a leaf a drop is waiting
+// to take ACCESS EXCLUSIVE on, and every later reader would queue behind
+// the drop (DESIGN.md §6.3). A channel store with no clock (a unit-test
+// stub) reads from the beginning.
+func (cs *channelStore) rangeFloor() string {
+	if cs.clock == nil {
+		return ""
+	}
+	return cs.RetainedSince(time.Now())
 }
 
 // idempotencyFloor is the lower serial bound of the idempotency lookup:
