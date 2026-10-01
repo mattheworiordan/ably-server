@@ -71,15 +71,20 @@ BEGIN
     FROM (SELECT name, channel_serial FROM channels
           WHERE name = ANY(v_skip_names) ORDER BY name FOR UPDATE SKIP LOCKED) l;
 
-  -- Channels with no row yet (Storage.Channel or the batching path
-  -- normally creates the row before a publish is queued, so this is a
-  -- fallback) are created as ensure_channel would and then locked
-  -- without waiting, in sorted order: a row another transaction is
-  -- creating or holding defers its cms like any busy channel, so this
-  -- step never waits while holding locks. ON CONFLICT DO NOTHING does not
-  -- wait on a committed row; on an uncommitted concurrent insert it
-  -- would, which is why the fallback is only reached for names no bind
-  -- or earlier publish has created.
+  -- Channels with no row yet are created here, as ensure_channel would,
+  -- and then locked without waiting, in sorted order. This is the normal
+  -- path for a publish on a channel no bind has created the row for (a
+  -- write-only REST publish, a presence operation on a cold channel); only
+  -- under --publish-bind-on-write does a bind or an earlier statement
+  -- create the row first, making this a fallback. A row another
+  -- transaction holds locked defers its cms like any busy channel, so the
+  -- lock step never waits while holding locks. The INSERT itself can wait:
+  -- ON CONFLICT DO NOTHING does not wait on a committed row, but it waits
+  -- for another transaction's uncommitted insert of the same new name (two
+  -- nodes' first publishes to one channel at the same instant). That wait
+  -- is bounded by that transaction's commit and cannot deadlock, because
+  -- every transaction inserts new rows in sorted order and waits for
+  -- nothing else after them (DESIGN.md §6.3 "Channel rows").
   SELECT array_agg(c ORDER BY c) INTO v_missing
     FROM unnest(v_wait_names || v_skip_names) AS c
     WHERE NOT c = ANY(v_names) AND NOT EXISTS (SELECT 1 FROM channels WHERE name = c);

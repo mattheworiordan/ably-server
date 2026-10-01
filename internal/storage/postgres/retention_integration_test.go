@@ -396,3 +396,248 @@ func TestRetentionDropsOrphanedDetachedLeaf(t *testing.T) {
 		t.Error("orphaned detached leaf was not dropped")
 	}
 }
+
+// TestRetentionDropTimesOutOnAHeldLeafAndRetries: a reader holding a lock
+// on a detached leaf must not stall the DROP (and every later reader of
+// the leaf queued behind it). The DROP gives up after the lock timeout,
+// counts it and leaves the leaf as an orphan; the next sweep drops it by
+// name once the reader is gone (DESIGN.md §6.3). The leaf here is a
+// detached orphan, the state a leaf is in after its detach succeeded and
+// its DROP failed.
+func TestRetentionDropTimesOutOnAHeldLeafAndRetries(t *testing.T) {
+	defer postgres.SetDropLockTimeout(300 * time.Millisecond)()
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+	s, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	const leaf = "channel_messages_live_00000000060000"
+	reader, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect reader: %v", err)
+	}
+	defer reader.Close(ctx)
+	if _, err := reader.Exec(ctx, `CREATE TABLE `+leaf+` (LIKE channel_messages_live)`); err != nil {
+		t.Fatalf("create orphan: %v", err)
+	}
+	tx, err := reader.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin reader: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE `+leaf+` IN ACCESS SHARE MODE`); err != nil {
+		t.Fatalf("lock leaf: %v", err)
+	}
+
+	start := time.Now()
+	if err := s.MaintainDropAt(ctx, 0); err != nil {
+		t.Fatalf("drop sweep with a held leaf returned %v; drops are best effort", err)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("drop sweep took %v with a held leaf, want it bounded by the lock timeout", took)
+	}
+	if got := s.DropLockTimeouts(); got != 1 {
+		t.Errorf("ably_storage_partition_drop_lock_timeouts_total = %v, want 1 (one attempt, not retried in the same sweep)", got)
+	}
+	if !relationExists(t, dsn, leaf) {
+		t.Fatalf("leaf %s was dropped while a reader held it", leaf)
+	}
+
+	_ = tx.Rollback(ctx)
+	if err := s.MaintainDropAt(ctx, 0); err != nil {
+		t.Fatalf("second drop sweep: %v", err)
+	}
+	if relationExists(t, dsn, leaf) {
+		t.Errorf("leaf %s still exists after the reader finished; the next sweep should drop the orphan", leaf)
+	}
+}
+
+// TestRetentionRangeReadsDoNotLockExpiredLeaves: the chain's log range
+// reads are bounded below by the channel's retention floor, so they prune
+// (and never lock) a leaf older than retention. An ACCESS EXCLUSIVE lock
+// held on such a leaf, as a drop waiting its turn would be, must not
+// stall them. Eight reads, past the point where a cached statement would
+// switch to a generic plan, which locks every leaf.
+func TestRetentionRangeReadsDoNotLockExpiredLeaves(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+	s, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ch, err := s.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	if _, _, err := ch.Store(ctx, []*protocol.Message{{Data: "x"}}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	// An old leaf, an hour before now (retention is 2 minutes), locked.
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close(ctx)
+	lo := time.Now().Add(-time.Hour).UnixMilli()
+	hi := lo + int64(time.Minute/time.Millisecond)
+	const old = "channel_messages_live_old_test"
+	for _, stmt := range []string{
+		`CREATE TABLE ` + old + ` (LIKE channel_messages_live INCLUDING DEFAULTS)`,
+		fmt.Sprintf(`ALTER TABLE channel_messages_live ATTACH PARTITION %s FOR VALUES FROM ('%014d') TO ('%014d')`, old, lo, hi),
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	locker, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect locker: %v", err)
+	}
+	defer locker.Close(ctx)
+	tx, err := locker.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE `+old+` IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock old leaf: %v", err)
+	}
+
+	for i := range 8 {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		n, err := s.LoadRangeAfter(rctx, "room", "")
+		cancel()
+		if err != nil {
+			t.Fatalf("range read %d blocked or failed with an expired leaf locked: %v", i, err)
+		}
+		if n != 1 {
+			t.Fatalf("range read %d returned %d cms, want the 1 published", i, n)
+		}
+	}
+}
+
+// TestRetentionPrunesIdleChannelRows: a channels row idle past the
+// longest retention and with no presence member is deleted by the sweep;
+// a channel with a presence row keeps its row; a later publish on a
+// pruned channel works and mints above every serial the channel ever had
+// (DESIGN.md §6.3).
+func TestRetentionPrunesIdleChannelRows(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+	s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Retention: postgres.Retention{Persisted: 3 * time.Minute}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	idle, err := s.Channel(ctx, "idle", nil)
+	if err != nil {
+		t.Fatalf("Channel idle: %v", err)
+	}
+	held, err := s.Channel(ctx, "held", nil)
+	if err != nil {
+		t.Fatalf("Channel held: %v", err)
+	}
+	oldCM, _, err := idle.Store(ctx, []*protocol.Message{{ID: "i1", Data: "old"}})
+	if err != nil {
+		t.Fatalf("Store idle: %v", err)
+	}
+	if _, _, err := held.Store(ctx, []*protocol.Message{{Data: "m"}}); err != nil {
+		t.Fatalf("Store held: %v", err)
+	}
+	if _, _, err := held.StorePresence(ctx, []*protocol.PresenceMessage{{
+		Action: protocol.PresenceEnter, ClientID: "alice", ConnectionID: "conn1",
+	}}); err != nil {
+		t.Fatalf("enter presence: %v", err)
+	}
+	rowExists := func(name string) bool {
+		return countRows(t, dsn, `SELECT count(*) FROM channels WHERE name = $1`, name) == 1
+	}
+
+	// Inside the longest retention (3m) nothing is pruned.
+	if err := s.MaintainDropAt(ctx, time.Minute); err != nil {
+		t.Fatalf("sweep at +1m: %v", err)
+	}
+	if !rowExists("idle") || !rowExists("held") {
+		t.Fatal("a channels row was pruned inside the retention window")
+	}
+
+	// Past it: the idle channel's row goes, the one with a presence row stays.
+	if err := s.MaintainDropAt(ctx, 10*time.Minute); err != nil {
+		t.Fatalf("sweep at +10m: %v", err)
+	}
+	if rowExists("idle") {
+		t.Error("idle channel's row was not pruned")
+	}
+	if !rowExists("held") {
+		t.Error("a channel with a presence row lost its channels row")
+	}
+	if got := s.ChannelRowsDropped(); got != 1 {
+		t.Errorf("ably_storage_channel_rows_dropped_total = %v, want 1", got)
+	}
+
+	// The skewed sweep dropped the leaves around real now too; the next
+	// create tick of a real deployment makes them again.
+	if err := s.MaintainCreateAt(ctx, 0); err != nil {
+		t.Fatalf("create tick: %v", err)
+	}
+
+	// A later publish recreates the row and mints above the old serials.
+	idle2, err := s.Channel(ctx, "idle", nil)
+	if err != nil {
+		t.Fatalf("Channel idle again: %v", err)
+	}
+	newCM, _, err := idle2.Store(ctx, []*protocol.Message{{ID: "i2", Data: "new"}})
+	if err != nil {
+		t.Fatalf("Store after prune: %v", err)
+	}
+	if newCM.ChannelSerial <= oldCM.ChannelSerial {
+		t.Errorf("serial after prune = %s, want above the old %s", newCM.ChannelSerial, oldCM.ChannelSerial)
+	}
+	if !rowExists("idle") {
+		t.Error("publish after prune did not recreate the channels row")
+	}
+}
+
+// A fresh storage whose node cached a channels row it then lost still
+// binds and publishes: the known-row cache falls back to ensure_channel.
+func TestRetentionPruneThenBindWithAKnownRowCache(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+	s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Retention: postgres.Retention{Persisted: 3 * time.Minute}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ch, err := s.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	if _, _, err := ch.Store(ctx, []*protocol.Message{{Data: "a"}}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if err := s.MaintainDropAt(ctx, 10*time.Minute); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n := countRows(t, dsn, `SELECT count(*) FROM channels WHERE name = 'room'`); n != 0 {
+		t.Fatalf("channels rows after prune = %d, want 0", n)
+	}
+	if err := s.MaintainCreateAt(ctx, 0); err != nil { // the skewed drop took the current leaf too
+		t.Fatalf("create tick: %v", err)
+	}
+	// The same node publishes on its still-bound store: the row is made again.
+	if _, _, err := ch.Store(ctx, []*protocol.Message{{Data: "b"}}); err != nil {
+		t.Fatalf("Store on a pruned channel's existing store: %v", err)
+	}
+	if n := countRows(t, dsn, `SELECT count(*) FROM channels WHERE name = 'room'`); n != 1 {
+		t.Errorf("channels rows after republish = %d, want 1", n)
+	}
+}

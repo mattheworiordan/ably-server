@@ -282,14 +282,6 @@ type streamState struct {
 	acrossResume bool       // a RESUMED re-attach happened since this stream's last message
 }
 
-func (s *streamState) missingCount() int64 {
-	var n int64
-	for _, r := range s.missing {
-		n += r.hi - r.lo + 1
-	}
-	return n
-}
-
 // fill removes seq from the missing ranges, reporting whether it was
 // missing.
 func (s *streamState) fill(seq int64) bool {

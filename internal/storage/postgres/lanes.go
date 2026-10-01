@@ -255,10 +255,12 @@ func (ls *laneSet) close() {
 		}
 		close(done)
 	}()
+	grace := time.NewTimer(laneCloseGrace)
 	select {
 	case <-done:
-	case <-time.After(laneCloseGrace):
+	case <-grace.C:
 	}
+	grace.Stop()
 	ls.cancel()
 	<-done
 }
@@ -581,12 +583,6 @@ func (l *lane) attempt(batch []*pending) ([]*pending, error) {
 	ctx, cancel := context.WithTimeout(l.ctx, commitAttemptTimeout)
 	defer cancel()
 	return l.c.commitBatch(ctx, batch)
-}
-
-// close fails queued publishes and waits for in-flight batches.
-func (l *lane) close() {
-	l.stop()
-	l.wg.Wait()
 }
 
 // stop marks the lane closed and fails its queued publishes, without

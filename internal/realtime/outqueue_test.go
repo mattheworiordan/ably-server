@@ -188,3 +188,40 @@ func TestOutQueueBoundHeldUnderBurst(t *testing.T) {
 		t.Fatalf("queue peaked at %d bytes, over its %d-byte limit", p, limit)
 	}
 }
+
+// A queue that never fully drains must not grow its backing array by one
+// slot per frame ever pushed: one frame is always left queued while ten
+// thousand pass through, and the order is preserved across compaction.
+func TestOutQueueNeverDrainingStaysBounded(t *testing.T) {
+	q := newOutQueue(1<<20, time.Second)
+	ctx := context.Background()
+	if err := q.push(ctx, frameOf(1)); err != nil {
+		t.Fatalf("seed push: %v", err)
+	}
+	for i := 2; i <= 10000; i++ {
+		if err := q.push(ctx, frameOf(i%50+1)); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+		f, ok := q.pop()
+		if !ok {
+			t.Fatalf("pop %d: empty", i)
+		}
+		// Each pop returns the frame pushed one step earlier.
+		want := 1
+		if i > 2 {
+			want = (i-1)%50 + 1
+		}
+		if len(f.data) != want {
+			t.Fatalf("pop %d = %d bytes, want %d (order lost across compaction)", i, len(f.data), want)
+		}
+	}
+	q.mu.Lock()
+	capFrames, live := cap(q.frames), len(q.frames)-q.head
+	q.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("live frames = %d, want 1", live)
+	}
+	if capFrames > 256 {
+		t.Fatalf("backing array cap = %d after 10000 pushes with one frame always queued; want it bounded (<= 256)", capFrames)
+	}
+}

@@ -103,7 +103,7 @@ type Server struct {
 	// used by Shutdown to disconnect them gracefully on SIGTERM (DESIGN.md
 	// §11); byKey indexes them by connectionId (the identity a
 	// connectionKey authenticates) so a REST publish-on-behalf can resolve
-	// a connectionKey to its connection (DESIGN.md §13, ResolveConnectionKey).
+	// a connectionKey to its connection (DESIGN.md §3.2, §8, ResolveConnectionKey).
 	mu    sync.Mutex
 	conns map[*connection]struct{}
 	byKey map[string]*connection
@@ -125,6 +125,11 @@ type Server struct {
 	// reaperStop guards the close against a double Shutdown.
 	reaperDone chan struct{}
 	reaperStop sync.Once
+	// reaperWG counts the grace fires past their reaperDone check, so
+	// Shutdown can wait for LEAVEs already being written (waitReapers).
+	// Add runs under graceMu after that check, and stopReaper closes
+	// reaperDone under graceMu, so every Add happens before the Wait.
+	reaperWG sync.WaitGroup
 
 	// graceMu guards grace, the members of abruptly dropped connections
 	// held for the presence grace window, by connectionId (DESIGN.md
@@ -260,6 +265,11 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.logger.Debug("websocket upgrade failed", "err", err)
 		return
 	}
+
+	// Bound the inbound frame size: gorilla/websocket has no default limit,
+	// so without this a client could send a frame of any size
+	// (DESIGN.md §2.2). An oversize frame closes the connection with 1009.
+	ws.SetReadLimit(protocol.MaxRequestBodyBytes)
 
 	if authErr != nil {
 		s.rejectWithError(ws, format, authErr)
@@ -487,12 +497,15 @@ func (s *Server) fireGrace(g *graceLeave) {
 	if s.grace[g.connID] == g {
 		delete(s.grace, g.connID)
 	}
-	s.graceMu.Unlock()
 	select {
 	case <-s.reaperDone:
+		s.graceMu.Unlock()
 		return
 	default:
 	}
+	s.reaperWG.Add(1)
+	s.graceMu.Unlock()
+	defer s.reaperWG.Done()
 
 	s.mu.Lock()
 	live := s.byKey[g.connID]
@@ -530,8 +543,8 @@ func (s *Server) fireGrace(g *graceLeave) {
 // Shutdown: the node is going away, so its connections' members go with it.
 func (s *Server) stopReaper() {
 	s.reaperStop.Do(func() {
-		close(s.reaperDone)
 		s.graceMu.Lock()
+		close(s.reaperDone)
 		for id, g := range s.grace {
 			if g.timer.Stop() {
 				g.fired = true
@@ -645,7 +658,7 @@ func (s *Server) reenterGrace(ctx context.Context, g *graceLeave) (entered, fail
 
 // ResolveConnectionKey resolves a REST publish's connectionKey to the live
 // connection it names, returning that connection's connectionId (DESIGN.md
-// §13). ok is false when the key doesn't authenticate (VerifyConnectionKey)
+// §3.2, §8). ok is false when the key doesn't authenticate (VerifyConnectionKey)
 // or no live connection on this node holds the connectionId it names — the
 // caller maps that to Ably error 40006 (invalid connectionKey). Resolution is
 // per-node only: connection-state and the registry are process-local
@@ -684,6 +697,12 @@ func (s *Server) Shutdown(ctx context.Context) {
 	// to be disconnected below would otherwise schedule fresh ones, and the
 	// node's presence set departs with the node anyway (DESIGN.md §12.5).
 	s.stopReaper()
+	// A reaper already past its timer is firing LEAVEs through the storage;
+	// wait for it (bounded by ctx) once every connection has finished its
+	// teardown, so no grace LEAVE writes after the caller closes the
+	// storage. Connection teardown is what starts reapers, so none starts
+	// after this wait begins.
+	defer s.waitReapers(ctx)
 
 	s.mu.Lock()
 	s.closing = true
@@ -715,6 +734,20 @@ func (s *Server) Shutdown(ctx context.Context) {
 		}
 	}
 	s.waitConns(ctx)
+}
+
+// waitReapers waits for the in-flight delayed-LEAVE goroutines to finish,
+// or for ctx to end. Each is bounded by teardownLeaveTimeout.
+func (s *Server) waitReapers(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		s.reaperWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // waitConns waits for every connection goroutine to finish its teardown,

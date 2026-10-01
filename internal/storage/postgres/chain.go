@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ably/ably-server/internal/protocol"
@@ -59,6 +60,13 @@ var (
 // catch-up, reconcile); a read that fills the page loops until it has
 // caught up. A package var so tests can force paging.
 var rangePageSize = 500
+
+// maxPendingHold caps the cms a channel's delivery point holds with a
+// body (DESIGN.md §7.2). Held cms are normally bounded by publish rate
+// times gapFillDelay; the cap bounds them against a flood of out-of-order
+// bus messages. Past it a cm keeps its serial and loses its body, and a
+// gap fill is forced, which reads the bodies from the log.
+const maxPendingHold = 1024
 
 // reconcileChunk caps the channels one batched reconcile query covers.
 // A package var so tests can force several chunks.
@@ -117,10 +125,16 @@ var sweepNamesHook atomic.Pointer[func(names []string)]
 // of its channelStores) runs with.
 type chainTiming struct {
 	gapDelay, gapMaxDelay, fetchTimeout time.Duration
+	// overflowDelay is how long a forced gap fill (a hold overflow,
+	// maxPendingHold) waits to coalesce a burst before reading the log.
+	overflowDelay time.Duration
 }
 
 func currentChainTiming() chainTiming {
-	return chainTiming{gapDelay: gapFillDelay, gapMaxDelay: gapFillMaxDelay, fetchTimeout: busFetchTimeout}
+	return chainTiming{
+		gapDelay: gapFillDelay, gapMaxDelay: gapFillMaxDelay, fetchTimeout: busFetchTimeout,
+		overflowDelay: min(gapFillDelay, 10*time.Millisecond),
+	}
 }
 
 // eventSource records which path offered a cm to the delivery point, so
@@ -143,6 +157,18 @@ type busEvent struct {
 	heldAt  time.Time // when the delivery point first held it (zero if never held)
 }
 
+// fetchContext is the context of one log read by the delivery point (a
+// pointer's body, a gap-fill page): the Storage's loop context, so closing
+// the Storage cancels a read in flight instead of leaving pool.Close to
+// wait for it, bounded by the fetch timeout.
+func (cs *channelStore) fetchContext() (context.Context, context.CancelFunc) {
+	parent := cs.ctx
+	if parent == nil {
+		parent = context.Background() // a unit-test stub with no Storage
+	}
+	return context.WithTimeout(parent, cs.timing.fetchTimeout)
+}
+
 // resolvePointer reads a pointer event's body from the log, outside
 // hwmMu, so a slow read never blocks the channel's other deliveries (the
 // publisher fast path among them). An event the delivery point would
@@ -153,7 +179,7 @@ func (cs *channelStore) resolvePointer(ev busEvent) busEvent {
 	if ev.cm != nil || ev.serial <= cs.watermark() {
 		return ev
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
+	ctx, cancel := cs.fetchContext()
 	defer cancel()
 	cm, err := loadChannelMessagePool(ctx, cs.pool, cs.name, ev.serial)
 	if err != nil {
@@ -275,6 +301,22 @@ func (cs *channelStore) holdLocked(ev busEvent) {
 			ev.heldAt = old.heldAt
 		}
 	}
+	if _, exists := cs.pending[ev.prev]; !exists && len(cs.pending) >= maxPendingHold {
+		// Over the cap: keep the serial (the gap fill's upper bound) but
+		// not the body, and read the range from the log now rather than
+		// after gapFillDelay. The entry itself is small and the forced
+		// fill drains it.
+		ev.cm = nil
+		cs.holdOverflows++
+		if cs.holdOverflows == 1 {
+			cs.logger.Warn("storage/postgres: channel hold map full; dropping bodies and forcing a gap fill", "channel", cs.name, "cap", maxPendingHold)
+		}
+		if !cs.overflowArmed {
+			cs.overflowArmed = true
+			cs.stopGapFillLocked()
+			cs.armGapFillLocked(cs.timing.overflowDelay)
+		}
+	}
 	cs.pending[ev.prev] = ev
 }
 
@@ -376,7 +418,7 @@ func (cs *channelStore) appendTimed(cm *protocol.ChannelMessage) {
 // or a fill is in flight (the fill re-arms when it finishes if a gap is
 // left), so fills never overlap.
 func (cs *channelStore) armGapFillLocked(d time.Duration) {
-	if cs.gapTimer != nil || cs.filling {
+	if cs.gapTimer != nil || cs.filling || cs.closed() {
 		return
 	}
 	cs.gapTimer = time.AfterFunc(d, cs.fillGap)
@@ -399,6 +441,7 @@ func (cs *channelStore) stopGapFillLocked() {
 func (cs *channelStore) fillGap() {
 	cs.hwmMu.Lock()
 	cs.gapTimer = nil
+	cs.overflowArmed = false
 	if cs.closed() || cs.released || !cs.seeded || len(cs.pending) == 0 || cs.filling {
 		cs.hwmMu.Unlock()
 		return
@@ -414,7 +457,7 @@ func (cs *channelStore) fillGap() {
 	cs.hwmMu.Unlock()
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), cs.timing.fetchTimeout)
+		ctx, cancel := cs.fetchContext()
 		r, err := cs.readRange(ctx, after, upTo, check)
 		cancel()
 
@@ -516,13 +559,13 @@ func (cs *channelStore) readRange(ctx context.Context, after, upTo string, check
 		return (*hook)(cs, after, upTo, check)
 	}
 	if !check {
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, rangePageSize)
+		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, cs.rangeFloor(), rangePageSize)
 		if err != nil {
 			return rangeRead{}, err
 		}
 		return rangeRead{after: after, upTo: upTo, cms: cms, full: len(cms) == rangePageSize}, nil
 	}
-	reads, err := loadRangesChecked(ctx, cs.pool, []rangeRequest{{name: cs.name, after: after, upTo: upTo, check: true}})
+	reads, err := loadRangesChecked(ctx, cs.pool, []rangeRequest{{name: cs.name, after: after, upTo: upTo, floor: cs.rangeFloor(), check: true}})
 	if err != nil {
 		return rangeRead{}, err
 	}
@@ -767,32 +810,42 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 	return len(stores), firstErr
 }
 
-// sqlLoadRangeMany reads, for each (channel, after, upTo) triple, up to
-// $5 cms in (after, upTo] (an empty upTo is unbounded), every kind,
-// ascending: one round trip for many channels. A channel whose check
-// flag is set also gets, once per channel (the materialised CTE) and
-// from the same snapshot as its range, its current serial and whether
-// the cm at after is still in the log (rangeRead.unproven); for the
-// others neither is read. A channel with no cms past its mark comes back
-// as one row with a NULL serial.
+// sqlLoadRangeMany reads, for each (channel, after, upTo, floor) tuple,
+// up to $6 cms in (after, upTo] at or above floor (an empty upTo is
+// unbounded), every kind, ascending: one round trip for many channels.
+// The floor is the channel's retention floor (rangeFloor); the bound lets
+// the planner prune the leaves older than retention, so the read takes
+// no lock on a leaf a drop is waiting on (DESIGN.md §6.3). A channel
+// whose check flag is set also gets, once per channel (the materialised
+// CTE) and from the same snapshot as its range, its current serial and
+// whether the cm at after is still in the log (rangeRead.unproven); for
+// the others neither is read. A channel with no cms past its mark comes
+// back as one row with a NULL serial.
+//
+// Both range queries run with pgx.QueryExecModeExec (an unnamed
+// statement, planned for the actual parameters on every call): a named,
+// cached statement switches to a generic plan after five executions, and
+// a generic plan locks every leaf whether or not runtime pruning skips
+// it, which would defeat the floor.
 const sqlLoadRangeMany = `
 WITH t AS MATERIALIZED (
-	SELECT u.name, u.after, u.upto,
+	SELECT u.name, u.after, u.upto, u.floor,
 		CASE WHEN u.chk THEN (SELECT c.channel_serial FROM channels c WHERE c.name = u.name) END AS current,
 		CASE WHEN u.chk THEN EXISTS (
 			SELECT 1 FROM channel_messages x WHERE x.channel = u.name AND x.channel_serial = u.after) END AS anchored
-	FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[]) AS u(name, after, upto, chk)
+	FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[], $5::text[]) AS u(name, after, upto, chk, floor)
 )
 SELECT t.name, t.current, t.anchored, m.channel_serial, m.idx, m.kind, m.payload, m.summary
 FROM t
 LEFT JOIN LATERAL (
 	SELECT cm.channel_serial, cm.idx, cm.kind, cm.payload, cm.summary
 	FROM channel_messages cm
-	WHERE cm.channel = t.name AND cm.channel_serial IN (
+	WHERE cm.channel = t.name AND cm.channel_serial >= t.floor AND cm.channel_serial IN (
 		SELECT DISTINCT channel_serial FROM channel_messages
-		WHERE channel = t.name AND channel_serial > t.after AND (t.upto = '' OR channel_serial <= t.upto)
+		WHERE channel = t.name AND channel_serial > t.after AND channel_serial >= t.floor
+		  AND (t.upto = '' OR channel_serial <= t.upto)
 		ORDER BY channel_serial
-		LIMIT $5)
+		LIMIT $6)
 ) m ON true
 ORDER BY t.name, m.channel_serial, m.idx
 `
@@ -800,7 +853,8 @@ ORDER BY t.name, m.channel_serial, m.idx
 // rangeRequest is one channel's part of a batched range read.
 type rangeRequest struct {
 	name, after, upTo string
-	check             bool // read the continuity check (rangeRead.unproven)
+	floor             string // the channel's retention floor (rangeFloor): the read's lower bound
+	check             bool   // read the continuity check (rangeRead.unproven)
 }
 
 // loadRangesChecked runs sqlLoadRangeMany for reqs (distinct names) and
@@ -811,11 +865,12 @@ func loadRangesChecked(ctx context.Context, pool *pgxpool.Pool, reqs []rangeRequ
 	byName := make(map[string]rangeRequest, len(reqs))
 	upTos := make([]string, len(reqs))
 	checks := make([]bool, len(reqs))
+	floors := make([]string, len(reqs))
 	for i, q := range reqs {
-		names[i], afters[i], upTos[i], checks[i] = q.name, q.after, q.upTo, q.check
+		names[i], afters[i], upTos[i], checks[i], floors[i] = q.name, q.after, q.upTo, q.check, q.floor
 		byName[q.name] = q
 	}
-	rows, err := pool.Query(ctx, sqlLoadRangeMany, names, afters, upTos, checks, rangePageSize)
+	rows, err := pool.Query(ctx, sqlLoadRangeMany, pgx.QueryExecModeExec, names, afters, upTos, checks, floors, rangePageSize)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: batched range read: %w", err)
 	}
@@ -890,7 +945,7 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 			continue
 		}
 		byName[cs.name] = cs
-		reqs = append(reqs, rangeRequest{name: cs.name, after: after, check: check})
+		reqs = append(reqs, rangeRequest{name: cs.name, after: after, floor: cs.rangeFloor(), check: check})
 	}
 	if len(reqs) == 0 {
 		return nil
@@ -1017,25 +1072,29 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 }
 
 // sqlLoadRange reads the cms on one channel in (after, upTo] ($3 = ""
-// means unbounded), up to $4 of them, every kind, ascending.
+// means unbounded) at or above the retention floor $4, up to $5 of them,
+// every kind, ascending. The floor is what lets the planner prune leaves
+// older than retention (see sqlLoadRangeMany).
 const sqlLoadRange = `
 SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
-WHERE channel = $1 AND channel_serial IN (
+WHERE channel = $1 AND channel_serial >= $4::text AND channel_serial IN (
 	SELECT DISTINCT channel_serial FROM channel_messages
-	WHERE channel = $1 AND channel_serial > $2 AND ($3 = '' OR channel_serial <= $3)
+	WHERE channel = $1 AND channel_serial > $2::text AND ($3::text = '' OR channel_serial <= $3::text)
+	  AND channel_serial >= $4::text
 	ORDER BY channel_serial
-	LIMIT $4)
+	LIMIT $5)
 ORDER BY channel_serial, idx
 `
 
 // loadChannelMessagesAfter reads up to limit cms on channel with a
-// serial in (after, upTo] (upTo "" means unbounded), of every kind,
+// serial in (after, upTo] (upTo "" means unbounded) and at or above floor
+// (the channel's retention floor, rangeFloor), of every kind,
 // ascending, with annotation summary snapshots. The chained buses' gap
 // fill and catch-up read the log through it; unlike the History-based
 // reconcile of the pgnotify bus it includes annotation cms, which a
 // chain must see to stay unbroken.
-func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo string, limit int) ([]*protocol.ChannelMessage, error) {
-	rows, err := pool.Query(ctx, sqlLoadRange, channel, after, upTo, limit)
+func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo, floor string, limit int) ([]*protocol.ChannelMessage, error) {
+	rows, err := pool.Query(ctx, sqlLoadRange, pgx.QueryExecModeExec, channel, after, upTo, floor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: load range %s (%s, %s]: %w", channel, after, upTo, err)
 	}

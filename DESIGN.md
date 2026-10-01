@@ -73,9 +73,10 @@ limits to adopt for the connection:
   resume is a non-goal (§1, §11), so it is the process-local
   `connectionId` and is not recoverable.
 - `maxMessageSize` — `65536` (64 KiB), the largest payload of a single
-  publish; SDKs reject oversize publishes client-side.
-- `maxFrameSize` — `524288` (512 KiB), the largest WebSocket frame / POST
-  body.
+  publish; SDKs reject oversize publishes client-side and the server
+  rejects them with `40009` (§2.2).
+- `maxFrameSize` — `524288` (512 KiB), the advertised largest WebSocket
+  frame / POST body. The server's hard cap on both is 2 MiB (§2.2).
 - `maxInboundRate` — `1000`, the advisory per-connection publish ceiling
   in messages/second.
 - `connectionStateTtl` — `120000` ms, how long an SDK treats the
@@ -84,8 +85,8 @@ limits to adopt for the connection:
   longest the server leaves the server→client direction idle before
   emitting `HEARTBEAT`).
 
-The limits are advisory: the server publishes them for SDK consumption but
-does not itself enforce them yet.
+`maxMessageSize` is enforced (§2.2); the others are advisory: the server
+publishes them for SDK consumption but does not itself enforce them.
 
 Supported `Action` values:
 
@@ -143,6 +144,22 @@ message, in batch order, each the message's stable identity `serial` (§8)
 — the value a client uses to address the message via `PATCH` / `GET
 .../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
 surfaces.
+
+**Request and message size limits.** Every REST request body is read
+through `http.MaxBytesReader` with one cap, `protocol.MaxRequestBodyBytes`
+(2 MiB): publish, mutation, annotation, `requestToken` and the discarded
+`POST /stats` body. A declared `Content-Length` over the cap is refused
+before any byte is read; a chunked or under-declared body is cut off by
+the reader. Both return `413` with Ably code `40009` ("request body too
+large"). The same 2 MiB bounds an inbound WebSocket frame (the connection
+closes with 1009). The cap is a transport guard well above the message
+limit; it is not the limit SDKs see. The message limit is
+`maxMessageSize` (64 KiB, §2.1): the sum over the messages of one publish
+of the name, `clientId`, decoded data and extras lengths in bytes (Ably's
+TM6 size). A REST publish or mutation over it returns `400` with `40009`
+and a realtime `MESSAGE` over it is NACKed `40009`, in both cases before
+anything is queued or stored, so the lane queues (§6.3) only ever hold
+messages within the limit.
 
 **Keep-alive and the publish fast path.** REST publishers are expected
 to reuse connections: the HTTP server keeps an idle keep-alive connection
@@ -949,7 +966,11 @@ encoded frames (`--conn-outbound-max-bytes`, default 1 MiB), not in
 messages: frames range from a few bytes to the 64 KiB message limit, so
 only a byte bound caps the memory one connection can pin. A frame is
 always admitted to an empty queue, so a single frame larger than the
-bound cannot wedge a connection.
+bound cannot wedge a connection. The queue is a slice with a head index:
+when the consumed prefix passes 32 slots and half the slice, the live tail
+is slid to the front, so a connection that never fully drains (one frame
+always queued) holds a backing array proportional to its live frames, not
+to every frame it has ever been sent.
 
 A push that would take the queue past its bound waits for the writer to
 make room (backpressure; this absorbs bursts such as a resume replay),
@@ -1186,100 +1207,62 @@ gives us pub/sub and the same database serves as the durable store, so
 cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
 a NATS server or cluster for delivery; Postgres stays the store.
 
-Schema sketch:
+Schema. The shipped DDL is the migration files under
+`internal/storage/postgres/migrations/` (`0001_initial.sql` to
+`0004_presence_nodes.sql`); they are the source of truth and each carries
+the reasoning in its header. In outline (columns elided where the
+migrations say more):
 
-```sql
--- The append-only LOG: one row per individual Message or PresenceMessage,
--- both kinds interleaved in one channelSerial namespace (§12.1). The PK
--- groups a publish's Messages under their shared channelSerial; the
--- channelSerial prefix encodes the mint timestamp (§8), so a forward
--- range scan over the PK covers ordered history reads AND time-based
--- retention without a separate created_at column. action is NOT a column
--- — it lives in the payload (nothing scans by it); kind is, because reads
--- filter by it.
-CREATE TABLE channel_messages (
-  channel        TEXT     NOT NULL,
-  channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8) — this cm's position
-  idx            INT      NOT NULL,    -- position within the publish batch
-  id             TEXT,                 -- nullable, client-supplied idempotency key
-  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14)
-  message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
-  payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
-  persisted      BOOLEAN  NOT NULL DEFAULT FALSE,  -- retention class, the level-1 partition key (see Retention)
-  PRIMARY KEY (channel, channel_serial, idx, persisted)
-) PARTITION BY LIST (persisted);  -- each class then PARTITION BY RANGE (channel_serial)
-
--- Idempotency lookup: a non-NULL client-supplied id is unique per
--- channel within the channel's retention. A partitioned table cannot
--- carry a UNIQUE index without the partition key, so this is a plain
--- index and the channels-row lock is the arbiter (see below).
-CREATE INDEX channel_messages_id_idx
-  ON channel_messages (channel, id) WHERE id IS NOT NULL;
-
--- serial → versions: every version of a message in version order, backing
--- GET .../messages/{serial}/versions and update/delete target validation
--- (§13.4). Partial — message rows only; presence rows have no identity.
-CREATE INDEX channel_messages_serial_idx
-  ON channel_messages (channel, message_serial, channel_serial)
-  WHERE message_serial IS NOT NULL;
-
--- Materialised current MESSAGE state: one row per live message holding its
--- latest version — the message-side analogue of the presence table below.
--- UPSERTed in the same transaction as the version's INSERT into
--- channel_messages; a delete sets deleted = true but the row (and its
--- versions in the log) stay queryable (soft delete, §13.2). create_serial
--- keeps the message in its original position for collapsed history.
-CREATE TABLE messages (
-  channel         TEXT    NOT NULL,
-  message_serial  TEXT    NOT NULL,  -- stable identity
-  create_serial   TEXT    NOT NULL,  -- the create's channel_serial:idx (ordering position)
-  version_serial  TEXT    NOT NULL,  -- the latest version's channel_serial:idx
-  deleted         BOOLEAN NOT NULL DEFAULT false,
-  payload         BYTEA   NOT NULL,  -- msgpack of the merged latest Message
-  PRIMARY KEY (channel, message_serial)
-);
-
--- Materialised current PRESENCE state: one row per live member, keyed by
--- connectionId:clientId. ENTER/UPDATE upsert, LEAVE deletes — maintained
--- in the same transaction as the presence cm's INSERT into channel_messages,
--- so the set stays consistent with the log. node_id names the owning node,
--- whose liveness lease drives the dead-node reaper (§12.5).
-CREATE TABLE presence (
-  channel        TEXT        NOT NULL,
-  connection_id  TEXT        NOT NULL,
-  client_id      TEXT        NOT NULL,
-  channel_serial TEXT        NOT NULL,  -- serial of the latest ENTER/UPDATE
-  payload        BYTEA       NOT NULL,  -- msgpack-encoded protocol.PresenceMessage
-  node_id        TEXT        NOT NULL,  -- owning node, for lease bump + reap
-  expires_at     TIMESTAMPTZ NOT NULL,  -- member lease mode: the row's lease; node mode and fixtures: 'infinity'
-  PRIMARY KEY (channel, connection_id, client_id)
-);
--- The reaper's skip scan over member owners and its per-node deletes,
--- and the member-mode bump's per-node select (§12.5).
-CREATE INDEX presence_node_idx ON presence (node_id);
-
--- One liveness lease per node (node lease mode, §12.5): the node renews
--- its row on the bump cadence; the reaper removes the members of a node
--- with no unexpired row, then the row.
-CREATE TABLE presence_nodes (
-  node_id    TEXT        PRIMARY KEY,
-  expires_at TIMESTAMPTZ NOT NULL
-);
-```
-
-The sketch abbreviates partitioning. In the shipped schema (migration
-`0002_partitioned_log`) `channel_messages` and `messages` each carry the
-`persisted` column and are partitioned on two levels, described under
-"Retention" below; `messages` is ranged on `message_serial` and its key
-is `(channel, message_serial, persisted)`.
+- `channels (name PK, channel_serial, initial_channel_serial)`: one row
+  per channel name, holding the serial the next publish continues from
+  (minted under the row lock by `advance_channel_serial` and, batched, by
+  `publish_batch_lock`) and the immutable seed serial a rewind to the
+  channel's beginning attaches at (§4.3). `ensure_channel` creates a row
+  with a fresh seed. Rows are pruned once idle (see "Channel rows"
+  below).
+- `channel_messages`, the append-only LOG: one row per individual
+  `Message`, `PresenceMessage` or annotation (`kind`), all interleaved in
+  one `channel_serial` namespace (§12.1), keyed `(channel, channel_serial,
+  idx, persisted)`. `idx` is the position within the publish; `id` is the
+  client-supplied idempotency key (nullable); `message_serial` is the
+  message identity a row is a version of (NULL for presence); `is_append`
+  marks a streamed append (§13.3); `summary` holds the annotation summary
+  snapshot of an annotation row (§14.2); `payload` is the msgpack
+  `Message` or `PresenceMessage`. The action is in the payload, not a
+  column. Partitioned on two levels (see "Retention"). Indexes:
+  `channel_messages_id_idx (channel, id) WHERE id IS NOT NULL`, a plain
+  index because a partitioned table cannot carry a unique index without
+  its partition key (the `channels` row lock is the arbiter of id
+  uniqueness); and `channel_messages_versions_idx (channel, message_serial,
+  channel_serial, idx) WHERE message_serial IS NOT NULL`, which backs
+  version scans and the update/delete target lookup (§13.4).
+- `messages (channel, message_serial, payload, deleted, persisted)`, keyed
+  `(channel, message_serial, persisted)`: the latest-version projection,
+  one row per message, upserted in the same transaction as the version's
+  log row. A delete sets `deleted`; the row and its versions stay
+  queryable (§13.2). Partitioned like the log, ranged on `message_serial`
+  (the create's serial, which is also the order of collapsed history).
+- `presence (channel, connection_id, client_id, channel_serial, payload,
+  node_id, expires_at)`, keyed `(channel, connection_id, client_id)`: one
+  row per live member, maintained in the same transaction as the presence
+  cm (§12.5); `presence_node_idx (node_id)` serves the reaper and the
+  member-mode lease bump. `presence_nodes (node_id PK, expires_at)` is the
+  per-node liveness lease of node lease mode.
+- `retention_state (key, value)`: the legacy-leaf bound recorded by
+  migration 0002 (below). `schema_migrations (version PK, applied_at)`:
+  the migration tracker.
+- SQL functions: `format_channel_serial`, `next_channel_serial`,
+  `ensure_channel`, `advance_channel_serial` (0001) and
+  `publish_batch_lock` (0003).
 
 Reads over the log (`channel_messages`) add `kind = 'message'` (or
-`'presence'`) to the predicates above. Collapsed message history reads the
-materialised `messages` table ordered by `create_serial`; a version scan
-reads `channel_messages` via `channel_messages_serial_idx`. The retention
-sweep deletes log rows by channel_serial range and, when a message's last
-surviving version ages out, drops its `messages` projection row too. The
-`presence` projection is independent of the log's retention sweep (§12.5).
+`'presence'`) to the predicates. Collapsed message history reads the
+materialised `messages` table ordered by `message_serial`; a version scan
+reads `channel_messages` via `channel_messages_versions_idx`. Retention
+does not delete log rows: it drops whole leaf partitions (below), and a
+message's projection row goes with the leaf that holds its create serial.
+The `presence` projection is independent of the log's retention sweep
+(§12.5).
 
 The DDL ships as versioned migrations under
 `internal/storage/postgres/migrations/*.sql` (e.g. `0001_initial.sql`)
@@ -1302,18 +1285,34 @@ and is applied at `postgres.Open` by an auto-migrate sweep:
 The mechanism is forward-only, hand-rolled (no migration library),
 and matches what a load balancer rolling-restart of N nodes against
 the same Postgres needs: every restart is a no-op except the one
-that introduces a new migration file. A migration that loses a
-deadlock or a lock wait against nodes still on the old version is
-retried (up to five attempts).
+that introduces a new migration file.
 
-`0002_partitioned_log` is the exception to a cheap rolling upgrade. It
-locks both tables, attaches the existing log as one leaf (a scan and a
-primary-key build in proportion to its size), and changes what the
-old version writes to: until every node runs the new version, old nodes
-write channels of persisted namespaces into the live class, where those
-rows age out on the continuity window. Rows written before the upgrade
-also land in the live class, so a persisted namespace's history from
-before the upgrade is kept only for the continuity window.
+Every migration runs under `SET LOCAL lock_timeout = '5s'`, so a lock
+held by a node still serving traffic ends the attempt with `55P03` after
+5 seconds instead of waiting without limit (a waiting `ACCESS EXCLUSIVE`
+request also queues every later statement on the table behind it). The
+attempt rolls back whole, and the runner retries a `55P03` or a deadlock
+(`40P01`) up to 5 attempts in all, 250 ms apart. A migration whose lock
+never frees therefore fails `Open` after about 26 seconds and changes
+nothing; the timeout bounds the wait for a lock, not the time a
+migration holds the locks it did get.
+
+**`0002_partitioned_log` is the one migration that cannot run under
+traffic**, and the only one that needs an offline step; the others
+(`0001`, `0003`, `0004`) take brief locks or only add objects. It takes
+`ACCESS EXCLUSIVE` on both log tables for the whole transaction, so every
+node, old or new, blocks on every publish until it ends. On a populated
+log it attaches the old table as one leaf, which validates every row
+against the partition bound and builds the new primary key on it, and
+does the same for the `messages` projection: time in proportion to the
+number of rows. The rate (rows per second) depends on hardware, row size
+and the existing indexes, and has not been measured; see §11 "Upgrading
+across 0002" for the procedure and how to estimate it. It also changes
+what the old version writes to: until every node runs the new version,
+old nodes write channels of persisted namespaces into the live class,
+where those rows age out on the continuity window. Rows written before
+the upgrade also land in the live class, so a persisted namespace's
+history from before the upgrade is kept only for the continuity window.
 
 Per-publish writes run inside one transaction that first locks the
 channel's row in `channels` (`advance_channel_serial` mints the next
@@ -1346,12 +1345,20 @@ partition drop, not a row-by-row DELETE:
   Each leaf covers one width: half the class's retention, clamped to
   between 1 minute and 1 hour (1 minute for the continuity window, 1 hour
   for 24 hours). While sweeps succeed, a row lives for at most its
-  retention plus one width plus one sweep interval.
+  retention plus one width plus two maintenance ticks (drops run on every
+  second tick).
 
 Every node runs a maintenance sweep at `Open` (before it serves) and then
-every half leaf width (30 s by default). It reads the time from the
+a tick every half leaf width (30 s by default). It reads the time from the
 database's clock, the same clock that mints serials, so a node with a
-skewed clock cannot drop a leaf still being written. Then:
+skewed clock cannot drop a leaf still being written. Ticks alternate:
+even ticks run step 1 and odd ticks run step 2, never both in one tick
+(`Open` runs step 1 only). A detach can wait up to 30 seconds holding the
+parent's `SHARE UPDATE EXCLUSIVE` lock, which creation's `ATTACH` also
+needs, under a 10 second lock timeout; back to back, a slow detach could
+fail the creation that publishes depend on. With the hour of lookahead,
+creating on every second tick (a minute by default) loses nothing, and a
+leaf lives one more tick at most.
 
 1. **Create ahead.** Under a transaction-scoped advisory lock, it creates
    every missing leaf from the current slot to at least an hour (and at
@@ -1376,6 +1383,22 @@ skewed clock cannot drop a leaf still being written. Then:
    channel's oldest cms: a catch-up relies on that to prove its
    continuity (§7.2).
 
+   The `DROP TABLE` needs `ACCESS EXCLUSIVE` on the detached leaf, which
+   queues behind any reader still holding it and makes every later reader
+   queue behind the drop. It therefore runs in its own transaction under
+   `lock_timeout = 1s`. On timeout the leaf stays as a detached orphan
+   (counted in `ably_storage_partition_drop_lock_timeouts_total`, not
+   retried in the same sweep) and the next drop tick's by-name pass drops
+   it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
+   are bounded below by the channel's retention floor (the same bound a
+   resume is checked against), and run as unnamed statements planned for
+   the actual parameters, so the planner prunes the leaves older than
+   retention and the reads never lock a leaf a drop is waiting on, except that a checked catch-up (§7.2) also asks whether the cm at the mark still exists, which touches the one leaf that would hold it. A
+   cached statement would switch to a generic plan after five executions,
+   and a generic plan locks every leaf. A cm older than the floor is
+   outside the retention the channel promises; a gap fill that would have
+   reached below it does not.
+
 A resume whose cursor was minted before now minus the channel's retention
 is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
 by its offset from the database clock (measured at every sweep) plus one
@@ -1394,7 +1417,8 @@ whose target has aged out finds no row and gets `ErrTargetNotFound` (§13.2):
 the projection row goes with the leaf that holds the message's create
 serial. The `presence` table and the `channels` table are not partitioned:
 presence rows are bounded by live membership (§12.5), and a `channels` row
-is one small row per channel ever used.
+is one small row per channel name, pruned once the channel has been idle
+past every retention (see "Channel rows" below).
 
 Every node must run with the same retention settings, since whichever node
 sweeps applies its own. Changing a channel's class (editing a namespace's
@@ -1408,7 +1432,8 @@ continuity window.
 
 Series (§10): `ably_storage_partitions_created_total{table}`,
 `ably_storage_partitions_dropped_total{table}`,
-`ably_storage_retention_errors_total`, and the gauges
+`ably_storage_retention_errors_total`,
+`ably_storage_partition_drop_lock_timeouts_total`, and the gauges
 `ably_storage_log_bytes{table}` (heap, indexes and TOAST of every leaf) and
 `ably_storage_log_partitions{table}`, as of the node's last sweep.
 
@@ -1559,15 +1584,60 @@ bind. The insert can wait on another transaction that is inserting the
 same new name uncommitted (two nodes' first publishes to one channel at
 the same instant): at most one commit, and never a deadlock, since every
 transaction inserts new rows in sorted order and waits for nothing else
-after them. Rows are never deleted, so each node keeps a bounded set of
-names it knows have a row (65,536 per database, oldest forgotten first):
-a bind of a known name reads the row with a plain `SELECT` instead of
-`ensure_channel`, which writes a new row version and waits for the row
-lock of a channel another node is publishing on. Either read comes after
+after them. Each node keeps a bounded set of names it knows have a row
+(65,536 per database, oldest forgotten first): a bind of a known name
+reads the row with a plain `SELECT` instead of `ensure_channel`, which
+writes a new row version and waits for the row lock of a channel another
+node is publishing on. A known name whose row has since been pruned (see
+below) reads no row, and the bind falls back to `ensure_channel`, which
+creates it. Either read comes after
 the bus subscription, so the bind misses nothing (§7.2). With
 `--publish-bind-on-write=true` the earlier behaviour returns: every bind
 runs `ensure_channel`, and a batched publish (message or presence)
 creates a missing row in a statement of its own before it is queued.
+
+**Pruning `channels` rows.** One row per channel name ever used is
+unbounded: a workload that touches millions of distinct names an hour
+(the 1x shape in `bench/aws` touches 2.2 million) would leave that many
+rows behind, each probed by the primary key on every batch. Each drop tick
+of the retention sweep (§6.3 "Retention", step 2), under the drop lock,
+deletes one chunk of up to 1,000 rows whose `channel_serial` was minted
+longer ago than the longest retention (`--persisted-retention`, default 24
+hours; the larger of the two if configured the other way round) and that
+have no `presence` row, using `FOR UPDATE SKIP LOCKED` so a publish in
+flight keeps its row. It counts them in
+`ably_storage_channel_rows_dropped_total`. At most one chunk per node per
+drop tick bounds the load the step adds, and also bounds the pruning rate:
+with the default 30 s maintenance interval a node's drop ticks are a minute
+apart, so one node prunes at most 1,000 rows a minute, 60,000 an hour. The
+drop lock is held by one node at a time, so the fleet prunes at most one
+chunk per drop tick of any node. A workload that creates more than that
+many new names an hour grows the table until the fleet is large enough or
+the maintenance interval short enough to keep up; the growth rate is the
+difference. There is no index on `channels.channel_serial` (building one
+is a blocking operation on a hot table), so a tick that finds nothing to
+prune scans the table once.
+
+Consequences of deleting a row, none of which loses a message, since by
+the predicate no cm of the channel is older than the longest retention
+and so none survives:
+
+- A later publish recreates the row through `publish_batch_lock` (or
+  `ensure_channel`) with a fresh time-based seed serial. That serial is
+  above every old serial of the channel, because the old row's serial was
+  already older than the retention floor when it was deleted.
+- `initial_channel_serial`, the seed a rewind to the channel's beginning
+  attaches at, is lost: after the row is recreated the beginning of the
+  channel is the new seed (§4.3). The old beginning could not be served
+  anyway, as every cm after it has aged out.
+- A node that has the channel bound keeps its delivery mark at the old
+  serial. The first publish after the idle period announces the new seed
+  as its predecessor, which is ahead of the mark, so the delivery point
+  holds it and the gap fill reads it from the log about 100 ms later
+  (§7.2); that one cm is delivered late, none is lost, and no
+  discontinuity is signalled because the log read returns the cm.
+- A resume with a `channelSerial` from before the idle period is already
+  refused as a discontinuity by the retention floor (§4.3).
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -1590,7 +1660,9 @@ Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
 in-flight bound, §12.5), `ably_publish_server_presence_unbatched_total`
 (server-synthesised presence written outside a full lane, above) and
 `ably_publish_server_presence_forced_total` (queued past the bound
-because its channel's earlier publishes were stuck).
+because its channel's earlier publishes were stuck), `ably_storage_channel_rows_dropped_total` and
+`ably_storage_channel_binds_total{source}` (`ensure`: a bind that ran
+`ensure_channel`; `read`: a bind that read a row the node knew existed).
 
 ### 6.4 Channel sharding
 
@@ -1845,7 +1917,14 @@ The `postgres` and `nats` buses share one delivery point
   read from the log (all kinds, serial order, a page at a time) and
   delivered. The mark's lock is held across `Appender.Append`, so a
   Channel sees every cm once and in serial order whichever path
-  delivered it.
+  delivered it. Held cms are bounded: a channel holds at most 1,024 with
+  a body (`maxPendingHold`). Normally the hold is bounded by publish rate
+  times 100 ms, but a flood of out-of-order bus messages (a hostile or
+  buggy sender; the bus is a trusted network) could hold 256 KiB bodies
+  without limit. Past the cap a cm keeps its serial and loses its body,
+  and a gap fill is forced after about 10 ms; it reads the range, bodies
+  included, from the log, so nothing is lost, only read from Postgres
+  instead of the bus.
 - **Reconcile.** After the bus connection comes back, the channels in the
   sweep scope (below: by default the bound channels with a subscriber on
   this node) are caught up from their mark, 500 channels per query, after
@@ -2527,7 +2606,8 @@ name = "persisted:presence_fixtures"
   - Cluster mode only, from the retention sweep (§6.3):
     `ably_storage_partitions_created_total{table}`,
     `ably_storage_partitions_dropped_total{table}`,
-    `ably_storage_retention_errors_total` (counters) and
+    `ably_storage_retention_errors_total`,
+    `ably_storage_partition_drop_lock_timeouts_total` (counters) and
     `ably_storage_log_bytes{table}`, `ably_storage_log_partitions{table}`
     (gauges). `table` is `channel_messages` or `messages`.
   - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres
@@ -2723,7 +2803,16 @@ On SIGTERM the server enters a graceful shutdown:
    staggered rather than as a thundering herd. Any connection still open
    at the deadline is force-closed immediately.
 3. Concurrently, drain in-flight REST handlers.
-4. Close storage.
+4. Wait, bounded by the same grace window, for any delayed presence `LEAVE`
+   (§12.5) already past its timer to finish writing, so none fires after
+   the storage is closed. Pending ones that have not reached their timer
+   are abandoned: the node's members go with it.
+5. Close storage. For the Postgres backend this finishes in-flight publish
+   batches (up to 5 seconds, then cancels them), cancels the background
+   loops, stops every channel's pending gap-fill timer, and cancels a gap
+   fill or pointer read in flight (they run on the storage's own context,
+   with a 10 second fetch timeout) before it releases the pool, so closing
+   never waits on a log read.
 
 **Readiness.** `/readyz` (§2.2) is what an orchestrator or load balancer
 should route on. In `memory` and `disk` mode it is always 200. In
@@ -2752,6 +2841,49 @@ In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection
 and, on each `ATTACH`, replays missed messages from Postgres using the
 client-supplied `channelSerial`. No connection state crosses nodes.
+
+**Upgrading across `0002_partitioned_log`** (once, for a database created
+before it; a fresh database, or one already past it, takes ordinary
+rolling restarts). This is an offline step, not a rolling one (§6.3):
+
+1. Take a snapshot or backup of the database.
+2. Optional, to shorten step 5: delete log rows older than the
+   continuity window, in batches, while the old version still runs
+   (`DELETE FROM channel_messages WHERE ctid IN (SELECT ctid FROM
+   channel_messages WHERE channel_serial < '<14-digit ms time two minutes
+   ago>' LIMIT 10000)`, repeated until it deletes nothing; the same on
+   `messages` by `message_serial`; then `VACUUM`). Every
+   pre-upgrade row lands in the live class and is dropped within a few
+   minutes of the upgrade, so older rows are only migration cost. This
+   also drops pre-upgrade persisted history, which the upgrade keeps for
+   the continuity window only (§6.3).
+3. Estimate the downtime. Rows per second is unknown for your hardware.
+   Restore the snapshot into a scratch database and run the new binary
+   against it once, timing `Open`; that is the downtime to plan for.
+   Failing that, `SELECT count(*), pg_size_pretty(pg_total_relation_size(
+   'channel_messages')) FROM channel_messages` and
+   `pg_total_relation_size('messages')` give the work the attach does:
+   it reads each row once and builds one index.
+4. Stop every node of the old version (or take them out of the load
+   balancer and wait for their connections to drain, then stop them). Do
+   not leave any running: the migration cannot take its lock while one
+   holds a transaction on the tables, and gives up after about 26
+   seconds (§6.3).
+5. Start one node of the new version and wait for it to report ready
+   (`/readyz` is 200). `Open` does not return, so `/readyz` does not
+   answer, until the migration commits. Confirm
+   `SELECT version FROM schema_migrations` lists
+   `0002_partitioned_log`. If `Open` failed, nothing was applied (the
+   transaction rolled back): fix the cause and start again, or start the
+   old version.
+6. Start the rest of the fleet. Their `Open` finds every migration
+   applied and takes no table lock. Starting them before step 5 ends is
+   safe (they wait on the migration advisory lock) but their readiness
+   checks fail until it ends.
+
+Do not run old and new versions together across this migration: an old
+node would write persisted-namespace rows into the live class, and a
+resume across the resulting hole would be accepted as continuous.
 
 ## 12. Presence
 

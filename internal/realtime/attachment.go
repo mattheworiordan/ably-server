@@ -23,11 +23,14 @@ const (
 	AppendModeFull  = "full"
 )
 
-// defaultReplayCap caps the number of Messages replayed per ATTACH
-// (resume or rewind). A client that has missed more than this many
-// messages still receives the most recent defaultReplayCap, with
-// ATTACHED.Error set and FlagResumed cleared so the SDK can surface a
-// discontinuity.
+// defaultReplayCap caps the number of channel messages (ChannelMessage,
+// one per publish, each carrying one or more Messages) replayed per ATTACH
+// (resume or rewind), not the number of Messages: the replay reads the
+// log in channel-message units, so a client that missed publishes of
+// several Messages each receives more than this many Messages. A client
+// that has missed more than this many channel messages still receives the
+// most recent defaultReplayCap of them, with ATTACHED.Error set and
+// FlagResumed cleared so the SDK can surface a discontinuity.
 const defaultReplayCap = 1000
 
 // attachment is the (connection, channel) pair on this node. It owns

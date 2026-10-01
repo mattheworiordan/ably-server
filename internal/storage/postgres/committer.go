@@ -36,11 +36,9 @@ func validText(s string) bool {
 // fail a batch. Under Options.BindOnWrite the channel's row is created
 // here if this store has never seen it, so a batch never has to insert
 // one; otherwise a missing row is created by the batch's
-// publish_batch_lock, in the same round trip that locks the rows. (The
-// comments in migration 0003 predate this and call that path a fallback
-// that never waits; DESIGN.md §6.3 "Channel rows" is current: the insert
-// can wait for another transaction's uncommitted insert of the same new
-// name, never deadlocking.)
+// publish_batch_lock, in the same round trip that locks the rows. That
+// insert can wait for another transaction's uncommitted insert of the same
+// new name, and never deadlocks (DESIGN.md §6.3 "Channel rows").
 func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if !validText(cs.name) {
 		return nil, false, storage.ErrInvalidChannelName
@@ -355,9 +353,16 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 	b.Queue("BEGIN")
 	b.Queue(`SELECT ord, status, serial, prev, dup_serial FROM publish_batch_lock($1, $2, $3, $4, $5, $6)`,
 		s.series, channels, wait, floors, idCM, ids)
-	err := func() error {
+	err := func() (err error) {
 		br := conn.SendBatch(ctx, b)
-		defer br.Close()
+		defer func() {
+			// Every result is read below, so Close finds nothing unread; a
+			// failure it reports (the connection, mid-close) is the only
+			// sign of a statement that did not complete.
+			if cerr := br.Close(); cerr != nil && err == nil {
+				err = fmt.Errorf("close batch: %w", cerr)
+			}
+		}()
 		if _, err := br.Exec(); err != nil {
 			return fmt.Errorf("begin: %w", err)
 		}
@@ -444,23 +449,9 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 	// Round trip 2: rows, the presence fold, the bus hook, COMMIT.
 	b = &pgx.Batch{}
 	rows.queue(b, s.node, s.leaseNode)
-	queued, err := beforeCommitBatch(ctx, s.bus, b, nil, items)
-	if err != nil {
+	if err := s.bus.beforeCommitBatch(ctx, b, items); err != nil {
 		rollback()
 		return nil, err
-	}
-	if !queued {
-		// A bus without a batched hook: send the rows, run its hook per
-		// cm on the open transaction, then commit.
-		if err := sendAll(ctx, conn.Conn(), b); err != nil {
-			rollback()
-			return nil, fmt.Errorf("storage/postgres: batch insert: %w", err)
-		}
-		if _, err := beforeCommitBatch(ctx, s.bus, nil, connTx{conn.Conn()}, items); err != nil {
-			rollback()
-			return nil, err
-		}
-		b = &pgx.Batch{}
 	}
 	b.Queue("COMMIT")
 	if err := sendAll(ctx, conn.Conn(), b); err != nil {
@@ -473,13 +464,17 @@ func (s *Storage) commitBatchTx(ctx context.Context, conn *pgxpool.Conn, slots [
 // sendAll sends b and checks every statement's result. When b ends in
 // COMMIT it also checks the transaction really committed: an aborted
 // transaction answers COMMIT with ROLLBACK.
-func sendAll(ctx context.Context, conn *pgx.Conn, b *pgx.Batch) error {
+func sendAll(ctx context.Context, conn *pgx.Conn, b *pgx.Batch) (err error) {
 	n := b.Len()
 	if n == 0 {
 		return nil
 	}
 	br := conn.SendBatch(ctx, b)
-	defer br.Close()
+	defer func() {
+		if cerr := br.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close batch: %w", cerr)
+		}
+	}()
 	for i := range n {
 		tag, err := br.Exec()
 		if err != nil {

@@ -326,7 +326,8 @@ type Storage struct {
 	wmetrics  *writeMetrics
 	// bindOnWrite is Options.BindOnWrite; rows remembers channels known to
 	// have a row (nil when bindOnWrite). ensureCalls and rowReads count the
-	// binds that ran ensure_channel and those that read a known row.
+	// binds that ran ensure_channel and those that read a known row
+	// (ably_storage_channel_binds_total{source}).
 	bindOnWrite           bool
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
@@ -784,6 +785,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		bus:       s.bus,
 		logger:    s.logger,
 		done:      s.done,
+		ctx:       s.loopCtx,
 		timing:    s.timing,
 		stats:     &s.stats,
 	}
@@ -860,6 +862,7 @@ func (s *Storage) close(graceful bool) error {
 			s.lanes.close() // finish in-flight batches before the bus stops
 		}
 		s.cancel()
+		s.stopGapTimers()
 		s.wg.Wait()
 		if graceful && s.leaseNode {
 			s.releaseNodeLease()
@@ -870,6 +873,23 @@ func (s *Storage) close(graceful bool) error {
 	return nil
 }
 
+// stopGapTimers stops every bound channel's pending gap-fill timer, so no
+// fill starts against the pool once Close is releasing it. A fill already
+// reading the log runs on the cancelled loop context and ends at once.
+func (s *Storage) stopGapTimers() {
+	s.mu.Lock()
+	stores := make([]*channelStore, 0, len(s.channels))
+	for _, cs := range s.channels {
+		stores = append(stores, cs)
+	}
+	s.mu.Unlock()
+	for _, cs := range stores {
+		cs.hwmMu.Lock()
+		cs.stopGapFillLocked()
+		cs.hwmMu.Unlock()
+	}
+}
+
 // Collectors returns the backend's Prometheus collectors (the
 // ably_storage_* retention series and the ably_publish_* batching series,
 // DESIGN.md §10), for registration on the process registry. A lone
@@ -878,6 +898,16 @@ func (s *Storage) close(graceful bool) error {
 func (s *Storage) Collectors() []prometheus.Collector {
 	out := append(s.metrics.collectors(), s.wmetrics.collectors()...)
 	out = append(out, s.lmetrics.collectors()...)
+	for _, src := range []struct {
+		label string
+		n     *atomic.Uint64
+	}{{"ensure", &s.ensureCalls}, {"read", &s.rowReads}} {
+		out = append(out, prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "ably_storage_channel_binds_total",
+			Help:        "Channel binds on this node by how the channels row was read: ensure (ensure_channel, which writes) or read (a plain read of a row the node knows exists).",
+			ConstLabels: prometheus.Labels{"source": src.label},
+		}, func() float64 { return float64(src.n.Load()) }))
+	}
 	if s.shard.count == 1 {
 		out = append(out, shardsGauge(1))
 	}
@@ -1136,18 +1166,34 @@ func listMigrations() ([]migration, error) {
 	return out, nil
 }
 
-// migrationRetryDelay is the pause between attempts of a migration that
-// lost a deadlock or a lock wait.
-var migrationRetryDelay = 250 * time.Millisecond
+// Migration lock handling (DESIGN.md §6.3, §11). Every migration runs in
+// one transaction under lock_timeout = migrationLockTimeout, so a lock
+// held by a node still serving traffic makes the attempt fail with 55P03
+// after that long instead of waiting indefinitely (and, behind it, queuing
+// every other statement on the table). A failed attempt rolls back whole;
+// applyMigrationWithRetry makes up to migrationAttempts attempts,
+// migrationRetryDelay apart, so Open fails after about
+// attempts x (lock timeout + delay) = 5 x (5 s + 250 ms), roughly 26 s,
+// when the lock never frees. The vars exist so tests can shorten them.
+const migrationAttempts = 5
+
+var (
+	migrationLockTimeout = 5 * time.Second
+	migrationRetryDelay  = 250 * time.Millisecond
+)
+
+// migrationLockTimeouts counts attempts that lost a lock wait (55P03),
+// for tests.
+var migrationLockTimeouts atomic.Int64
 
 // applyMigrationWithRetry retries a migration that failed on a deadlock
 // or a lock timeout: a migration that restructures tables in use by
 // nodes still running the old version can lose the deadlock detector's
-// choice, and the whole transaction rolls back, so a retry is safe.
+// choice or wait out the lock timeout, and the whole transaction rolls
+// back, so a retry is safe.
 func applyMigrationWithRetry(ctx context.Context, conn *pgxpool.Conn, m migration) error {
-	const attempts = 5
 	var err error
-	for i := range attempts {
+	for i := range migrationAttempts {
 		if err = applyMigration(ctx, conn, m); err == nil {
 			return nil
 		}
@@ -1155,7 +1201,10 @@ func applyMigrationWithRetry(ctx context.Context, conn *pgxpool.Conn, m migratio
 		if !errors.As(err, &pgErr) || (pgErr.Code != "40P01" && pgErr.Code != "55P03") {
 			return err
 		}
-		if i < attempts-1 {
+		if pgErr.Code == "55P03" {
+			migrationLockTimeouts.Add(1)
+		}
+		if i < migrationAttempts-1 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1175,6 +1224,11 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// SET LOCAL does not take a bind parameter; the value is a constant
+	// duration rendered as milliseconds.
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = %d`, migrationLockTimeout.Milliseconds())); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
 	if _, err := tx.Exec(ctx, m.sql); err != nil {
 		return fmt.Errorf("exec migration sql: %w", err)
 	}
@@ -1206,6 +1260,7 @@ type channelStore struct {
 	bus       Bus
 	logger    *logging.Logger
 	done      <-chan struct{} // the owning Storage's shutdown signal
+	ctx       context.Context // the owning Storage's loop context (nil in unit-test stubs)
 	timing    chainTiming
 	stats     *busStats // the owning Storage's bus counters (nil in unit tests)
 	pgChan    string    // the postgres bus's notification channel (pgChannelName)
@@ -1283,10 +1338,11 @@ type channelStore struct {
 	gapTimer       *time.Timer
 	filling        bool // a gap fill is reading the log
 	gapBackoff     time.Duration
+	overflowArmed  bool   // a forced fill is armed after a hold overflow
 	sweptWatermark string // the channel's watermark at the previous sweep
 
 	// Delivery counters for tests (guarded by hwmMu).
-	delivered, duplicates, held, gapFills, sweepCatchUps int
+	delivered, duplicates, held, gapFills, sweepCatchUps, holdOverflows int
 
 	// Bus-specific state: the nats bus's subscription (guarded by subMu)
 	// and the postgres bus's delivery queue.
@@ -1353,14 +1409,21 @@ func (cs *channelStore) advanceSerial(ctx context.Context, tx pgx.Tx) (channelSe
 	return channelSerial, prev, nil
 }
 
-// Store persists one publish atomically: advance the channel's serial
-// via advance_channel_serial (which takes a row-level lock on the
-// channels row and is the per-channel write serialiser), then look up
-// any contained Message.IDs for prior matches (idempotent return on a
-// hit, rolling the advance back), otherwise stamp each Message.Serial,
-// insert one row per Message, and emit a NOTIFY on the broker channel. The cm is
-// delivered to the channel's appender asynchronously by the LISTEN
-// goroutine after the NOTIFY round-trips through the database.
+// Store persists one publish atomically. With publish lanes (the server's
+// default, Options.Batching), it queues the publish on the channel's lane
+// and a batch commits it with the others queued (storeBatched,
+// committer.go, DESIGN.md §6.3). Without lanes it runs the single-publish
+// transaction below: advance the channel's serial via
+// advance_channel_serial (which takes a row-level lock on the channels row
+// and is the per-channel write serialiser), then look up any contained
+// Message.IDs for prior matches (idempotent return on a hit, rolling the
+// advance back), otherwise stamp each Message.Serial, insert one row per
+// Message and run the bus's in-transaction hook. Either way the commit is
+// announced through the Bus (bus.go, DESIGN.md §7.2): the publishing node
+// delivers its own cm to the channel's appender straight after commit, and
+// the other nodes receive it over the bus (a NOTIFY and the LISTEN
+// round-trip on pgnotify, inline over the per-channel postgres or nats
+// subscription otherwise).
 func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
 		return nil, false, errors.New("storage/postgres: Store with no messages")
@@ -1456,8 +1519,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 // latest version from the projection (ErrTargetNotFound if absent),
 // apply the shallow-mixin merge, mint a fresh version serial, insert the
 // merged version row on channel_messages (message_serial = identity),
-// upsert the projection (deleted = TRUE for a delete), and NOTIFY. The
-// cm reaches every node's appender via the LISTEN round-trip, like Store.
+// upsert the projection (deleted = TRUE for a delete), and announce the
+// cm on the bus. It reaches every node's appender the way Store's does.
 func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if mut == nil || !mut.Action.IsMutation() {
 		return nil, false, errors.New("storage/postgres: Mutate requires a mutation action")
@@ -1651,9 +1714,8 @@ func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.
 
 // StorePresence persists a presence publish on channel_messages (kind =
 // presence) and folds it into the presence projection table, all in one
-// transaction, then emits a NOTIFY. The cm reaches the channel's
-// appender via the LISTEN round-trip exactly like a message publish
-// (DESIGN.md §12.2, §12.5); the membership table is authoritative across
+// transaction, then announces the cm on the bus. It reaches the channel's
+// appender exactly like a message publish (DESIGN.md §12.2, §12.5); the membership table is authoritative across
 // nodes the moment the tx commits.
 func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	if len(presence) == 0 {
@@ -1850,9 +1912,8 @@ func (cs *channelStore) absentMembers(ctx context.Context, tx pgx.Tx, presence [
 // StoreAnnotation persists an annotation publish on channel_messages
 // (kind = annotation, message_serial = the TARGET message serial so the
 // channel_messages serial index serves annotations-for-message scans,
-// DESIGN.md §14.1, §14.4), then emits a NOTIFY so the cm reaches every
-// node's appender via the LISTEN round-trip exactly like a message
-// publish. Every target must resolve in the messages projection
+// DESIGN.md §14.1, §14.4), then announces the cm on the bus so it reaches
+// every node's appender exactly like a message publish. Every target must resolve in the messages projection
 // (ErrTargetNotFound otherwise, like a mutation). The returned cm is the
 // annotation summary-fold seam.
 func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
@@ -2060,7 +2121,7 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 // watermark in the same transaction, under the channel's row lock. A
 // node seeding its local member set from this (DESIGN.md §12.4) can then
 // fold exactly the cms after the as-of serial.
-func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+func (cs *channelStore) Members(ctx context.Context) (members []*protocol.PresenceMessage, asOfSerial string, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -2071,7 +2132,13 @@ func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessag
 	b.Queue(`SELECT channel_serial FROM channels WHERE name = $1`, cs.name)
 	b.Queue(`COMMIT`)
 	br := cs.pool.SendBatch(ctx, b)
-	defer br.Close()
+	defer func() {
+		// Every result is read below, so Close finds nothing unread; what
+		// it reports is the only sign of a statement that did not complete.
+		if cerr := br.Close(); cerr != nil && retErr == nil {
+			members, asOfSerial, retErr = nil, "", fmt.Errorf("storage/postgres: members close: %w", cerr)
+		}
+	}()
 	if _, err := br.Exec(); err != nil {
 		return nil, "", fmt.Errorf("storage/postgres: members begin: %w", err)
 	}

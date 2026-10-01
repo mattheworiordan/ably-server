@@ -204,10 +204,8 @@ func (s *Storage) batchStats() (uint64, float64) {
 // commitCall is one afterCommit the committer made.
 type commitCall struct{ channel, serial, prev string }
 
-// recordingBus wraps a Bus and records every afterCommit call; the
-// variant with batch=true also forwards (and records) the batched
-// in-transaction hook, the other hides it so the committer takes the
-// per-cm connTx fallback.
+// recordingBus wraps a Bus and records every afterCommit call and the
+// channels of each batched in-transaction hook call.
 type recordingBus struct {
 	Bus
 	mu      sync.Mutex
@@ -222,9 +220,7 @@ func (r *recordingBus) afterCommit(cs *channelStore, cm *protocol.ChannelMessage
 	r.Bus.afterCommit(cs, cm, prev)
 }
 
-type recordingBatchBus struct{ *recordingBus }
-
-func (r recordingBatchBus) beforeCommitBatch(ctx context.Context, b *pgx.Batch, items []batchItem) error {
+func (r *recordingBus) beforeCommitBatch(ctx context.Context, b *pgx.Batch, items []batchItem) error {
 	names := make([]string, len(items))
 	for i, it := range items {
 		names[i] = it.cs.name
@@ -232,105 +228,98 @@ func (r recordingBatchBus) beforeCommitBatch(ctx context.Context, b *pgx.Batch, 
 	r.mu.Lock()
 	r.batches = append(r.batches, names)
 	r.mu.Unlock()
-	return r.Bus.(batchBeforeCommitter).beforeCommitBatch(ctx, b, items)
+	return r.Bus.beforeCommitBatch(ctx, b, items)
 }
 
 // TestBatchedPredecessorChain checks the predecessor every cm of a batch
 // announces to a chaining bus directly: on each channel, each cm's prev
 // must be the serial of the cm before it in the log (the first one's,
 // the channel's serial before the test), earlier cms of the same batch
-// included. It runs with the batched hook and with the per-cm connTx
-// fallback, on the transactional postgres bus (chaining, NOTIFY in the
-// transaction) and on nats.
+// included. It runs on the transactional postgres bus (chaining, NOTIFY
+// in the transaction) and on nats.
 func TestBatchedPredecessorChain(t *testing.T) {
 	c := pgtest.Start(t)
 	ctx := context.Background()
 	n := natstest.Start(t)
 	for _, busName := range []string{"postgres-transactional", "nats"} {
-		for _, batched := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/batchHook=%v", busName, batched), func(t *testing.T) {
-				dsn := c.FreshSchemaDSN(t)
-				o := Options{DSN: dsn, Bus: BusPostgres, NotifyMode: NotifyTransactional, Batching: Batching{Lanes: 1}}
-				if busName == "nats" {
-					o = Options{DSN: dsn, Bus: BusNATS, NATSURL: n.URL, Batching: Batching{Lanes: 1}}
+		t.Run(busName, func(t *testing.T) {
+			dsn := c.FreshSchemaDSN(t)
+			o := Options{DSN: dsn, Bus: BusPostgres, NotifyMode: NotifyTransactional, Batching: Batching{Lanes: 1}}
+			if busName == "nats" {
+				o = Options{DSN: dsn, Bus: BusNATS, NATSURL: n.URL, Batching: Batching{Lanes: 1}}
+			}
+			s := openOpts(t, o)
+			rec := &recordingBus{Bus: s.bus}
+			s.bus = rec
+			channels := []string{"x", "y"}
+			start := map[string]string{}
+			stores := map[string]storage.ChannelStore{}
+			for _, ch := range channels {
+				cs, err := s.Channel(ctx, ch, &orderAppender{})
+				if err != nil {
+					t.Fatalf("Channel: %v", err)
 				}
-				s := openOpts(t, o)
-				rec := &recordingBus{Bus: s.bus}
-				if batched {
-					s.bus = recordingBatchBus{rec}
-				} else {
-					s.bus = rec
+				stores[ch] = cs
+				var cur string
+				if err := s.pool.QueryRow(ctx, `SELECT channel_serial FROM channels WHERE name = $1`, ch).Scan(&cur); err != nil {
+					t.Fatalf("channels row: %v", err)
 				}
-				channels := []string{"x", "y"}
-				start := map[string]string{}
-				stores := map[string]storage.ChannelStore{}
-				for _, ch := range channels {
-					cs, err := s.Channel(ctx, ch, &orderAppender{})
-					if err != nil {
-						t.Fatalf("Channel: %v", err)
-					}
-					stores[ch] = cs
-					var cur string
-					if err := s.pool.QueryRow(ctx, `SELECT channel_serial FROM channels WHERE name = $1`, ch).Scan(&cur); err != nil {
-						t.Fatalf("channels row: %v", err)
-					}
-					start[ch] = cur
-				}
-				var wg sync.WaitGroup
-				for w := range 16 {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						for i := range 15 {
-							ch := channels[(w+i)%2]
-							if _, _, err := stores[ch].Store(ctx, []*protocol.Message{{Data: "p"}}); err != nil {
-								t.Errorf("Store: %v", err)
-								return
-							}
+				start[ch] = cur
+			}
+			var wg sync.WaitGroup
+			for w := range 16 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := range 15 {
+						ch := channels[(w+i)%2]
+						if _, _, err := stores[ch].Store(ctx, []*protocol.Message{{Data: "p"}}); err != nil {
+							t.Errorf("Store: %v", err)
+							return
 						}
-					}()
-				}
-				wg.Wait()
+					}
+				}()
+			}
+			wg.Wait()
 
-				rec.mu.Lock()
-				calls := append([]commitCall(nil), rec.commits...)
-				multi := false
-				for _, b := range rec.batches {
-					seen := map[string]bool{}
-					for _, name := range b {
-						if seen[name] {
-							multi = true
-						}
-						seen[name] = true
+			rec.mu.Lock()
+			calls := append([]commitCall(nil), rec.commits...)
+			multi := false
+			for _, b := range rec.batches {
+				seen := map[string]bool{}
+				for _, name := range b {
+					if seen[name] {
+						multi = true
 					}
+					seen[name] = true
 				}
-				rec.mu.Unlock()
-				prevOf := map[string]string{}
-				for _, cc := range calls {
-					prevOf[cc.channel+"|"+cc.serial] = cc.prev
+			}
+			rec.mu.Unlock()
+			prevOf := map[string]string{}
+			for _, cc := range calls {
+				prevOf[cc.channel+"|"+cc.serial] = cc.prev
+			}
+			for _, ch := range channels {
+				page, err := stores[ch].History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
+				if err != nil {
+					t.Fatalf("History: %v", err)
 				}
-				for _, ch := range channels {
-					page, err := stores[ch].History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
-					if err != nil {
-						t.Fatalf("History: %v", err)
+				want := start[ch]
+				for _, cm := range page.ChannelMessages {
+					got, ok := prevOf[ch+"|"+cm.ChannelSerial]
+					if !ok {
+						t.Fatalf("%s: no afterCommit for stored cm %s", ch, cm.ChannelSerial)
 					}
-					want := start[ch]
-					for _, cm := range page.ChannelMessages {
-						got, ok := prevOf[ch+"|"+cm.ChannelSerial]
-						if !ok {
-							t.Fatalf("%s: no afterCommit for stored cm %s", ch, cm.ChannelSerial)
-						}
-						if got != want {
-							t.Fatalf("%s: cm %s announced prev %s, want %s (the cm before it in the log)", ch, cm.ChannelSerial, got, want)
-						}
-						want = cm.ChannelSerial
+					if got != want {
+						t.Fatalf("%s: cm %s announced prev %s, want %s (the cm before it in the log)", ch, cm.ChannelSerial, got, want)
 					}
+					want = cm.ChannelSerial
 				}
-				if batched && !multi {
-					t.Log("no batch carried two cms of one channel this run; the chain check still covered consecutive batches")
-				}
-			})
-		}
+			}
+			if !multi {
+				t.Log("no batch carried two cms of one channel this run; the chain check still covered consecutive batches")
+			}
+		})
 	}
 }
 
