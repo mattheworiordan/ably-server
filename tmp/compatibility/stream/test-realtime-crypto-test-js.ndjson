@@ -1,0 +1,38 @@
+{"event":"start","at":1790813490511}
+{"event":"pass","fullTitle":"realtime/crypto generateRandomKey0","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto generateRandomKey1","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto getDefaultParams_withResultOfGenerateRandomKey","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto getDefaultParams_ArrayBuffer_key","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto getDefaultParams_base64_key","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto getDefaultParams_check_keylength","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto getDefaultParams_preserves_custom_algorithms","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto encrypt_message_128","duration":4}
+{"event":"pass","fullTitle":"realtime/crypto encrypt_message_256","duration":5}
+{"event":"pass","fullTitle":"realtime/crypto decrypt_message_128","duration":0}
+{"event":"pass","fullTitle":"realtime/crypto decrypt_message_256","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto fromEncoded_cipher_options","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto msgpack_128","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto msgpack_256","duration":6}
+{"event":"pass","fullTitle":"realtime/crypto single_send_128 with web_socket binary protocol","duration":5}
+{"event":"pass","fullTitle":"realtime/crypto single_send_128 with web_socket text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto single_send_128 with binary protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto single_send_128 with text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto single_send_256 with web_socket binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto single_send_256 with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto single_send_256 with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/crypto single_send_256 with text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_binary_2_200","duration":204}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_text_2_200","duration":205}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_binary_20_100","duration":1935}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_text_20_100","duration":1940}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_binary_10_10","duration":108}
+{"event":"pass","fullTitle":"realtime/crypto multiple_send_text_10_10","duration":110}
+{"event":"pass","fullTitle":"realtime/crypto single_send_binary_text","duration":5}
+{"event":"pass","fullTitle":"realtime/crypto single_send_text_binary","duration":3}
+{"event":"pass","fullTitle":"realtime/crypto publish_immediately","duration":3}
+{"event":"pass","fullTitle":"realtime/crypto encrypted history","duration":8}
+{"event":"pass","fullTitle":"realtime/crypto single_send_key_mismatch","duration":3}
+{"event":"pass","fullTitle":"realtime/crypto single_send_unencrypted","duration":2}
+{"event":"pass","fullTitle":"realtime/crypto single_send_encrypted_unhandled","duration":3}
+{"event":"pass","fullTitle":"realtime/crypto set_cipher_params0","duration":4}
+{"event":"end","at":1790813495125,"stats":{"suites":1,"tests":36,"passes":36,"pending":0,"failures":0,"start":"2026-10-01T00:11:30.511Z","end":"2026-10-01T00:11:35.125Z","duration":4614}}

@@ -1,0 +1,8 @@
+{"event":"start","at":1790813558076}
+{"event":"fail","fullTitle":"rest/batchPublish when invoked with an array of specs performs a batch publish and returns an array of results","duration":5,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/batchPublish when invoked with a single spec performs a batch publish and returns a single result","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/batchPresence performs a batch presence fetch and returns a result","duration":6,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/revokeTokens revokes tokens matching the given specifiers","duration":3,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/revokeTokens accepts optional issuedBefore and allowReauthMargin parameters","duration":1,"err":"requested resource not found"}
+{"event":"pass","fullTitle":"rest/revokeTokens throws an error when using token auth","duration":1}
+{"event":"end","at":1790813558149,"stats":{"suites":5,"tests":6,"passes":1,"pending":0,"failures":5,"start":"2026-10-01T00:12:38.076Z","end":"2026-10-01T00:12:38.149Z","duration":73}}

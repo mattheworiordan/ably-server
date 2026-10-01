@@ -1,0 +1,8 @@
+{"event":"start","at":1790813577530}
+{"event":"pass","fullTitle":"rest/init Init with key string","duration":1}
+{"event":"pass","fullTitle":"rest/init Init with token string","duration":5}
+{"event":"pass","fullTitle":"rest/init Init with tls: false","duration":0}
+{"event":"pass","fullTitle":"rest/init Init with tls: true","duration":0}
+{"event":"fail","fullTitle":"rest/init Init without any tls key should enable tls","duration":0,"err":"expected 'http://example.com:123' to equal 'https://example.com:456'"}
+{"event":"pass","fullTitle":"rest/init Init with clientId set to '*' or anything other than a string or null should error","duration":0}
+{"event":"end","at":1790813577572,"stats":{"suites":1,"tests":6,"passes":5,"pending":0,"failures":1,"start":"2026-10-01T00:12:57.530Z","end":"2026-10-01T00:12:57.572Z","duration":42}}

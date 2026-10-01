@@ -1,0 +1,6 @@
+{"event":"start","at":1790814239624}
+{"event":"pass","fullTitle":"rest/presence Presence get simple","duration":8}
+{"event":"pass","fullTitle":"rest/presence Presence history simple","duration":2}
+{"event":"pass","fullTitle":"rest/presence Presence message JSON serialisation","duration":1}
+{"event":"pass","fullTitle":"rest/presence Presence get limits and filtering","duration":0}
+{"event":"end","at":1790814240339,"stats":{"suites":1,"tests":4,"passes":4,"pending":0,"failures":0,"start":"2026-10-01T00:23:59.624Z","end":"2026-10-01T00:24:00.339Z","duration":715}}

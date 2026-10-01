@@ -2191,8 +2191,8 @@ name = "persisted:presence_fixtures"
     (counters) and `ably_publish_lane_queue_depth{lane}` (gauge).
   - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
     the SYNC snapshots served, by how each was obtained: `cached` (the
-    channel's current snapshot), `stale` (a snapshot within the refresh
-    window, followed by the operations it misses), `built` (rebuilt from
+    channel's current snapshot), `waited` (rebuilt by another attach
+    after waiting out the refresh window), `built` (rebuilt from
     the node's member set), `store` (`--presence-sync-source=store`),
     `fallback` (a store read because seeding the member set failed); and
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
@@ -2421,13 +2421,10 @@ that enters or leaves in the window between the snapshot's as-of serial
 and the live attach point arrives again on the cursor — a duplicate
 ENTER is idempotent and a later LEAVE supersedes a stale PRESENT — so no
 server-side coordination beyond taking the snapshot at-or-after the
-attach point is required. A snapshot from before the attach point is
-also served, within a short refresh window (below), but then together
-with the operations it misses up to the attach point, sent as one
-`PRESENCE` frame straight after the `SYNC`. That frame carries the attach
-point as its `channelSerial`, since the client has now seen everything up
-to there; the operations in it keep their own serials, which is what the
-merge compares.
+attach point is required. The `SYNC` alone must be complete as of the
+attach point: an SDK takes the set as final once the sync ends
+(`presence.get()` returns it), so operations the snapshot misses cannot
+follow in a later frame.
 
 **Where the snapshot comes from** (`--presence-sync-source`, default
 `local`). In `local` mode a node serves `SYNC` from its own copy of the
@@ -2450,11 +2447,12 @@ of the store's set as of a serial:
   (last writer wins, the rule the SDK merge applies).
 - The encoded `SYNC` frame is **cached**: the snapshot is built once and
   encoded once per wire format, then shared by every attach until a
-  presence cm changes the set. While members keep changing, a snapshot
-  younger than the refresh window (50 ms) is served with the operations
-  since (above) rather than rebuilt for every attach; an older one is
-  rebuilt. A client-initiated `SYNC` (RTP19) always gets a current
-  snapshot.
+  presence cm changes the set. It is rebuilt at most once per refresh
+  window (50 ms) while members keep changing: an attach that finds the
+  snapshot out of date but younger than the window waits out the rest of
+  it (at most 50 ms), and one rebuild then serves every attach that
+  waited. The snapshot is built after the attach's stream is opened, so
+  it is at or after the attach point.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
   If the seed read fails, that `SYNC` is read from the store and the next
   one tries to seed again. If the backend skips cms it cannot deliver (a

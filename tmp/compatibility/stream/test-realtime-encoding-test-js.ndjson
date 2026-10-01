@@ -1,0 +1,4 @@
+{"event":"start","at":1790813573372}
+{"event":"pass","fullTitle":"realtime/encoding message_decoding","duration":14}
+{"event":"pass","fullTitle":"realtime/encoding message_encoding","duration":6}
+{"event":"end","at":1790813573425,"stats":{"suites":1,"tests":2,"passes":2,"pending":0,"failures":0,"start":"2026-10-01T00:12:53.372Z","end":"2026-10-01T00:12:53.425Z","duration":53}}

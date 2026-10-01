@@ -1,0 +1,6 @@
+{"event":"start","at":1790813578416}
+{"event":"pass","fullTitle":"msgpack.encode() should handle emoji in strings","duration":1}
+{"event":"pass","fullTitle":"msgpack.encode() should handle special characters in strings","duration":0}
+{"event":"pass","fullTitle":"msgpack.encode() should encode and then decode emojies in string","duration":0}
+{"event":"pass","fullTitle":"msgpack.encode() should handle sparse encoding mode","duration":0}
+{"event":"end","at":1790813578419,"stats":{"suites":1,"tests":4,"passes":4,"pending":0,"failures":0,"start":"2026-10-01T00:12:58.416Z","end":"2026-10-01T00:12:58.419Z","duration":3}}

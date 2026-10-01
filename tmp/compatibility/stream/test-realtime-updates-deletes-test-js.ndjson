@@ -1,0 +1,8 @@
+{"event":"start","at":1790813569154}
+{"event":"pass","fullTitle":"realtime/message-operations Should return serials from publish","duration":7}
+{"event":"pass","fullTitle":"realtime/message-operations Should return multiple serials for batch publish","duration":1}
+{"event":"pass","fullTitle":"realtime/message-operations Should update a message over realtime","duration":2}
+{"event":"pass","fullTitle":"realtime/message-operations Should delete a message over realtime","duration":2}
+{"event":"pass","fullTitle":"realtime/message-operations Should error when called without serial","duration":1}
+{"event":"pass","fullTitle":"realtime/message-operations Should append to a message over realtime","duration":2}
+{"event":"end","at":1790813569207,"stats":{"suites":1,"tests":6,"passes":6,"pending":0,"failures":0,"start":"2026-10-01T00:12:49.154Z","end":"2026-10-01T00:12:49.207Z","duration":53}}

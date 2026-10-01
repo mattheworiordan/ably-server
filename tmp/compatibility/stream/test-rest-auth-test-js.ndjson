@@ -1,0 +1,34 @@
+{"event":"start","at":1790813555289}
+{"event":"pass","fullTitle":"rest/auth Base token generation case","duration":1}
+{"event":"pass","fullTitle":"rest/auth Base token generation with options","duration":0}
+{"event":"pass","fullTitle":"rest/auth Generate token and init library with it","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation with explicit timestamp","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation with invalid timestamp","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation with system timestamp","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with duplicate nonce","duration":2}
+{"event":"pass","fullTitle":"rest/auth Token generation with clientId","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with empty string clientId should error","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with capability that subsets key capability","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with specified key","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation with explicit auth","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with explicit auth, different key","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation with invalid mac","duration":0}
+{"event":"pass","fullTitle":"rest/auth Token generation with defaultTokenParams set and no tokenParams passed in","duration":1}
+{"event":"pass","fullTitle":"rest/auth Token generation: if tokenParams passed in, defaultTokenParams should be ignored altogether, not merged","duration":0}
+{"event":"pass","fullTitle":"rest/auth Authorize with different args","duration":1}
+{"event":"pass","fullTitle":"rest/auth Specify non-default ttl","duration":0}
+{"event":"pass","fullTitle":"rest/auth Should error with excessive ttl","duration":0}
+{"event":"pass","fullTitle":"rest/auth Should error with negative ttl","duration":1}
+{"event":"pass","fullTitle":"rest/auth Should error with invalid ttl","duration":1}
+{"event":"pass","fullTitle":"rest/auth createTokenRequest without authOptions","duration":0}
+{"event":"pass","fullTitle":"rest/auth createTokenRequest uses the key it was initialized with if authOptions does not have a \"key\" key","duration":0}
+{"event":"pass","fullTitle":"rest/auth createTokenRequest should serialise capability object as JSON","duration":0}
+{"event":"pass","fullTitle":"rest/auth Basic rest JWT","duration":1043}
+{"event":"pass","fullTitle":"rest/auth Rest JWT with return type ","duration":176}
+{"event":"fail","fullTitle":"rest/auth Rest embedded JWT","duration":116,"err":"Need a new token, but authOptions does not include any way to request one (no authUrl, authCallback, or key)"}
+{"event":"fail","fullTitle":"rest/auth Rest embedded JWT with encryption","duration":102,"err":"Need a new token, but authOptions does not include any way to request one (no authUrl, authCallback, or key)"}
+{"event":"pass","fullTitle":"rest/auth JWT request with invalid key","duration":87}
+{"event":"pass","fullTitle":"rest/auth Rest JWT with authCallback","duration":114}
+{"event":"pass","fullTitle":"rest/auth Rest JWT with authCallback and invalid keys","duration":79}
+{"event":"pass","fullTitle":"rest/auth authCallback is only invoked once on concurrent auth","duration":3}
+{"event":"end","at":1790813557102,"stats":{"suites":1,"tests":32,"passes":30,"pending":0,"failures":2,"start":"2026-10-01T00:12:35.289Z","end":"2026-10-01T00:12:37.102Z","duration":1813}}

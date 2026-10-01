@@ -1,0 +1,75 @@
+{"event":"start","at":1790813477387}
+{"event":"pass","fullTitle":"realtime/auth authbase0","duration":3}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthUrl_json","duration":593}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthUrl_post_json","duration":96}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthUrl_plainText","duration":81}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthCallback_tokenRequestResponse","duration":3}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthCallback_tokenDetailsResponse","duration":3}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthCallback_tokenStringResponse","duration":2}
+{"event":"pass","fullTitle":"realtime/auth auth_useAuthUrl_mixed_authParams_qsParams","duration":81}
+{"event":"pass","fullTitle":"realtime/auth auth_clientid_inheritance","duration":2}
+{"event":"pass","fullTitle":"realtime/auth auth_clientid_inheritance2","duration":1}
+{"event":"pass","fullTitle":"realtime/auth auth_clientid_inheritance3","duration":2}
+{"event":"pass","fullTitle":"realtime/auth auth_clientid_inheritance4","duration":2}
+{"event":"pass","fullTitle":"realtime/auth auth_clientid_inheritance5","duration":2}
+{"event":"pass","fullTitle":"realtime/auth authCallback_error","duration":1}
+{"event":"pass","fullTitle":"realtime/auth authCallback_timeout","duration":103}
+{"event":"pass","fullTitle":"realtime/auth authCallback_nothing","duration":1}
+{"event":"pass","fullTitle":"realtime/auth authCallback_malformed","duration":2}
+{"event":"pass","fullTitle":"realtime/auth authCallback_too_long_string","duration":3}
+{"event":"pass","fullTitle":"realtime/auth authCallback_empty_string","duration":0}
+{"event":"pass","fullTitle":"realtime/auth authUrl_timeout","duration":101}
+{"event":"pass","fullTitle":"realtime/auth authUrl_404","duration":182}
+{"event":"pass","fullTitle":"realtime/auth authUrl_wrong_content_type","duration":59}
+{"event":"pass","fullTitle":"realtime/auth authUrl_401","duration":70}
+{"event":"pass","fullTitle":"realtime/auth authUrl_double_encoded","duration":70}
+{"event":"pass","fullTitle":"realtime/auth authUrl_403","duration":89}
+{"event":"pass","fullTitle":"realtime/auth authUrl_403_custom_error","duration":82}
+{"event":"pass","fullTitle":"realtime/auth authUrl_403_previously_active","duration":166}
+{"event":"pass","fullTitle":"realtime/auth auth_token_expires with web_socket binary protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_token_expires with web_socket text protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_token_expires with binary protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_token_expires with text protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_query_time_once","duration":1}
+{"event":"pass","fullTitle":"realtime/auth auth_tokenDetails_expiry_with_authcallback with web_socket binary protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_tokenDetails_expiry_with_authcallback with web_socket text protocol","duration":5005}
+{"event":"pass","fullTitle":"realtime/auth auth_tokenDetails_expiry_with_authcallback with binary protocol","duration":5007}
+{"event":"pass","fullTitle":"realtime/auth auth_tokenDetails_expiry_with_authcallback with text protocol","duration":5006}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_authcallback with web_socket binary protocol","duration":5007}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_authcallback with web_socket text protocol","duration":5006}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_authcallback with binary protocol","duration":5004}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_authcallback with text protocol","duration":5006}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_token with web_socket binary protocol","duration":5002}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_token with web_socket text protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_token with binary protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_token_string_expiry_with_token with text protocol","duration":5003}
+{"event":"pass","fullTitle":"realtime/auth auth_expired_token_string with web_socket binary protocol","duration":139}
+{"event":"pass","fullTitle":"realtime/auth auth_expired_token_string with web_socket text protocol","duration":105}
+{"event":"pass","fullTitle":"realtime/auth auth_expired_token_string with binary protocol","duration":106}
+{"event":"pass","fullTitle":"realtime/auth auth_expired_token_string with text protocol","duration":109}
+{"event":"pending","fullTitle":"realtime/auth reauth_authCallback with web_socket binary protocol"}
+{"event":"pending","fullTitle":"realtime/auth reauth_authCallback with web_socket text protocol"}
+{"event":"pending","fullTitle":"realtime/auth reauth_authCallback with binary protocol"}
+{"event":"pending","fullTitle":"realtime/auth reauth_authCallback with text protocol"}
+{"event":"pass","fullTitle":"realtime/auth authorize_updates_stored_details","duration":1}
+{"event":"pass","fullTitle":"realtime/auth mocked_reauth","duration":3}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_clientid","duration":263}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_clientid_application_jwt","duration":183}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_subscribe_only_capability","duration":191}
+{"event":"pass","fullTitle":"realtime/auth realtime client mirrors the auth clientId","duration":73}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_publish_capability","duration":75}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_token_that_expires","duration":4432}
+{"event":"pass","fullTitle":"realtime/auth auth_jwt_with_token_that_renews","duration":5062}
+{"event":"pass","fullTitle":"realtime/auth init_client_with_simple_jwt_token","duration":70}
+{"event":"pass","fullTitle":"realtime/auth reauth_consistently_expired_token","duration":3104}
+{"event":"pass","fullTitle":"realtime/auth expired_token_no_autoremove_when_dont_have_servertime","duration":3}
+{"event":"pass","fullTitle":"realtime/auth expired_token_autoremove_when_have_servertime","duration":3}
+{"event":"pass","fullTitle":"realtime/auth multiple_concurrent_authorize","duration":5}
+{"event":"pass","fullTitle":"realtime/auth authorize_immediately_after_init with web_socket binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/auth authorize_immediately_after_init with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/auth authorize_immediately_after_init with binary protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/auth authorize_immediately_after_init with text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/auth v1_callback_auth_authorize_throws_synchronously","duration":1}
+{"event":"pass","fullTitle":"realtime/auth v1_callback_auth_requestToken_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/auth v1_callback_auth_createTokenRequest_throws_synchronously","duration":1}
+{"event":"end","at":1790813573265,"stats":{"suites":1,"tests":73,"passes":69,"pending":4,"failures":0,"start":"2026-10-01T00:11:17.387Z","end":"2026-10-01T00:12:53.265Z","duration":95878}}

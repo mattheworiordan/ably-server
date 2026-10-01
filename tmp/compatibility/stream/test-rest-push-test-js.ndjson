@@ -1,0 +1,24 @@
+{"event":"start","at":1790813498536}
+{"event":"fail","fullTitle":"rest/push Get subscriptions","duration":7,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push Publish","duration":7,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push deviceRegistrations save","duration":0,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push deviceRegistrations get and list","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push deviceRegistrations remove removeWhere","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push channelSubscriptions save","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push channelSubscriptions get","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push_channelSubscriptions_remove","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push channelSubscriptions listChannels","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation push_activation_succeeds","duration":2,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation device_push","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation subscribe_client","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation subscribe_client_without_clientId","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation unsubscribe_client","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation direct_publish_client_id","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation subscribe_device","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation unsubscribe_device","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation direct_publish_device_id","duration":1,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation push_channel_subscription_device_id","duration":0,"err":"requested resource not found"}
+{"event":"fail","fullTitle":"rest/push push activation push_channel_subscription_client_id","duration":1,"err":"requested resource not found"}
+{"event":"pass","fullTitle":"rest/push push activation failed_getting_device_details","duration":0}
+{"event":"fail","fullTitle":"rest/push push activation failed_registration","duration":1,"err":"expected 40400 to equal 40000"}
+{"event":"end","at":1790813498635,"stats":{"suites":2,"tests":22,"passes":1,"pending":0,"failures":21,"start":"2026-10-01T00:11:38.536Z","end":"2026-10-01T00:11:38.635Z","duration":99}}

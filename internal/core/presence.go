@@ -39,14 +39,11 @@ func ParsePresenceSyncSource(s string) (string, error) {
 }
 
 // DefaultPresenceSyncRefresh bounds how often a channel's SYNC snapshot
-// is rebuilt while its members keep changing: a snapshot younger than
-// this is served as it is, with the presence cms after it (DESIGN.md
-// §12.4).
+// is rebuilt while its members keep changing: an attach that finds the
+// snapshot out of date but younger than this waits out the rest of the
+// window, and one rebuild then serves every attach that waited
+// (DESIGN.md §12.4).
 const DefaultPresenceSyncRefresh = 50 * time.Millisecond
-
-// maxSnapshotGap caps the presence cms a stale snapshot is served with;
-// past it the snapshot is dropped and the next SYNC rebuilds.
-const maxSnapshotGap = 256
 
 // PresenceSnapshot is a channel's member set as of one serial, shared by
 // every attach it is served to. Members and AsOf are read-only.
@@ -104,34 +101,24 @@ type memberView struct {
 	members map[string]*protocol.PresenceMessage // by storage.MemberKey
 	asOf    string                               // the set is the fold of every cm up to here
 
-	// snap is the cached snapshot, built at snapBuilt (Channel clock).
-	// since holds the presence cms folded after it was built, which it
-	// does not reflect (stale when non-empty).
+	// snap is the cached snapshot, built at snapBuilt (Channel clock);
+	// stale is set once a presence cm has changed the set since.
 	snap      *PresenceSnapshot
 	snapBuilt int64
-	since     []*protocol.ChannelMessage
+	stale     bool
 }
 
 // observe feeds one delivered presence cm to the view: buffered while a
 // seed read is in flight, folded once seeded, ignored before the first
 // SYNC needs the view. Called with Channel.mu held.
-func (v *memberView) observe(cm *protocol.ChannelMessage, now int64, refresh time.Duration) {
+func (v *memberView) observe(cm *protocol.ChannelMessage) {
 	switch {
 	case v.seeding != nil:
 		v.buffer = append(v.buffer, cm)
 	case v.seeded:
-		if !v.fold(cm) || v.snap == nil {
-			return
+		if v.fold(cm) && v.snap != nil {
+			v.stale = true // the cached snapshot no longer reflects the set
 		}
-		// The cached snapshot no longer reflects the set. Keep it for the
-		// refresh window, with the cms since, unless it is already older
-		// than that or the gap has grown too long: then drop it, so it
-		// pins nothing.
-		if now-v.snapBuilt >= int64(refresh) || len(v.since) >= maxSnapshotGap {
-			v.snap, v.since = nil, nil
-			return
-		}
-		v.since = append(v.since, cm)
 	}
 }
 
@@ -190,70 +177,101 @@ func (v *memberView) build(asOf string) *PresenceSnapshot {
 	return newSnapshot(members, asOf)
 }
 
-// PresenceSync returns the snapshot an attach's SYNC delivers
-// (DESIGN.md §12.4) and the presence operations the snapshot does not
-// reflect that the attach's stream will not deliver either.
+// PresenceSync returns the snapshot an attach's SYNC delivers, or a
+// client-initiated SYNC (DESIGN.md §12.4). It reflects every presence cm
+// this node has delivered on the channel when it returns, so it is at or
+// after the position of any Stream opened before the call: the SYNC is
+// complete for the attach, and the client's merge handles the cms after
+// it that its stream also delivers.
 //
-// at is the attaching Stream's position (Stream.ChannelSerial before its
-// first Next). Every cm after at reaches the attach on its stream, so a
-// snapshot is complete for it if it reflects every presence cm up to at.
-// A snapshot built at or after at is; one built before it (served within
-// the refresh window so a busy room is not re-encoded for every attach)
-// is returned with gap, the operations of its missing cms up to at, for
-// the caller to deliver after it. An empty at asks for a current
-// snapshot (a client-initiated SYNC).
+// A snapshot is shared until a presence cm changes the set. One that is
+// out of date is rebuilt, at most once per refresh window: an attach
+// that finds it younger than the window waits out the rest, so a room
+// whose members keep changing is not re-encoded for every attach.
 //
 // In store mode, or when the local set cannot be seeded, the snapshot is
-// read from the store and gap is nil.
-func (c *Channel) PresenceSync(ctx context.Context, at string) (snap *PresenceSnapshot, gap []*protocol.PresenceMessage, err error) {
+// read from the store.
+func (c *Channel) PresenceSync(ctx context.Context) (*PresenceSnapshot, error) {
 	if c.syncSource == PresenceSyncStore {
 		c.metrics.PresenceSync("store")
 		return c.storeSnapshot(ctx)
 	}
 	if err := c.seedMembers(ctx); err != nil {
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return nil, ctx.Err()
 		}
 		c.logger().Warn("presence sync: seeding the local member set failed; reading the store", "channel", c.name, "err", err)
 		c.metrics.PresenceSync("fallback")
 		return c.storeSnapshot(ctx)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v := &c.pv
-	switch {
-	case v.snap != nil && len(v.since) == 0:
-		c.metrics.PresenceSync("cached")
-		return v.snap, nil, nil
-	case v.snap != nil && at != "" && c.now()-v.snapBuilt < int64(c.syncRefresh):
-		for _, cm := range v.since {
-			if cm.ChannelSerial > at {
-				break
+	waited := false
+	for {
+		c.mu.Lock()
+		v := &c.pv
+		if !v.seeded {
+			// A discontinuity dropped the set while this call waited.
+			c.mu.Unlock()
+			if err := c.seedMembers(ctx); err != nil {
+				return nil, err
 			}
-			gap = append(gap, cm.Presence...)
+			continue
 		}
-		c.metrics.PresenceSync("stale")
-		return v.snap, gap, nil
+		if v.snap != nil && !v.stale {
+			snap := v.snap
+			c.mu.Unlock()
+			if waited {
+				c.metrics.PresenceSync("waited")
+			} else {
+				c.metrics.PresenceSync("cached")
+			}
+			return snap, nil
+		}
+		if age := c.now() - v.snapBuilt; v.snap != nil && age < int64(c.syncRefresh) {
+			c.mu.Unlock()
+			if err := c.sleep(ctx, time.Duration(int64(c.syncRefresh)-age)); err != nil {
+				return nil, err
+			}
+			waited = true
+			continue
+		}
+		// The set covers every delivered cm, and cms that change no member
+		// do not change it, so it is current as of the tail too.
+		asOf := v.asOf
+		if tail := c.tail.cm; tail != nil && tail.ChannelSerial > asOf {
+			asOf = tail.ChannelSerial
+		}
+		v.snap, v.snapBuilt, v.stale = v.build(asOf), c.now(), false
+		snap := v.snap
+		c.mu.Unlock()
+		c.metrics.PresenceSync("built")
+		return snap, nil
 	}
-	// The set covers every delivered cm, and cms that change no member do
-	// not change it, so it is current as of the tail too.
-	asOf := v.asOf
-	if tail := c.tail.cm; tail != nil && tail.ChannelSerial > asOf {
-		asOf = tail.ChannelSerial
+}
+
+// sleep waits d on the Manager's sleeper (tests drive it with the clock)
+// or the wall clock, returning early with ctx's error.
+func (c *Channel) sleep(ctx context.Context, d time.Duration) error {
+	if c.mgr != nil && c.mgr.sleep != nil {
+		return c.mgr.sleep(ctx, d)
 	}
-	v.snap, v.snapBuilt, v.since = v.build(asOf), c.now(), nil
-	c.metrics.PresenceSync("built")
-	return v.snap, nil, nil
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // storeSnapshot reads the store's member set into a snapshot.
-func (c *Channel) storeSnapshot(ctx context.Context) (*PresenceSnapshot, []*protocol.PresenceMessage, error) {
+func (c *Channel) storeSnapshot(ctx context.Context) (*PresenceSnapshot, error) {
 	members, asOf, err := c.Members(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return newSnapshot(members, asOf), nil, nil
+	return newSnapshot(members, asOf), nil
 }
 
 // seedMembers seeds the local member set from the store, once per bind;

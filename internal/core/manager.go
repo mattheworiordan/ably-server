@@ -75,6 +75,9 @@ type Manager struct {
 	// now reads the Manager's monotonic clock in nanoseconds. A field so
 	// tests can drive eviction without sleeping.
 	now func() int64
+	// sleep, when set, replaces the wall-clock wait a SYNC does for the
+	// refresh window (Channel.sleep), so tests can drive it with now.
+	sleep func(ctx context.Context, d time.Duration) error
 
 	shards [shardCount]shard
 	bound  atomic.Int64

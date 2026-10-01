@@ -1,0 +1,9 @@
+{"event":"start","at":1790813577675}
+{"event":"pass","fullTitle":"ErrorInfo detail field should deserialise detail from server response via fromValues","duration":0}
+{"event":"pass","fullTitle":"ErrorInfo detail field should not include detail when absent in server response","duration":0}
+{"event":"pass","fullTitle":"ErrorInfo detail field should include detail in toString output when present","duration":1}
+{"event":"pass","fullTitle":"ErrorInfo detail field should not include detail in toString when absent","duration":0}
+{"event":"pass","fullTitle":"ErrorInfo detail field should accept detail as a constructor parameter","duration":0}
+{"event":"pass","fullTitle":"ErrorInfo detail field should accept both cause and detail as constructor parameters","duration":0}
+{"event":"pass","fullTitle":"ErrorInfo detail field should leave detail undefined when not passed to constructor","duration":0}
+{"event":"end","at":1790813577680,"stats":{"suites":2,"tests":7,"passes":7,"pending":0,"failures":0,"start":"2026-10-01T00:12:57.675Z","end":"2026-10-01T00:12:57.680Z","duration":5}}

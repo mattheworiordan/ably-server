@@ -90,51 +90,16 @@ func TestIntegrationClusterPresenceSyncMatchesStore(t *testing.T) {
 }
 
 // assertSyncMatchesStore attaches a fresh presence subscriber on addr
-// and checks the set it holds after the attach against the store's set
-// read over REST on restAddr. The attach's set is its SYNC plus any
-// PRESENCE frame sent straight after it: a snapshot reused from within
-// the refresh window is followed by the operations it misses up to the
-// attach (DESIGN.md §12.4), which a client applies on top of the SYNC.
+// and checks its SYNC against the store's set read over REST on
+// restAddr. The SYNC alone must be complete: a client takes the set as
+// final once the SYNC ends (presence.get returns it).
 func assertSyncMatchesStore(t *testing.T, addr, restAddr, room string, want int) {
 	t.Helper()
 	ws := dialRawAs(t, addr, "")
-	set := map[string]string{}
-	for _, e := range rawAttach(t, ws, room, protocol.FlagPresenceSubscribe) {
-		k, v, _ := strings.Cut(e, "=")
-		set[k] = v
-	}
-	// The gap frame, if any, is queued right behind the SYNC; the room is
-	// quiet, so nothing else arrives. A read deadline ends the wait (and
-	// the connection, which is closed next anyway).
-	for {
-		_ = ws.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		_, data, err := ws.ReadMessage()
-		if err != nil {
-			break
-		}
-		var m protocol.ProtocolMessage
-		if err := protocol.Unmarshal(data, protocol.FormatJSON, &m); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		if m.Action != protocol.ActionPresence {
-			continue
-		}
-		for _, p := range m.Presence {
-			if p.Action == protocol.PresenceLeave {
-				delete(set, p.ClientID)
-			} else {
-				set[p.ClientID] = fmt.Sprint(p.Data)
-			}
-		}
-	}
-	got := make([]string, 0, len(set))
-	for k, v := range set {
-		got = append(got, k+"="+v)
-	}
-	sort.Strings(got)
+	got := rawAttach(t, ws, room, protocol.FlagPresenceSubscribe)
 	store := restPresence(t, restAddr, room)
 	if len(got) != want || fmt.Sprint(got) != fmt.Sprint(store) {
-		t.Fatalf("set after attach on %s = %v, store set = %v (want %d members)", addr, got, store, want)
+		t.Fatalf("SYNC on %s = %v, store set = %v (want %d members)", addr, got, store, want)
 	}
 	_ = ws.Close()
 }

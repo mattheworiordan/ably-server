@@ -1,0 +1,49 @@
+{"event":"start","at":1790814239625}
+{"event":"pending","fullTitle":"realtime/presence presenceAttachAndEnter"}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterWithoutAttach","duration":13}
+{"event":"pass","fullTitle":"realtime/presence presence_enter_no_queueing","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterWithoutConnect","duration":3}
+{"event":"pending","fullTitle":"realtime/presence presenceEnterDetachRace"}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterWithCallback","duration":4}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterWithNothing","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterWithData","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceMessageAction","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceMessageExtras","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterDetachEnter","duration":54}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterInvalid","duration":24}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterAndLeave","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterUpdate","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterGet","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceSubscribeUnattached","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceGetUnattached","duration":52}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterLeaveGet","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceHistory","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presenceSecondConnection","duration":52}
+{"event":"pass","fullTitle":"realtime/presence presenceTwoMembers","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterAfterClose","duration":54}
+{"event":"pass","fullTitle":"realtime/presence presenceEnterClosed","duration":1}
+{"event":"pass","fullTitle":"realtime/presence presenceClientIdIsImplicit","duration":2}
+{"event":"pass","fullTitle":"realtime/presence presenceEncoding","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presence_enter_inherited_clientid","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presence_enter_before_know_clientid","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presence_refresh_on_detach","duration":105}
+{"event":"pass","fullTitle":"realtime/presence presence_detach_during_sync","duration":55}
+{"event":"pass","fullTitle":"realtime/presence presence_auto_reenter","duration":56}
+{"event":"pass","fullTitle":"realtime/presence presence_auto_reenter_different_connid","duration":15006}
+{"event":"pass","fullTitle":"realtime/presence presence_enter_while_disconnected_sent_after_reattach","duration":5}
+{"event":"pending","fullTitle":"realtime/presence presence_failed_auto_reenter"}
+{"event":"pass","fullTitle":"realtime/presence multiple_pending","duration":3}
+{"event":"pass","fullTitle":"realtime/presence leave_published_for_member_missing_from_sync","duration":57}
+{"event":"pass","fullTitle":"realtime/presence leave_published_for_members_on_presenceless_attached","duration":3}
+{"event":"pass","fullTitle":"realtime/presence suspended_preserves_presence","duration":1160}
+{"event":"pass","fullTitle":"realtime/presence presence_many_updates","duration":1012}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_enter_throws_synchronously","duration":2}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_update_throws_synchronously","duration":2}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_leave_throws_synchronously","duration":1}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_get_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_history_throws_synchronously","duration":1}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_subscribe_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/presence v1_callback_presence_subscribe_listener_callback_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/presence presence.get() without presence_subscribe mode with strictMode:true, rejects with 91008 and remediation naming presence_subscribe","duration":3}
+{"event":"pass","fullTitle":"realtime/presence presence.get() without presence_subscribe mode with strictMode disabled (default), logs a warning and resolves to []","duration":2}
+{"event":"end","at":1790814258118,"stats":{"suites":2,"tests":47,"passes":44,"pending":3,"failures":0,"start":"2026-10-01T00:23:59.625Z","end":"2026-10-01T00:24:18.118Z","duration":18493}}

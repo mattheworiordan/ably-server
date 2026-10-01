@@ -1,0 +1,26 @@
+{"event":"start","at":1790813498739}
+{"event":"pass","fullTitle":"realtime/resume resume_inactive with web_socket binary protocol","duration":11453}
+{"event":"pass","fullTitle":"realtime/resume resume_inactive with web_socket text protocol","duration":11444}
+{"event":"pass","fullTitle":"realtime/resume resume_inactive with binary protocol","duration":11442}
+{"event":"pass","fullTitle":"realtime/resume resume_inactive with text protocol","duration":11436}
+{"event":"pass","fullTitle":"realtime/resume resume_active with web_socket binary protocol","duration":11030}
+{"event":"pass","fullTitle":"realtime/resume resume_active with web_socket text protocol","duration":11031}
+{"event":"pass","fullTitle":"realtime/resume resume_active with binary protocol","duration":11027}
+{"event":"pass","fullTitle":"realtime/resume resume_active with text protocol","duration":11033}
+{"event":"pending","fullTitle":"realtime/resume resume_lost_continuity with web_socket binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_lost_continuity with web_socket text protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_lost_continuity with binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_lost_continuity with text protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_token_error with web_socket binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_token_error with web_socket text protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_token_error with binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_token_error with text protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_fatal_error with web_socket binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_fatal_error with web_socket text protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_fatal_error with binary protocol"}
+{"event":"pending","fullTitle":"realtime/resume resume_fatal_error with text protocol"}
+{"event":"pass","fullTitle":"realtime/resume channel_resumed_flag","duration":5}
+{"event":"pass","fullTitle":"realtime/resume resume_after_suspended","duration":1}
+{"event":"pass","fullTitle":"realtime/resume resume_rewind_1","duration":7007}
+{"event":"fail","fullTitle":"realtime/resume recover multiple channels","duration":120001,"err":"Timeout of 120000ms exceeded. For async tests and hooks, ensure \"done()\" is called; if returning a Promise, ensure it resolves. (/private/tmp/claude-501/-Users-matthew-oriordan-Projects-Ably-forks-ably-server--claude-worktrees-ws11-presence-path-561f09/d591a93d-4d6e-456d-94c7-9db45bf263d8/scratchpad/sdk/ably-js/test/realtime/resume.test.js)"}
+{"event":"end","at":1790813715701,"stats":{"suites":1,"tests":24,"passes":11,"pending":12,"failures":1,"start":"2026-10-01T00:11:38.739Z","end":"2026-10-01T00:15:15.701Z","duration":216962}}

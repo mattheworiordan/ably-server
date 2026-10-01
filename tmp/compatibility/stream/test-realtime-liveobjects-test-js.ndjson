@@ -1,0 +1,3 @@
+{"event":"start","at":1790813477237}
+{"event":"fail","fullTitle":"realtime/liveobjects \"before all\" hook for \"can attach to channel with object modes\"","duration":37,"err":"post: /channels/realtime_liveobjects_fixtures/objects FAILED; http code = 404, error code = 40400, message = requested resource not found; operation = {\"counterCreate\":{}}"}
+{"event":"end","at":1790813477277,"stats":{"suites":1,"tests":0,"passes":0,"pending":0,"failures":1,"start":"2026-10-01T00:11:17.237Z","end":"2026-10-01T00:11:17.277Z","duration":40}}

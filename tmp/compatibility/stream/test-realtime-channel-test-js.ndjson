@@ -1,0 +1,100 @@
+{"event":"start","at":1790813477226}
+{"event":"pass","fullTitle":"realtime/channel channelinit0 with web_socket binary protocol","duration":7}
+{"event":"pass","fullTitle":"realtime/channel channelinit0 with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelinit0 with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelinit0 with text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach0 with web_socket binary protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelattach0 with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach0 with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach0 with text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach2 with web_socket binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach2 with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach2 with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattach2 with text protocol","duration":1}
+{"event":"pending","fullTitle":"realtime/channel channelattach3 with web_socket binary protocol"}
+{"event":"pending","fullTitle":"realtime/channel channelattach3 with web_socket text protocol"}
+{"event":"pending","fullTitle":"realtime/channel channelattach3 with binary protocol"}
+{"event":"pending","fullTitle":"realtime/channel channelattach3 with text protocol"}
+{"event":"pass","fullTitle":"realtime/channel channelattachempty with web_socket binary protocol","duration":1023}
+{"event":"pass","fullTitle":"realtime/channel channelattachempty with web_socket text protocol","duration":1005}
+{"event":"pass","fullTitle":"realtime/channel channelattachempty with binary protocol","duration":1006}
+{"event":"pass","fullTitle":"realtime/channel channelattachempty with text protocol","duration":1006}
+{"event":"pass","fullTitle":"realtime/channel channelattachinvalid with web_socket binary protocol","duration":1005}
+{"event":"pass","fullTitle":"realtime/channel channelattachinvalid with web_socket text protocol","duration":1004}
+{"event":"pass","fullTitle":"realtime/channel channelattachinvalid with binary protocol","duration":1005}
+{"event":"pass","fullTitle":"realtime/channel channelattachinvalid with text protocol","duration":1006}
+{"event":"pass","fullTitle":"realtime/channel publish_no_attach with web_socket binary protocol","duration":4}
+{"event":"pass","fullTitle":"realtime/channel publish_no_attach with web_socket text protocol","duration":3}
+{"event":"pass","fullTitle":"realtime/channel publish_no_attach with binary protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel publish_no_attach with text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelattach_publish_invalid with web_socket binary protocol","duration":3}
+{"event":"pass","fullTitle":"realtime/channel channelattach_publish_invalid with web_socket text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelattach_publish_invalid with binary protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelattach_publish_invalid with text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelattach_invalid_twice with web_socket binary protocol","duration":1006}
+{"event":"pass","fullTitle":"realtime/channel channelattach_invalid_twice with web_socket text protocol","duration":1009}
+{"event":"pass","fullTitle":"realtime/channel channelattach_invalid_twice with binary protocol","duration":1006}
+{"event":"pass","fullTitle":"realtime/channel channelattach_invalid_twice with text protocol","duration":1005}
+{"event":"pass","fullTitle":"realtime/channel channelattachWhenState","duration":1}
+{"event":"pass","fullTitle":"realtime/channel channelattachOnceOrIfBefore","duration":1}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicChannelsGet with web_socket binary protocol","duration":507}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicChannelsGet with web_socket text protocol","duration":507}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicChannelsGet with binary protocol","duration":506}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicChannelsGet with text protocol","duration":507}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicSetOptions with web_socket binary protocol","duration":509}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicSetOptions with web_socket text protocol","duration":510}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicSetOptions with binary protocol","duration":506}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsBasicSetOptions with text protocol","duration":509}
+{"event":"pass","fullTitle":"realtime/channel subscribeAfterSetOptions with web_socket binary protocol","duration":3}
+{"event":"pass","fullTitle":"realtime/channel subscribeAfterSetOptions with web_socket text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel subscribeAfterSetOptions with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel subscribeAfterSetOptions with text protocol","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelGetShouldThrowWhenWouldCauseReattach","duration":2}
+{"event":"pass","fullTitle":"realtime/channel setOptionsCallbackBehaviour with web_socket binary protocol","duration":3}
+{"event":"pass","fullTitle":"realtime/channel setOptionsCallbackBehaviour with web_socket text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel setOptionsCallbackBehaviour with binary protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel setOptionsCallbackBehaviour with text protocol","duration":1}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsModesAndChannelModes with web_socket binary protocol","duration":507}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsModesAndChannelModes with web_socket text protocol","duration":507}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsModesAndChannelModes with binary protocol","duration":511}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsModesAndChannelModes with text protocol","duration":510}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelModes with web_socket binary protocol","duration":514}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelModes with web_socket text protocol","duration":510}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelModes with binary protocol","duration":509}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelModes with text protocol","duration":508}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsDeltaAndModes with web_socket binary protocol","duration":5}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsDeltaAndModes with web_socket text protocol","duration":4}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsDeltaAndModes with binary protocol","duration":4}
+{"event":"pass","fullTitle":"realtime/channel attachWithChannelParamsDeltaAndModes with text protocol","duration":3}
+{"event":"pass","fullTitle":"realtime/channel attachWithInvalidChannelParams","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channelsubscribe0","duration":1003}
+{"event":"pass","fullTitle":"realtime/channel channelsubscribe1","duration":2}
+{"event":"pass","fullTitle":"realtime/channel server_sent_detached","duration":102}
+{"event":"pass","fullTitle":"realtime/channel server_sent_detached_while_attaching","duration":1}
+{"event":"pass","fullTitle":"realtime/channel server_sent_error","duration":1}
+{"event":"pass","fullTitle":"realtime/channel server_sent_attached_err","duration":0}
+{"event":"pass","fullTitle":"realtime/channel publish_no_queueing","duration":0}
+{"event":"pass","fullTitle":"realtime/channel v1_callback_publish_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/channel v1_callback_subscribe_throws_synchronously","duration":1}
+{"event":"pass","fullTitle":"realtime/channel v1_callback_subscribe_listener_callback_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/channel v1_callback_history_throws_synchronously","duration":0}
+{"event":"pass","fullTitle":"realtime/channel channel_attach_timeout","duration":2090}
+{"event":"pass","fullTitle":"realtime/channel suspended_connection","duration":3109}
+{"event":"pass","fullTitle":"realtime/channel attached_while_detaching","duration":5}
+{"event":"pass","fullTitle":"realtime/channel detaching from suspended channel transitions channel to detached state","duration":1}
+{"event":"pass","fullTitle":"realtime/channel detaching when connection is not connected immediately transitions channel to detached","duration":2}
+{"event":"pass","fullTitle":"realtime/channel detaching from failed channel results in error","duration":1}
+{"event":"pass","fullTitle":"realtime/channel rewind works on channel after reattaching","duration":3}
+{"event":"pass","fullTitle":"realtime/channel attach_returns_state_change","duration":2}
+{"event":"pass","fullTitle":"realtime/channel subscribe_returns_state_change","duration":3}
+{"event":"pass","fullTitle":"realtime/channel rewind_has_backlog_0","duration":1}
+{"event":"pass","fullTitle":"realtime/channel rewind_has_backlog_1","duration":7}
+{"event":"pass","fullTitle":"realtime/channel should not throw exception then run RealtimeChannels.get() with same options","duration":0}
+{"event":"pass","fullTitle":"realtime/channel whenState","duration":1}
+{"event":"pass","fullTitle":"realtime/channel set channelSerial field for ATTACH ProtocolMessage if available","duration":2}
+{"event":"pass","fullTitle":"realtime/channel channel.properties.channelSerial is updated with channelSerial from latest message","duration":8}
+{"event":"pass","fullTitle":"realtime/channel attach resolves even if channel.off() is called while attaching","duration":1}
+{"event":"pass","fullTitle":"realtime/channel detach resolves even if channel.off() is called while detaching","duration":3}
+{"event":"pass","fullTitle":"realtime/channel subscribe() without subscribe mode with strictMode:true, attach resolves but subscribe rejects with 90009 and a subscribe-mode remediation","duration":2}
+{"event":"pass","fullTitle":"realtime/channel subscribe() without subscribe mode with strictMode disabled (default), subscribe resolves and logs a warning once per attachment","duration":1}
+{"event":"end","at":1790813503955,"stats":{"suites":2,"tests":98,"passes":94,"pending":4,"failures":0,"start":"2026-10-01T00:11:17.226Z","end":"2026-10-01T00:11:43.955Z","duration":26729}}

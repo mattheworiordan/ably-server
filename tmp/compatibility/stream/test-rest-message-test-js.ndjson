@@ -1,0 +1,10 @@
+{"event":"start","at":1790813564322}
+{"event":"pass","fullTitle":"rest/message Should implicitly send clientId when authenticated with clientId","duration":5}
+{"event":"pass","fullTitle":"rest/message Should publish clientId when provided explicitly in message","duration":2}
+{"event":"pass","fullTitle":"rest/message Should error when clientId sent in message is different than authenticated clientId","duration":4}
+{"event":"pass","fullTitle":"rest/message Should error when publishing message larger than maxMessageSize","duration":0}
+{"event":"pass","fullTitle":"rest/message Should send correct IDs when idempotentRestPublishing set to false","duration":2}
+{"event":"pass","fullTitle":"rest/message Should add IDs when automatic idempotent rest publishing option enabled","duration":1}
+{"event":"pass","fullTitle":"rest/message Rest publish params","duration":4}
+{"event":"pass","fullTitle":"rest/message allows you to publish a message on behalf of a Realtime connection by setting connectionKey on the message","duration":5}
+{"event":"end","at":1790813564380,"stats":{"suites":1,"tests":8,"passes":8,"pending":0,"failures":0,"start":"2026-10-01T00:12:44.322Z","end":"2026-10-01T00:12:44.380Z","duration":58}}

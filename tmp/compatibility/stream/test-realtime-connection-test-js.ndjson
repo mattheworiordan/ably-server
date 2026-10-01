@@ -1,0 +1,10 @@
+{"event":"start","at":1790813558250}
+{"event":"pass","fullTitle":"realtime/connection connectionPing","duration":5}
+{"event":"fail","fullTitle":"realtime/connection connectionPingWithCallback","duration":1,"err":"check that responseTime was +ve: expected false to be truthy"}
+{"event":"pass","fullTitle":"realtime/connection connectionAttributes","duration":4}
+{"event":"pass","fullTitle":"realtime/connection unrecoverableConnection","duration":1}
+{"event":"pass","fullTitle":"realtime/connection connectionQueuing","duration":2}
+{"event":"pass","fullTitle":"realtime/connection connectionDetails","duration":1}
+{"event":"pass","fullTitle":"realtime/connection whenState","duration":1}
+{"event":"pass","fullTitle":"realtime/connection v1_callback_ping_throws_synchronously","duration":1}
+{"event":"end","at":1790813558303,"stats":{"suites":1,"tests":8,"passes":7,"pending":0,"failures":1,"start":"2026-10-01T00:12:38.250Z","end":"2026-10-01T00:12:38.303Z","duration":53}}

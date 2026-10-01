@@ -71,6 +71,11 @@ func testChannel(t *testing.T, store storage.ChannelStore, seed string) (*Channe
 	c := newReadyChannel("room", seed)
 	c.store = store
 	c.mgr = &Manager{now: clk.now, logger: logging.Default()}
+	// A SYNC that waits out the refresh window moves the fake clock on.
+	c.mgr.sleep = func(_ context.Context, d time.Duration) error {
+		clk.ns.Add(int64(d))
+		return nil
+	}
 	return c, clk
 }
 
@@ -145,9 +150,9 @@ func TestPresenceSyncSeedsOnceAndFoldsDeliveredCMs(t *testing.T) {
 	c, _ := testChannel(t, store, "005")
 	ctx := context.Background()
 
-	snap, gap, err := c.PresenceSync(ctx, "005")
-	if err != nil || gap != nil {
-		t.Fatalf("PresenceSync: gap=%v err=%v", gap, err)
+	snap, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatalf("PresenceSync: %v", err)
 	}
 	if got := setOf(snap.Members); fmt.Sprint(got) != "[c1:alice=a]" {
 		t.Fatalf("seeded set = %v", got)
@@ -162,7 +167,7 @@ func TestPresenceSyncSeedsOnceAndFoldsDeliveredCMs(t *testing.T) {
 	c.Append(newCM("007", "m1")) // a message cm changes no member
 	c.Append(presCM("008", op(protocol.PresenceLeave, "c1", "alice", "")))
 
-	snap, _, err = c.PresenceSync(ctx, "")
+	snap, err = c.PresenceSync(ctx)
 	if err != nil {
 		t.Fatalf("PresenceSync: %v", err)
 	}
@@ -173,7 +178,7 @@ func TestPresenceSyncSeedsOnceAndFoldsDeliveredCMs(t *testing.T) {
 		t.Errorf("asOf = %q, want 008", snap.AsOf)
 	}
 	c.Append(newCM("009", "m2"))
-	if got, _, _ := c.PresenceSync(ctx, ""); got != snap {
+	if got, _ := c.PresenceSync(ctx); got != snap {
 		t.Error("a message cm invalidated the cached snapshot")
 	}
 	if n := store.calls.Load(); n != 1 {
@@ -206,7 +211,7 @@ func TestPresenceSyncSeedBuffersConcurrentDeliveries(t *testing.T) {
 	results := make(chan result, 2)
 	for range 2 {
 		go func() {
-			snap, _, err := c.PresenceSync(ctx, "")
+			snap, err := c.PresenceSync(ctx)
 			results <- result{snap, err}
 		}()
 	}
@@ -233,74 +238,100 @@ func TestPresenceSyncSeedBuffersConcurrentDeliveries(t *testing.T) {
 	}
 }
 
-func TestPresenceSyncStaleSnapshotWithinRefreshWindow(t *testing.T) {
+// TestPresenceSyncWaitsOutRefreshWindow: a snapshot out of date but
+// younger than the refresh window is not served (it would miss members
+// that entered before the attach) and not rebuilt at once: the attach
+// waits out the rest of the window, and one rebuild serves every attach
+// that waited.
+func TestPresenceSyncWaitsOutRefreshWindow(t *testing.T) {
 	store := &membersStore{asOf: "010"}
 	c, clk := testChannel(t, store, "010")
 	ctx := context.Background()
+	var slept []time.Duration
+	c.mgr.sleep = func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		clk.ns.Add(int64(d))
+		return nil
+	}
 
-	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a"))) // before the seed: not tracked
-	first, _, err := c.PresenceSync(ctx, "011")
+	first, err := c.PresenceSync(ctx)
 	if err != nil {
 		t.Fatalf("PresenceSync: %v", err)
 	}
-	if len(first.Members) != 0 {
-		t.Fatalf("seed = %v, want the store's (empty) set", setOf(first.Members))
-	}
-
-	// Two members enter after the snapshot. Within the window, an attach
-	// anchored at 012 gets the old snapshot plus 012's operations; 013
-	// reaches it on its stream.
-	c.Append(presCM("012", op(protocol.PresenceEnter, "c2", "bob", "b")))
-	c.Append(presCM("013", op(protocol.PresenceEnter, "c3", "carol", "c")))
+	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
 	clk.ns.Add(int64(10 * time.Millisecond))
-	snap, gap, err := c.PresenceSync(ctx, "012")
+
+	snap, err := c.PresenceSync(ctx)
 	if err != nil {
 		t.Fatalf("PresenceSync: %v", err)
 	}
-	if snap != first {
-		t.Fatal("within the refresh window the snapshot was rebuilt")
+	if fmt.Sprint(slept) != fmt.Sprint([]time.Duration{DefaultPresenceSyncRefresh - 10*time.Millisecond}) {
+		t.Errorf("slept %v, want the rest of the window once", slept)
 	}
-	if len(gap) != 1 || gap[0].ClientID != "bob" {
-		t.Errorf("gap = %v, want bob's ENTER only", setOf(gap))
+	if snap == first || fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
+		t.Errorf("after the wait: set %v, want a rebuilt [c1:alice=a]", setOf(snap.Members))
 	}
-
-	// A client-initiated SYNC (no anchor) always gets a current snapshot.
-	cur, gap, err := c.PresenceSync(ctx, "")
-	if err != nil || gap != nil {
-		t.Fatalf("PresenceSync: gap=%v err=%v", gap, err)
-	}
-	if got := setOf(cur.Members); fmt.Sprint(got) != "[c2:bob=b c3:carol=c]" {
-		t.Errorf("current set = %v", got)
+	if again, _ := c.PresenceSync(ctx); again != snap {
+		t.Error("an unchanged set was rebuilt")
 	}
 
-	// Past the window a stale snapshot is rebuilt.
-	c.Append(presCM("014", op(protocol.PresenceLeave, "c2", "bob", "")))
+	// Past the window an out-of-date snapshot is rebuilt without waiting.
+	slept = nil
+	c.Append(presCM("012", op(protocol.PresenceLeave, "c1", "alice", "")))
 	clk.ns.Add(int64(DefaultPresenceSyncRefresh))
-	rebuilt, gap, err := c.PresenceSync(ctx, "014")
-	if err != nil || gap != nil {
-		t.Fatalf("PresenceSync: gap=%v err=%v", gap, err)
+	rebuilt, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatalf("PresenceSync: %v", err)
 	}
-	if rebuilt == cur || fmt.Sprint(setOf(rebuilt.Members)) != "[c3:carol=c]" {
-		t.Errorf("after the window: set = %v, want a rebuilt [c3:carol=c]", setOf(rebuilt.Members))
+	if len(slept) != 0 || len(rebuilt.Members) != 0 {
+		t.Errorf("past the window: slept %v, set %v; want no wait and an empty set", slept, setOf(rebuilt.Members))
 	}
 }
 
-// TestPresenceSyncDropsExpiredSnapshot: a stale snapshot older than the
-// refresh window is dropped on the next presence cm, so a channel whose
-// members churn with no attaches pins no cms.
-func TestPresenceSyncDropsExpiredSnapshot(t *testing.T) {
-	c, clk := testChannel(t, &membersStore{asOf: "010"}, "010")
-	if _, _, err := c.PresenceSync(context.Background(), ""); err != nil {
+// TestPresenceSyncWaitersShareOneRebuild: attaches that wait out the
+// window together get the same rebuilt snapshot.
+func TestPresenceSyncWaitersShareOneRebuild(t *testing.T) {
+	c, _ := testChannel(t, &membersStore{asOf: "010"}, "010")
+	ctx := context.Background()
+	release := make(chan struct{})
+	var waiting atomic.Int32
+	c.mgr.sleep = func(ctx context.Context, d time.Duration) error {
+		waiting.Add(1)
+		<-release
+		return nil
+	}
+	if _, err := c.PresenceSync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	c.Append(presCM("011", op(protocol.PresenceEnter, "c1", "alice", "a")))
-	if c.pv.snap == nil || len(c.pv.since) != 1 {
-		t.Fatalf("within the window: snap=%v since=%d, want kept with one cm", c.pv.snap != nil, len(c.pv.since))
+	const n = 5
+	got := make(chan *PresenceSnapshot, n)
+	for range n {
+		go func() {
+			snap, err := c.PresenceSync(ctx)
+			if err != nil {
+				t.Error(err)
+			}
+			got <- snap
+		}()
 	}
-	clk.ns.Add(int64(DefaultPresenceSyncRefresh))
-	c.Append(presCM("012", op(protocol.PresenceEnter, "c2", "bob", "b")))
-	if c.pv.snap != nil || c.pv.since != nil {
-		t.Error("an expired stale snapshot was kept")
+	for waiting.Load() < n {
+		time.Sleep(time.Millisecond)
+	}
+	// The window passes (the fake clock never moved, so make the rebuild
+	// due by ageing the snapshot).
+	c.mu.Lock()
+	c.pv.snapBuilt -= int64(DefaultPresenceSyncRefresh)
+	c.mu.Unlock()
+	close(release)
+	first := <-got
+	for range n - 1 {
+		if s := <-got; s != first {
+			t.Fatal("waiting attaches got different snapshots: more than one rebuild")
+		}
+	}
+	if fmt.Sprint(setOf(first.Members)) != "[c1:alice=a]" {
+		t.Errorf("set = %v", setOf(first.Members))
 	}
 }
 
@@ -309,9 +340,9 @@ func TestPresenceSyncStoreModeReadsStoreEveryTime(t *testing.T) {
 	c, _ := testChannel(t, store, "005")
 	c.syncSource = PresenceSyncStore
 	for range 3 {
-		snap, gap, err := c.PresenceSync(context.Background(), "005")
-		if err != nil || gap != nil {
-			t.Fatalf("PresenceSync: gap=%v err=%v", gap, err)
+		snap, err := c.PresenceSync(context.Background())
+		if err != nil {
+			t.Fatalf("PresenceSync: %v", err)
 		}
 		if snap.AsOf != "005" || fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
 			t.Errorf("store snapshot = %v as of %q", setOf(snap.Members), snap.AsOf)
@@ -328,7 +359,7 @@ func TestPresenceSyncStoreModeReadsStoreEveryTime(t *testing.T) {
 func TestPresenceSyncSeedFailureFallsBackAndRetries(t *testing.T) {
 	store := &membersStore{err: errors.New("database down")}
 	c, _ := testChannel(t, store, "005")
-	if _, _, err := c.PresenceSync(context.Background(), ""); err == nil {
+	if _, err := c.PresenceSync(context.Background()); err == nil {
 		t.Fatal("PresenceSync succeeded with a failing store")
 	}
 	if c.pv.seeded || c.pv.seeding != nil {
@@ -336,7 +367,7 @@ func TestPresenceSyncSeedFailureFallsBackAndRetries(t *testing.T) {
 	}
 	store.err = nil
 	store.asOf = "005"
-	if _, _, err := c.PresenceSync(context.Background(), ""); err != nil {
+	if _, err := c.PresenceSync(context.Background()); err != nil {
 		t.Fatalf("PresenceSync after recovery: %v", err)
 	}
 	if !c.pv.seeded {
@@ -378,14 +409,14 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
 	c, _ := testChannel(t, store, "005")
 	ctx := context.Background()
-	if _, _, err := c.PresenceSync(ctx, ""); err != nil {
+	if _, err := c.PresenceSync(ctx); err != nil {
 		t.Fatal(err)
 	}
 
 	// A LEAVE for alice was skipped; the store no longer has her.
 	store.members, store.asOf = nil, "007"
 	c.Discontinuity()
-	snap, _, err := c.PresenceSync(ctx, "")
+	snap, err := c.PresenceSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +430,7 @@ func TestPresenceSyncDiscontinuityReseeds(t *testing.T) {
 	store.calls.Store(0)
 	done := make(chan *PresenceSnapshot, 1)
 	go func() {
-		snap, _, _ := c.PresenceSync(ctx, "")
+		snap, _ := c.PresenceSync(ctx)
 		done <- snap
 	}()
 	<-store.entered

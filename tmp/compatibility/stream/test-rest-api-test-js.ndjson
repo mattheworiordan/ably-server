@@ -1,0 +1,7 @@
+{"event":"start","at":1790813578309}
+{"event":"pass","fullTitle":"rest/api Client constructors","duration":0}
+{"event":"pass","fullTitle":"rest/api constructor without any arguments","duration":1}
+{"event":"pass","fullTitle":"rest/api Crypto","duration":0}
+{"event":"pass","fullTitle":"rest/api Message","duration":0}
+{"event":"pass","fullTitle":"rest/api PresenceMessage","duration":0}
+{"event":"end","at":1790813578314,"stats":{"suites":1,"tests":5,"passes":5,"pending":0,"failures":0,"start":"2026-10-01T00:12:58.309Z","end":"2026-10-01T00:12:58.314Z","duration":5}}

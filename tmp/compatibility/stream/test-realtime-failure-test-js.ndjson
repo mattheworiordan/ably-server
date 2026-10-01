@@ -1,0 +1,21 @@
+{"event":"start","at":1790813495229}
+{"event":"pass","fullTitle":"realtime/failure invalid_cred_failure","duration":25}
+{"event":"pass","fullTitle":"realtime/failure break_transport","duration":3}
+{"event":"pass","fullTitle":"realtime/failure no_connection_lifecycle","duration":4804}
+{"event":"pass","fullTitle":"realtime/failure disconnected_backoff_web_socket","duration":1087}
+{"event":"pass","fullTitle":"realtime/failure failed_channel","duration":8}
+{"event":"pass","fullTitle":"realtime/failure attach_timeout","duration":2926}
+{"event":"pass","fullTitle":"realtime/failure channel_backoff_web_socket","duration":1398}
+{"event":"pass","fullTitle":"realtime/failure nack_of_sent_message_on_connection_suspended","duration":4}
+{"event":"pass","fullTitle":"realtime/failure nack_of_sent_message_on_connection_failed","duration":2}
+{"event":"pass","fullTitle":"realtime/failure nack_of_sent_message_on_connection_closed","duration":1}
+{"event":"pass","fullTitle":"realtime/failure nack_of_queued_message_on_connection_suspended","duration":1}
+{"event":"pass","fullTitle":"realtime/failure nack_of_queued_message_on_connection_failed","duration":1}
+{"event":"pass","fullTitle":"realtime/failure nack_of_queued_message_on_connection_closed","duration":1}
+{"event":"pass","fullTitle":"realtime/failure idle_transport_timeout","duration":2204}
+{"event":"pass","fullTitle":"realtime/failure try_fallback_hosts_on_placement_constraint with web_socket binary protocol","duration":10252}
+{"event":"pass","fullTitle":"realtime/failure try_fallback_hosts_on_placement_constraint with web_socket text protocol","duration":10046}
+{"event":"pass","fullTitle":"realtime/failure try_fallback_hosts_on_placement_constraint with binary protocol","duration":10062}
+{"event":"pass","fullTitle":"realtime/failure try_fallback_hosts_on_placement_constraint with text protocol","duration":10052}
+{"event":"pass","fullTitle":"realtime/failure no_messages_if_not_attached","duration":7005}
+{"event":"end","at":1790813555164,"stats":{"suites":1,"tests":19,"passes":19,"pending":0,"failures":0,"start":"2026-10-01T00:11:35.229Z","end":"2026-10-01T00:12:35.163Z","duration":59934}}

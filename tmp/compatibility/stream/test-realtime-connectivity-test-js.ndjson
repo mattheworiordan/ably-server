@@ -1,0 +1,10 @@
+{"event":"start","at":1790813575865}
+{"event":"pass","fullTitle":"realtime/connectivity http_connectivity_check","duration":251}
+{"event":"pass","fullTitle":"realtime/connectivity disable_connectivity_check","duration":3}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url succeeds with scheme","duration":224}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url fails with scheme","duration":67}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url succeeds with querystring","duration":83}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url fails with querystring","duration":68}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url succeeds with plain url","duration":269}
+{"event":"pass","fullTitle":"realtime/connectivity configured_connectivity_check_url fails with plain url","duration":89}
+{"event":"end","at":1790813576968,"stats":{"suites":2,"tests":8,"passes":8,"pending":0,"failures":0,"start":"2026-10-01T00:12:55.865Z","end":"2026-10-01T00:12:56.968Z","duration":1103}}

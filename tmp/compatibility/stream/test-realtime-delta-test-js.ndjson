@@ -1,0 +1,7 @@
+{"event":"start","at":1790813569322}
+{"event":"fail","fullTitle":"realtime/delta deltaPlugin","duration":9,"err":"Check number of delta messages: expected +0 to equal 4"}
+{"event":"pass","fullTitle":"realtime/delta unusedPlugin","duration":3}
+{"event":"fail","fullTitle":"realtime/delta lastMessageNotFoundRecovery","duration":2,"err":"Check number of delta messages: expected +0 to equal 3"}
+{"event":"pass","fullTitle":"realtime/delta deltaDecodeFailureRecovery","duration":2}
+{"event":"fail","fullTitle":"realtime/delta noPlugin","duration":60001,"err":"Timeout of 60000ms exceeded. For async tests and hooks, ensure \"done()\" is called; if returning a Promise, ensure it resolves. (/private/tmp/claude-501/-Users-matthew-oriordan-Projects-Ably-forks-ably-server--claude-worktrees-ws11-presence-path-561f09/d591a93d-4d6e-456d-94c7-9db45bf263d8/scratchpad/sdk/ably-js/test/realtime/delta.test.js)"}
+{"event":"end","at":1790813629402,"stats":{"suites":1,"tests":5,"passes":2,"pending":0,"failures":3,"start":"2026-10-01T00:12:49.322Z","end":"2026-10-01T00:13:49.402Z","duration":60080}}

@@ -403,7 +403,7 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 	if len(cm.Presence) > 0 {
 		c.trackMembers(cm.Presence)
 		if c.pv.seeded || c.pv.seeding != nil {
-			c.pv.observe(cm, c.now(), c.syncRefresh)
+			c.pv.observe(cm)
 		}
 	}
 	e := &entry{cm: cm, notify: make(chan struct{})}
