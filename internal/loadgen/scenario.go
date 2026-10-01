@@ -185,30 +185,68 @@ type PassSpec struct {
 	// TailMargin: clock margin for the tail-loss check (default 1s).
 	TailMargin Duration `toml:"tail_margin" json:"tail_margin"`
 	// MinDeliveryRatio: deliveries/s measured over the plan's (default
-	// 0.9). Catches load that was planned but never generated.
+	// 0.99). Catches load that was planned but never generated, and is
+	// the only check on channels outside the sample, so loss on them
+	// below 1 - MinDeliveryRatio is not detected.
 	MinDeliveryRatio float64 `toml:"min_delivery_ratio" json:"min_delivery_ratio"`
+	// MinDeliveryRatioFault is the same for a run whose fault injection
+	// ran (default 0.9): a killed node's clients are away while they
+	// reconnect.
+	MinDeliveryRatioFault float64 `toml:"min_delivery_ratio_fault" json:"min_delivery_ratio_fault"`
 	// MaxLoadDrift: allowed change of the generator's own connections
 	// and attachments from the start to the end of the hold (default
 	// 0.03). Beyond it the run is invalid: node growth would measure the
 	// generator, not the server.
 	MaxLoadDrift float64 `toml:"max_load_drift" json:"max_load_drift"`
+	// MinAttachCoverage: the share of attach claims the publishers'
+	// serial logs must settle (default 0.9), outside a fault run.
+	MinAttachCoverage float64 `toml:"min_attach_coverage" json:"min_attach_coverage"`
+	// MinTailCoverage: the share of the plan's sampled streams the tail
+	// check must have covered (default 0.5), outside a fault run.
+	MinTailCoverage float64 `toml:"min_tail_coverage" json:"min_tail_coverage"`
+	// MinPresenceCompared: the share of members on sampled presence
+	// channels that must have been settled (connected, nothing in flight)
+	// when their set was compared (default 0.9), outside a fault run.
+	MinPresenceCompared float64 `toml:"min_presence_compared" json:"min_presence_compared"`
+	// MaxNegativeLatency: the share of in-window deliveries whose latency
+	// from the actual send time may be negative (default 0.001): more
+	// means the generators' clocks disagree.
+	MaxNegativeLatency float64 `toml:"max_negative_latency" json:"max_negative_latency"`
+	// MaxClockOffset: the largest offset of any generator box from NTP at
+	// the start or end of the run (default 5ms), when measured.
+	MaxClockOffset Duration `toml:"max_clock_offset" json:"max_clock_offset"`
+	// MaxRetryRatio: publish retries over first attempts (default 0.01),
+	// outside a fault run.
+	MaxRetryRatio float64 `toml:"max_retry_ratio" json:"max_retry_ratio"`
+	// MaxGeneratorCPU: the busy CPU fraction of any generator or
+	// publisher box averaged over the hold (default 0.7), outside a fault
+	// run: above it the box, not the server, may be what the run measured.
+	MaxGeneratorCPU float64 `toml:"max_generator_cpu" json:"max_generator_cpu"`
 }
 
 // DefaultPass returns plan §8's criteria.
 func DefaultPass() PassSpec {
 	return PassSpec{
-		DeliveryP50:        Duration{50 * time.Millisecond},
-		DeliveryP99:        Duration{250 * time.Millisecond},
-		DeliveryP99Str:     Duration{100 * time.Millisecond},
-		RestAckP99:         Duration{100 * time.Millisecond},
-		ConnectAttachP99:   Duration{500 * time.Millisecond},
-		MinAchievedRatio:   0.95,
-		MaxMemoryGrowth:    0.10,
-		MaxGoroutineGrowth: 0.10,
-		MaxConnectionLoss:  0.01,
-		TailMargin:         Duration{time.Second},
-		MinDeliveryRatio:   0.9,
-		MaxLoadDrift:       0.03,
+		DeliveryP50:           Duration{50 * time.Millisecond},
+		DeliveryP99:           Duration{250 * time.Millisecond},
+		DeliveryP99Str:        Duration{100 * time.Millisecond},
+		RestAckP99:            Duration{100 * time.Millisecond},
+		ConnectAttachP99:      Duration{500 * time.Millisecond},
+		MinAchievedRatio:      0.95,
+		MaxMemoryGrowth:       0.10,
+		MaxGoroutineGrowth:    0.10,
+		MaxConnectionLoss:     0.01,
+		TailMargin:            Duration{time.Second},
+		MinDeliveryRatio:      0.99,
+		MinDeliveryRatioFault: 0.9,
+		MaxLoadDrift:          0.03,
+		MinAttachCoverage:     0.9,
+		MinTailCoverage:       0.5,
+		MinPresenceCompared:   0.9,
+		MaxNegativeLatency:    0.001,
+		MaxClockOffset:        Duration{5 * time.Millisecond},
+		MaxRetryRatio:         0.01,
+		MaxGeneratorCPU:       0.7,
 	}
 }
 
@@ -248,8 +286,32 @@ func (p PassSpec) withDefaults() PassSpec {
 	if p.MinDeliveryRatio == 0 {
 		p.MinDeliveryRatio = d.MinDeliveryRatio
 	}
+	if p.MinDeliveryRatioFault == 0 {
+		p.MinDeliveryRatioFault = d.MinDeliveryRatioFault
+	}
 	if p.MaxLoadDrift == 0 {
 		p.MaxLoadDrift = d.MaxLoadDrift
+	}
+	if p.MinAttachCoverage == 0 {
+		p.MinAttachCoverage = d.MinAttachCoverage
+	}
+	if p.MinTailCoverage == 0 {
+		p.MinTailCoverage = d.MinTailCoverage
+	}
+	if p.MinPresenceCompared == 0 {
+		p.MinPresenceCompared = d.MinPresenceCompared
+	}
+	if p.MaxNegativeLatency == 0 {
+		p.MaxNegativeLatency = d.MaxNegativeLatency
+	}
+	if p.MaxClockOffset.Duration == 0 {
+		p.MaxClockOffset = d.MaxClockOffset
+	}
+	if p.MaxRetryRatio == 0 {
+		p.MaxRetryRatio = d.MaxRetryRatio
+	}
+	if p.MaxGeneratorCPU == 0 {
+		p.MaxGeneratorCPU = d.MaxGeneratorCPU
 	}
 	return p
 }
@@ -566,14 +628,31 @@ func hash64(s string) uint64 {
 }
 
 // Sampled reports whether the serial-continuity check covers channel j of
-// class c: a deterministic SamplePercent of channels by name hash, plus
-// the first channel of every class so hot and shared channels are always
+// class c: a deterministic SamplePercent of channels by hash, plus the
+// first channel of every class so hot and shared channels are always
 // covered.
+//
+// The hash is of the scenario name, class name and channel index, not of
+// the channel name, so the run tag (which is in the name, to keep runs
+// from sharing idempotency keys) does not move the sample: the same
+// scenario samples the same channels in every run, and two runs are
+// comparable on what they covered. The multiplier does not move it
+// either, except that channels beyond the base count exist only above 1x.
 func (p *Plan) Sampled(c *ResolvedClass, j int) bool {
 	if j == 0 && p.Scenario.SamplePercent > 0 {
 		return true
 	}
-	return hash64(p.ChannelName(c, j))%10000 < p.sampleCut
+	return hash64(p.Scenario.Name+"|"+c.Name+"|"+strconv.Itoa(j))%10000 < p.sampleCut
+}
+
+// PresenceSampled reports whether the member-set check covers presence
+// channel c: always the first, plus a deterministic SamplePercent of the
+// rest by hash (of scenario name and index, so not of the run tag).
+func (p *Plan) PresenceSampled(c int) bool {
+	if c == 0 {
+		return true
+	}
+	return hash64(p.Scenario.Name+"|presence|"+strconv.Itoa(c))%10000 < p.sampleCut
 }
 
 // PubID names stream l of a channel. It carries the run tag so two runs
@@ -588,10 +667,16 @@ type Totals struct {
 	Attachments int64 `json:"attachments"`
 	// ChurnSlots are held on top of Attachments: the generator should
 	// hold Attachments + ChurnSlots attachments through the hold.
-	ChurnSlots         int     `json:"churn_slots"`
-	Channels           int     `json:"channels"`
-	SubscribedChannels int     `json:"subscribed_channels"`
-	SampledChannels    int     `json:"sampled_channels"`
+	ChurnSlots         int `json:"churn_slots"`
+	Channels           int `json:"channels"`
+	SubscribedChannels int `json:"subscribed_channels"`
+	SampledChannels    int `json:"sampled_channels"`
+	// SampledSubscribed counts the sampled channels that have at least
+	// one subscriber: only those are checked.
+	SampledSubscribed int `json:"sampled_subscribed_channels"`
+	// SampledStreams counts the publish streams on those channels: what
+	// the tail check can cover.
+	SampledStreams     int     `json:"sampled_streams"`
 	PublishesPerSec    float64 `json:"publishes_per_sec"`
 	RESTPublishesPerS  float64 `json:"rest_publishes_per_sec"`
 	RTPublishesPerSec  float64 `json:"realtime_publishes_per_sec"`
@@ -602,6 +687,9 @@ type Totals struct {
 	ConnectsPerSec     float64 `json:"connects_per_sec"`
 	ChannelOpensPerSec float64 `json:"channel_opens_per_sec"`
 	PresenceMembers    int     `json:"presence_members"`
+	// PresenceSampled counts the presence channels whose member set is
+	// checked at the end of the hold.
+	PresenceSampled    int     `json:"presence_sampled_channels"`
 	PresenceEventsPerS float64 `json:"presence_events_per_sec"`
 	InboundBytesPerSec float64 `json:"inbound_bytes_per_sec"`
 }
@@ -632,6 +720,11 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 	}
 	if p.Presence.Enabled {
 		t.PresenceMembers = p.Presence.Channels * p.Presence.MembersPerChannel
+		for c := 0; c < p.Presence.Channels; c++ {
+			if p.PresenceSampled(c) {
+				t.PresenceSampled++
+			}
+		}
 		t.PresenceEventsPerS = p.Presence.EventsPerSec
 	}
 	var cts []ClassTotals
@@ -647,6 +740,12 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 			}
 			if p.Sampled(c, j) {
 				t.SampledChannels++
+				if n > 0 {
+					t.SampledSubscribed++
+					if c.RatePerChannel > 0 {
+						t.SampledStreams += c.StreamCount
+					}
+				}
 			}
 			ct.DeliveriesPerSec += float64(n) * c.RatePerChannel
 		}

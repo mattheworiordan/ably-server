@@ -196,6 +196,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	timeLimit := fs.Duration("time-limit", 0, "hard limit for the whole run (default planned length + 5m)")
 	onTimeout := fs.String("on-timeout", "", "shell command run when the time limit is hit (for instance the teardown script)")
 	format := fs.String("format", "msgpack", "realtime wire format for the jobs: msgpack | json")
+	allowUnmeasured := fs.Bool("allow-unmeasured", false, "do not gate on node-metrics coverage and generator/publisher box CPU (a local run); the record says so and the run is not fit to quote")
 	var idleTimeout optionalDuration
 	fs.Var(&idleTimeout, "server-idle-timeout", "the servers' --channel-idle-timeout: node memory and goroutine growth are measured from hold start plus this (default: the scenario's server_idle_timeout, else 60s; 0 measures from hold start)")
 	var envs multiFlag
@@ -286,7 +287,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		Scenario: sc, Multiplier: sf.multiplier, Scale: sf.scale, RunID: id, RunTag: tag, Inventory: inv,
 		ResultsDir: *results, RunDir: runDir, LogFile: *logFile, StateFile: *stateFile, StartDelay: *startDelay, Poll: *poll,
 		FaultHook: *faultHook, FaultAt: *faultAt, TimeLimit: *timeLimit, OnTimeout: *onTimeout,
-		Format: *format, Out: stdout, ServerIdleTimeout: idleTimeout.conductorIdle(),
+		Format: *format, Out: stdout, ServerIdleTimeout: idleTimeout.conductorIdle(), AllowUnmeasured: *allowUnmeasured,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)

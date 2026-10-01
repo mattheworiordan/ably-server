@@ -87,6 +87,9 @@ type counters struct {
 	received, inWindow, negLatency, foreign                                     atomic.Int64
 	presEntered, presLeft, presNacks, presReceived                              atomic.Int64
 	openAtEnd, attachedAtEnd, openAtStart, attachedAtStart                      atomic.Int64
+	serialsDropped, throttled                                                   atomic.Int64
+	presChecksPlanned, presChecksDone, presChecksFailed                         atomic.Int64
+	presMembersPlanned, presCompared, presIndeterminate                         atomic.Int64
 }
 
 // Job runs one role for one run.
@@ -103,8 +106,9 @@ type Job struct {
 
 	start, measureStart, measureEnd, end time.Time
 
-	streamsMu sync.Mutex
-	streams   map[string]map[string]StreamRecord
+	streamsMu     sync.Mutex
+	streams       map[string]map[string]StreamRecord
+	serialsLogged atomic.Int64
 
 	pubStreams  int
 	pubTarget   float64
@@ -167,7 +171,7 @@ func NewJob(spec JobSpec, m *Metrics) (*Job, error) {
 		state:   "pending",
 		done:    make(chan struct{}),
 	}
-	for _, name := range []string{LatDelivery, LatDeliveryCrossNode, LatDeliverySameNode, LatRESTAck, LatRESTService, LatRealtimeAck, LatConnectAttach, LatReconnectAttach, LatChannelOpen, LatPresenceAck} {
+	for _, name := range []string{LatDelivery, LatDeliveryFromSend, LatDeliveryCrossNode, LatDeliverySameNode, LatRESTAck, LatRESTService, LatRealtimeAck, LatConnectAttach, LatReconnectAttach, LatChannelOpen, LatPresenceAck} {
 		j.hist[name] = NewHistogram()
 	}
 	j.checker.OnViolation = func(k ViolationKind, n int64) {
@@ -369,7 +373,13 @@ func readRSS() uint64 {
 	return pages * uint64(os.Getpagesize())
 }
 
-func (j *Job) recordStream(channel, pubID string, seq int64, atUS int64) {
+// MaxSerialLogEntries caps the serials one process keeps for the
+// attach-point check (about 45 bytes each in memory, 32 in the summary).
+// Past it a stream's log simply ends: claims beyond it are reported as
+// unverifiable, never as a pass.
+const MaxSerialLogEntries = 1_500_000
+
+func (j *Job) recordStream(channel, pubID string, seq int64, atUS int64, serial string) {
 	j.streamsMu.Lock()
 	defer j.streamsMu.Unlock()
 	m := j.streams[channel]
@@ -377,9 +387,23 @@ func (j *Job) recordStream(channel, pubID string, seq int64, atUS int64) {
 		m = make(map[string]StreamRecord)
 		j.streams[channel] = m
 	}
-	if r, ok := m[pubID]; !ok || seq > r.LastAckedSeq {
-		m[pubID] = StreamRecord{LastAckedSeq: seq, LastAckedUS: atUS}
+	r := m[pubID]
+	if r.LastAckedUS == 0 || seq > r.LastAckedSeq {
+		r.LastAckedSeq, r.LastAckedUS = seq, atUS
 	}
+	// Serials is indexed by seq. A stream is sequential, so seq is almost
+	// always the next index; a hole (an ACK that carried no serial) is
+	// kept as "" and treated as unknown by the check.
+	if serial != "" && int64(len(r.Serials)) <= seq && j.serialsLogged.Load() < MaxSerialLogEntries {
+		for int64(len(r.Serials)) < seq {
+			r.Serials = append(r.Serials, "")
+		}
+		r.Serials = append(r.Serials, serial)
+		j.serialsLogged.Add(1)
+	} else if serial != "" && int64(len(r.Serials)) <= seq {
+		j.c.serialsDropped.Add(1)
+	}
+	m[pubID] = r
 }
 
 func (j *Job) buildSummary() *Summary {
@@ -416,6 +440,7 @@ func (j *Job) buildSummary() *Summary {
 			Unresolved:      j.c.unresolved.Load(),
 			OfferedInWindow: j.c.offeredInWindow.Load(), AckedInWindow: j.c.ackedInWindow.Load(),
 			OfferedRate: rate(j.c.offeredInWindow.Load()), AchievedRate: rate(j.c.ackedInWindow.Load()),
+			SerialsDropped: j.c.serialsDropped.Load(), Throttled: j.c.throttled.Load(),
 		},
 		Deliveries: DeliveryStats{
 			Received: j.c.received.Load(), InWindow: j.c.inWindow.Load(), Rate: rate(j.c.inWindow.Load()),
@@ -424,6 +449,8 @@ func (j *Job) buildSummary() *Summary {
 		Presence: PresenceStats{
 			Members: j.presMembers, Entered: j.c.presEntered.Load(), Left: j.c.presLeft.Load(),
 			Nacks: j.c.presNacks.Load(), Received: j.c.presReceived.Load(),
+			ChecksPlanned: j.c.presChecksPlanned.Load(), ChecksDone: j.c.presChecksDone.Load(), ChecksFailed: j.c.presChecksFailed.Load(),
+			MembersPlanned: j.c.presMembersPlanned.Load(), MembersCompared: j.c.presCompared.Load(), Indeterminate: j.c.presIndeterminate.Load(),
 		},
 		Latency:     j.hist,
 		Correctness: j.checker.Summary(),

@@ -29,6 +29,9 @@ for a in "$@"; do
   case "$a" in -y | --yes) confirmed=1 ;; *) die "unknown argument: $a" ;; esac
 done
 if [ "${ASSUME_YES:-0}" = 1 ]; then confirmed=1; fi
+if [ "${PROJECT_TAG_DEFAULTED:-0}" = 1 ]; then
+  log "PROJECT_TAG is not set: using the per-user default '$PROJECT_TAG'. Teardown deletes every resource tagged Project=$PROJECT_TAG."
+fi
 if [ "$confirmed" = 0 ] && ! is_dry; then
   die "this deletes every resource tagged Project=$PROJECT_TAG in $AWS_REGION. Re-run with --yes."
 fi

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +51,10 @@ type pubReq struct {
 	attempts  int
 	body      []byte // REST request body, fixed across retries
 	data      string // payload, fixed across retries
+	// serial is the channelSerial the server assigned on the last ACK of
+	// this publish ("" when unknown or the stream is not sampled); the
+	// sender sets it before calling done.
+	serial string
 }
 
 type schedClass struct {
@@ -193,7 +199,14 @@ func (sc *scheduler) dispatch(r *pubReq) {
 	if r.attempts == 0 {
 		r.firstSent = time.Now()
 		r.node = int(sc.nodeRR.Add(1) % uint64(len(j.Spec.Endpoints)))
-		r.data = EncodePayload(Payload{PubID: r.s.plan.PubID, Seq: r.seq, SentAtUS: r.firstSent.UnixMicro(), Node: r.node}, r.s.msgBytes)
+		// SentAtUS is the scheduled time, so latency measured from it
+		// includes any wait the generator imposed on the publish (one in
+		// flight per stream, a backlog behind a slow server); LagUS lets
+		// the report also show latency from the actual send.
+		r.data = EncodePayload(Payload{
+			PubID: r.s.plan.PubID, Seq: r.seq, SentAtUS: r.intended.UnixMicro(), Node: r.node,
+			LagUS: max(r.firstSent.Sub(r.intended).Microseconds(), 0),
+		}, r.s.msgBytes)
 		j.c.sent.Add(1)
 	}
 	sc.snd.send(sc.sendCtx, r, func(err error) { sc.complete(r, err) })
@@ -206,9 +219,14 @@ func (sc *scheduler) complete(r *pubReq, err error) {
 		r.attempts++
 		j.c.retries.Add(1)
 		j.M.Publishes.WithLabelValues(sc.transport, "retried").Inc()
-		if pe, ok := err.(*restStatusError); ok && pe.permanent() {
-			j.c.rejected.Add(1)
-			j.M.Publishes.WithLabelValues(sc.transport, "rejected").Inc()
+		if pe, ok := err.(*restStatusError); ok {
+			if pe.status == http.StatusTooManyRequests {
+				j.c.throttled.Add(1)
+			}
+			if pe.permanent() {
+				j.c.rejected.Add(1)
+				j.M.Publishes.WithLabelValues(sc.transport, "rejected").Inc()
+			}
 		}
 		if r.attempts <= 3 || r.attempts%100 == 0 {
 			j.logErr("%s publish %s %s seq %d attempt %d: %v", sc.transport, r.s.plan.Channel, r.s.plan.PubID, r.seq, r.attempts, err)
@@ -235,7 +253,7 @@ func (sc *scheduler) complete(r *pubReq, err error) {
 	// by then has the drain to arrive. Publishes that finish during the
 	// publisher's grace period are not held to that.
 	if r.s.plan.Sampled && !now.After(j.measureEnd) {
-		j.recordStream(r.s.plan.Channel, r.s.plan.PubID, r.seq, now.UnixMicro())
+		j.recordStream(r.s.plan.Channel, r.s.plan.PubID, r.seq, now.UnixMicro(), r.serial)
 	}
 	s := r.s
 	s.mu.Lock()
@@ -395,7 +413,7 @@ func (rs *restSender) do(ctx context.Context, r *pubReq) error {
 	if err != nil {
 		return err
 	}
-	var buf [256]byte
+	var buf [1024]byte
 	n, _ := io.ReadFull(resp.Body, buf[:])
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
@@ -405,7 +423,32 @@ func (rs *restSender) do(ctx context.Context, r *pubReq) error {
 	if resp.StatusCode != http.StatusCreated {
 		return &restStatusError{status: resp.StatusCode, body: string(buf[:n])}
 	}
+	if r.s.plan.Sampled {
+		r.serial = serialFromRESTBody(buf[:n])
+	}
 	return nil
+}
+
+// serialFromRESTBody returns the channelSerial of the first message in a
+// REST publish response ({"serials":["<channelSerial>:<idx>"]}), or "" if
+// the body does not carry one.
+func serialFromRESTBody(b []byte) string {
+	var v struct {
+		Serials []string `json:"serials"`
+	}
+	if json.Unmarshal(b, &v) != nil || len(v.Serials) == 0 {
+		return ""
+	}
+	return channelSerialOf(v.Serials[0])
+}
+
+// channelSerialOf strips the ":<idx>" a Message.serial adds to its
+// channelSerial (DESIGN.md §8). A bare channelSerial is returned as is.
+func channelSerialOf(msgSerial string) string {
+	if i := strings.LastIndexByte(msgSerial, ':'); i >= 0 {
+		return msgSerial[:i]
+	}
+	return msgSerial
 }
 
 // realtimeSender publishes over a small pool of WebSocket connections.
@@ -498,7 +541,14 @@ func (rs *realtimeSender) send(_ context.Context, r *pubReq, done func(error)) {
 		return
 	}
 	msg := &protocol.Message{ID: MessageID(r.s.plan.PubID, r.seq), Name: "lg", Data: r.data}
-	if err := c.Publish(r.s.plan.Channel, []*protocol.Message{msg}, done); err != nil {
+	sampled := r.s.plan.Sampled
+	err := c.PublishWithResult(r.s.plan.Channel, []*protocol.Message{msg}, func(res *protocol.PublishResult, err error) {
+		if sampled && err == nil && res != nil && len(res.Serials) > 0 {
+			r.serial = channelSerialOf(res.Serials[0])
+		}
+		done(err)
+	})
+	if err != nil {
 		done(err)
 	}
 }

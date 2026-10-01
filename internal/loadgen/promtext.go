@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -57,6 +58,59 @@ func ParseMetricSums(r io.Reader, wanted ...string) (map[string]float64, error) 
 	return out, sc.Err()
 }
 
+// ParseMetricLabels reads the Prometheus text exposition format and
+// returns the label sets of every sample of the named metric.
+func ParseMetricLabels(r io.Reader, name string) ([]map[string]string, error) {
+	var out []map[string]string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	prefix := name + "{"
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		end := strings.LastIndexByte(line, '}')
+		if end < 0 {
+			continue
+		}
+		labels := map[string]string{}
+		rest := line[len(prefix):end]
+		for rest != "" {
+			eq := strings.IndexByte(rest, '=')
+			if eq < 0 || eq+1 >= len(rest) || rest[eq+1] != '"' {
+				break
+			}
+			key := strings.TrimSpace(rest[:eq])
+			i := eq + 2
+			var val strings.Builder
+			for i < len(rest) && rest[i] != '"' {
+				if rest[i] == '\\' && i+1 < len(rest) {
+					i++
+				}
+				val.WriteByte(rest[i])
+				i++
+			}
+			labels[key] = val.String()
+			rest = strings.TrimPrefix(strings.TrimSpace(rest[min(i+1, len(rest)):]), ",")
+			rest = strings.TrimSpace(rest)
+		}
+		out = append(out, labels)
+	}
+	return out, sc.Err()
+}
+
+// Server configuration gauges the nodes export (DESIGN.md §10), read so a
+// run record shows the flags the nodes actually ran with.
+const (
+	metricPublishLanes     = "ably_publish_lanes"
+	metricLingerMax        = "ably_publish_linger_max_seconds"
+	metricLingerMin        = "ably_publish_linger_min_seconds"
+	metricStorageShards    = "ably_storage_shards"
+	metricBusInfo          = "ably_bus_info"
+	metricBusSweepInterval = "ably_bus_sweep_interval_seconds"
+)
+
 // Node metric names the conductor samples from each ably-server node's
 // debug listener (DESIGN.md §10).
 var nodeMetricNames = []string{
@@ -68,6 +122,11 @@ var nodeMetricNames = []string{
 	"ably_channels_bound",
 	"ably_messages_published_total",
 	"ably_messages_delivered_total",
+	metricPublishLanes,
+	metricLingerMax,
+	metricLingerMin,
+	metricStorageShards,
+	metricBusSweepInterval,
 }
 
 // NodeSample is one scrape of one node.
@@ -76,7 +135,9 @@ type NodeSample struct {
 	AtUS   int64              `json:"at_us"`
 	Phase  string             `json:"phase"`
 	Values map[string]float64 `json:"values,omitempty"`
-	Error  string             `json:"error,omitempty"`
+	// Info is the label set of ably_bus_info (bus, mode) when exported.
+	Info  map[string]string `json:"info,omitempty"`
+	Error string            `json:"error,omitempty"`
 }
 
 func scrapeNode(ctx context.Context, client *http.Client, node, url, phase string) NodeSample {
@@ -98,9 +159,18 @@ func scrapeNode(ctx context.Context, client *http.Client, node, url, phase strin
 		s.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		return s
 	}
-	s.Values, err = ParseMetricSums(resp.Body, nodeMetricNames...)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		s.Error = err.Error()
+		return s
+	}
+	s.Values, err = ParseMetricSums(bytes.NewReader(body), nodeMetricNames...)
+	if err != nil {
+		s.Error = err.Error()
+		return s
+	}
+	if info, _ := ParseMetricLabels(bytes.NewReader(body), metricBusInfo); len(info) > 0 {
+		s.Info = info[0]
 	}
 	return s
 }

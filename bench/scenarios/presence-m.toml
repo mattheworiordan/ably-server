@@ -1,9 +1,14 @@
 # Short presence run (plan §8 run 6): shape M's presence load for 15
 # minutes. About 500 rooms of 2k members (the plan's 1k to 3k) enter over
 # five minutes, then enter/leave churn at 1.2k events/s with every member
-# also subscribed to presence. SYNC timing on attach to a 3k-member room,
-# member-set checks against the REST presence endpoint and the node kill
-# are driven by the conductor's hooks, not by this file.
+# also subscribed to presence. At the end of the hold the presence role
+# fetches the member set of the first channel and a deterministic
+# sample_percent of the rest over REST and compares it with the members'
+# own enter and leave record (a mismatch fails the run, and so does a run
+# that compared none). SYNC timing on attach to a 3k-member room and the
+# node kill are not driven by this file: the conductor's --fault-hook does
+# the kill, and SYNC time is not measured separately (the connect+attach
+# latency of a member includes it).
 name = "PM"
 shape = "M"
 description = "presence: about 500 rooms of 2k members, enter over 5m, churn at 1.2k events/s"
@@ -11,7 +16,7 @@ bus = "nats"
 nodes = 10
 shards = 1
 message_bytes = 64
-sample_percent = 0
+sample_percent = 5
 
 [timing]
 ramp = "5m"

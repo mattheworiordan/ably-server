@@ -137,6 +137,18 @@ check "PG_ names win and feed RDS_ names" "gp3 gp3 100 / r7i.8xlarge postgres:17
 check "RDS_ENGINE_VERSION picks the image tag" "io2 io2 1000 / r7i.4xlarge postgres:16" "$(alias_out RDS_ENGINE_VERSION=16.3)"
 check "PG_PASSWORD feeds the masking variable" "Pgpassword012345678" "$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/alias-state.json" PROJECT_TAG=t AWS_REGION=r PG_PASSWORD=Pgpassword012345678 bash -c 'source "$0"; echo "$RDS_PASSWORD"' "$HERE/../lib.sh")"
 
+# neutral defaults: nothing in lib.sh points at one person's home directory
+defaults_out() { env -i PATH="$PATH" HOME="/home/nobody-in-particular" USER="$1" DRY_RUN=1 DRY_STATE_FILE="$tmp/default-state.json" AWS_REGION=test-region-1 "${@:2}" \
+  bash -c 'source "$0"; echo "$PROJECT_TAG|${PROJECT_TAG_DEFAULTED:-0}|$STATE_FILE|$LOG_FILE|$RESULTS_DIR"' "$HERE/../lib.sh"; }
+want_user=$(id -un | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-')
+repo_state="$(cd "$HERE/../../.." && pwd)/bench/aws/state"
+check "default PROJECT_TAG names the user" "ably-server-scale-$want_user|1|$repo_state/STATE.json|$repo_state/LOG.md|$repo_state/results" "$(defaults_out ignored)"
+check "an explicit PROJECT_TAG is kept and not flagged" "mine|0|$repo_state/STATE.json|$repo_state/LOG.md|$repo_state/results" "$(defaults_out ignored PROJECT_TAG=mine)"
+check "STATE, LOG and RESULTS stay overridable" "x|1|/s/STATE.json|/l/LOG.md|/r" "$(defaults_out ignored STATE_FILE=/s/STATE.json LOG_FILE=/l/LOG.md RESULTS_DIR=/r | sed "s/^ably-server-scale-[^|]*/x/")"
+case "$(defaults_out ignored)" in */home/nobody-in-particular/*) echo "FAIL a default path points into a home directory"; fails=$((fails + 1)) ;; *) echo "ok   no default path is in a home directory" ;; esac
+state_dir_mode=$(env -i PATH="$PATH" HOME="$HOME" DRY_RUN=1 DRY_STATE_FILE="$tmp/newdir/sub/state.json" PROJECT_TAG=t AWS_REGION=r bash -c 'source "$0"; state_init; stat -f %Lp "$(dirname "$ACTIVE_STATE")" 2>/dev/null || stat -c %a "$(dirname "$ACTIVE_STATE")"' "$HERE/../lib.sh")
+check "the state directory is private" 700 "$state_dir_mode"
+
 # the operator's public key goes into user-data
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment\n' >"$tmp/key.pub"
 check "ssh public key is read" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeytestkeytestkey comment' "$(SSH_PUBLIC_KEY_PATH="$tmp/key.pub" ssh_pubkey)"

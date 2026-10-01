@@ -113,18 +113,31 @@ the agents run on their own boxes and the conductor gets an inventory.
   point) and that each stream's sequence numbers arrive once, in order,
   with no gap. Counted kinds: `duplicate`, `gap`, `reorder`,
   `serial_regression`, `resume_gap` (a gap across a re-attach the server
-  reported as RESUMED) and `tail_loss` (a message a publisher saw
+  reported as RESUMED), `tail_loss` (a message a publisher saw
   acknowledged by the end of the hold that an attachment present
-  throughout never received; the conductor computes it). The first ten
-  of each process are kept verbatim. A resume the server declines (no
-  RESUMED flag, DESIGN.md §4.3) is a signalled discontinuity: counted,
-  not a violation.
-- **Latency.** Each message carries its publisher's send time and node;
-  the subscriber records one-way latency into log-linear histograms
-  (within 1.6%, mergeable across processes) split into same-node and
-  cross-node. Clocks must be synced (chrony). REST ACK latency is from
-  the *scheduled* send time, retries included, so a saturated server
-  cannot hide behind a slower schedule.
+  throughout never received; the conductor computes it) and `attach_gap`
+  (a message published after an attachment's attach point that never
+  arrived before the first message the attachment did receive from that
+  stream; the conductor computes it, see "What the correctness check
+  sees"). The first ten of each process are kept verbatim. A resume the
+  server declines (no RESUMED flag, DESIGN.md §4.3) is a signalled
+  discontinuity: counted, not a violation.
+- **Latency.** Each message carries the time the schedule called for it
+  (its *scheduled* send time), how long after that the generator handed it
+  to its sender, and the publisher's node. The subscriber records one-way
+  latency into log-linear histograms (within 1.6%, mergeable across
+  processes) split into same-node and cross-node. The gated delivery
+  latency is from the **scheduled** time, so waiting the generator imposed
+  because the server was slow (one publish in flight per stream, a backlog
+  behind it) is in the number rather than hidden by a late clock start;
+  `delivery_from_send` records the same deliveries from the actual send
+  time and is reported beside it. REST and realtime ACK latency is from
+  the scheduled time too, retries included. Clocks must be synced (chrony):
+  each agent can measure its box's offset from NTP (`GET /v1/clock`,
+  `--ntp-server`), the conductor records it at the start and end of the
+  run, and the run fails if one is above 5 ms (`max_clock_offset`) or if
+  more than 0.1% of in-window deliveries have a negative latency from the
+  actual send time (`max_negative_latency`), the direct sign of skew.
 - **Churn is steady state.** Both kinds replace, never add, so after
   the ramp the generator's connections and attachments are flat. A
   connection drop is followed at once by a reconnect of the same
@@ -139,7 +152,7 @@ the agents run on their own boxes and the conductor gets an inventory.
 ### `ably-loadgen`
 
     ably-loadgen serve [--listen :9200] [--metrics-listen :9101] [--role generator|publisher|all]
-                       [--summary-dir DIR] [--addr-file FILE]
+                       [--summary-dir DIR] [--addr-file FILE] [--ntp-server HOST:PORT]
 
 (`agent` is an alias.) On the cloud boxes (host networking; 9100 is
 node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
@@ -153,6 +166,8 @@ node-exporter): generator boxes run `ably-loadgen serve --listen=:9200
 | `POST /v1/jobs` | start a job (body: JobSpec JSON) |
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | status (connections, attached, acked, received, violations) |
 | `GET /v1/jobs/{id}/summary` | the job's summary (202 while running) |
+| `GET /v1/clock` | this box's clock offset from `--ntp-server` (501 without one) |
+| `GET /v1/host` | this box's cumulative CPU time from `/proc/stat` (501 off Linux); the conductor reads it at the start and end of the hold |
 | `POST /v1/stop` | stop every running job (summaries are still written) |
 | `DELETE /v1/jobs` | forget finished jobs |
 | `GET /metrics` | Prometheus: `ably_loadgen_*` plus Go and process collectors |
@@ -193,12 +208,18 @@ connect failures, reconnects, churn and unplanned drops), `attachments`,
 unresolved, offered and achieved rates over the hold), `deliveries`
 (received, in window, rate, negative latencies, foreign messages),
 `presence`, `latency` (histograms: `delivery`, `delivery_cross_node`,
-`delivery_same_node`, `rest_ack`, `rest_service`, `realtime_ack`,
+`delivery_same_node`, `delivery_from_send`, `rest_ack`, `rest_service`, `realtime_ack`,
 `connect_attach`, `reconnect_attach`, `channel_open`, `presence_ack`;
 each with count, min, max, mean, p50, p90, p99, p99.9 and the raw
 buckets), `correctness` (checked messages, violations by kind, resumes,
 discontinuities, first violations, per sampled channel records),
-`streams` (publisher: last acknowledged sequence per sampled stream),
+`streams` (publisher: last acknowledged sequence and the channelSerial
+of every acknowledged sequence, per sampled stream; the serial log feeds
+the attach-point check and is capped at 1.5M entries per process),
+`correctness.attach_claims` (subscriber: each stream's first sequence
+number on each attachment, with the attach point; identical claims, such
+as thousands of attachments of one hot channel made at about the same
+time, are kept once with a count, up to 500k distinct claims per process),
 `resources` (the generator's own heap, stacks, RSS and goroutines every
 10 s, and bytes per connection at the end of the ramp) and `errors`.
 
@@ -233,6 +254,7 @@ is a run. `run` flags:
 | `--time-limit D` | planned length + 5m | hard limit: stops every agent, runs `--on-timeout`, verdict ABORTED |
 | `--on-timeout CMD` | | for instance `bench/aws/90-teardown.sh` |
 | `--env k=v` | | labels for the run record (bus, storage, instance types) |
+| `--allow-unmeasured` | off | waive the node-metrics coverage and box-CPU gates (a local run); the record says so and the run is not fit to quote |
 | `--format` | msgpack | realtime wire format |
 | `--server-idle-timeout D` | the scenario's `server_idle_timeout`, else 60s | the nodes' `--channel-idle-timeout`; node memory and goroutine growth are measured from hold start + D (0: from hold start) |
 
@@ -281,27 +303,86 @@ footprint.
 
 #### Run record (`results/<run-id>/`)
 
+`summary.md` and `summary.json` carry what a quoted run needs to prove
+what it was: the server flags in effect as the nodes report them
+(`ably_publish_lanes`, `ably_publish_linger_max_seconds`,
+`ably_publish_linger_min_seconds`, `ably_bus_info{bus,mode}`,
+`ably_storage_shards`, and `ably_bus_sweep_interval_seconds` if a node
+exports it; none does yet, and the summary says "not exported"), each
+box's clock offset and CPU, the nodes sampled, and the coverage of every
+check. A configuration that differs between nodes fails the run.
+
 - `plan.json`: scenario, multiplier, scale, derived totals, inventory
   (key removed), phase times.
 - `agents/<job-id>.json`: every job's summary.
-- `summary.json`: the merged result, node samples and stats, footprint,
-  fault record, checks and verdict.
+- `summary.json`: the merged result, node samples and stats (with
+  per-node scrape counts and coverage), footprint, per-box clock offsets
+  and CPU, fault record, checks and verdict.
 - `summary.md`: the same as tables.
 
-Pass criteria (plan §8, overridable per scenario in `[pass]`): delivery
-p50 <= 50 ms and p99 <= 250 ms, cross-node where there is such traffic
-(p99 < 100 ms reported as stretch); REST ACK p99 <= 100 ms; connect plus
-attach p99 <= 500 ms at the target churn; zero violations of every kind
-on the sample; achieved publish rate >= 95% of offered and offered >=
-95% of target (the generator kept up); no rejected publishes;
-connections open at the end of the hold >= 99% of target; deliveries/s
->= 90% of the plan's; the generator's own connections and attachments
-within ±3% from hold start to end (else node growth would measure the
-generator); node RSS and goroutines grow <= 10% from the growth baseline
-to the end of the hold (reported, not gated, in a fault run). The record sets the generator's connections
-and attachments at hold start and end beside the nodes'
-`ably_connections_open` and `ably_channels_bound`, and gives server
-channels bound over generator attachments at the end of the hold. The footprint (vCPU and memory,
+Pass criteria (plan §8, overridable per scenario in `[pass]`). A run
+passes only if every gating check passes; "fault run" below means a
+`--fault-hook` that ran and exited 0 (see "Fault runs").
+
+*Latency and rates*
+
+- Delivery p50 <= 50 ms and p99 <= 250 ms, from the scheduled send time
+  and cross-node where there is such traffic (p99 < 100 ms reported as
+  stretch; latency from the actual send time reported).
+- REST ACK p99 <= 100 ms; connect plus attach p99 <= 500 ms at the target
+  churn.
+- Achieved publish rate >= 95% of offered; offered >= 95% of target (the
+  generator kept up); no rejected publishes; no unresolved publishes and
+  retries under 1% of publishes sent (`max_retry_ratio`), both waived in a
+  fault run (retries, 429s and unresolved are printed either way).
+- Connections open at the end of the hold >= 99% of target; deliveries/s
+  >= 99% of the plan's (90% in a fault run), which is the only check on
+  unsampled channels.
+- The generator's own connections and attachments within ±3% from hold
+  start to end (else node growth would measure the generator).
+
+*Correctness*
+
+- Zero violations of every kind on the sample, including `attach_gap` and
+  `presence_set_mismatch`; at least 90% of attach claims settled
+  (`min_attach_coverage`); the tail check covering at least 50% of the
+  sampled streams (`min_tail_coverage`); a run that publishes with no
+  sampled channel that has a subscriber fails "sample coverage".
+- A presence run must have compared the end-of-hold REST member set of
+  every sampled presence channel, with at least 90% of those members
+  settled (`min_presence_compared`), no mismatch and no NACK.
+- The coverage checks above are reported, not gated, in a fault run.
+
+*Measurement credibility*
+
+- Negative latency under 0.1% of in-window deliveries
+  (`max_negative_latency`) and, where the agents can measure it, every
+  generator box within 5 ms of NTP at the start and end of the run
+  (`max_clock_offset`).
+- Every inventory node sampled at hold start, at the growth baseline
+  (when one falls inside the hold) and at hold end; "N of M nodes
+  sampled" is printed with the scrape errors.
+- Every generator and publisher box under 70% CPU averaged over the hold
+  (`max_generator_cpu`, read from the box's `/proc/stat`), so a saturated
+  harness cannot produce a quoted number.
+- The nodes report one and the same server configuration (publish lanes,
+  linger, bus, storage shards, read from `/metrics`), and the shard count
+  in the record is the nodes'. `summary.md` prints the flags in effect.
+- Node RSS and goroutines grow <= 10% from the growth baseline to the end
+  of the hold (reported, not gated, in a fault run).
+
+*Fault runs.* A `--fault-hook` relaxes the growth, load-steadiness,
+coverage, retry, unresolved, CPU and delivery-rate gates only when it ran
+and exited 0 (the surviving nodes take the dead node's load, its metrics
+stop). A hook that failed, or never ran before the run ended, relaxes
+nothing and is itself a failing check ("fault injection").
+`--allow-unmeasured` waives the node-metrics and CPU gates for a local run
+and is recorded as `unmeasured_waived`: such a run is not fit to quote.
+
+The record sets the generator's connections and attachments at hold
+start and end beside the nodes' `ably_connections_open` and
+`ably_channels_bound`, and gives server channels bound over generator
+attachments at the end of the hold. The footprint (vCPU and memory,
 provisioned and used, per 100k connections, per 100k deliveries/s and
 per 10k writes/s) is reported, not gated.
 
@@ -325,6 +406,95 @@ growth window: growth is reported as not measured and not gated, so a
 run that must judge memory needs a hold of several idle timeouts (the
 15-minute holds of plan §8 give fourteen minutes).
 
+#### What the correctness check sees
+
+"0 violations in N checked" is narrower than it reads. The check covers
+the *sampled* channels only (see "Unsampled channels" below), and within
+them:
+
+- **From the first message on.** An attachment learns a stream's sequence
+  number from the first message it receives, so the per-attachment checks
+  (gap, reorder, duplicate, serial regression) start there. Anything
+  between the attach point and that first message used to be invisible.
+  It is now settled by the **attach-point check**: each subscriber records
+  `(channel, pubID, ATTACHED.channelSerial, first seq)` for every stream it
+  sees on an attachment, each publisher records the channelSerial the
+  server assigned to every acknowledged message of a sampled stream (from
+  the REST response `serials` or the realtime ACK `res`), and the conductor
+  finds the first sequence whose serial sorts after the attach point. An
+  attachment whose first message is a later sequence lost the messages in
+  between (`attach_gap`, counted per message). An earlier first sequence
+  (a replay from before the attach point) is not a violation. Serials are
+  compared as strings, the order the server uses (DESIGN.md §8), so no
+  clock is involved. The attach point is the one from the last attach that
+  was not a resume: an honoured resume keeps it, a declined one starts a
+  new one.
+- **What the attach-point check cannot settle** is reported as
+  `unverifiable` and gated by coverage (at least 90% of claims settled
+  outside a fault run, `min_attach_coverage`): a claim whose stream has no
+  serial log (the publisher is not a generator of that stream, or the
+  process reached the 1.5M-entry cap), whose first sequence lies beyond the
+  log (the log ends with the last acknowledgement before the end of the
+  hold, so an attachment made after that cannot be settled), or whose
+  needed serial is unknown (an ACK that carried none). A run that settles
+  none fails; it never passes on "0 of 0".
+- **Residual blind spots.** A stream an attachment never received a single
+  message from is invisible to the per-attachment and attach-point checks;
+  only the tail check covers it, and only for streams still publishing at
+  least `tail_margin` after the attachment. Messages are checked against
+  the attach point the server reports: if the server reported an attach
+  point later than where it really started delivering, messages in that
+  stretch would not be seen as missing. A message published to a sampled
+  channel by someone other than a generator stream is ignored.
+
+**Presence member sets.** The presence role checks its own record at
+the end of the hold. After churn stops and a short settle (up to 1 s of
+the drain) it fetches, for each sampled presence channel that has one of
+its members (the first channel always, plus `sample_percent` of the rest
+by a hash of the scenario name and index), the channel's member set over
+REST (`GET /channels/{name}/presence`, `limit=1000`, following the `Link`
+`rel="next"` pages), and compares it with what its members believe:
+a settled member that entered must be in the set (`missing`), one that is
+not entered must not be (`stale`), and a client that is not a member of
+that channel at all is `stray`. Each disagreement is one
+`presence_set_mismatch` violation. A member whose connection, attach or
+operation was in flight before or after the fetch is skipped and counted
+`indeterminate`; members owned by other presence processes are not judged
+(this process does not know their state), only their absence from the
+wrong channel is. The run fails unless every sampled channel was fetched
+and compared, at least 90% of the members on them were settled
+(`min_presence_compared`, waived after a successful fault), there were no
+mismatches and, outside a fault run, no presence NACKs. A presence run
+that compared nothing fails "sample coverage (presence)": it never passes
+as 0 of 0. Not checked: SYNC contents received by members, presence event
+ordering, and member sets during the hold (only the end of it).
+
+**Tail check coverage.** The tail check compares each publisher's last
+acknowledged message of a sampled stream with what every subscriber
+process that held a continuous attachment received. It skips a stream on
+a subscriber when the stream's last acknowledgement came less than
+`tail_margin` (1 s, the clock-skew allowance) after that subscriber's
+latest attach, because an attachment made then cannot be held to it. A
+check that skipped most streams proved little, so outside a fault run the
+run fails unless it checked at least one and at least 50%
+(`min_tail_coverage`) of the plan's sampled streams (streams on sampled
+channels that have subscribers). `summary.md` prints the streams checked,
+the planned count and the (subscriber, stream) pairs skipped for the
+margin.
+
+**Unsampled channels.** `sample_percent` of channels (plus the first of
+every class) get the per-message checks; the other 95% in shapes F, M and
+D do not. Their only check is the deliveries-vs-plan gate: measured
+deliveries/s over the plan's, at least **99%** outside a fault run (90%
+in one that ran, `min_delivery_ratio_fault`). Loss on unsampled channels
+below 1% is therefore **not detected**, and `summary.md` says so with the
+gate's actual value. The sample is a hash of scenario name, class name
+and channel index, so it does not change with the run tag: the same
+scenario samples the same channels in every run. (It does change if the
+scenario's name, class names or channel counts change.) The sampled
+channels that have at least one subscriber are the ones checked; the
+plan and the summary count them separately.
+
 `report` groups full-scale runs by bus, shape, multiplier, nodes and
 shards: envelope with pass counts and run-to-run spread, footprint, and
 the node and shard curves.
@@ -341,7 +511,8 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     nodes = 10                 # node count (node curve parameter)
     shards = 1                 # Postgres shards (shard curve parameter)
     message_bytes = 470
-    sample_percent = 5         # channels under the serial-continuity check
+    sample_percent = 5         # channels under the per-message checks (the rest: delivery-rate gate only);
+                               # also the share of presence channels whose member set is compared
     server_idle_timeout = "60s" # the nodes' --channel-idle-timeout (growth baseline; absent or "0s" = 60s;
                                 # to measure growth from hold start pass --server-idle-timeout 0)
 
@@ -387,8 +558,16 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     max_memory_growth = 0.10
     max_goroutine_growth = 0.10
     max_connection_loss = 0.01
+    max_negative_latency = 0.001 # in-window deliveries with negative latency from the send (clock skew)
+    max_clock_offset = "5ms"     # generator box clock vs NTP, start and end of run (when measured)
+    max_retry_ratio = 0.01       # publish retries over first attempts (not in a fault run)
+    max_generator_cpu = 0.7      # busy CPU of any generator or publisher box over the hold (not in a fault run)
     tail_margin = "1s"
-    min_delivery_ratio = 0.9     # deliveries/s measured over planned
+    min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
+    min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded
+    min_attach_coverage = 0.9    # share of attach claims the serial logs must settle
+    min_tail_coverage = 0.5      # share of the plan's sampled streams the tail check must cover
+    min_presence_compared = 0.9  # share of members on sampled presence channels settled when compared
     max_load_drift = 0.03        # generator connections and attachments, hold start to end
 
 `ably-conductor plan` prints the derived connections, attachments,

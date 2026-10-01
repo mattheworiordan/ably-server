@@ -27,13 +27,22 @@ REPO_ROOT="$(cd "$BENCH_AWS_DIR/../.." && pwd)"
 export BENCH_AWS_DIR REPO_ROOT
 SCRIPT_NAME="${SCRIPT_NAME:-$(basename "${0:-lib}" .sh)}"
 
-: "${PROJECT_TAG:=ably-server-scale}"
+# PROJECT_TAG tags every resource and prefixes every name, and 90-teardown.sh
+# deletes by it. The default includes the user name so that two people sharing
+# an AWS account never tear down each other's fleet by accident; set it
+# explicitly to share a fleet on purpose.
+_default_user=$(id -un 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' || true)
+if [ -z "${PROJECT_TAG:-}" ]; then export PROJECT_TAG_DEFAULTED=1; fi
+: "${PROJECT_TAG:=ably-server-scale-${_default_user:-user}}"
 export PROJECT_TAG
 : "${DRY_RUN:=0}"
-_default_workshop="$HOME/Workshop/work/research/ably-server-scale-proof-2026-10"
-: "${LOG_FILE:=$_default_workshop/LOG.md}"
-: "${RESULTS_DIR:=$_default_workshop/results}"
-: "${STATE_FILE:=$_default_workshop/STATE.json}"
+# State, log and results default to a git-ignored directory in the repository,
+# not to anyone's home directory. STATE.json holds the database password and
+# the API key (the directory is created 0700): keep it out of any commit.
+_default_state_dir="$REPO_ROOT/bench/aws/state"
+: "${LOG_FILE:=$_default_state_dir/LOG.md}"
+: "${RESULTS_DIR:=$_default_state_dir/results}"
+: "${STATE_FILE:=$_default_state_dir/STATE.json}"
 : "${DRY_STATE_FILE:=${TMPDIR:-/tmp}/${PROJECT_TAG}-dryrun-STATE.json}"
 
 : "${BILLING_REGION:=us-east-1}" # the only region that has billing metrics
@@ -700,9 +709,9 @@ state_init() {
     rm -f "$ACTIVE_STATE"
     export _DRY_RESET_DONE=1
   fi
-  mkdir -p "$(dirname "$ACTIVE_STATE")"
+  (umask 077 && mkdir -p "$(dirname "$ACTIVE_STATE")")
   if [ ! -s "$ACTIVE_STATE" ]; then
-    printf '%s\n' '{"resources":[],"images":{},"runs":[]}' >"$ACTIVE_STATE"
+    (umask 077 && printf '%s\n' '{"resources":[],"images":{},"runs":[]}' >"$ACTIVE_STATE")
   fi
 }
 

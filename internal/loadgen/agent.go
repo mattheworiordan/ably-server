@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Agent is the HTTP control endpoint a generator box runs
@@ -22,6 +23,8 @@ import (
 //	GET  /v1/jobs/{id}         one job's status
 //	GET  /v1/jobs/{id}/summary its summary (202 while running)
 //	POST /v1/stop              stop every running job
+//	GET  /v1/clock             this box's clock offset from NTP (501 without NTPServer)
+//	GET  /v1/host              this box's cumulative CPU time from /proc/stat (501 off Linux)
 //	DELETE /v1/jobs            forget finished jobs
 //	GET  /metrics, /healthz
 type Agent struct {
@@ -30,6 +33,9 @@ type Agent struct {
 	SummaryDir string
 	// Roles, if non-empty, limits the job roles this agent accepts.
 	Roles []string
+	// NTPServer (host:port, UDP) is what GET /v1/clock measures this box's
+	// clock against: on AWS the Amazon Time Sync address. Empty disables.
+	NTPServer string
 
 	ctx  context.Context
 	mu   sync.Mutex
@@ -58,6 +64,8 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{id}", a.handleStatus)
 	mux.HandleFunc("GET /v1/jobs/{id}/summary", a.handleSummary)
 	mux.HandleFunc("POST /v1/stop", a.handleStop)
+	mux.HandleFunc("GET /v1/clock", a.handleClock)
+	mux.HandleFunc("GET /v1/host", a.handleHost)
 	return mux
 }
 
@@ -164,6 +172,30 @@ func (a *Agent) handleSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
+}
+
+func (a *Agent) handleClock(w http.ResponseWriter, r *http.Request) {
+	if a.NTPServer == "" {
+		writeErr(w, http.StatusNotImplemented, fmt.Errorf("no NTP server configured (--ntp-server)"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	off, err := MeasureClockOffset(ctx, a.NTPServer, 5, time.Second)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, off)
+}
+
+func (a *Agent) handleHost(w http.ResponseWriter, _ *http.Request) {
+	h, err := ReadHostCPU()
+	if err != nil {
+		writeErr(w, http.StatusNotImplemented, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (a *Agent) handleStop(w http.ResponseWriter, _ *http.Request) {

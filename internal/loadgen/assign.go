@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"strconv"
+	"strings"
 )
 
 // AttachPlan is one attachment a subscriber connection makes.
@@ -131,6 +132,26 @@ type PresenceMember struct {
 	ClientID string
 }
 
+// PresenceChannel returns the name of presence channel c.
+func (p *Plan) PresenceChannel(c int) string { return p.Prefix + "-presence-" + strconv.Itoa(c) }
+
+// PresenceClientID returns the clientId of member g.
+func (p *Plan) PresenceClientID(g int) string { return p.RunTag + "m" + strconv.Itoa(g) }
+
+// PresenceMemberChannel returns the presence channel that clientID is a
+// member of, or false if it is not one of this run's members.
+func (p *Plan) PresenceMemberChannel(clientID string) (int, bool) {
+	rest, ok := strings.CutPrefix(clientID, p.RunTag+"m")
+	if !ok || p.Presence.MembersPerChannel < 1 {
+		return 0, false
+	}
+	g, err := strconv.Atoi(rest)
+	if err != nil || g < 0 || g >= p.Presence.Channels*p.Presence.MembersPerChannel {
+		return 0, false
+	}
+	return g / p.Presence.MembersPerChannel, true
+}
+
 // PresenceSlice returns the presence members owned by presence process
 // index of count: member g (channel g / membersPerChannel) belongs to
 // process g mod count.
@@ -144,8 +165,8 @@ func (p *Plan) PresenceSlice(index, count int) []PresenceMember {
 	for g := index; g < total; g += count {
 		out = append(out, PresenceMember{
 			Global:   g,
-			Channel:  p.Prefix + "-presence-" + strconv.Itoa(g/m),
-			ClientID: p.RunTag + "m" + strconv.Itoa(g),
+			Channel:  p.PresenceChannel(g / m),
+			ClientID: p.PresenceClientID(g),
 		})
 	}
 	return out

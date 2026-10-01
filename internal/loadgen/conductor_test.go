@@ -2,7 +2,9 @@ package loadgen_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -64,6 +66,40 @@ max_memory_growth = 10.0
 max_goroutine_growth = 10.0
 `
 
+// startFakeNTP serves SNTP on loopback from a clock 2 ms ahead of this one.
+func startFakeNTP(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 48 {
+				continue
+			}
+			now := time.Now().Add(2 * time.Millisecond)
+			sec := uint32(now.Unix() + 2208988800)
+			frac := uint32(uint64(now.Nanosecond()) << 32 / 1_000_000_000)
+			var resp [48]byte
+			resp[0], resp[1] = 0x24, 2
+			copy(resp[24:32], buf[40:48])
+			for _, off := range []int{32, 40} {
+				binary.BigEndian.PutUint32(resp[off:], sec)
+				binary.BigEndian.PutUint32(resp[off+4:], frac)
+			}
+			_, _ = pc.WriteTo(resp[:], addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
 func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	addr, metricsURL := startServerWithMetrics(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -74,6 +110,9 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 		{loadgen.RoleSubscriber, loadgen.RoleREST},
 	} {
 		a := loadgen.NewAgent(ctx, nil)
+		if i == 0 {
+			a.NTPServer = startFakeNTP(t) // the second agent has none: recorded as not measured
+		}
 		srv := httptest.NewServer(a.Handler())
 		t.Cleanup(srv.Close)
 		agents = append(agents, loadgen.InventoryAgent{Name: "a" + string(rune('1'+i)), URL: srv.URL, Roles: roles, Workers: 8})
@@ -117,6 +156,33 @@ func TestConductorRunsAScenarioEndToEnd(t *testing.T) {
 	}
 	if rec.Footprint.VCPU != 4 {
 		t.Errorf("footprint %+v", rec.Footprint)
+	}
+	// Node coverage: n1 has a metrics URL and was scraped at the fixed
+	// points; n2 has none and so counts as not sampled. (A fault run does
+	// not gate on it.)
+	if cov := rec.NodeStats.Coverage; len(cov) != 2 || !cov[0].Sampled(rec.NodeStats.BaselineDue) || cov[1].HasURL || cov[1].Sampled(false) {
+		t.Errorf("node coverage %+v", rec.NodeStats.Coverage)
+	}
+	if len(rec.AgentCPU) != 2 || rec.AgentCPU[0].Kind != "generator" {
+		t.Errorf("agent CPU records %+v", rec.AgentCPU)
+	}
+	if len(rec.Clocks) != 2 {
+		t.Fatalf("clock records %+v", rec.Clocks)
+	}
+	for _, c := range rec.Clocks {
+		switch c.Agent {
+		case "a1":
+			if c.Start == nil || c.End == nil || c.Start.OffsetUS > -1000 || c.Start.OffsetUS < -4000 {
+				t.Errorf("a1 clock %+v, want offsets of about -2000 us at start and end", c)
+			}
+		case "a2":
+			if c.Start != nil || c.End != nil || c.Error == "" {
+				t.Errorf("a2 has no NTP server and must be recorded as not measured: %+v", c)
+			}
+		}
+	}
+	if !strings.Contains(rec.Markdown(), "Generator box") {
+		t.Error("summary.md lacks the clock table")
 	}
 	if rec.Result.CheckedMessages == 0 || rec.Result.Tail.Checked == 0 {
 		t.Errorf("correctness not exercised: checked=%d tail=%+v", rec.Result.CheckedMessages, rec.Result.Tail)
@@ -195,5 +261,44 @@ func TestConductorTimeLimitStopsAgents(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Error("on-timeout hook did not run")
+	}
+}
+
+// A fault hook that is configured but never runs (the run ends first) is
+// recorded as a failed fault and fails the run: it must not read as a
+// fault-free pass.
+func TestConductorFaultThatNeverRanFailsTheRun(t *testing.T) {
+	addr, metricsURL := startServerWithMetrics(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := loadgen.NewAgent(ctx, nil)
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+	inv := &loadgen.Inventory{
+		Key:    testKey,
+		Nodes:  []loadgen.InventoryNode{{Name: "n1", Endpoint: addr, Metrics: metricsURL}},
+		Agents: []loadgen.InventoryAgent{{Name: "a1", URL: srv.URL, Roles: []string{loadgen.RoleSubscriber, loadgen.RoleREST}, Workers: 8}},
+	}
+	sc, err := loadgen.ParseScenario([]byte(strings.Replace(conductorScenario, `hold = "4s"`, `hold = "2s"`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
+		Scenario: sc, RunID: "nf", RunTag: "nf", Inventory: inv, ResultsDir: t.TempDir(),
+		StartDelay: time.Second, Poll: 500 * time.Millisecond,
+		FaultHook: "echo never", FaultAt: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Pass || rec.Fault == nil || rec.Fault.ExitCode == 0 {
+		t.Fatalf("pass=%v fault=%+v\n%s", rec.Pass, rec.Fault, rec.Markdown())
+	}
+	found := false
+	for _, c := range rec.Checks {
+		found = found || (c.Name == "fault injection" && !c.Pass && c.Gating)
+	}
+	if !found {
+		t.Fatalf("no failing fault injection check:\n%s", rec.Markdown())
 	}
 }

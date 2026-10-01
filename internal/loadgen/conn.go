@@ -80,6 +80,11 @@ type Handler interface {
 // *ProtocolError on NACK, ErrConnClosed if the connection ended first.
 type PublishCallback func(err error)
 
+// ResultCallback is a PublishCallback that also receives the ACK's
+// publish result (the server-assigned serials, DESIGN.md §8); res is nil
+// on a NACK, an error or an ACK without one.
+type ResultCallback func(res *protocol.PublishResult, err error)
+
 // Conn is one realtime WebSocket connection. Frames are written under a
 // mutex from any goroutine; frames are read only by ReadLoop.
 type Conn struct {
@@ -100,7 +105,7 @@ type Conn struct {
 	wmu       sync.Mutex
 	closed    bool
 	msgSerial int64
-	pending   map[int64]PublishCallback
+	pending   map[int64]ResultCallback
 }
 
 // Dial opens a connection and waits for CONNECTED. The context bounds the
@@ -137,7 +142,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*Conn, error) {
 		ws:      ws,
 		format:  cfg.Format,
 		msgType: websocket.TextMessage,
-		pending: make(map[int64]PublishCallback),
+		pending: make(map[int64]ResultCallback),
 	}
 	if cfg.Format == protocol.FormatMsgpack {
 		c.msgType = websocket.BinaryMessage
@@ -232,6 +237,15 @@ func (c *Conn) Detach(channel string) error {
 // on its ACK or NACK. msgSerial is assigned here, under the write lock,
 // so wire order and msgSerial order agree (DESIGN.md §8).
 func (c *Conn) Publish(channel string, msgs []*protocol.Message, cb PublishCallback) error {
+	var rcb ResultCallback
+	if cb != nil {
+		rcb = func(_ *protocol.PublishResult, err error) { cb(err) }
+	}
+	return c.PublishWithResult(channel, msgs, rcb)
+}
+
+// PublishWithResult is Publish with the ACK's serials passed to cb.
+func (c *Conn) PublishWithResult(channel string, msgs []*protocol.Message, cb ResultCallback) error {
 	ch := channel
 	return c.sendWithSerial(&protocol.ProtocolMessage{Action: protocol.ActionMessage, Channel: &ch, Messages: msgs}, cb)
 }
@@ -240,10 +254,14 @@ func (c *Conn) Publish(channel string, msgs []*protocol.Message, cb PublishCallb
 // on its ACK or NACK (DESIGN.md §12.2).
 func (c *Conn) Presence(channel string, pms []*protocol.PresenceMessage, cb PublishCallback) error {
 	ch := channel
-	return c.sendWithSerial(&protocol.ProtocolMessage{Action: protocol.ActionPresence, Channel: &ch, Presence: pms}, cb)
+	var rcb ResultCallback
+	if cb != nil {
+		rcb = func(_ *protocol.PublishResult, err error) { cb(err) }
+	}
+	return c.sendWithSerial(&protocol.ProtocolMessage{Action: protocol.ActionPresence, Channel: &ch, Presence: pms}, rcb)
 }
 
-func (c *Conn) sendWithSerial(pm *protocol.ProtocolMessage, cb PublishCallback) error {
+func (c *Conn) sendWithSerial(pm *protocol.ProtocolMessage, cb ResultCallback) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	if c.closed {
@@ -288,7 +306,7 @@ func (c *Conn) Abort() error {
 	c.wmu.Unlock()
 	err := c.ws.Close()
 	for _, cb := range pending {
-		cb(ErrConnClosed)
+		cb(nil, ErrConnClosed)
 	}
 	return err
 }
@@ -315,13 +333,13 @@ func (c *Conn) ReadLoop(ctx context.Context, h Handler) error {
 		case protocol.ActionHeartbeat:
 			// Any frame proves liveness; the deadline is reset above.
 		case protocol.ActionAck:
-			c.resolve(pm.GetMsgSerial(), pm.Count, nil)
+			c.resolve(pm.GetMsgSerial(), pm.Count, pm.Res, nil)
 		case protocol.ActionNack:
 			info := protocol.ErrorInfo{Message: "nack"}
 			if pm.Error != nil {
 				info = *pm.Error
 			}
-			c.resolve(pm.GetMsgSerial(), pm.Count, &ProtocolError{Action: pm.Action, Info: info})
+			c.resolve(pm.GetMsgSerial(), pm.Count, nil, &ProtocolError{Action: pm.Action, Info: info})
 		case protocol.ActionDisconnected, protocol.ActionClosed:
 			info := protocol.ErrorInfo{Message: pm.Action.String()}
 			if pm.Error != nil {
@@ -344,21 +362,30 @@ func (c *Conn) ReadLoop(ctx context.Context, h Handler) error {
 	}
 }
 
-// resolve completes the publishes msgSerial .. msgSerial+count-1.
-func (c *Conn) resolve(serial int64, count int, err error) {
+// resolve completes the publishes msgSerial .. msgSerial+count-1; res
+// holds one result per publish in order, when the server sent them.
+func (c *Conn) resolve(serial int64, count int, res []*protocol.PublishResult, err error) {
 	if count < 1 {
 		count = 1
 	}
 	c.wmu.Lock()
-	cbs := make([]PublishCallback, 0, count)
+	type resolved struct {
+		cb  ResultCallback
+		res *protocol.PublishResult
+	}
+	cbs := make([]resolved, 0, count)
 	for s := serial; s < serial+int64(count); s++ {
 		if cb, ok := c.pending[s]; ok {
-			cbs = append(cbs, cb)
+			r := resolved{cb: cb}
+			if i := int(s - serial); i < len(res) {
+				r.res = res[i]
+			}
+			cbs = append(cbs, r)
 			delete(c.pending, s)
 		}
 	}
 	c.wmu.Unlock()
-	for _, cb := range cbs {
-		cb(err)
+	for _, r := range cbs {
+		r.cb(r.res, err)
 	}
 }
