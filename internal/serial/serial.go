@@ -160,6 +160,49 @@ func Timestamp(s string) (int64, error) {
 	return v, nil
 }
 
+// maxSeriesIDLen bounds the seriesId part ParseChannelSerial accepts.
+// A minted one is 10 hex characters (NewSeriesID); the bound leaves room
+// for a test's or a future generator's own without accepting arbitrary
+// input.
+const maxSeriesIDLen = 64
+
+// ParseChannelSerial checks that s is a channelSerial in the fixed-width
+// form Mint and the Postgres backend's SQL produce (DESIGN.md §8):
+// exactly 14 digits, '-', exactly 3 digits, '@', then a non-empty
+// seriesId of at most 64 characters from [A-Za-z0-9_-]. It returns the
+// timestamp prefix (ms since epoch). A Message.serial (with a ":idx"
+// suffix) is not a channelSerial and is rejected. The cluster bus uses it
+// to drop an envelope whose serial could not have been minted (§7.2).
+func ParseChannelSerial(s string) (int64, error) {
+	const head = timestampWidth + 1 + counterWidth + 1 // "<ts>-<ctr>@"
+	if len(s) <= head || len(s) > head+maxSeriesIDLen {
+		return 0, fmt.Errorf("serial: %q is not a channelSerial (length)", s)
+	}
+	var ts int64
+	for i := 0; i < timestampWidth; i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("serial: %q is not a channelSerial (timestamp)", s)
+		}
+		ts = ts*10 + int64(c-'0')
+	}
+	if s[timestampWidth] != '-' || s[head-1] != '@' {
+		return 0, fmt.Errorf("serial: %q is not a channelSerial (separators)", s)
+	}
+	for i := timestampWidth + 1; i < head-1; i++ {
+		if c := s[i]; c < '0' || c > '9' {
+			return 0, fmt.Errorf("serial: %q is not a channelSerial (counter)", s)
+		}
+	}
+	for i := head; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '-') {
+			return 0, fmt.Errorf("serial: %q is not a channelSerial (seriesId)", s)
+		}
+	}
+	return ts, nil
+}
+
 // TimestampBounds maps an inclusive ms-since-epoch range to a
 // half-open lex range over channelSerials. Useful for backends that
 // implement timestamp-bounded history reads via prefix/range scans on
