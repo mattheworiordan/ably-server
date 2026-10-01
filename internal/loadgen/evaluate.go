@@ -756,8 +756,16 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if bad > 0 {
 		value = strings.Join(parts, " ")
 	}
-	add(Check{Name: "loss, duplicate, reorder on the sample", Value: value, Limit: "0", Pass: bad == 0, Gating: true,
-		Note: fmt.Sprintf("tail check covered %d streams, attach-point check %d claims", res.Tail.Checked, res.Attach.Checked)})
+	if msgBad := bad - res.Violations[PresenceSetMismatch.String()]; rec.Plan.SampledStreams == 0 && res.CheckedMessages == 0 && msgBad == 0 {
+		// A plan with no sampled message stream (a presence-only run) has
+		// nothing for this row to judge: say so rather than pass on "0 of 0
+		// checked". Its correctness gates are the presence rows below.
+		add(Check{Name: "loss, duplicate, reorder on the sample", Value: "not applicable (no sampled message streams)", Limit: "n/a",
+			Pass: true, Gating: false, Note: "the presence coverage and presence correctness rows gate this run"})
+	} else {
+		add(Check{Name: "loss, duplicate, reorder on the sample", Value: value, Limit: "0", Pass: bad == 0, Gating: true,
+			Note: fmt.Sprintf("tail check covered %d streams, attach-point check %d claims", res.Tail.Checked, res.Attach.Checked)})
+	}
 	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
 	}

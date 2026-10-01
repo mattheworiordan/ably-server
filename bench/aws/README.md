@@ -348,7 +348,11 @@ passes only if every gating check passes; "fault run" below means a
   (`min_attach_coverage`, row "sample coverage (attach)"; a run that
   settled no claim at all fails it, fault or not); the tail check covering at least 50% of the
   sampled streams (`min_tail_coverage`); a run that publishes with no
-  sampled channel that has a subscriber fails "sample coverage".
+  sampled channel that has a subscriber fails "sample coverage". A
+  presence-only run has no sampled message stream: its "loss, duplicate,
+  reorder on the sample" row reads "not applicable (no sampled message
+  streams)" instead of "0 of 0 checked", and the presence coverage and
+  presence correctness (`presence_set_mismatch`, NACKs) rows are its gates.
 - A presence run must have compared the end-of-hold REST member set of
   every sampled presence channel, with at least 90% of those members
   settled (`min_presence_compared`), no mismatch and no NACK.

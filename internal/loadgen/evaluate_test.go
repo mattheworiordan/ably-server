@@ -1005,3 +1005,36 @@ func TestEvaluateServerConfiguration(t *testing.T) {
 		t.Fatal(rec.Markdown())
 	}
 }
+
+func TestPresenceOnlyRunSaysTheMessageRowIsNotApplicable(t *testing.T) {
+	rec := presenceRecord(nil)
+	var row *Check
+	for i, c := range rec.Checks {
+		if c.Name == "loss, duplicate, reorder on the sample" {
+			row = &rec.Checks[i]
+		}
+	}
+	if row == nil || row.Value != "not applicable (no sampled message streams)" || row.Gating {
+		t.Fatalf("row %+v", row)
+	}
+	if strings.Contains(rec.Markdown(), "0 of 0 checked") {
+		t.Fatalf("a presence run must not print '0 of 0 checked':\n%s", rec.Markdown())
+	}
+	// Its correctness gates are the presence rows, and they still fail it.
+	for _, want := range []string{"sample coverage (presence)", "presence correctness"} {
+		found := false
+		for _, c := range rec.Checks {
+			found = found || (c.Name == want && c.Gating)
+		}
+		if !found {
+			t.Fatalf("no gating %q row", want)
+		}
+	}
+	mustFail(t, presenceRecord(func(r *RunRecord) { r.Result.Violations = map[string]int64{"presence_set_mismatch": 1} }), "presence correctness")
+	// A message plan with sampled streams keeps the real, gating row.
+	for _, c := range evalFixture(t, nil).Checks {
+		if c.Name == "loss, duplicate, reorder on the sample" && (!c.Gating || strings.HasPrefix(c.Value, "not applicable")) {
+			t.Fatalf("%+v", c)
+		}
+	}
+}
