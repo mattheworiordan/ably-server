@@ -139,12 +139,12 @@ func New() *Metrics {
 		}),
 		deliveryFanout: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_delivery_fanout_seconds",
-			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in 8 (DESIGN.md §10).",
+			Help:    "Time from a cm's append to the channel's live list to its frame being queued on an attachment's connection, for live cms on one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
 			Buckets: storage.StageBuckets,
 		}),
 		connWriteWait: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_conn_write_wait_seconds",
-			Help:    "Time from a frame being queued on a connection's outbound queue to its socket write completing, for one connection in 8 (DESIGN.md §10).",
+			Help:    "Time from a frame being queued on a connection's outbound queue to its socket write completing, for one connection in " + strconv.Itoa(DeliverySampleEvery) + " (DESIGN.md §10).",
 			Buckets: storage.StageBuckets,
 		}),
 	}
@@ -171,7 +171,7 @@ func New() *Metrics {
 		m.connWriteWait,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "ably_delivery_fanout_size",
-			Help: "The largest number of attachments one cm append woke since the previous scrape (DESIGN.md §10). Reading it resets it.",
+			Help: "The largest number of attachments open on a channel when a cm was appended to it, since the previous scrape (DESIGN.md §10). Reading it resets it.",
 		}, func() float64 { return float64(m.fanoutMax.Swap(0)) }),
 	)
 	return m
@@ -344,8 +344,9 @@ func (m *Metrics) PresenceSeed() {
 	m.presenceSeeds.Inc()
 }
 
-// DeliveryFanoutSize records the number of attachments one append woke,
-// keeping the largest since the last scrape (ably_delivery_fanout_size).
+// DeliveryFanoutSize records the number of attachments open on a channel
+// at an append, keeping the largest since the last scrape
+// (ably_delivery_fanout_size).
 func (m *Metrics) DeliveryFanoutSize(n int64) {
 	if m == nil {
 		return

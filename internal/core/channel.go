@@ -514,19 +514,7 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0 && len(cm.Annotations) == 0) {
 		return
 	}
-	c.mu.Lock()
-	if len(cm.Presence) > 0 {
-		c.trackMembers(cm.Presence)
-		if c.pv.seeded || c.pv.seeding != nil {
-			c.pv.observe(cm)
-		}
-	}
-	e := newEntry(cm, c.subs.Load())
-	e.at = time.Now()
-	prev := c.tail
-	prev.next = e
-	c.tail = e
-	c.mu.Unlock()
+	prev := c.link(cm)
 	// Wake the parked streams outside mu. Closing a channel readies every
 	// goroutine parked on it, one by one, so on a channel with tens of
 	// thousands of attachments the wake-up is the costly part of Append;
@@ -538,6 +526,25 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 	// entries in list order.
 	prev.wakeAll()
 	c.metrics.DeliveryFanoutSize(c.subs.Load())
+}
+
+// link folds a presence cm into the member sets and links cm at the
+// tail, under mu, returning the entry it was linked after.
+func (c *Channel) link(cm *protocol.ChannelMessage) *entry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(cm.Presence) > 0 {
+		c.trackMembers(cm.Presence)
+		if c.pv.seeded || c.pv.seeding != nil {
+			c.pv.observe(cm)
+		}
+	}
+	e := newEntry(cm, c.subs.Load())
+	e.at = time.Now()
+	prev := c.tail
+	prev.next = e
+	c.tail = e
+	return prev
 }
 
 // trackMembers folds a presence cm into the local member set that

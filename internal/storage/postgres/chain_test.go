@@ -245,3 +245,24 @@ func TestChainRecordsReceiveStages(t *testing.T) {
 		t.Errorf("hold time = %vs, want about the 20 ms s2 waited", hold.Sum)
 	}
 }
+
+// TestChainHoldTimeSpansAReplacedOffer: when a held pointer (no body) is
+// replaced by a later offer of the same cm that carries one, the hold
+// time still runs from the first offer.
+func TestChainHoldTimeSpansAReplacedOffer(t *testing.T) {
+	cs, rec := newTestChain(t)
+	cs.stats = &busStats{}
+	cs.seed("s0")
+	pointer := ev("s2", "s1")
+	pointer.cm = nil
+	cs.deliverChained(pointer)
+	time.Sleep(30 * time.Millisecond)
+	cs.deliverChained(ev("s2", "s1"))
+	cs.deliverChained(ev("s1", "s0"))
+	if want := []string{"s1", "s2"}; !slices.Equal(rec.serials, want) {
+		t.Fatalf("delivered %v, want %v", rec.serials, want)
+	}
+	if hold := cs.stats.stageSnapshot()["hold"]; hold.Count != 1 || hold.Sum < 0.03 {
+		t.Errorf("hold = %d observations, %vs; want 1 of at least the 30 ms since the pointer", hold.Count, hold.Sum)
+	}
+}

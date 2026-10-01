@@ -68,11 +68,11 @@ func TestStreamMemoBuildsOncePerEntry(t *testing.T) {
 	}
 }
 
-// TestAppendWakesStreamsOutsideLock checks that a stream woken by an
-// Append can Attach and read the channel's state at once: the wake-ups
-// run after Append releases mu (DESIGN.md §5.1), and every stream sees
-// the cms in list order even when Appends race their wake-ups.
-func TestAppendWakesStreamsOutsideLock(t *testing.T) {
+// TestAppendOrderWithWakeupsOutsideLock checks that with the wake-ups
+// run after Append releases mu (DESIGN.md §5.1), every stream still sees
+// the cms in list order when back-to-back Appends race their wake-ups,
+// while the woken streams Attach (which takes mu) as they go.
+func TestAppendOrderWithWakeupsOutsideLock(t *testing.T) {
 	c := newReadyChannel("test", "000")
 	const streams = 20
 	const cms = 200

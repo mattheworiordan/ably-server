@@ -238,8 +238,14 @@ func (cs *channelStore) holdLocked(ev busEvent) {
 	if cs.pending == nil {
 		cs.pending = make(map[string]busEvent)
 	}
-	if old, ok := cs.pending[ev.prev]; ok && old.cm != nil && ev.cm == nil {
-		return
+	if old, ok := cs.pending[ev.prev]; ok {
+		if old.cm != nil && ev.cm == nil {
+			return
+		}
+		// The hold started with the first offer of this cm.
+		if !old.heldAt.IsZero() && old.heldAt.Before(ev.heldAt) {
+			ev.heldAt = old.heldAt
+		}
 	}
 	cs.pending[ev.prev] = ev
 }

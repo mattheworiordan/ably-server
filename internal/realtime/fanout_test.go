@@ -31,7 +31,8 @@ type fanoutRig struct {
 	atts   []*attachment
 }
 
-func newFanoutRig(tb testing.TB, n int, format protocol.Format, shared bool) *fanoutRig {
+// Connection i uses formats[i%len(formats)]; every attachment has modes.
+func newFanoutRig(tb testing.TB, n int, formats []protocol.Format, modes int64, shared bool) *fanoutRig {
 	tb.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := core.NewManager(memory.New(memory.Options{}))
@@ -43,7 +44,7 @@ func newFanoutRig(tb testing.TB, n int, format protocol.Format, shared bool) *fa
 	logger := logging.New(slog.DiscardHandler)
 	r.queued.Add(n) // the ATTACHED frames
 	for i := range n {
-		c := &connection{format: format, out: newOutQueue(1<<20, 10*time.Second), logger: logger}
+		c := &connection{format: formats[i%len(formats)], out: newOutQueue(1<<20, 10*time.Second), logger: logger}
 		stream, err := ch.Attach(ctx)
 		if err != nil {
 			tb.Fatal(err)
@@ -53,7 +54,7 @@ func newFanoutRig(tb testing.TB, n int, format protocol.Format, shared bool) *fa
 			r.queued.Done()
 			return ok
 		}
-		a := newAttachment(ctx, "fanout", stream.Channel(), stream, "", false, protocol.FlagSubscribe, protocol.FlagSubscribe, nil, out, fmt.Sprintf("conn-%d", i), true, nil, logger)
+		a := newAttachment(ctx, "fanout", stream.Channel(), stream, "", false, modes, modes, nil, out, fmt.Sprintf("conn-%d", i), true, nil, logger)
 		if shared {
 			a.outShared = func(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
 				ok := c.queueShared(ctx, msg, memo)
@@ -104,41 +105,81 @@ func (r *fanoutRig) publish(tb testing.TB, msg *protocol.Message) {
 }
 
 // TestFanoutSharesEncodedFrame checks encode-once delivery (DESIGN.md
-// §5.1): a message cm reaches every attachment on the channel as one
-// encoding per wire format, byte-identical to what each attachment would
-// have encoded for itself.
+// §5.1): a message cm, and a presence cm, reach every attachment on the
+// channel as one encoding per wire format, with JSON and msgpack
+// connections on the same channel, byte-identical to the frame the
+// per-attachment path sends for the same cm.
 func TestFanoutSharesEncodedFrame(t *testing.T) {
-	for _, format := range []protocol.Format{protocol.FormatJSON, protocol.FormatMsgpack} {
-		r := newFanoutRig(t, 20, format, true)
-		r.publish(t, &protocol.Message{Name: "m", Data: "hello"})
-		frames := r.drain()
-		r.close()
+	formats := []protocol.Format{protocol.FormatJSON, protocol.FormatMsgpack}
+	modes := protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+	publish := []struct {
+		name string
+		do   func(*fanoutRig)
+	}{
+		{"message", func(r *fanoutRig) { r.publish(t, &protocol.Message{Name: "m", Data: "hello", ID: "id1"}) }},
+		{"presence", func(r *fanoutRig) {
+			r.queued.Add(len(r.conns))
+			if _, _, err := r.ch.PublishPresence(context.Background(), []*protocol.PresenceMessage{{
+				Action: protocol.PresenceEnter, ClientID: "c1", ConnectionID: "conn-x", Data: "hi",
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			r.queued.Wait()
+		}},
+	}
+	for _, p := range publish {
+		const n = 20
+		shared := newFanoutRig(t, n, formats, modes, true)
+		p.do(shared)
+		got := shared.drain()
+		shared.close()
+		own := newFanoutRig(t, n, formats, modes, false)
+		p.do(own)
+		want := own.drain()
+		own.close()
 
-		first := frames[0]
-		if len(first) != 1 {
-			t.Fatalf("format %v: attachment 0 queued %d frames, want 1", format, len(first))
-		}
-		var want protocol.ProtocolMessage
-		if err := protocol.Unmarshal(first[0].data, format, &want); err != nil {
-			t.Fatal(err)
-		}
-		if want.Action != protocol.ActionMessage || len(want.Messages) != 1 || want.Messages[0].Data != "hello" {
-			t.Fatalf("format %v: frame = %+v", format, want)
-		}
-		ownEncoding, err := protocol.Marshal(&want, format)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i, fs := range frames {
-			if len(fs) != 1 {
-				t.Fatalf("format %v: attachment %d queued %d frames, want 1", format, i, len(fs))
+		first := map[protocol.Format]*byte{}
+		for i, fs := range got {
+			format := formats[i%len(formats)]
+			if len(fs) != 1 || len(want[i]) != 1 {
+				t.Fatalf("%s: attachment %d queued %d shared / %d own frames, want 1", p.name, i, len(fs), len(want[i]))
 			}
-			if &fs[0].data[0] != &first[0].data[0] {
-				t.Errorf("format %v: attachment %d has its own encoding; want the shared one", format, i)
+			var a, b protocol.ProtocolMessage
+			if err := protocol.Unmarshal(fs[0].data, format, &a); err != nil {
+				t.Fatal(err)
+			}
+			if err := protocol.Unmarshal(want[i][0].data, format, &b); err != nil {
+				t.Fatal(err)
+			}
+			// Serials and timestamps differ between the two rigs' stores;
+			// everything else in the frame must match. Within one rig the
+			// bytes are compared exactly below.
+			a.ChannelSerial, b.ChannelSerial = "", ""
+			for _, m := range append(a.Messages, b.Messages...) {
+				m.Serial, m.Timestamp, m.Version = "", 0, nil
+			}
+			for _, m := range append(a.Presence, b.Presence...) {
+				m.Serial, m.Timestamp, m.ID = "", 0, ""
+			}
+			ab, _ := protocol.Marshal(&a, protocol.FormatJSON)
+			bb, _ := protocol.Marshal(&b, protocol.FormatJSON)
+			if !bytes.Equal(ab, bb) {
+				t.Errorf("%s: attachment %d (%v): shared frame %s, per-attachment frame %s", p.name, i, format, ab, bb)
+			}
+			if f, ok := first[format]; !ok {
+				first[format] = &fs[0].data[0]
+				if i >= len(formats) {
+					t.Fatalf("%s: first %v frame at attachment %d", p.name, format, i)
+				}
+			} else if f != &fs[0].data[0] {
+				t.Errorf("%s: attachment %d (%v) has its own encoding; want the shared one", p.name, i, format)
+			}
+			if !bytes.Equal(fs[0].data, got[i%len(formats)][0].data) {
+				t.Errorf("%s: attachment %d (%v) bytes differ from the format's first frame", p.name, i, format)
 			}
 		}
-		if !bytes.Equal(first[0].data, ownEncoding) {
-			t.Errorf("format %v: shared frame differs from a per-attachment encoding", format)
+		if first[protocol.FormatJSON] == first[protocol.FormatMsgpack] {
+			t.Errorf("%s: JSON and msgpack connections share one encoding", p.name)
 		}
 	}
 }
@@ -148,23 +189,26 @@ func TestFanoutSharesEncodedFrame(t *testing.T) {
 // for an attachment that has seen the message and the full version for
 // one that has not (DESIGN.md §13.3).
 func TestFanoutAppendDeltaNotShared(t *testing.T) {
-	r := newFanoutRig(t, 2, protocol.FormatJSON, true)
+	r := newFanoutRig(t, 3, []protocol.Format{protocol.FormatJSON}, protocol.FlagSubscribe, true)
 	defer r.close()
+	r.atts[2].appendModeFull = true
 	delta := &protocol.Message{Action: protocol.MessageAppend, Serial: "s1", Data: "+more"}
 	full := &protocol.Message{
 		Action: protocol.MessageUpdate, Serial: "s1", Data: "start+more",
 		Alt: map[string]*protocol.Message{protocol.DeltaAppend: delta},
 	}
-	// Mark the message seen on attachment 0 only, as if it had received
-	// the create before attachment 1 attached.
+	// Mark the message seen on attachments 0 and 2, as if they had
+	// received the create before attachment 1 attached; attachment 2
+	// asked for appendMode=full.
 	r.atts[0].seen["s1"] = struct{}{}
+	r.atts[2].seen["s1"] = struct{}{}
 
-	r.queued.Add(2)
+	r.queued.Add(3)
 	r.ch.Append(&protocol.ChannelMessage{ChannelSerial: "zzz", Messages: []*protocol.Message{full}})
 	r.queued.Wait()
 	frames := r.drain()
 
-	var got [2]protocol.ProtocolMessage
+	var got [3]protocol.ProtocolMessage
 	for i := range got {
 		if len(frames[i]) != 1 {
 			t.Fatalf("attachment %d queued %d frames, want 1", i, len(frames[i]))
@@ -178,6 +222,9 @@ func TestFanoutAppendDeltaNotShared(t *testing.T) {
 	}
 	if a := got[1].Messages[0]; a.Action != protocol.MessageUpdate || a.Data != "start+more" {
 		t.Errorf("attachment that did not see the message got %v %v, want the full version", a.Action, a.Data)
+	}
+	if a := got[2].Messages[0]; a.Action != protocol.MessageUpdate || a.Data != "start+more" {
+		t.Errorf("appendMode=full attachment got %v %v, want the full version", a.Action, a.Data)
 	}
 }
 
@@ -196,7 +243,7 @@ func BenchmarkFanoutEnqueue(b *testing.B) {
 				name = fmt.Sprintf("format=%v/shared", format)
 			}
 			b.Run(name, func(b *testing.B) {
-				r := newFanoutRig(b, n, format, shared)
+				r := newFanoutRig(b, n, []protocol.Format{format}, protocol.FlagSubscribe, shared)
 				defer r.close()
 				b.ResetTimer()
 				for b.Loop() {

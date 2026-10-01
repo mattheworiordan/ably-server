@@ -807,9 +807,10 @@ last of them takes to queue its frame:
 
 `BenchmarkFanoutEnqueue` (`internal/realtime`) measures one publish to
 20,000 attachments, from the publish to every frame queued, on 8 cores
-of a laptop: about 41 ms (msgpack) and 36 ms (JSON) with a per-attachment
-encode and one wake channel per entry, and about 7 ms for either with
-the three changes above. The socket writes that follow are not in it.
+of a laptop: about 41 ms (msgpack) and 36 ms (JSON) on the code before
+these changes (the same benchmark run on a copy of the earlier tree), and
+about 7 ms for either with them. The socket writes that follow are not
+in it.
 
 The first `ATTACH` to a name (or the first publish, or any REST read)
 creates the Channel and binds it: `storage.Channel(name, channel)`
@@ -902,6 +903,10 @@ cursor and the live tail, so memory grows with its lag. The retention
 policy (§6) is intended to bound the working set: once a message ages past
 the retention window or the per-channel `max_messages` cap, the Channel drops its own
 back-pointer to it, so any unreferenced entries become eligible for GC.
+Each retained entry also keeps its wake-slot array (8 bytes a slot: 4 KiB
+on a channel with 20,000 attachments, at most 8 KiB) and its shared
+encoded frames, one per wire format in use, so an attachment lagging on
+a large channel holds a few KiB per entry it is behind.
 
 ### 5.2 Connection loop
 
@@ -2346,7 +2351,8 @@ name = "persisted:presence_fixtures"
     delivery after the append: waking and running the attachment
     goroutine (and encoding, for the first attachment on a shared frame),
     then the connection's write loop. `ably_delivery_fanout_size`
-    (gauge) is the largest number of attachments one append woke since
+    (gauge) is the largest number of attachments open on a channel when a
+    cm was appended to it (the attachments that append fans out to), since
     the previous scrape; reading it resets it, so it is meant for one
     scraper.
   - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
