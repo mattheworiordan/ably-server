@@ -650,12 +650,14 @@ continuation must not replay history the client has already seen.
 
 An attachment is a per-node (connection, channel) pair, structured as
 a cursor over the Channel's linked list of entries (§5.1). A single
-goroutine per attachment walks the cursor — parking on the current
-entry's `notify` until the next entry is linked, then advancing and
-forwarding the ChannelMessage. `forward` writes one `MESSAGE`
-`ProtocolMessage` per ChannelMessage onto the connection's outbound
-queue (with `ChannelSerial = cm.ChannelSerial`, `Messages =
-cm.Messages`, gated by mode flags). The connection's single writer
+goroutine per attachment walks the cursor — parking on one of the
+current entry's wake channels until the next entry is linked, then
+advancing and forwarding the ChannelMessage. `forward` writes one
+`MESSAGE` `ProtocolMessage` per ChannelMessage onto the connection's
+outbound queue (with `ChannelSerial = cm.ChannelSerial`, `Messages =
+cm.Messages`, gated by mode flags), encoded once per wire format for all
+the channel's attachments when no attachment needs its own version of
+it (§5.1). The connection's single writer
 goroutine (§5.2) serialises actual frame writes. There is no
 per-attachment buffered fan-out channel: each attachment proceeds at
 its own pace, lagging the live tail with no upper bound but its own
@@ -664,7 +666,7 @@ memory footprint.
 The starting cursor depends on how the attachment was created:
 
 - Fresh attach (no `channelSerial`, no `rewind`) — `a.e = channel.Tail()`,
-  so the first iteration parks on `notify` and wakes on the next live
+  so the first iteration parks on the tail and wakes on the next live
   publish.
 - Resume by `channelSerial` — the attachment first reads the gap from
   history storage, walking those messages directly (without going through
@@ -767,10 +769,47 @@ This is the unified flow: every cm that lands on a Channel's live
 list arrives through `storage → Appender.Append`, whether the publish
 originated locally or on a remote node.
 
-Each entry holds one ChannelMessage plus a `notify` channel that is
-closed once the next entry is linked; parked attachment goroutines wake
-on that close. The list is grow-only — older entries become eligible
-for GC once no attachment retains a reference (see Memory below).
+Each entry holds one ChannelMessage plus wake channels that are closed
+once the next entry is linked; parked attachment goroutines wake on that
+close. The list is grow-only — older entries become eligible for GC once
+no attachment retains a reference (see Memory below).
+
+**Fan-out cost.** On a channel with tens of thousands of attachments on
+one node (shape M's hot channel has about 20,000 per node), one Append
+wakes that many goroutines at once, and three things decide how long the
+last of them takes to queue its frame:
+
+- *Wake channels.* Parking on a Go channel takes the channel's lock, so
+  if every attachment parked on one channel per entry, each fan-out would
+  end with all of them queueing on that lock to park on the next entry.
+  An entry's wake channels are split over slots instead, about 64
+  attachments to a slot (a power of two, 1 to 1,024 slots, sized from
+  the channel's attachment count when the entry is appended), and each
+  attachment parks on the slot its attach-time number selects. A slot's
+  channel is made by the first attachment that parks on it, so an entry
+  on a one-subscriber channel holds one channel.
+- *Wake-up outside the lock.* Append links the entry under the
+  Channel's mutex and wakes the parked attachments after releasing it,
+  so the wake-up (which readies every parked goroutine, one by one) does
+  not hold up `Attach` or the eviction sweep. The list order is fixed
+  under the mutex, and an attachment reaches an entry only through its
+  predecessor, so it still sees the cms in order.
+- *Encode once.* A live frame that is the same for every attachment on
+  the channel (a `MESSAGE` with no append delta to resolve, §13.3, or a
+  `PRESENCE`) is encoded once per wire format, by the first attachment
+  that sends it, and kept on the entry; every other attachment on that
+  format queues the same bytes, shared read-only (as the SYNC snapshot's
+  frame is, §12.4). A frame that needs a per-attachment transform (an
+  append delivered as a delta to one attachment and as the full version
+  to another) and every replayed frame (resume and rewind read from the
+  log, not the live list) are encoded per attachment. The `echo=false`
+  filter (§2.1) only skips a frame, so it does not stop the sharing.
+
+`BenchmarkFanoutEnqueue` (`internal/realtime`) measures one publish to
+20,000 attachments, from the publish to every frame queued, on 8 cores
+of a laptop: about 41 ms (msgpack) and 36 ms (JSON) with a per-attachment
+encode and one wake channel per entry, and about 7 ms for either with
+the three changes above. The socket writes that follow are not in it.
 
 The first `ATTACH` to a name (or the first publish, or any REST read)
 creates the Channel and binds it: `storage.Channel(name, channel)`
@@ -1621,7 +1660,7 @@ right after the persist commits. A publish is:
      calls `appender.Append(cm)` — which is `core.Channel.Append`,
      linking the cm onto the live list.
 
-Local subscribers parked on the previous tail's `notify` wake up and
+Local subscribers parked on the previous tail's wake channels wake up and
 observe the new entry. ACK/201 fires once `Publish` returns; the
 linked-list update has already happened by then.
 
@@ -2295,6 +2334,21 @@ name = "persisted:presence_fixtures"
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
     `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`
     (counters) and `ably_publish_lane_queue_depth{lane}` (gauge).
+  - Delivery stages after the append (§5.1, §5.2), from one connection in
+    8 so a fan-out to tens of thousands of attachments does not make as
+    many observations on one histogram: `ably_delivery_fanout_seconds`
+    (histogram, buckets 100 µs to 2.5 s), the time from a cm's append to
+    the channel's live list to its frame being queued on the attachment's
+    connection, for live cms (not replays); and
+    `ably_conn_write_wait_seconds` (histogram, same buckets), the time
+    from a frame being queued on the connection's outbound queue to its
+    socket write completing. Together they split the node's part of a
+    delivery after the append: waking and running the attachment
+    goroutine (and encoding, for the first attachment on a shared frame),
+    then the connection's write loop. `ably_delivery_fanout_size`
+    (gauge) is the largest number of attachments one append woke since
+    the previous scrape; reading it resets it, so it is meant for one
+    scraper.
   - Presence sync (§12.4): `ably_presence_syncs_total{snapshot}` (counter),
     the SYNC snapshots served, by how each was obtained: `cached` (the
     channel's current snapshot), `waited` (rebuilt by another attach
@@ -2326,6 +2380,19 @@ name = "persisted:presence_fixtures"
     whose watermark a sweep read, summed over sweeps: the sweep scope's
     size), `ably_bus_sweep_catch_ups_total`,
     `ably_bus_sweep_seconds_total`.
+  - Receive-side stages (histograms, buckets 100 µs to 2.5 s), which
+    split the delivery lag below: `ably_bus_receive_queue_wait_seconds`
+    (nats bus: from the publishing node's send to a dispatch worker taking
+    the message off its shard queue, so NATS transit plus the wait in the
+    queue, on the two nodes' clocks; one observation per message
+    received), `ably_bus_hold_seconds` (a cm that arrived ahead of its
+    predecessor, from the hold to its append, §7.2) and
+    `ably_bus_append_seconds` (the time inside the channel's Append for a
+    cm the bus delivered, on any bus, including the wake-up of every
+    attachment parked on the channel, §5.1). A dispatch worker delivers
+    one channel at a time, so a long Append on a channel with many
+    attachments shows here and as queue wait for the other channels on
+    its shard.
   - `ably_bus_delivery_lag_seconds{path}` (histogram, buckets 1 ms to
     30 s): for each cm a node appends that came from another node, the
     time from its commit to the append, by delivery path (`inline`,

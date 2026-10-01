@@ -50,7 +50,7 @@ func isClosed(ch <-chan struct{}) bool {
 
 func TestChannelAppendBuildsList(t *testing.T) {
 	c := newChannel("test")
-	head := c.tail // sentinel; notify open, next nil
+	head := c.tail // sentinel; wake channels open, next nil
 
 	cms := []*protocol.ChannelMessage{
 		newCM("001", "m1"),
@@ -65,7 +65,7 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	// reachable as one entry, in order.
 	e := head
 	for i, want := range cms {
-		if !isClosed(e.notify) {
+		if !isClosed(e.wait(0)) {
 			t.Fatalf("entry %d: notify not closed", i)
 		}
 		if e.next == nil {
@@ -84,7 +84,7 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	}
 
 	// The final entry's notify is still open — no successor yet.
-	if isClosed(e.notify) {
+	if isClosed(e.wait(0)) {
 		t.Fatal("final entry's notify is closed; expected open until next append")
 	}
 }
@@ -98,7 +98,7 @@ func TestChannelAppendIsNoOpOnNilOrEmpty(t *testing.T) {
 
 	// Nothing should have been linked; the sentinel's notify is still
 	// open and next is nil.
-	if isClosed(head.notify) {
+	if isClosed(head.wait(0)) {
 		t.Error("notify closed on a no-op Append")
 	}
 	if head.next != nil {
@@ -112,7 +112,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 
 	got := make(chan *entry, 1)
 	go func() {
-		<-head.notify
+		<-head.wait(0)
 		got <- head.next
 	}()
 
@@ -139,7 +139,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 	woken := make(chan struct{}, waiters)
 	for range waiters {
 		go func() {
-			<-head.notify
+			<-head.wait(0)
 			woken <- struct{}{}
 		}()
 	}

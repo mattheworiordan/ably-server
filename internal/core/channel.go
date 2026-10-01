@@ -17,10 +17,20 @@ import (
 
 // entry is a node in a Channel's linked list of ChannelMessages. Each
 // entry is one atomic publish carrying one or more Messages. Streams
-// tail the list at their own pace; entry.notify is closed once
-// entry.next has been set, which wakes all parked streams. The list is
-// grow-only — older entries become eligible for GC once no stream
-// retains a reference.
+// tail the list at their own pace; a Stream parked at an entry waits on
+// one of the entry's wake channels, which are closed once entry.next has
+// been set. The list is grow-only — older entries become eligible for GC
+// once no stream retains a reference.
+//
+// The wake channels are split over slots, each Stream parking on the
+// slot its Attach-time number selects, and a slot's channel is made by
+// the first Stream that parks on it. Parking on a channel takes that
+// channel's lock, so if every Stream on a channel with tens of thousands
+// of attachments parked on one channel, each fan-out would end with all
+// of them queueing on one lock to park again. Append sizes the new
+// entry's slots from the channel's attachment count, about
+// streamsPerWakeSlot Streams to a slot (DESIGN.md §5.1), so an entry on a
+// channel with one subscriber has one slot.
 //
 // The sentinel head (the entry installed at construction, before any
 // Append) carries a serial-only ChannelMessage once Initialize has
@@ -28,9 +38,75 @@ import (
 // Messages, so Stream.Next never returns it as a delivered cm — it
 // is only inspected via Stream.ChannelSerial.
 type entry struct {
-	cm     *protocol.ChannelMessage
-	notify chan struct{}
-	next   *entry
+	cm   *protocol.ChannelMessage
+	next *entry
+	// wake holds each slot's wake channel: nil until a Stream parks on
+	// the slot, closedWaker once Append has linked next. Its length is
+	// fixed when the entry is made.
+	wake []atomic.Pointer[waker]
+	// at is when Append linked the entry (zero for the sentinel), from
+	// which the realtime layer measures the fan-out time to each
+	// attachment (ably_delivery_fanout_seconds, DESIGN.md §10).
+	at time.Time
+	// memo holds values derived from cm that every attachment shares,
+	// such as its encoded frame in one wire format (Stream.Memo). Nil
+	// until first used.
+	memo atomic.Pointer[sync.Map]
+}
+
+// streamsPerWakeSlot is about how many Streams share one wake channel
+// of an entry, and maxWakeSlots caps an entry's slots (see entry).
+const (
+	streamsPerWakeSlot = 64
+	maxWakeSlots       = 1024
+)
+
+// newEntry makes an entry with wake slots for about streams parked
+// Streams: a power of two, at least one, at most maxWakeSlots.
+func newEntry(cm *protocol.ChannelMessage, streams int64) *entry {
+	n := 1
+	for int64(n)*streamsPerWakeSlot < streams && n < maxWakeSlots {
+		n <<= 1
+	}
+	return &entry{cm: cm, wake: make([]atomic.Pointer[waker], n)}
+}
+
+// waker is one slot's wake channel.
+type waker struct{ c chan struct{} }
+
+// closedWaker marks a slot whose entry has its next linked; its channel
+// is closed, so a Stream that finds it does not park.
+var closedWaker = func() *waker {
+	w := &waker{c: make(chan struct{})}
+	close(w.c)
+	return w
+}()
+
+// wait returns the channel a Stream on slot parks on until next is
+// linked: the slot's channel, made now if no Stream has parked on the
+// slot yet, or a closed one if next is already linked.
+func (e *entry) wait(slot uint64) <-chan struct{} {
+	p := &e.wake[slot&uint64(len(e.wake)-1)]
+	w := p.Load()
+	if w == nil {
+		nw := &waker{c: make(chan struct{})}
+		if p.CompareAndSwap(nil, nw) {
+			return nw.c
+		}
+		w = p.Load()
+	}
+	return w.c
+}
+
+// wakeAll wakes every Stream parked at e. Called once, by the Append
+// that linked e.next, after the link: a Stream that makes a slot's
+// channel after this finds closedWaker instead and does not park.
+func (e *entry) wakeAll() {
+	for i := range e.wake {
+		if w := e.wake[i].Swap(closedWaker); w != nil && w != closedWaker {
+			close(w.c)
+		}
+	}
 }
 
 // Channel holds the live ChannelMessage list for one channel name and
@@ -56,6 +132,9 @@ type Channel struct {
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
+	// attachSeq numbers Streams to spread them over the wake slots
+	// (entry.wait). Guarded by mu.
+	attachSeq uint64
 	// members is the set of presence members this Channel has seen
 	// enter and not yet leave, keyed by storage.MemberKey. It is fed by
 	// Append, so it counts every member whose ENTER reached this node
@@ -77,10 +156,14 @@ type Channel struct {
 	// Lifecycle state for idle-channel eviction (DESIGN.md §5.1), guarded
 	// by life. Kept apart from mu so that pinning a channel for an
 	// operation never contends with the append path.
-	mgr      *Manager // nil for channels built outside a Manager (tests)
-	life     sync.Mutex
-	evicted  bool  // set once, by the Manager's sweeper; the Channel is then dropped
-	refs     int   // open Streams (attachments)
+	mgr     *Manager // nil for channels built outside a Manager (tests)
+	life    sync.Mutex
+	evicted bool // set once, by the Manager's sweeper; the Channel is then dropped
+	refs    int  // open Streams (attachments)
+	// subs mirrors refs for Append, which runs under mu and so cannot
+	// take life (idle takes mu inside life). It is the number of
+	// attachments an Append wakes (ably_delivery_fanout_size).
+	subs     atomic.Int64
 	inflight int   // storage operations in progress
 	lastUsed int64 // Manager clock reading when refs or inflight last fell, or at bind
 
@@ -101,7 +184,7 @@ func newChannel(name string) *Channel {
 	return &Channel{
 		name:        name,
 		ready:       make(chan struct{}),
-		tail:        &entry{notify: make(chan struct{})},
+		tail:        newEntry(nil, 0),
 		bound:       make(chan struct{}),
 		released:    make(chan struct{}),
 		syncSource:  PresenceSyncLocal,
@@ -144,6 +227,7 @@ func (c *Channel) pin(ctx context.Context, attach bool) (*Channel, error) {
 		if !ch.evicted {
 			if attach {
 				ch.refs++
+				ch.subs.Add(1)
 			} else {
 				ch.inflight++
 			}
@@ -167,6 +251,7 @@ func (c *Channel) unpin(attach bool) {
 	c.life.Lock()
 	if attach {
 		c.refs--
+		c.subs.Add(-1)
 	} else {
 		c.inflight--
 	}
@@ -430,18 +515,29 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if len(cm.Presence) > 0 {
 		c.trackMembers(cm.Presence)
 		if c.pv.seeded || c.pv.seeding != nil {
 			c.pv.observe(cm)
 		}
 	}
-	e := &entry{cm: cm, notify: make(chan struct{})}
-	c.tail.next = e
-	close(c.tail.notify)
+	e := newEntry(cm, c.subs.Load())
+	e.at = time.Now()
+	prev := c.tail
+	prev.next = e
 	c.tail = e
+	c.mu.Unlock()
+	// Wake the parked streams outside mu. Closing a channel readies every
+	// goroutine parked on it, one by one, so on a channel with tens of
+	// thousands of attachments the wake-up is the costly part of Append;
+	// holding mu across it would stall Attach and the eviction sweep for
+	// that long. The list order is fixed under mu; the wake-up only tells
+	// the streams parked on prev that its next entry is linked. A later
+	// Append may wake the streams parked on e before this wake-up runs,
+	// but a stream reaches e only through prev, so it still sees the
+	// entries in list order.
+	prev.wakeAll()
+	c.metrics.DeliveryFanoutSize(c.subs.Load())
 }
 
 // trackMembers folds a presence cm into the local member set that
@@ -487,7 +583,8 @@ func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
 	}
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	return &Stream{cursor: ch.tail, ch: ch}, nil
+	ch.attachSeq++
+	return &Stream{cursor: ch.tail, ch: ch, slot: ch.attachSeq}, nil
 }
 
 // Stream is an attachment's per-channel view of the linked list. Its
@@ -496,6 +593,7 @@ func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
 type Stream struct {
 	cursor *entry
 	ch     *Channel
+	slot   uint64 // selects the wake slot this Stream parks on (entry.wait)
 	closed atomic.Bool
 }
 
@@ -522,12 +620,37 @@ func (s *Stream) ChannelSerial() string {
 	return s.cursor.cm.ChannelSerial
 }
 
+// AppendedAt returns when the cursor's entry was appended: the time the
+// last ChannelMessage Next returned was linked onto the live list. Zero
+// before the first Next.
+func (s *Stream) AppendedAt() time.Time {
+	return s.cursor.at
+}
+
+// Memo returns the value build makes for key, calling build at most once
+// per key for the cursor's entry, the ChannelMessage Next last returned,
+// however many Streams ask. The realtime layer keeps the entry's encoded
+// frame here, one per wire format, so a cm fanned out to many attachments
+// is encoded once per format (DESIGN.md §5.1). The value is shared
+// between goroutines and must be treated as read-only.
+func (s *Stream) Memo(key any, build func() any) any {
+	e := s.cursor
+	m := e.memo.Load()
+	if m == nil {
+		m = new(sync.Map)
+		if !e.memo.CompareAndSwap(nil, m) {
+			m = e.memo.Load()
+		}
+	}
+	return memoize(m, key, build)
+}
+
 // Next blocks until the next ChannelMessage is available, advances
 // the cursor to that entry, and returns the ChannelMessage. Returns
 // ctx.Err() if the context is cancelled.
 func (s *Stream) Next(ctx context.Context) (*protocol.ChannelMessage, error) {
 	select {
-	case <-s.cursor.notify:
+	case <-s.cursor.wait(s.slot):
 		s.cursor = s.cursor.next
 		return s.cursor.cm, nil
 	case <-ctx.Done():

@@ -268,11 +268,28 @@ type BusStats struct {
 	// (DESIGN.md §10, ably_bus_delivery_lag_seconds). Nil when the bus
 	// records none.
 	DeliveryLag map[string]LagHistogram
+
+	// Stages are the receive-side delivery stages, keyed by stage, on the
+	// StageBuckets bounds (DESIGN.md §10): "receive_queue_wait" (nats bus:
+	// from the publisher's send to a dispatch worker taking the message
+	// off its shard queue), "hold" (a cm that arrived ahead of its
+	// predecessor, from the hold to its append) and "append" (the time
+	// inside the appender's Append, which wakes the channel's
+	// attachments). Each is exported as ably_bus_<stage>_seconds. Nil
+	// when the bus records none.
+	Stages map[string]LagHistogram
 }
 
 // BusLagBuckets are the upper bounds, in seconds, of the bus delivery
 // lag histogram (ably_bus_delivery_lag_seconds).
 var BusLagBuckets = []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+
+// StageBuckets are the upper bounds, in seconds, of the node-side
+// delivery stage histograms (ably_bus_receive_queue_wait_seconds,
+// ably_bus_hold_seconds, ably_bus_append_seconds,
+// ably_delivery_fanout_seconds, ably_conn_write_wait_seconds). They start
+// at 100 µs: most stages take well under the bus lag's first bucket.
+var StageBuckets = []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5}
 
 // LagHistogram is a snapshot of one delivery-lag histogram: Counts[i]
 // is the cumulative number of observations at or below BusLagBuckets[i],

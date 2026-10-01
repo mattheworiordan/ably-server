@@ -31,38 +31,75 @@ const (
 
 var lagPathNames = [lagPaths]string{"inline", "fetched", "filled"}
 
-// lagHistogram counts observations per storage.BusLagBuckets bucket
-// (not cumulative; the last slot is +Inf) and their sum.
+// lagHistogram counts observations per bucket of one bounds list
+// (storage.BusLagBuckets for the delivery lag, storage.StageBuckets for
+// the stages), not cumulative, with the last used slot for +Inf, and
+// their sum.
 type lagHistogram struct {
-	counts   [16]atomic.Uint64 // len(storage.BusLagBuckets)+1 slots used
+	counts   [16]atomic.Uint64 // len(bounds)+1 slots used
 	sumNanos atomic.Uint64
 }
 
 func init() {
-	if len(storage.BusLagBuckets)+1 > len(lagHistogram{}.counts) {
-		panic("storage/postgres: lagHistogram has fewer slots than storage.BusLagBuckets")
+	for _, b := range [][]float64{storage.BusLagBuckets, storage.StageBuckets} {
+		if len(b)+1 > len(lagHistogram{}.counts) {
+			panic("storage/postgres: lagHistogram has fewer slots than a bucket list")
+		}
 	}
 }
 
 func (h *lagHistogram) observe(d time.Duration) {
+	h.observeOn(storage.BusLagBuckets, d)
+}
+
+func (h *lagHistogram) observeOn(bounds []float64, d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
-	i := sort.SearchFloat64s(storage.BusLagBuckets, d.Seconds())
+	i := sort.SearchFloat64s(bounds, d.Seconds())
 	h.counts[i].Add(1)
 	h.sumNanos.Add(uint64(d))
 }
 
 // snapshot returns the histogram with cumulative bucket counts.
 func (h *lagHistogram) snapshot() storage.LagHistogram {
-	out := storage.LagHistogram{Counts: make([]uint64, len(storage.BusLagBuckets))}
+	return h.snapshotOn(storage.BusLagBuckets)
+}
+
+func (h *lagHistogram) snapshotOn(bounds []float64) storage.LagHistogram {
+	out := storage.LagHistogram{Counts: make([]uint64, len(bounds))}
 	var cum uint64
-	for i := range storage.BusLagBuckets {
+	for i := range bounds {
 		cum += h.counts[i].Load()
 		out.Counts[i] = cum
 	}
-	out.Count = cum + h.counts[len(storage.BusLagBuckets)].Load()
+	out.Count = cum + h.counts[len(bounds)].Load()
 	out.Sum = time.Duration(h.sumNanos.Load()).Seconds()
+	return out
+}
+
+// Receive-side delivery stages (DESIGN.md §10, storage.BusStats.Stages),
+// on the storage.StageBuckets bounds.
+const (
+	stageQueueWait = iota // nats: publisher send to dispatch-worker pickup
+	stageHold             // a held cm: hold to append
+	stageAppend           // inside the appender's Append
+	stages
+)
+
+var stageNames = [stages]string{"receive_queue_wait", "hold", "append"}
+
+// observeStage records one observation of a receive-side stage.
+func (c *busStats) observeStage(stage int, d time.Duration) {
+	c.stage[stage].observeOn(storage.StageBuckets, d)
+}
+
+// stageSnapshot returns the stage histograms by stage name.
+func (c *busStats) stageSnapshot() map[string]storage.LagHistogram {
+	out := make(map[string]storage.LagHistogram, stages)
+	for i := range c.stage {
+		out[stageNames[i]] = c.stage[i].snapshotOn(storage.StageBuckets)
+	}
 	return out
 }
 

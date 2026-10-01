@@ -239,6 +239,16 @@ func addBusStats(a, b storage.BusStats) storage.BusStats {
 		}
 		a.DeliveryLag = merged
 	}
+	if len(b.Stages) > 0 {
+		merged := make(map[string]storage.LagHistogram, len(a.Stages)+len(b.Stages))
+		for stage, h := range a.Stages {
+			merged[stage] = h
+		}
+		for stage, h := range b.Stages {
+			merged[stage] = addLag(merged[stage], h)
+		}
+		a.Stages = merged
+	}
 	return a
 }
 

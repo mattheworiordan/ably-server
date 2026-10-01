@@ -316,6 +316,9 @@ func (b *natsBus) handle(m *nats.Msg) {
 		b.s.logger.Warn("storage/postgres: undecodable NATS bus message", "subject", m.Subject, "err", err)
 		return
 	}
+	if ev.sentAt > 0 {
+		b.s.stats.observeStage(stageQueueWait, time.Since(time.Unix(0, ev.sentAt)))
+	}
 	var cs *channelStore
 	if m.Subject == natsSubject(b.prefix, channel) {
 		cs = b.s.boundStore(channel)

@@ -129,3 +129,27 @@ func TestNATSEnvelopeCarriesSendTime(t *testing.T) {
 		}
 	}
 }
+
+// TestStageHistogramBuckets: the stage histograms use StageBuckets, which
+// start at 100 µs, and snapshot under their stage names.
+func TestStageHistogramBuckets(t *testing.T) {
+	var c busStats
+	c.observeStage(stageQueueWait, 50*time.Microsecond)
+	c.observeStage(stageQueueWait, 300*time.Microsecond)
+	c.observeStage(stageAppend, 10*time.Second)
+	snap := c.stageSnapshot()
+	if len(snap) != 3 {
+		t.Fatalf("stages = %v, want receive_queue_wait, hold, append", snap)
+	}
+	qw := snap["receive_queue_wait"]
+	if qw.Count != 2 || qw.Counts[0] != 1 || qw.Counts[2] != 2 {
+		t.Errorf("receive_queue_wait = %+v, want 1 at le=0.0001 and 2 at le=0.0005", qw)
+	}
+	ap := snap["append"]
+	if ap.Count != 1 || ap.Counts[len(storage.StageBuckets)-1] != 0 {
+		t.Errorf("append = %+v, want one observation in +Inf only", ap)
+	}
+	if snap["hold"].Count != 0 {
+		t.Errorf("hold = %+v, want empty", snap["hold"])
+	}
+}

@@ -55,7 +55,12 @@ type connection struct {
 	out          *outQueue
 	writeTimeout time.Duration
 	// slow latches the slow-consumer disconnect so it runs once.
-	slow        atomic.Bool
+	slow atomic.Bool
+	// sampled is set on one connection in metrics.DeliverySampleEvery:
+	// it records each frame's wait in the outbound queue
+	// (ably_conn_write_wait_seconds) and its attachments the fan-out time
+	// (ably_delivery_fanout_seconds, DESIGN.md §10).
+	sampled     bool
 	attachments map[string]*attachment
 
 	// publishQ is the per-connection publish pipeline: one buffered
@@ -536,6 +541,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// §5.1).
 	a := newAttachment(ctx, name, stream.Channel(), stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, requested, effective, msg.Params, c.queue, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	a.outShared = c.queueShared
+	a.sampled = c.sampled
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	c.logger.Debug("channel attached", "channel", name)
@@ -797,6 +803,10 @@ func messageSerials(msgs []*protocol.Message) []string {
 	return out
 }
 
+// deliverySampleSeq numbers connections for the delivery-stage sampling
+// (connection.sampled).
+var deliverySampleSeq atomic.Uint64
+
 // queue encodes a frame and pushes it onto the outbound queue, waiting
 // under backpressure for at most the write timeout (DESIGN.md §5.2).
 // Returns false if the frame was not queued: the connection's context
@@ -812,22 +822,34 @@ func (c *connection) queue(ctx context.Context, msg *protocol.ProtocolMessage) b
 	return c.push(ctx, f)
 }
 
-// memoizer keeps one value per key; *core.PresenceSnapshot is one.
+// memoizer keeps one value per key; *core.PresenceSnapshot and
+// *core.Stream (for the cm it last returned) are memoizers.
 type memoizer interface {
 	Memo(key any, build func() any) any
 }
 
+// sharedFrameKey keys a shared frame's encoding on its memoizer: one per
+// frame action and wire format. It is a small integer so that boxing it
+// as the memo key does not allocate (Go keeps the values below 256
+// preallocated); actions and formats are well inside that.
+type sharedFrameKey uint16
+
+func frameKey(action protocol.Action, format protocol.Format) sharedFrameKey {
+	return sharedFrameKey(uint16(action)<<2 | uint16(format)&3)
+}
+
 // queueShared is queue for a frame that every connection sends
-// unchanged, such as a channel's SYNC snapshot (DESIGN.md §12.4): its
-// encoding in this connection's wire format is kept on memo, so the
-// frame is encoded once per format however many attaches it is served
-// to. The encoded bytes are shared read-only between connections.
+// unchanged, such as a channel's SYNC snapshot (DESIGN.md §12.4) or a
+// live MESSAGE with no per-attachment transform (§5.1): its encoding in
+// this connection's wire format is kept on memo, so the frame is encoded
+// once per format however many attachments it is sent to. The encoded
+// bytes are shared read-only between connections.
 func (c *connection) queueShared(ctx context.Context, msg *protocol.ProtocolMessage, memo memoizer) bool {
 	type encoded struct {
 		f   outFrame
 		err error
 	}
-	e := memo.Memo(c.format, func() any {
+	e := memo.Memo(frameKey(msg.Action, c.format), func() any {
 		f, err := c.encode(msg)
 		return encoded{f, err}
 	}).(encoded)
@@ -840,6 +862,9 @@ func (c *connection) queueShared(ctx context.Context, msg *protocol.ProtocolMess
 
 // push queues an encoded frame (see queue).
 func (c *connection) push(ctx context.Context, f outFrame) bool {
+	if c.sampled {
+		f.queued = time.Now()
+	}
 	switch err := c.out.push(ctx, f); {
 	case err == nil:
 		return true
@@ -915,6 +940,9 @@ func (c *connection) writeLoop(ctx context.Context) {
 				}
 				if err := c.writeFrame(f); err != nil {
 					return
+				}
+				if !f.queued.IsZero() {
+					c.metrics.ConnWriteWait(time.Since(f.queued))
 				}
 				// A server-initiated DISCONNECTED (shutdown, DESIGN.md §11;
 				// slow consumer, §5.2) is the connection's last frame: once
