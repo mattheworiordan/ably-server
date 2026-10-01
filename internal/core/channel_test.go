@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
 // newCM builds a deterministic ChannelMessage for tests. The serial
@@ -354,4 +356,49 @@ func TestChannelAttachRespectsContextBeforeInitialize(t *testing.T) {
 	if _, err := c.Attach(ctx); err == nil {
 		t.Fatal("Attach returned nil error on cancelled ctx before Initialize")
 	}
+}
+
+// TestChannelHasSubscribers: a channel has subscribers while it has an
+// open Stream or a presence member this node saw enter and not leave; a
+// channel bound only for a REST operation has none (DESIGN.md §7.2, the
+// watermark sweep's scope).
+func TestChannelHasSubscribers(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(memory.New(memory.Options{}))
+	ch, err := m.GetChannel(ctx, "room")
+	if err != nil {
+		t.Fatalf("GetChannel: %v", err)
+	}
+	if ch.HasSubscribers() {
+		t.Fatal("a freshly bound channel reports subscribers")
+	}
+	if _, _, err := ch.Publish(ctx, []*protocol.Message{{Name: "rest"}}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if ch.HasSubscribers() {
+		t.Fatal("a channel used only for a publish reports subscribers")
+	}
+
+	st, err := ch.Attach(ctx)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if !ch.HasSubscribers() {
+		t.Fatal("a channel with an open Stream reports no subscribers")
+	}
+	st.Close()
+	if ch.HasSubscribers() {
+		t.Fatal("a channel whose only Stream closed still reports subscribers")
+	}
+
+	ch.Append(&protocol.ChannelMessage{ChannelSerial: "s1", Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, ClientID: "c", ConnectionID: "x"}}})
+	if !ch.HasSubscribers() {
+		t.Fatal("a channel with a tracked presence member reports no subscribers")
+	}
+	ch.Append(&protocol.ChannelMessage{ChannelSerial: "s2", Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceLeave, ClientID: "c", ConnectionID: "x"}}})
+	if ch.HasSubscribers() {
+		t.Fatal("a channel whose last member left still reports subscribers")
+	}
+
+	var _ storage.SubscriberReporter = ch
 }

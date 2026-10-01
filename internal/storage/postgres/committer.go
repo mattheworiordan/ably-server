@@ -30,8 +30,14 @@ func validText(s string) bool {
 // waits for the batch that commits it (DESIGN.md §6.3). Everything that
 // can reject one publish on its own (the id format, text Postgres would
 // refuse) is checked here, before it is queued, so one bad publish cannot
-// fail a batch. The channel's row is created here if this store has
-// never seen it, so a batch never has to insert one.
+// fail a batch. Under Options.BindOnWrite the channel's row is created
+// here if this store has never seen it, so a batch never has to insert
+// one; otherwise a missing row is created by the batch's
+// publish_batch_lock, in the same round trip that locks the rows. (The
+// comments in migration 0003 predate this and call that path a fallback
+// that never waits; DESIGN.md §6.3 "Channel rows" is current: the insert
+// can wait for another transaction's uncommitted insert of the same new
+// name, never deadlocking.)
 func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if !validText(cs.name) {
 		return nil, false, storage.ErrInvalidChannelName
@@ -46,7 +52,7 @@ func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs [
 	if err != nil {
 		return nil, false, err
 	}
-	if !cs.rowEnsured.Load() {
+	if cs.preInsertRow && !cs.rowEnsured.Load() {
 		// Create the row if absent, as ensure_channel would, but without
 		// its ON CONFLICT DO UPDATE: that takes the row lock, which would
 		// queue this publish behind a hot channel's in-flight batch.
@@ -146,6 +152,9 @@ func (s *Storage) commitBatch(ctx context.Context, batch []*pending) ([]*pending
 	chains := s.bus.chains()
 	for i := range slots {
 		sl := &slots[i]
+		if sl.status == "ok" || sl.status == "duplicate" {
+			s.rememberRow(sl.p.channel) // publish_batch_lock found or made its row
+		}
 		switch {
 		case sl.item != nil:
 			if sl.item.w.notified {

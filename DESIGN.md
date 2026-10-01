@@ -777,6 +777,25 @@ creates the Channel and binds it: `storage.Channel(name, channel)`
 registers the Channel as the Appender and Initializes it from the store's
 watermark.
 
+**Write-only REST publish.** In cluster mode a REST message publish to a
+name with no Channel on this node (so no attachment and no presence
+member here) does not bind it. The Manager hands the REST handler an
+unbound store (`storage.UnboundPublisher`), and the publish is minted,
+written and committed in its batch exactly as through a bound store; the
+bus's post-commit hook still announces it, so other nodes' subscribers
+receive it (§7.2). Nothing is created on this node: no Channel, no bus
+subscription, no sweep entry, nothing for eviction to release 60 s later.
+The local fast path is skipped because there is no local appender,
+unless the channel was bound here while the publish was in flight, in
+which case the fast path (or, on `pgnotify`, the NOTIFY round trip)
+delivers it to that binding and the bind's watermark read keeps it
+exactly once. A name whose Channel is bound or still binding takes the
+normal path; one being evicted takes the write-only path. Presence,
+annotations, mutations and realtime publishes keep the normal path.
+`--publish-bind-on-write=true` restores binding on every publish.
+`ably_channel_unbound_publishes_total` counts the publishes that take
+this path.
+
 **Idle-channel eviction.** A node that serves hundreds of thousands of
 channels an hour cannot hold every channel it has ever touched. With
 `--channel-idle-timeout` set (default 60 s, `0` disables), the Manager
@@ -1338,7 +1357,16 @@ keep their order. Per lane:
    flight longer than `--publish-linger-max` (default 5 ms), the queued
    publishes of other channels start a second batch, so a stalled commit
    delays only the channels in it (at most two batches per lane).
-4. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
+4. `--publish-linger-min` (default 0, off) puts a floor under step 1:
+   an idle lane holds its first publish until it has waited that long, or
+   `--publish-batch-max` publishes are queued, so publishes arriving
+   meanwhile share its commit. Publishes that have already waited behind
+   an in-flight commit for longer are not held again. It trades up to that
+   much ACK latency for deeper batches when many lanes across many nodes
+   each find little queued (measured: 1.2 to 4 publishes a commit with 4
+   lanes on 10 to 20 nodes, where one primary needs about 30 to reach its
+   rate).
+5. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
    Beyond it a publish is refused at once with Ably error **42910** (HTTP
    429 on REST, a NACK on realtime): nothing is stored and the client
    should back off and retry.
@@ -1369,8 +1397,7 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
 - Everything that can reject a single publish (the id format; an id or
   channel name that is not valid UTF-8 or contains NUL, which Postgres
   cannot store, refused with 40031 or 40010) is checked before it is
-  queued, and a channel's row is created (without taking its lock) before
-  its first publish is queued, so one bad publish cannot fail a batch. A publish that repeats a client id of an earlier publish
+  queued, so one bad publish cannot fail a batch. A publish that repeats a client id of an earlier publish
   of the same channel in the batch takes that publish's result,
   idempotently. Server-generated ids are unique by construction and skip
   the lookup on a first attempt.
@@ -1389,6 +1416,27 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   shutdown get the same error.
 - ACKs are per publish, sent when its batch commits.
 
+**Channel rows.** A channel's `channels` row (its serial and initial
+serial) is created by the first write or bind that needs it. A batched
+publish on a channel with no row creates it inside `publish_batch_lock`,
+in round trip 1: the missing rows are inserted in sorted name order
+(`ON CONFLICT DO NOTHING`) and then locked without waiting, so a cold
+channel's first publish costs no round trip of its own. This matters for
+write-only REST publishes (§5.1), which reach cold channels without a
+bind. The insert can wait on another transaction that is inserting the
+same new name uncommitted (two nodes' first publishes to one channel at
+the same instant): at most one commit, and never a deadlock, since every
+transaction inserts new rows in sorted order and waits for nothing else
+after them. Rows are never deleted, so each node keeps a bounded set of
+names it knows have a row (65,536 per database, oldest forgotten first):
+a bind of a known name reads the row with a plain `SELECT` instead of
+`ensure_channel`, which writes a new row version and waits for the row
+lock of a channel another node is publishing on. Either read comes after
+the bus subscription, so the bind misses nothing (§7.2). With
+`--publish-bind-on-write=true` the earlier behaviour returns: every bind
+runs `ensure_channel`, and a publish creates a missing row in a statement
+of its own before it is queued.
+
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
 under load). One hot channel is still serialised by its row lock: across
@@ -1399,7 +1447,9 @@ width across channels, not depth per channel. Cluster write throughput is
 still one primary's per database; channel sharding (§6.4) spreads
 channels over several.
 
-Series (§10): `ably_publish_batch_size` (histogram),
+Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
+`ably_publish_linger_min_seconds` (gauges: the configuration in effect),
+`ably_publish_batch_size` (histogram),
 `ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
@@ -1624,11 +1674,33 @@ The `postgres` and `nats` buses share one delivery point
   delivered it.
 - **Reconcile.** After the bus connection comes back, every bound channel
   is caught up from its mark, 500 channels per query.
-- **Sweep.** Every sweep interval (`--bus-sweep-interval`; defaults 2 s for
-  `postgres`, 5 s for `nats`) each node reads the committed serial of its
-  bound channels, 1,000 per query, and catches up any channel still
-  behind the serial the previous sweep saw. A cm that old whose bus
-  message has not arrived is treated as lost, not late.
+- **Sweep.** Every sweep interval (`--bus-sweep-interval`, default 30 s
+  for both buses) each node reads the committed serial of the channels
+  in its sweep scope, 1,000 per query and one query per shard's
+  database, and catches up any channel still behind the serial the
+  previous sweep saw. A cm that old whose bus message has not arrived is
+  treated as lost, not late.
+- **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
+  only bound channels with a subscriber on this node: an open
+  attachment, or a presence member the node has seen enter and not leave
+  (whose LEAVE eviction waits for). `bound` sweeps every bound channel,
+  the behaviour before the scope existed. A channel bound only by a REST
+  request, or kept bound after its last detach until eviction, has
+  nobody on this node a lost cm could be late for, so reading it is
+  waste: in a 15-minute shape-D run the full sweep was about a quarter of
+  Postgres's time. The bound: a lost bus message on a subscribed channel
+  with no later cm is delivered up to two intervals late (60 s at the
+  default). On a channel with no local subscriber nothing is waiting for
+  it. The binding goes on receiving the bus, so a later cm's predecessor
+  still reveals the gap; if none comes, the lost tail is delivered
+  within two intervals of the channel gaining a subscriber, and a channel
+  evicted meanwhile re-seeds from the watermark on its next bind, which
+  covers the tail. Nothing is lost. (A receiver cannot tell which
+  channels it missed a message on, so there is no cheaper "dirty set" to
+  sweep instead.) The postgres bus's coalesced overflow (below) is
+  delivered by the same sweep, so an overflowed write is also up to two
+  intervals late; lower the interval if that matters more than the
+  sweep's cost.
 
 #### postgres
 
@@ -1802,7 +1874,9 @@ that the log has moved, and every loss below is recovered from the log.
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 
-Worst case for the chained buses is about two sweep intervals late. The
+Worst case for the chained buses is about two sweep intervals late,
+counted from the moment the channel has a subscriber on the receiving
+node (the sweep scope above). The
 load tests check this rather than assume it: the serial-continuity
 check fails on any gap or duplicate.
 
@@ -2001,7 +2075,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
 --postgres-notify-window 50ms   coalescing window (coalesced mode)
 --postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
---bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (postgres 2s, nats 5s)
+--bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (30s) (§7.2)
+--bus-sweep-scope subscribed  channels that sweep reads: subscribed (an attachment or presence member here) or bound (all)
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -2020,7 +2095,9 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
+--publish-linger-min 0s       cluster mode: how long an idle lane holds its first publish; 0 = leading edge (§6.3)
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
+--publish-bind-on-write false cluster mode: true binds a channel on every REST publish (§5.1, §6.3)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2034,15 +2111,16 @@ Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `postgres-notify-mode`, `postgres-notify-window`,
-`postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
+`postgres-notify-max-pending`, `bus-sweep-interval`, `bus-sweep-scope`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`, `publish-queue-max` —
+`publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
+`publish-queue-max`, `publish-bind-on-write` —
 `shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
 `channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
-retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
+retentions, `publish-linger-max` and `publish-linger-min` as duration strings, e.g. `"10s"`,
 the sizes and counts as integers). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
@@ -2134,6 +2212,9 @@ name = "persisted:presence_fixtures"
   - `ably_channel_evictions_total` (counter) — idle channels evicted.
   - `ably_channel_release_errors_total` (counter) — storage `Release` calls
     that failed during eviction.
+  - `ably_channel_unbound_publishes_total` (counter) — REST publishes that
+    took the write-only path: stored on a channel not bound on this node,
+    without binding it (§5.1).
   - `ably_slow_consumer_disconnects_total{reason}` (counter) — connections
     disconnected for not reading fast enough: `queue_full` (the outbound
     queue stayed at its bound for the write timeout) or `write_timeout` (a
@@ -2150,6 +2231,8 @@ name = "persisted:presence_fixtures"
     label (the shard's index in the `--postgres-dsn` list), and the
     `ably_bus_*` series below are summed over shards.
   - Cluster mode only, from publish batching (§6.3):
+    `ably_publish_lanes`, `ably_publish_linger_max_seconds`,
+    `ably_publish_linger_min_seconds` (gauges, the configuration),
     `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
     `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`
@@ -2171,7 +2254,9 @@ name = "persisted:presence_fixtures"
     `ably_bus_gap_fills_total`, `ably_bus_fetch_errors_total`,
     `ably_bus_drops_total`, `ably_bus_reconciles_total`,
     `ably_bus_reconciled_channels_total`, `ably_bus_reconcile_seconds_total`,
-    `ably_bus_sweeps_total`, `ably_bus_sweep_catch_ups_total`,
+    `ably_bus_sweeps_total`, `ably_bus_sweep_channels_total` (channels
+    whose watermark a sweep read, summed over sweeps: the sweep scope's
+    size), `ably_bus_sweep_catch_ups_total`,
     `ably_bus_sweep_seconds_total`.
   - `ably_bus_delivery_lag_seconds{path}` (histogram, buckets 1 ms to
     30 s): for each cm a node appends that came from another node, the

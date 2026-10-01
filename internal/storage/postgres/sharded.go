@@ -35,7 +35,11 @@ type Sharded struct {
 	gauge  prometheus.Collector // ably_storage_shards
 }
 
-var _ storage.Storage = (*Sharded)(nil)
+var (
+	_ storage.Storage          = (*Sharded)(nil)
+	_ storage.UnboundPublisher = (*Sharded)(nil)
+	_ storage.UnboundPublisher = (*Storage)(nil)
+)
 
 // OpenSharded opens one Storage per DSN, in list order, with opts
 // applied to each (opts.DSN is ignored). Shard 0 opens first, then the
@@ -125,6 +129,13 @@ func (s *Sharded) Channel(ctx context.Context, name string, appender storage.App
 	return s.shardOf(name).Channel(ctx, name, appender)
 }
 
+// UnboundChannel returns an unbound store for the channel from the shard
+// that owns it (storage.UnboundPublisher), so a write-only publish routes
+// by channel hash like everything else.
+func (s *Sharded) UnboundChannel(name string) storage.ChannelStore {
+	return s.shardOf(name).UnboundChannel(name)
+}
+
 // Release drops this node's binding of the channel on the shard that
 // owns it (storage.Storage.Release).
 func (s *Sharded) Release(ctx context.Context, name string) error {
@@ -206,6 +217,7 @@ func addBusStats(a, b storage.BusStats) storage.BusStats {
 	a.Reconciles += b.Reconciles
 	a.ReconcileSeconds += b.ReconcileSeconds
 	a.Sweeps += b.Sweeps
+	a.SweepChannels += b.SweepChannels
 	a.SweepCatchUps += b.SweepCatchUps
 	a.SweepSeconds += b.SweepSeconds
 	a.Drops += b.Drops

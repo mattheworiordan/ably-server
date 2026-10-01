@@ -179,14 +179,24 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		defer span.End()
 	}
 
-	ch, err := s.manager.GetChannel(ctx, name)
-	if err != nil {
-		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
-		s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
-		return
+	// A channel with no Channel on this node (no attachment, no presence
+	// member here) takes the write-only path: the publish is stored and
+	// announced to the other nodes without binding the channel here
+	// (DESIGN.md §5.1, §6.3).
+	var publish func(context.Context, []*protocol.Message) (*protocol.ChannelMessage, bool, error)
+	if st := s.manager.WriteOnlyStore(name); st != nil {
+		publish = st.Store
+	} else {
+		ch, err := s.manager.GetChannel(ctx, name)
+		if err != nil {
+			s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+			s.writeErrorInfo(w, r, http.StatusInternalServerError, 50000, "channel unavailable")
+			return
+		}
+		publish = ch.Publish
 	}
 	accepted := time.Now()
-	cm, _, err := ch.Publish(ctx, msgs)
+	cm, _, err := publish(ctx, msgs)
 	if errors.Is(err, storage.ErrInvalidMessageID) {
 		// Ably 40031 — "invalid publish request (invalid client-specified
 		// id)": a multi-message publish whose client-supplied ids don't

@@ -36,7 +36,7 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,8 +50,10 @@ jobs:
       # contract suite runs on every bus mode in this job too.
       - name: go test (integration, race)
         # The postgres package alone runs past go test's 10m default on a CI
-        # runner since the batching and retention suites landed.
-        run: go test -tags=integration -race -timeout 30m ./...
+        # runner since the batching and retention suites landed, and past
+        # 30m since the write-only, sweep-scope and one-lane contract suites
+        # (about 20m before them).
+        run: go test -tags=integration -race -timeout 45m ./...
 
   # One cell per cluster bus (DESIGN.md §7.2): the storage contract suite
   # for that bus, then the SDK integration suite with the servers on it.

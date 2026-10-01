@@ -37,6 +37,7 @@ type Metrics struct {
 	channelBinds         prometheus.Counter
 	channelEvictions     prometheus.Counter
 	channelReleaseErrors prometheus.Counter
+	unboundPublishes     prometheus.Counter
 
 	slowConsumerDisconnects *prometheus.CounterVec
 }
@@ -99,6 +100,10 @@ func New() *Metrics {
 			Name: "ably_channel_release_errors_total",
 			Help: "Total storage Release calls that returned an error during eviction.",
 		}),
+		unboundPublishes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ably_channel_unbound_publishes_total",
+			Help: "REST publishes sent down the write-only path: to a channel not bound on this node, stored without binding it.",
+		}),
 		slowConsumerDisconnects: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ably_slow_consumer_disconnects_total",
 			Help: "Total WebSocket connections disconnected for not reading fast enough, by reason (queue_full: the outbound queue stayed at its byte limit for the write timeout; write_timeout: a frame write missed its deadline).",
@@ -119,6 +124,7 @@ func New() *Metrics {
 		m.channelBinds,
 		m.channelEvictions,
 		m.channelReleaseErrors,
+		m.unboundPublishes,
 		m.slowConsumerDisconnects,
 	)
 	return m
@@ -231,6 +237,16 @@ func (m *Metrics) ChannelBound() {
 	}
 	m.channelBinds.Inc()
 	m.channelsBound.Inc()
+}
+
+// UnboundPublish records a publish sent down the write-only path: to a
+// channel not bound on this node, stored without binding it (DESIGN.md
+// §5.1).
+func (m *Metrics) UnboundPublish() {
+	if m == nil {
+		return
+	}
+	m.unboundPublishes.Inc()
 }
 
 // ChannelEvicted records an idle channel eviction: it bumps the

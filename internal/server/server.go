@@ -61,6 +61,7 @@ const (
 	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
 	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
 	busSweepEnv        = "ABLY_SERVER_BUS_SWEEP_INTERVAL"
+	busSweepScopeEnv   = "ABLY_SERVER_BUS_SWEEP_SCOPE"
 	channelIdleEnv     = "ABLY_SERVER_CHANNEL_IDLE_TIMEOUT"
 	connOutboundEnv    = "ABLY_SERVER_CONN_OUTBOUND_MAX_BYTES"
 	connWriteTOEnv     = "ABLY_SERVER_CONN_WRITE_TIMEOUT"
@@ -74,7 +75,9 @@ const (
 	publishLanesEnv     = "ABLY_SERVER_PUBLISH_LANES"
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
+	publishLingerMinEnv = "ABLY_SERVER_PUBLISH_LINGER_MIN"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
+	publishBindEnv      = "ABLY_SERVER_PUBLISH_BIND_ON_WRITE"
 )
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
@@ -192,7 +195,17 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	publishLingerMinDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMinEnv), file.PublishLingerMin, 0)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 	publishQueueMaxDefault, err := config.DefaultInt(opts.Getenv(publishQueueMaxEnv), file.PublishQueueMax, postgres.DefaultPublishQueueMax)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+	publishBindDefault, err := config.DefaultBool(opts.Getenv(publishBindEnv), file.PublishBindOnWrite, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
 		return 1
@@ -238,13 +251,16 @@ func Run(ctx context.Context, opts Opts) int {
 	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), file.PostgresNotifyMode, string(postgres.NotifyCoalesced)), "--bus=postgres notify mode: coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) or transactional (one NOTIFY per write, inside its transaction) (env: "+pgNotifyModeEnv+")")
 	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced; under 20ms logs a warning (DESIGN.md §7.2) (env: "+pgNotifyWindowEnv+")")
 	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
-	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks every bound channel against its committed serial and catches up one that fell behind; 0 means the bus default (postgres 2s, nats 5s) (env: "+busSweepEnv+")")
+	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks the channels in --bus-sweep-scope against their committed serial and catches up one that fell behind; 0 means the bus default (30s) (env: "+busSweepEnv+")")
+	busSweepScope := fs.String("bus-sweep-scope", config.Default(opts.Getenv(busSweepScopeEnv), file.BusSweepScope, postgres.SweepSubscribed), "channels the --bus-sweep-interval sweep reads: subscribed (bound channels with an attachment or presence member on this node) or bound (every bound channel) (DESIGN.md §7.2) (env: "+busSweepScopeEnv+")")
 	messageRetention := fs.Duration("message-retention", messageRetentionDefault, "cluster mode: how long a channel outside any persisted namespace keeps its message log, the continuity window (DESIGN.md §6.3) (env: "+messageRetentionEnv+")")
 	persistedRetention := fs.Duration("persisted-retention", persistedRetentionDefault, "cluster mode: how long a channel in a persisted namespace keeps its message log (DESIGN.md §6.3) (env: "+persistedRetentionEnv+")")
 	publishLanes := fs.Int("publish-lanes", publishLanesDefault, "cluster mode: publish lanes for leading-edge batching; a channel always uses the same lane; 0 commits every publish in its own transaction (DESIGN.md §6.3) (env: "+publishLanesEnv+")")
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
+	publishLingerMin := fs.Duration("publish-linger-min", publishLingerMinDefault, "cluster mode: how long an idle lane holds its first publish so others can join its commit; 0 commits at once (DESIGN.md §6.3) (env: "+publishLingerMinEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
+	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -264,6 +280,10 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
+		return 2
+	}
+	if *publishLingerMin < 0 {
+		fmt.Fprintln(opts.Out, "--publish-linger-min must not be negative")
 		return 2
 	}
 	if *channelIdleTimeout < 0 {
@@ -340,16 +360,19 @@ func Run(ctx context.Context, opts Opts) int {
 		notifyWindow:     *pgNotifyWindow,
 		notifyMaxPending: *pgNotifyMaxPending,
 		sweepInterval:    *busSweep,
+		sweepScope:       *busSweepScope,
 		logger:           logger,
 		retention: postgres.Retention{
 			Message:   *messageRetention,
 			Persisted: *persistedRetention,
 		},
-		persisted: persistedNamespaces(file.Namespaces),
+		persisted:   persistedNamespaces(file.Namespaces),
+		bindOnWrite: *publishBindOnWrite,
 		batching: postgres.Batching{
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
 			LingerMax: *publishLingerMax,
+			LingerMin: *publishLingerMin,
 			QueueMax:  *publishQueueMax,
 		},
 	})
@@ -385,9 +408,10 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	manager := core.NewManagerWithOptions(store, core.Options{
-		IdleTimeout: *channelIdleTimeout,
-		Metrics:     m,
-		Logger:      logger,
+		IdleTimeout:      *channelIdleTimeout,
+		Metrics:          m,
+		Logger:           logger,
+		WriteOnlyPublish: !*publishBindOnWrite,
 	})
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
@@ -810,20 +834,23 @@ type clusterOptions struct {
 	notifyWindow     time.Duration
 	notifyMaxPending int
 	sweepInterval    time.Duration
+	sweepScope       string
 	logger           *logging.Logger
 	retention        postgres.Retention        // log retention classes (DESIGN.md §6.3)
 	batching         postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted        func(channel string) bool // persisted-namespace resolver
+	bindOnWrite      bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 }
 
 // options returns the postgres.Options every bus shares.
 func (c clusterOptions) options() postgres.Options {
 	return postgres.Options{
-		DSN:       c.dsn,
-		Logger:    c.logger,
-		Retention: c.retention,
-		Persisted: c.persisted,
-		Batching:  c.batching,
+		DSN:         c.dsn,
+		Logger:      c.logger,
+		Retention:   c.retention,
+		Persisted:   c.persisted,
+		Batching:    c.batching,
+		BindOnWrite: c.bindOnWrite,
 	}
 }
 
@@ -842,6 +869,9 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 	case "cluster":
 		if cluster.dsn == "" {
 			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
+		}
+		if _, err := postgres.ParseSweepScope(cluster.sweepScope); err != nil {
+			return nil, fmt.Errorf("invalid --bus-sweep-scope: %w", err)
 		}
 		switch cluster.bus {
 		case postgres.BusPGNotify:
@@ -862,6 +892,7 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 				cluster.logger.Warn(msg)
 			}
 			opts.SweepInterval = cluster.sweepInterval
+			opts.SweepScope = cluster.sweepScope
 			return openPostgres(ctx, opts)
 		case postgres.BusNATS:
 			if cluster.natsURL == "" {
@@ -872,6 +903,7 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 			opts.NATSURL = cluster.natsURL
 			opts.NATSInlineMaxBytes = cluster.natsInlineMax
 			opts.SweepInterval = cluster.sweepInterval
+			opts.SweepScope = cluster.sweepScope
 			return openPostgres(ctx, opts)
 		default:
 			return nil, fmt.Errorf("unknown --bus %q (valid: %s, %s, %s)", cluster.bus, postgres.BusPGNotify, postgres.BusPostgres, postgres.BusNATS)

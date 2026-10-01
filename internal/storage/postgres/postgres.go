@@ -124,7 +124,7 @@ const fixtureNodeID = "__fixtures__"
 // DefaultPostgresSweepInterval is the postgres bus's default watermark
 // sweep interval: the safety net that delivers a write whose coalesced
 // wake-up was lost (DESIGN.md §7.2).
-const DefaultPostgresSweepInterval = 2 * time.Second
+const DefaultPostgresSweepInterval = 30 * time.Second
 
 // postgresSweepDefault and natsSweepDefault are the sweep intervals Open
 // uses when Options.SweepInterval is zero. Package vars so integration
@@ -189,6 +189,12 @@ type Options struct {
 	// DefaultNATSSweepInterval.
 	SweepInterval time.Duration
 
+	// SweepScope selects the bound channels the watermark sweep reads
+	// (DESIGN.md §7.2): SweepSubscribed, only those whose appender reports
+	// a subscriber on this node (storage.SubscriberReporter), or
+	// SweepBound, every bound channel. Empty means SweepSubscribed.
+	SweepScope string
+
 	// Retention configures how long the message log keeps each class of
 	// channel (DESIGN.md §6.3). The zero value applies the defaults.
 	Retention Retention
@@ -202,6 +208,16 @@ type Options struct {
 	// §6.3). The zero value (Lanes 0) commits every publish in its own
 	// transaction; the server enables 4 lanes by default.
 	Batching Batching
+
+	// BindOnWrite restores how channel rows were made before the
+	// write-only publish path (the server's --publish-bind-on-write,
+	// DESIGN.md §6.3): every bind runs ensure_channel, and a batched
+	// publish through a store that has not seen its row creates the row
+	// in a statement of its own before it is queued. False (the default)
+	// leaves a missing row to the batch transaction's publish_batch_lock
+	// and lets a bind read a row this node knows exists (rowCache)
+	// without ensure_channel.
+	BindOnWrite bool
 
 	// shard is this Storage's place in a shard list, set by OpenSharded
 	// (DESIGN.md §6.4). The zero value is a lone Storage.
@@ -222,6 +238,12 @@ type Storage struct {
 	metrics   *retentionMetrics
 	lanes     *laneSet // publish batching; nil when off (§6.3)
 	wmetrics  *writeMetrics
+	// bindOnWrite is Options.BindOnWrite; rows remembers channels known to
+	// have a row (nil when bindOnWrite). ensureCalls and rowReads count the
+	// binds that ran ensure_channel and those that read a known row.
+	bindOnWrite           bool
+	rows                  *rowCache
+	ensureCalls, rowReads atomic.Uint64
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
 	clockOffset atomic.Int64
@@ -237,6 +259,7 @@ type Storage struct {
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
+	sweepAll                    bool          // sweep every bound channel, not only subscribed ones
 	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
 
 	mu       sync.RWMutex
@@ -272,6 +295,10 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		if mode, err = ParseNotifyMode(string(opts.NotifyMode)); err != nil {
 			return nil, fmt.Errorf("storage/postgres: %w", err)
 		}
+	}
+	sweepScope, err := ParseSweepScope(opts.SweepScope)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	if busKind == BusNATS && opts.NATSURL == "" {
 		return nil, errors.New("storage/postgres: the NATS bus requires a NATS URL")
@@ -341,11 +368,13 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		reconnectBase: listenReconnectBaseDelay,
 		reconnectMax:  listenReconnectMaxDelay,
 		sweepInterval: opts.SweepInterval,
+		sweepAll:      sweepScope == SweepBound,
 		timing:        currentChainTiming(),
 		retention:     opts.Retention.resolve(),
 		persisted:     persisted,
 		metrics:       newRetentionMetrics(),
 		wmetrics:      newWriteMetrics(),
+		bindOnWrite:   opts.BindOnWrite,
 		channels:      make(map[string]*channelStore),
 		reconcileCh:   make(chan struct{}, 1),
 		loopCtx:       loopCtx,
@@ -414,6 +443,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if batching.enabled() {
 		s.lanes = newLaneSet(batching, s, s.wmetrics)
 	}
+	if !s.bindOnWrite {
+		s.rows = newRowCache(rowCacheSize)
+	}
 
 	s.wg.Add(3)
 	go s.presenceLeaseBumpLoop(loopCtx)
@@ -430,8 +462,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 //
 // Binding with a non-nil appender first puts the bus subscription in
 // place (Bus.bind: a no-op for pgnotify, whose one LISTEN covers every
-// channel; a LISTEN or a NATS subscription otherwise), then upserts the
-// channels row via ensure_channel (creating it with a fresh seed serial
+// channel; a LISTEN or a NATS subscription otherwise), then reads the
+// channels row (channelRow: a plain read of a row this node knows
+// exists, else ensure_channel, which creates it with a fresh seed serial
 // if absent) and hands the resulting channelSerial — the watermark — to
 // appender.Initialize before this call returns. Because the
 // subscription is in effect before the read, a cm committed after it
@@ -470,9 +503,9 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("registered")
 	}
-	var current, initial string
-	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
-		return fail(fmt.Errorf("storage/postgres: ensure_channel: %w", err))
+	current, initial, err := s.channelRow(ctx, name)
+	if err != nil {
+		return fail(err)
 	}
 	cs.rowEnsured.Store(true)
 	if hook := channelBindHook.Load(); hook != nil {
@@ -493,6 +526,55 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 		s.bus.unbind(cs)
 	}
 	return cs, nil
+}
+
+// channelRow returns the channel's current and initial serial for a
+// bind, creating its row if absent. A row this node knows exists
+// (rowCache) is read with a plain SELECT: no row version is written and
+// no row lock is waited for, which matters for a channel another
+// transaction is publishing on. Otherwise ensure_channel creates or
+// touches the row. Either read happens after the bus subscription is in
+// place, and a publish that commits after it is announced on the bus, so
+// the bind misses nothing whichever read it uses (DESIGN.md §7.2).
+func (s *Storage) channelRow(ctx context.Context, name string) (current, initial string, err error) {
+	if s.rows != nil && s.rows.has(name) {
+		err := s.pool.QueryRow(ctx, `SELECT channel_serial, initial_channel_serial FROM channels WHERE name = $1`, name).Scan(&current, &initial)
+		if err == nil {
+			s.rowReads.Add(1)
+			return current, initial, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", "", fmt.Errorf("storage/postgres: read channel row: %w", err)
+		}
+		// Not there after all (a test database reset under a live node):
+		// create it.
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
+		return "", "", fmt.Errorf("storage/postgres: ensure_channel: %w", err)
+	}
+	s.ensureCalls.Add(1)
+	s.rememberRow(name)
+	return current, initial, nil
+}
+
+// rememberRow records that name has a channels row.
+func (s *Storage) rememberRow(name string) {
+	if s.rows != nil {
+		s.rows.add(name)
+	}
+}
+
+// UnboundChannel returns a store for publishing on name without binding
+// it (storage.UnboundPublisher, DESIGN.md §6.3): no appender, no bus
+// subscription, no entry in the channel map, so nothing for the sweep to
+// read or for eviction to release. Its publishes go through the same
+// lanes and bus hooks as a bound store's: the bus announces each one to
+// the other nodes, and the publisher fast path delivers it to this
+// node's binding of the channel if one exists by then. A publish on a
+// channel with no row yet creates the row inside its batch transaction
+// (publish_batch_lock), so a cold channel costs no extra round trip.
+func (s *Storage) UnboundChannel(name string) storage.ChannelStore {
+	return s.newChannelStore(name, nil)
 }
 
 // Channel and Release for the same name are not meant to run
@@ -538,6 +620,7 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		timing:   s.timing,
 		stats:    &s.stats,
 	}
+	cs.preInsertRow, cs.rows = s.bindOnWrite, s.rows
 	if s.busKind == BusPostgres {
 		cs.pgChan = pgChannelName(s.namespace, name)
 	}
@@ -1008,12 +1091,17 @@ type channelStore struct {
 	persisted bool
 	// lanes is the storage's publish batcher, nil when batching is off
 	// (DESIGN.md §6.3); rowEnsured records that this channel's channels
-	// row is known to exist, so a batch never has to create it.
-	lanes      *laneSet
-	rowEnsured atomic.Bool
-	retention  time.Duration
-	clock      *atomic.Int64
-	floorMin   string
+	// row is known to exist. preInsertRow (Options.BindOnWrite) makes a
+	// batched publish create a missing row in its own statement before it
+	// is queued, so the batch never has to; otherwise publish_batch_lock
+	// creates it inside the batch.
+	lanes        *laneSet
+	rowEnsured   atomic.Bool
+	preInsertRow bool
+	rows         *rowCache // the storage's known-row cache (nil under BindOnWrite)
+	retention    time.Duration
+	clock        *atomic.Int64
+	floorMin     string
 
 	// hwmMu guards lastSeen, the highest channel_serial delivered to
 	// appender (seeded with the bind-time watermark). It is the
@@ -1214,6 +1302,9 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 
 	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindMessage, rows: rows}); err != nil {
 		return nil, false, err
+	}
+	if cs.rows != nil {
+		cs.rows.add(cs.name) // advance_channel_serial made or found the row
 	}
 	return cm, false, nil
 }

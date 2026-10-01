@@ -41,9 +41,9 @@ type File struct {
 	// Bus selects cluster mode's cross-node bus, "pgnotify", "postgres"
 	// or "nats" (DESIGN.md §7.2); NATSURL and NATSInlineMaxBytes
 	// configure the nats bus; the PostgresNotify* keys configure the
-	// postgres bus; BusSweepInterval the chaining buses' safety-net
-	// sweep. Durations are strings, like ShutdownGrace; a zero int means
-	// absent.
+	// postgres bus; BusSweepInterval and BusSweepScope the chaining
+	// buses' safety-net sweep. Durations are strings, like ShutdownGrace;
+	// a zero int means absent.
 	Bus                      string `toml:"bus"`
 	NATSURL                  string `toml:"nats-url"`
 	NATSInlineMaxBytes       int    `toml:"nats-inline-max-bytes"`
@@ -51,17 +51,23 @@ type File struct {
 	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
 	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`
 	BusSweepInterval         string `toml:"bus-sweep-interval"`
+	BusSweepScope            string `toml:"bus-sweep-scope"`
 	// MessageRetention and PersistedRetention are duration strings (e.g.
 	// "2m", "24h") for the cluster-mode message log's retention classes
 	// (DESIGN.md §6.3, §9).
 	MessageRetention   string `toml:"message-retention"`
 	PersistedRetention string `toml:"persisted-retention"`
 	// Publish batching for the cluster-mode write path (DESIGN.md §6.3,
-	// §9). Zero means absent; publish-linger-max is a duration string.
+	// §9). Zero means absent; publish-linger-max and publish-linger-min
+	// are duration strings.
 	PublishLanes     int    `toml:"publish-lanes"`
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
+	PublishLingerMin string `toml:"publish-linger-min"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
+	// PublishBindOnWrite restores binding a channel on every REST publish
+	// (DESIGN.md §6.3); absent/false keeps the write-only path.
+	PublishBindOnWrite bool `toml:"publish-bind-on-write"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual

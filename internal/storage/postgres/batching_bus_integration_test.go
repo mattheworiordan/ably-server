@@ -60,6 +60,23 @@ func TestBatchedChannelStoreContractEveryBus(t *testing.T) {
 	}
 }
 
+// TestOneLaneLingerChannelStoreContractEveryBus runs the storage contract
+// suite with one lane and a linger floor and cap (--publish-lanes=1
+// --publish-linger-min=2ms --publish-linger-max=10ms), the batch-depth
+// settings the scale runs compare (DESIGN.md §6.3), on every bus.
+func TestOneLaneLingerChannelStoreContractEveryBus(t *testing.T) {
+	c := pgtest.Start(t)
+	for name, opts := range batchedBuses(t) {
+		t.Run(name, func(t *testing.T) {
+			storagetest.RunChannelStoreTests(t, func(t *testing.T) storage.Storage {
+				o := opts(c.FreshSchemaDSN(t))
+				o.Batching = Batching{Lanes: 1, LingerMin: 2 * time.Millisecond, LingerMax: 10 * time.Millisecond}
+				return openOpts(t, o)
+			})
+		})
+	}
+}
+
 // orderAppender records every delivered serial and whether any arrived
 // out of order or twice.
 type orderAppender struct {
@@ -369,10 +386,11 @@ func TestBatchedLostCommitReplyStillDelivers(t *testing.T) {
 	t.Fatal("remote node did not receive the recovered publish within 2s (the sweep is an hour away)")
 }
 
-// TestPublishBatchLockCreatesMissingRow drives the function's fallback
-// for a channel with no row (which the Go path never reaches, since it
-// creates the row before queueing): the row is created, locked and
-// advanced, and the cm's prev is the new row's seed serial.
+// TestPublishBatchLockCreatesMissingRow drives the function's path for a
+// channel with no row (the default Go path's first publish on a cold
+// channel; under BindOnWrite the row is made before queueing instead):
+// the row is created, locked and advanced, and the cm's prev is the new
+// row's seed serial.
 func TestPublishBatchLockCreatesMissingRow(t *testing.T) {
 	c := pgtest.Start(t)
 	ctx := context.Background()
