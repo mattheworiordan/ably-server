@@ -1137,10 +1137,11 @@ type channelStore struct {
 	gapTimer       *time.Timer
 	filling        bool // a gap fill is reading the log
 	gapBackoff     time.Duration
+	overflowArmed  bool   // a forced fill is armed after a hold overflow
 	sweptWatermark string // the channel's watermark at the previous sweep
 
 	// Delivery counters for tests (guarded by hwmMu).
-	delivered, duplicates, held, gapFills, sweepCatchUps int
+	delivered, duplicates, held, gapFills, sweepCatchUps, holdOverflows int
 
 	// Bus-specific state: the nats bus's subscription (guarded by subMu)
 	// and the postgres bus's delivery queue.

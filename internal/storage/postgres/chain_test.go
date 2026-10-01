@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func newTestChain(t *testing.T) (*channelStore, *chainRecorder) {
 		appender: rec,
 		logger:   logging.Default(),
 		done:     done,
-		timing:   chainTiming{gapDelay: time.Hour, gapMaxDelay: time.Hour, fetchTimeout: time.Second},
+		timing:   chainTiming{gapDelay: time.Hour, gapMaxDelay: time.Hour, fetchTimeout: time.Second, overflowDelay: time.Hour},
 	}
 	t.Cleanup(func() {
 		cs.hwmMu.Lock()
@@ -264,5 +265,66 @@ func TestChainHoldTimeSpansAReplacedOffer(t *testing.T) {
 	}
 	if hold := cs.stats.stageSnapshot()["hold"]; hold.Count != 1 || hold.Sum < 0.03 {
 		t.Errorf("hold = %d observations, %vs; want 1 of at least the 30 ms since the pointer", hold.Count, hold.Sum)
+	}
+}
+
+// A channel's hold map is capped at maxPendingHold bodies: past it a cm
+// keeps its serial and loses its body, and a gap fill is forced, which
+// delivers every cm from the log in order (DESIGN.md §7.2).
+func TestChainHoldMapIsCappedAndOverflowForcesAGapFill(t *testing.T) {
+	cs, rec := newTestChain(t)
+	cs.seed("s00000")
+	name := func(i int) string { return fmt.Sprintf("s%05d", i) }
+
+	// s00001 never arrives; everything after it is held.
+	total := maxPendingHold + 50
+	for i := 2; i <= total+1; i++ {
+		cs.deliverChained(ev(name(i), name(i-1)))
+	}
+	if len(rec.serials) != 0 {
+		t.Fatalf("delivered %d cms ahead of the missing predecessor", len(rec.serials))
+	}
+
+	cs.hwmMu.Lock()
+	bodies, serialsOnly := 0, 0
+	for _, e := range cs.pending {
+		if e.cm != nil {
+			bodies++
+		} else {
+			serialsOnly++
+		}
+	}
+	forced, overflows := cs.overflowArmed, cs.holdOverflows
+	cs.hwmMu.Unlock()
+	if bodies != maxPendingHold {
+		t.Errorf("held bodies = %d, want the cap %d", bodies, maxPendingHold)
+	}
+	if serialsOnly != 50 || overflows != 50 {
+		t.Errorf("serial-only holds = %d, overflows = %d, want 50 each", serialsOnly, overflows)
+	}
+	if !forced || cs.gapTimer == nil {
+		t.Errorf("overflowArmed=%v timer=%v, want a forced gap fill armed", forced, cs.gapTimer != nil)
+	}
+
+	// The forced fill reads the range from the log (every serial, bodies
+	// included): each cm is delivered exactly once, in order.
+	var log []*protocol.ChannelMessage
+	for i := 1; i <= total+1; i++ {
+		log = append(log, ev(name(i), name(i-1)).cm)
+	}
+	cs.hwmMu.Lock()
+	cs.applyRangeLocked(log, name(total+1))
+	left := len(cs.pending)
+	cs.hwmMu.Unlock()
+	if len(rec.serials) != total+1 {
+		t.Fatalf("delivered %d cms, want %d", len(rec.serials), total+1)
+	}
+	for i, got := range rec.serials {
+		if got != name(i+1) {
+			t.Fatalf("delivery %d = %s, want %s", i, got, name(i+1))
+		}
+	}
+	if left != 0 {
+		t.Errorf("pending after the fill = %d, want 0", left)
 	}
 }

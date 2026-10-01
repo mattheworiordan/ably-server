@@ -51,6 +51,13 @@ var (
 // caught up. A package var so tests can force paging.
 var rangePageSize = 500
 
+// maxPendingHold caps the cms a channel's delivery point holds with a
+// body (DESIGN.md §7.2). Held cms are normally bounded by publish rate
+// times gapFillDelay; the cap bounds them against a flood of out-of-order
+// bus messages. Past it a cm keeps its serial and loses its body, and a
+// gap fill is forced, which reads the bodies from the log.
+const maxPendingHold = 1024
+
 // reconcileChunk caps the channels one batched reconcile query covers.
 const reconcileChunk = 500
 
@@ -89,10 +96,16 @@ var sweepNamesHook atomic.Pointer[func(names []string)]
 // of its channelStores) runs with.
 type chainTiming struct {
 	gapDelay, gapMaxDelay, fetchTimeout time.Duration
+	// overflowDelay is how long a forced gap fill (a hold overflow,
+	// maxPendingHold) waits to coalesce a burst before reading the log.
+	overflowDelay time.Duration
 }
 
 func currentChainTiming() chainTiming {
-	return chainTiming{gapDelay: gapFillDelay, gapMaxDelay: gapFillMaxDelay, fetchTimeout: busFetchTimeout}
+	return chainTiming{
+		gapDelay: gapFillDelay, gapMaxDelay: gapFillMaxDelay, fetchTimeout: busFetchTimeout,
+		overflowDelay: min(gapFillDelay, 10*time.Millisecond),
+	}
 }
 
 // eventSource records which path offered a cm to the delivery point, so
@@ -247,6 +260,22 @@ func (cs *channelStore) holdLocked(ev busEvent) {
 			ev.heldAt = old.heldAt
 		}
 	}
+	if _, exists := cs.pending[ev.prev]; !exists && len(cs.pending) >= maxPendingHold {
+		// Over the cap: keep the serial (the gap fill's upper bound) but
+		// not the body, and read the range from the log now rather than
+		// after gapFillDelay. The entry itself is small and the forced
+		// fill drains it.
+		ev.cm = nil
+		cs.holdOverflows++
+		if cs.holdOverflows == 1 {
+			cs.logger.Warn("storage/postgres: channel hold map full; dropping bodies and forcing a gap fill", "channel", cs.name, "cap", maxPendingHold)
+		}
+		if !cs.overflowArmed {
+			cs.overflowArmed = true
+			cs.stopGapFillLocked()
+			cs.armGapFillLocked(cs.timing.overflowDelay)
+		}
+	}
 	cs.pending[ev.prev] = ev
 }
 
@@ -371,6 +400,7 @@ func (cs *channelStore) stopGapFillLocked() {
 func (cs *channelStore) fillGap() {
 	cs.hwmMu.Lock()
 	cs.gapTimer = nil
+	cs.overflowArmed = false
 	if cs.closed() || cs.released || !cs.seeded || len(cs.pending) == 0 || cs.filling {
 		cs.hwmMu.Unlock()
 		return

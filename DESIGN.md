@@ -1789,7 +1789,14 @@ The `postgres` and `nats` buses share one delivery point
   read from the log (all kinds, serial order, a page at a time) and
   delivered. The mark's lock is held across `Appender.Append`, so a
   Channel sees every cm once and in serial order whichever path
-  delivered it.
+  delivered it. Held cms are bounded: a channel holds at most 1,024 with
+  a body (`maxPendingHold`). Normally the hold is bounded by publish rate
+  times 100 ms, but a flood of out-of-order bus messages (a hostile or
+  buggy sender; the bus is a trusted network) could hold 256 KiB bodies
+  without limit. Past the cap a cm keeps its serial and loses its body,
+  and a gap fill is forced after about 10 ms; it reads the range, bodies
+  included, from the log, so nothing is lost, only read from Postgres
+  instead of the bus.
 - **Reconcile.** After the bus connection comes back, every bound channel
   is caught up from its mark, 500 channels per query.
 - **Sweep.** Every sweep interval (`--bus-sweep-interval`, default 30 s
