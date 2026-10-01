@@ -788,15 +788,19 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	}
 	if rec.Plan.SampledStreams > 0 {
 		// The tail check is the only one that sees a stream an attachment
-		// received nothing from. It skips streams whose last
-		// acknowledgement is within the margin of the attach, so a run
-		// where most streams were skipped proved little.
+		// received nothing from. It skips a stream on a subscriber whose last
+		// acknowledgement is within the margin of that subscriber's latest
+		// attach (a late churn re-attach, a slow stream): legitimately, so the
+		// floor is 50%, not more (bench/aws/README.md says why). The row
+		// prints the fraction and what was skipped for which reason.
 		t := res.Tail
 		cov := float64(t.StreamsChecked) / float64(rec.Plan.SampledStreams)
+		other := max(int64(rec.Plan.SampledStreams)-t.StreamsChecked-t.StreamsSkippedMargin, 0)
 		add(Check{Name: "tail check coverage",
-			Value: fmt.Sprintf("%d of %d sampled streams checked (%.0f%%); %d (subscriber, stream) pairs skipped: last acknowledgement within the %s margin of the attach",
-				t.StreamsChecked, rec.Plan.SampledStreams, cov*100, t.SkippedMargin, t.Margin),
-			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinTailCoverage*100), Pass: t.StreamsChecked > 0 && cov >= spec.MinTailCoverage, Gating: !faultRelaxed(rec)})
+			Value: fmt.Sprintf("%d of %d sampled streams checked (%.1f%%); skipped %d for the margin (last acknowledgement within %s of a late attach), %d with no continuous subscriber or no acknowledgement",
+				t.StreamsChecked, rec.Plan.SampledStreams, cov*100, t.StreamsSkippedMargin, t.Margin, other),
+			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinTailCoverage*100), Pass: t.StreamsChecked > 0 && cov >= spec.MinTailCoverage, Gating: !faultRelaxed(rec),
+			Note: fmt.Sprintf("%d (subscriber, stream) pairs skipped for the margin", t.SkippedMargin)})
 	}
 	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		// The attach-point check settles each attachment's first message

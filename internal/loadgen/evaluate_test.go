@@ -548,9 +548,33 @@ func TestEvaluateTailCoverageThresholdAndFault(t *testing.T) {
 			t.Fatalf("a successful fault run does not gate tail coverage: %v", failing(rec))
 		}
 	}
-	if !strings.Contains(rec.Markdown(), "1 (subscriber, stream) pairs skipped") {
-		t.Fatalf("skipped pairs and the reason must be printed:\n%s", rec.Markdown())
+	md := rec.Markdown()
+	if !strings.Contains(md, "0 of 1 sampled streams checked (0.0%)") || !strings.Contains(md, "skipped 1 for the margin") ||
+		!strings.Contains(md, "1 (subscriber, stream) pairs skipped for the margin") {
+		t.Fatalf("the fraction and the skips by reason must be printed:\n%s", md)
 	}
+}
+
+func TestTailCoverageRowSplitsSkipsByReason(t *testing.T) {
+	// Of four planned streams: one checked, none skipped for the margin,
+	// three never seen by a continuous subscriber.
+	rec := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Plan.SampledStreams = 4 })
+	var row Check
+	for _, c := range rec.Checks {
+		if c.Name == "tail check coverage" {
+			row = c
+		}
+	}
+	if !strings.Contains(row.Value, "1 of 4 sampled streams checked (25.0%)") || !strings.Contains(row.Value, "skipped 0 for the margin") ||
+		!strings.Contains(row.Value, "3 with no continuous subscriber or no acknowledgement") {
+		t.Fatalf("%q", row.Value)
+	}
+	if row.Pass || !row.Gating {
+		t.Fatalf("25%% is under the 50%% floor: %+v", row)
+	}
+	// Exactly half passes: the floor is 50%.
+	rec = evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Plan.SampledStreams = 2 })
+	mustNotFail(t, rec, "tail check coverage")
 }
 
 // presenceFixtureRecord is a presence-only run record that passed its

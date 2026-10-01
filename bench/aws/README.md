@@ -478,9 +478,25 @@ latest attach, because an attachment made then cannot be held to it. A
 check that skipped most streams proved little, so outside a fault run the
 run fails unless it checked at least one and at least 50%
 (`min_tail_coverage`) of the plan's sampled streams (streams on sampled
-channels that have subscribers). `summary.md` prints the streams checked,
-the planned count and the (subscriber, stream) pairs skipped for the
-margin.
+channels that have subscribers). `summary.md` gives the check its own
+row, "tail check coverage": streams checked of planned with the
+fraction, the streams skipped for the margin, the rest (no continuous
+subscriber, or no acknowledgement), and the (subscriber, stream) pairs
+skipped for the margin.
+
+*Why 50% and not more.* The margin skips streams legitimately. Channel
+churn re-attaches subscribers all through the hold, so a subscriber's
+latest attach is often late; a slow stream (the long tail publishes about
+once per 100 s per channel) then has its last acknowledgement before that
+attach plus the margin and cannot be held to it, although nothing is
+wrong. In the committed shapes most streams are slow, so a high floor
+would fail healthy runs and teach people to loosen it. The floor is there
+to catch a check that covered nothing or almost nothing, not to measure
+loss: where a stream is checked the check is exact, and the two other
+checks (per attachment, and the attach point) do not depend on the
+margin. If a run's fraction sits near the floor, read the row: a large
+margin count is churn, a large "no continuous subscriber" count is
+attachments that never stayed up.
 
 **Unsampled channels.** `sample_percent` of channels (plus the first of
 every class) get the per-message checks; the other 95% in shapes F, M and
