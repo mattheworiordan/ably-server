@@ -16,8 +16,13 @@ import (
 )
 
 // Publish batching defaults (DESIGN.md §6.3 "Publish batching").
+// DefaultPublishLanes is 2, the value the measured write results used:
+// on one primary, 10 nodes committed 51.9k writes/s at 2 lanes against
+// 38.0k at 4 and 46.6k at 1 (capped by each node's one lane), and the best
+// value falls as nodes are added (lanes x nodes near 20 committers per
+// primary; §6.3).
 const (
-	DefaultPublishLanes     = 4
+	DefaultPublishLanes     = 2
 	DefaultPublishBatchMax  = 200
 	DefaultPublishLingerMax = 5 * time.Millisecond
 	DefaultPublishQueueMax  = 10000

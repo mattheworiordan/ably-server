@@ -1440,7 +1440,7 @@ Series (§10): `ably_storage_partitions_created_total{table}`,
 alike) can be committed together with other publishes of the same node in
 one transaction. This is how one Postgres primary carries tens of
 thousands of writes a second: the cost of a commit is shared by every
-publish in it. It is on by default (`--publish-lanes=4`) with every bus
+publish in it. It is on by default (`--publish-lanes=2`) with every bus
 (§7.2); `--publish-lanes=0` commits every publish in its own transaction.
 A presence operation (`StorePresence`, §12.2) joins the same lanes and
 batches, so ENTERs and LEAVEs from
@@ -1449,7 +1449,8 @@ batch, not once per operation (§12.5). Mutations and annotations are not
 batched.
 
 The policy is leading edge, not a fixed window. A node has
-`--publish-lanes` lanes (default 4); a channel's name hashes
+`--publish-lanes` lanes (default 2, see "How many lanes" below); a
+channel's name hashes
 to one lane, so all of a node's publishes to one channel share a lane and
 keep their order. Per lane:
 
@@ -1624,6 +1625,19 @@ and so none survives:
   discontinuity is signalled because the log read returns the cm.
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
+
+**How many lanes.** Each lane of each node is a committer on the
+primary, so the lane count is a cluster setting as much as a node one:
+more committers than the primary needs only make each batch shallower.
+Measured on one primary in the scale runs: with 10 nodes, 4 lanes
+committed 38.0k writes/s, 2 lanes 51.9k and 1 lane 46.6k (capped per
+node: one lane is one commit at a time); with 20 nodes, 2 lanes
+committed 43.1k. So the right value falls as nodes are added. The
+default is 2, the value every quoted write result used. Rule of thumb:
+keep lanes x nodes near 20 committers per primary (a 40-node cluster on
+one primary wants 1 lane per node; with channel sharding, §6.4, count
+per database). Adapting the number of commit slots to the load, which
+would remove the setting, is the proper fix and is not built.
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -2457,7 +2471,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --attachment-seen-max 4096    message serials one attachment remembers for append deltas; oldest evicted (§13.3)
 --message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
 --persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
---publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
+--publish-lanes 2             cluster mode: publish batching lanes; 0 = one transaction per publish; keep lanes x nodes near 20 per primary (§6.3)
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
@@ -2538,7 +2552,8 @@ in a warning at startup.
   `ably_publish_linger_min_seconds`: an idle lane always commits its first
   publish at once, the leading edge that was its `0s` default (§6.3
   "Publish batching"). A linger floor gave no measured gain in the scale
-  runs; the batch depth it aimed at is set by the lane count instead.
+  runs; the batch depth it aimed at is set by the lane count instead
+  (§6.3 "How many lanes").
 - `--presence-sync-source` (`presence-sync-source`): a node always serves
   an attach's presence `SYNC` from its own member set, the `local`
   default (§12.4), and reads the store only when seeding that set fails
@@ -3158,8 +3173,8 @@ into it transactionally and `Members` reads it (§6). Per backend:
   lease-lapse re-entry or a server-synthesised LEAVE written around a
   full lane) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
-  per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
-  16 when batching is off; server-synthesised LEAVEs are exempt (in the
+  per database (`--presence-max-inflight`, default 4 x `--publish-lanes`
+  (8 at the default 2 lanes), 16 when batching is off; server-synthesised LEAVEs are exempt (in the
   lanes they have a bound of their own, §6.3), so a mass disconnect with
   batching off can still hold
   many pool connections with LEAVEs, as before the bound existed): one

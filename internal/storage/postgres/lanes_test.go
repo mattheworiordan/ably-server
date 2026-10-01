@@ -577,3 +577,25 @@ func TestLaneConfigGauges(t *testing.T) {
 		}
 	}
 }
+
+// TestPresenceMaxInflightDefaults: the bound on presence writes outside
+// the lanes is 4 per lane, a fixed 16 with batching off (not a multiple
+// of the lane default, so changing that default does not move it), an
+// explicit value as given, and none when negative (DESIGN.md §12.5).
+func TestPresenceMaxInflightDefaults(t *testing.T) {
+	for _, c := range []struct {
+		n    int
+		b    Batching
+		want int
+	}{
+		{0, Batching{}, 16},
+		{0, Batching{Lanes: DefaultPublishLanes}, 4 * DefaultPublishLanes},
+		{0, Batching{Lanes: 3}, 12},
+		{5, Batching{Lanes: 3}, 5},
+		{-1, Batching{Lanes: 3}, 0},
+	} {
+		if got := presenceMaxInflight(c.n, c.b); got != c.want {
+			t.Errorf("presenceMaxInflight(%d, lanes %d) = %d, want %d", c.n, c.b.Lanes, got, c.want)
+		}
+	}
+}

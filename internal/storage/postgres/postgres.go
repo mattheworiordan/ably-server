@@ -216,7 +216,7 @@ type Options struct {
 
 	// Batching configures leading-edge publish batching (DESIGN.md
 	// §6.3). The zero value (Lanes 0) commits every publish in its own
-	// transaction; the server enables 4 lanes by default.
+	// transaction; the server enables DefaultPublishLanes (2) by default.
 	Batching Batching
 
 	// PresenceMaxInflight bounds the presence writes this Storage runs
@@ -224,8 +224,8 @@ type Options struct {
 	// §12.5), so a convoy on one room's row lock cannot hold the whole
 	// pool; a presence write beyond it fails at once with
 	// storage.ErrOverloaded. Zero means DefaultPresenceInflightPerLane x
-	// Batching.Lanes (x DefaultPublishLanes when batching is off);
-	// negative means no bound.
+	// Batching.Lanes, or DefaultPresenceInflightNoLanes when batching is
+	// off; negative means no bound.
 	PresenceMaxInflight int
 
 	// OnPresenceLeaseLapse, when set, is called after this node finds its
@@ -750,9 +750,15 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 	return cs
 }
 
-// DefaultPresenceInflightPerLane is the default bound on unbatched
-// presence writes per publish lane (Options.PresenceMaxInflight).
-const DefaultPresenceInflightPerLane = 4
+// DefaultPresenceInflightPerLane is the default bound on presence writes
+// outside the lanes per publish lane, and DefaultPresenceInflightNoLanes
+// the default with batching off (Options.PresenceMaxInflight). The
+// second is a number of its own, not a multiple of DefaultPublishLanes,
+// so the lane default does not move it.
+const (
+	DefaultPresenceInflightPerLane = 4
+	DefaultPresenceInflightNoLanes = 16
+)
 
 // presenceMaxInflight resolves Options.PresenceMaxInflight: the bound
 // on presence writes committed outside the lanes, or 0 for none.
@@ -765,7 +771,7 @@ func presenceMaxInflight(n int, b Batching) int {
 	case b.enabled():
 		return DefaultPresenceInflightPerLane * b.Lanes
 	default:
-		return DefaultPresenceInflightPerLane * DefaultPublishLanes
+		return DefaultPresenceInflightNoLanes
 	}
 }
 

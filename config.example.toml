@@ -121,7 +121,10 @@
 # ABLY_SERVER_PUBLISH_LANES=0.
 # (env: ABLY_SERVER_PUBLISH_LANES, ABLY_SERVER_PUBLISH_BATCH_MAX,
 # ABLY_SERVER_PUBLISH_LINGER_MAX, ABLY_SERVER_PUBLISH_QUEUE_MAX).
-# publish-lanes = 4
+# Each lane of each node is a committer on the primary: keep lanes x nodes
+# near 20 per primary (the default 2 suits about 10 nodes; DESIGN.md §6.3
+# "How many lanes").
+# publish-lanes = 2
 # publish-batch-max = 200
 # publish-linger-max = "5ms"
 # publish-queue-max = 10000
