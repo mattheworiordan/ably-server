@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -272,9 +273,20 @@ func (b *pgNotifyBus) beforeCommit(ctx context.Context, tx pgx.Tx, cs *channelSt
 // subscribers, arrives via the NOTIFY round-trip (DESIGN.md §7.2).
 func (b *pgNotifyBus) afterCommit(*channelStore, *protocol.ChannelMessage, string) {}
 
-// ready is always nil: as before the bus seam, readiness is the pool
-// ping alone (a dropped LISTEN connection redials in the background).
-func (b *pgNotifyBus) ready() error { return nil }
+// errPGNotifyListenDown is ready's answer while the pgnotify bus's
+// LISTEN connection is down (between a drop and its redial), when this
+// node receives no other node's publishes.
+var errPGNotifyListenDown = errors.New("storage/postgres: pgnotify bus LISTEN connection down")
+
+// ready reports the LISTEN connection (DESIGN.md §7.2): not ready while
+// it is down, so /readyz takes the node out of rotation until listenLoop
+// has redialled, as on the postgres bus.
+func (b *pgNotifyBus) ready() error {
+	if !b.connected.Load() {
+		return errPGNotifyListenDown
+	}
+	return nil
+}
 
 func (b *pgNotifyBus) close() {}
 

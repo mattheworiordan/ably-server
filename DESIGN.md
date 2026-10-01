@@ -133,7 +133,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres` and `--bus=pgnotify`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -2196,7 +2196,11 @@ chain repairs from the log. `ably_bus_receive_queue_depth` is the number
 of messages waiting across the queues. The queues bound messages, not
 bytes: at most 16 × 8,192 messages are buffered, each no larger than
 `--nats-inline-max-bytes` (a pointer is small), against nats.go's
-default of 64 MiB per subscription before the fan-in.
+default of 64 MiB per subscription before the fan-in. In bytes that is
+up to about 32 GiB (16 × 8,192 cms at the 256 KiB default inline cap) if
+every buffered cm were at the cap; small cms keep it far lower, and a
+node short of memory should lower `--nats-inline-max-bytes`, which also
+lowers the bound.
 
 `--nats-url` may list the servers of one NATS cluster, comma-separated.
 The client connects to one, learns the others from the cluster, and on a
@@ -2211,10 +2215,11 @@ consumer that NATS drops messages for counts in `ably_bus_drops_total`
 and is repaired the same way.
 
 **Readiness.** In `nats` mode `/readyz` returns 503 while the node has no
-NATS connection, and in `postgres` mode while its LISTEN connection is
-down: the node cannot receive cross-node deliveries, so it leaves
-rotation until it reconnects and reconciles. `pgnotify` reports ready
-while the pool pings, as before.
+NATS connection, and in `postgres` and `pgnotify` mode while its LISTEN
+connection is down: the node cannot receive cross-node deliveries, so it
+leaves rotation until it reconnects. On every bus the reconnect then
+reconciles the bound channels; the node is ready again from the
+reconnect, as it was before the outage, while that reconcile runs.
 
 #### Release and re-bind
 
@@ -2888,10 +2893,8 @@ should route on. In `memory` and `disk` mode it is always 200. In
 these hold, each within the probe's 2 s:
 
 - the Postgres pool answers a ping;
-- the bus is connected: the LISTEN connection for `--bus=postgres`, the
-  NATS connection for `--bus=nats` (§7.2); `pgnotify` does not gate
-  readiness on its LISTEN connection, which re-dials and reconciles on
-  its own;
+- the bus is connected: the LISTEN connection for `--bus=postgres` and
+  `--bus=pgnotify`, the NATS connection for `--bus=nats` (§7.2);
 - every publish lane is completing its commits: no lane's oldest queued
   publish has waited longer than one commit attempt (15 s), and no batch
   has been committing for longer than two (a commit and its retry). A

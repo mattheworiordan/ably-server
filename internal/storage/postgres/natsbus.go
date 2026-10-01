@@ -123,6 +123,11 @@ func natsSubject(prefix, channel string) string {
 // Deployment is the publishing cluster's deployment id (DESIGN.md §11);
 // a receiver drops an envelope of another cluster.
 type natsEnvelope struct {
+	// _msgpack is the msgpack library's array-encoding marker
+	// (as_array): it makes the envelope encode as a positional array
+	// rather than a map of field names. staticcheck reports it as unused
+	// (U1000) since no code reads it; it must stay, or the wire format
+	// changes.
 	_msgpack   struct{} `msgpack:",as_array"`
 	Channel    string
 	Serial     string
