@@ -2462,7 +2462,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only; a comma-separated list of URL DSNs shards channels (§6.4)
 --bus {postgres|nats|pgnotify}  cluster mode cross-node bus (§7.2); default: nats with --nats-url, else postgres
---nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
+--nats-url nats://…           the nats bus's servers (a comma-separated list of one NATS cluster); with --bus unset it selects nats
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
 --nats-creds                  --bus=nats: NATS credentials file (user JWT and NKey seed); nats://user:pass@host URLs also work (§7.2)
 --nats-tls-ca                 --bus=nats: PEM CA the NATS server's certificate chains to; tls:// URLs also work
@@ -2510,15 +2510,15 @@ Configuration may also be supplied via an optional TOML config file
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
-`attachment-seen-max`, `message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`,
-`publish-queue-max`,
-`presence-max-inflight` —
-`shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
-`channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
-retentions and `publish-linger-max` as duration strings, e.g. `"10s"`,
-the sizes and counts as integers). API keys are
-declared as structured
+`attachment-seen-max`, `message-retention`, `persisted-retention`,
+`publish-lanes`, `publish-batch-max`, `publish-linger-max`,
+`publish-queue-max`, `presence-max-inflight` — `shutdown-grace`,
+`postgres-notify-window`, `bus-sweep-interval`, `channel-idle-timeout`,
+`conn-write-timeout`, `http-idle-timeout`, the retentions and
+`publish-linger-max` as duration strings, e.g. `"10s"`, the sizes and
+counts as integers). That every one of these reaches the options the
+server runs with, by flag, env var and file, is a table test
+(`TestSettingsReachOptions`). API keys are declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
 key grants; omitting it grants the full capability, like a `--keys` flag
