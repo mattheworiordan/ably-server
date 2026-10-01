@@ -201,6 +201,9 @@ type PassSpec struct {
 	// MinAttachCoverage: the share of attach claims the publishers'
 	// serial logs must settle (default 0.9), outside a fault run.
 	MinAttachCoverage float64 `toml:"min_attach_coverage" json:"min_attach_coverage"`
+	// MinTailCoverage: the share of the plan's sampled streams the tail
+	// check must have covered (default 0.5), outside a fault run.
+	MinTailCoverage float64 `toml:"min_tail_coverage" json:"min_tail_coverage"`
 }
 
 // DefaultPass returns plan §8's criteria.
@@ -220,6 +223,7 @@ func DefaultPass() PassSpec {
 		MinDeliveryRatioFault: 0.9,
 		MaxLoadDrift:          0.03,
 		MinAttachCoverage:     0.9,
+		MinTailCoverage:       0.5,
 	}
 }
 
@@ -267,6 +271,9 @@ func (p PassSpec) withDefaults() PassSpec {
 	}
 	if p.MinAttachCoverage == 0 {
 		p.MinAttachCoverage = d.MinAttachCoverage
+	}
+	if p.MinTailCoverage == 0 {
+		p.MinTailCoverage = d.MinTailCoverage
 	}
 	return p
 }
@@ -618,7 +625,10 @@ type Totals struct {
 	SampledChannels    int `json:"sampled_channels"`
 	// SampledSubscribed counts the sampled channels that have at least
 	// one subscriber: only those are checked.
-	SampledSubscribed  int     `json:"sampled_subscribed_channels"`
+	SampledSubscribed int `json:"sampled_subscribed_channels"`
+	// SampledStreams counts the publish streams on those channels: what
+	// the tail check can cover.
+	SampledStreams     int     `json:"sampled_streams"`
 	PublishesPerSec    float64 `json:"publishes_per_sec"`
 	RESTPublishesPerS  float64 `json:"rest_publishes_per_sec"`
 	RTPublishesPerSec  float64 `json:"realtime_publishes_per_sec"`
@@ -676,6 +686,9 @@ func (p *Plan) Totals() (Totals, []ClassTotals) {
 				t.SampledChannels++
 				if n > 0 {
 					t.SampledSubscribed++
+					if c.RatePerChannel > 0 {
+						t.SampledStreams += c.StreamCount
+					}
 				}
 			}
 			ct.DeliveriesPerSec += float64(n) * c.RatePerChannel

@@ -476,8 +476,18 @@ type TailResult struct {
 	Checked int64 `json:"checked"`
 	// Lost counts acknowledged messages some continuous subscriber never
 	// received (per subscriber process).
-	Lost     int64       `json:"lost"`
-	Examples []Violation `json:"examples,omitempty"`
+	Lost int64 `json:"lost"`
+	// StreamsChecked counts distinct streams checked on at least one
+	// subscriber process.
+	StreamsChecked int64 `json:"streams_checked"`
+	// SkippedMargin counts (subscriber process, channel, stream) triples
+	// not checked because the stream's last acknowledgement came less
+	// than the margin after the latest continuous attach, so a subscriber
+	// attached then could not be held to it.
+	SkippedMargin int64 `json:"skipped_margin"`
+	// Margin is the margin used.
+	Margin   time.Duration `json:"margin_ns"`
+	Examples []Violation   `json:"examples,omitempty"`
 }
 
 // TailCheck compares publisher stream records with subscriber records
@@ -489,15 +499,19 @@ type TailResult struct {
 // was live for it); publishers and subscribers must share a clock to
 // within margin (chrony on every box).
 func TailCheck(published map[string]map[string]StreamRecord, seen []map[string]*ChannelSeen, margin time.Duration) TailResult {
-	var res TailResult
+	res := TailResult{Margin: margin}
+	type streamKey struct{ ch, pub string }
+	checkedStreams := map[streamKey]bool{}
 	for _, bySub := range seen {
 		for ch, cs := range bySub {
 			streams := published[ch]
 			for pub, rec := range streams {
 				if rec.LastAckedUS < cs.LatestAttachUS+margin.Microseconds() {
+					res.SkippedMargin++
 					continue
 				}
 				res.Checked++
+				checkedStreams[streamKey{ch, pub}] = true
 				got, ok := cs.MinMaxSeq[pub]
 				if !ok {
 					got = -1
@@ -524,6 +538,7 @@ func TailCheck(published map[string]map[string]StreamRecord, seen []map[string]*
 			}
 		}
 	}
+	res.StreamsChecked = int64(len(checkedStreams))
 	return res
 }
 

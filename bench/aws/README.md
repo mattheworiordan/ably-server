@@ -300,8 +300,9 @@ p50 <= 50 ms and p99 <= 250 ms, cross-node where there is such traffic
 (p99 < 100 ms reported as stretch); REST ACK p99 <= 100 ms; connect plus
 attach p99 <= 500 ms at the target churn; zero violations of every kind
 on the sample (including `attach_gap`), with at least 90% of attach
-claims settled (`min_attach_coverage`; reported, not gated, in a fault
-run that succeeded); achieved publish rate >= 95% of offered and offered >=
+claims settled (`min_attach_coverage`) and the tail check covering at
+least 50% of the sampled streams (`min_tail_coverage`), both reported,
+not gated, in a fault run that succeeded; achieved publish rate >= 95% of offered and offered >=
 95% of target (the generator kept up); no rejected publishes;
 connections open at the end of the hold >= 99% of target; deliveries/s
 >= 99% of the plan's (90% in a fault run that ran); the generator's own connections and attachments
@@ -374,6 +375,19 @@ them:
   point later than where it really started delivering, messages in that
   stretch would not be seen as missing. A message published to a sampled
   channel by someone other than a generator stream is ignored.
+
+**Tail check coverage.** The tail check compares each publisher's last
+acknowledged message of a sampled stream with what every subscriber
+process that held a continuous attachment received. It skips a stream on
+a subscriber when the stream's last acknowledgement came less than
+`tail_margin` (1 s, the clock-skew allowance) after that subscriber's
+latest attach, because an attachment made then cannot be held to it. A
+check that skipped most streams proved little, so outside a fault run the
+run fails unless it checked at least one and at least 50%
+(`min_tail_coverage`) of the plan's sampled streams (streams on sampled
+channels that have subscribers). `summary.md` prints the streams checked,
+the planned count and the (subscriber, stream) pairs skipped for the
+margin.
 
 **Unsampled channels.** `sample_percent` of channels (plus the first of
 every class) get the per-message checks; the other 95% in shapes F, M and
@@ -454,6 +468,7 @@ Values are at 1x and full scale. `--multiplier` (1 or 2) and `--scale`
     min_delivery_ratio = 0.99    # deliveries/s measured over planned (the only check on unsampled channels)
     min_delivery_ratio_fault = 0.9  # the same when a fault hook ran and succeeded
     min_attach_coverage = 0.9    # share of attach claims the serial logs must settle
+    min_tail_coverage = 0.5      # share of the plan's sampled streams the tail check must cover
     max_load_drift = 0.03        # generator connections and attachments, hold start to end
 
 `ably-conductor plan` prints the derived connections, attachments,

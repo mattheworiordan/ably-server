@@ -469,6 +469,18 @@ func Evaluate(rec *RunRecord, spec PassSpec) {
 	if res.CheckedMessages == 0 && rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		add(Check{Name: "sample coverage", Value: "0 messages checked", Limit: "> 0", Pass: false, Gating: true})
 	}
+	if rec.Plan.SampledStreams > 0 {
+		// The tail check is the only one that sees a stream an attachment
+		// received nothing from. It skips streams whose last
+		// acknowledgement is within the margin of the attach, so a run
+		// where most streams were skipped proved little.
+		t := res.Tail
+		cov := float64(t.StreamsChecked) / float64(rec.Plan.SampledStreams)
+		add(Check{Name: "tail check coverage",
+			Value: fmt.Sprintf("%d of %d sampled streams checked (%.0f%%); %d (subscriber, stream) pairs skipped: last acknowledgement within the %s margin of the attach",
+				t.StreamsChecked, rec.Plan.SampledStreams, cov*100, t.SkippedMargin, t.Margin),
+			Limit: fmt.Sprintf(">= %.0f%% and > 0", spec.MinTailCoverage*100), Pass: t.StreamsChecked > 0 && cov >= spec.MinTailCoverage, Gating: !faultRelaxed(rec)})
+	}
 	if rec.Plan.SampledChannels > 0 && rec.Plan.PublishesPerSec > 0 {
 		// The attach-point check settles each attachment's first message
 		// against the publishers' serial logs. If it settled few claims it

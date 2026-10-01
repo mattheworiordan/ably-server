@@ -60,7 +60,7 @@ func fixtureSummaries() []*Summary {
 func evalFixture(t *testing.T, mutate func(sums []*Summary, rec *RunRecord)) *RunRecord {
 	t.Helper()
 	sums := fixtureSummaries()
-	rec := &RunRecord{Plan: Totals{Connections: 100, PublishesPerSec: 100, DeliveriesPerSec: 90, SampledChannels: 1}}
+	rec := &RunRecord{Plan: Totals{Connections: 100, PublishesPerSec: 100, DeliveriesPerSec: 90, SampledChannels: 1, SampledSubscribed: 1, SubscribedChannels: 2, SampledStreams: 1}}
 	if mutate != nil {
 		mutate(sums, rec)
 	}
@@ -183,6 +183,16 @@ func TestEvaluateFailures(t *testing.T) {
 				s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 5_000_000} // no serial log
 			}
 		}, "attach-point check coverage"},
+		{"tail check skipped every stream on the margin", func(s []*Summary, _ *RunRecord) {
+			if s != nil {
+				// The last acknowledgement came 0.5 s after the attach (at
+				// 1.0 s): inside the 1 s margin, so nothing is checkable.
+				s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 1_500_000, Serials: fixtureSerials(10)}
+			}
+		}, "tail check coverage"},
+		{"tail check covers under half the sampled streams", func(_ []*Summary, r *RunRecord) {
+			r.Plan.SampledStreams = 3 // one of three checked
+		}, "tail check coverage"},
 		{"nothing checked", func(s []*Summary, _ *RunRecord) {
 			if s != nil {
 				s[0].Correctness.CheckedMessages = 0
@@ -511,5 +521,31 @@ func TestEvaluateAttachCoverageStandsDownInAFaultRun(t *testing.T) {
 		if strings.HasPrefix(n, "attach-point") {
 			t.Fatalf("a successful fault run does not gate attach coverage: %v", failing(rec))
 		}
+	}
+}
+
+func TestEvaluateTailCoverageThresholdAndFault(t *testing.T) {
+	// One of two sampled streams checked is exactly half: passes.
+	rec := evalFixture(t, func(_ []*Summary, r *RunRecord) { r.Plan.SampledStreams = 2 })
+	for _, n := range failing(rec) {
+		if n == "tail check coverage" {
+			t.Fatalf("half coverage passes: %v", failing(rec))
+		}
+	}
+	// A run whose fault ran reports it without gating.
+	rec = evalFixture(t, func(s []*Summary, r *RunRecord) {
+		if s != nil {
+			s[1].Streams["ch"]["p"] = StreamRecord{LastAckedSeq: 9, LastAckedUS: 1_500_000, Serials: fixtureSerials(10)}
+		} else {
+			r.Fault = &FaultRecord{Command: "kill", ExitCode: 0}
+		}
+	})
+	for _, n := range failing(rec) {
+		if n == "tail check coverage" {
+			t.Fatalf("a successful fault run does not gate tail coverage: %v", failing(rec))
+		}
+	}
+	if !strings.Contains(rec.Markdown(), "1 (subscriber, stream) pairs skipped") {
+		t.Fatalf("skipped pairs and the reason must be printed:\n%s", rec.Markdown())
 	}
 }
