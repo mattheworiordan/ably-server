@@ -953,7 +953,11 @@ encoded frames (`--conn-outbound-max-bytes`, default 1 MiB), not in
 messages: frames range from a few bytes to the 64 KiB message limit, so
 only a byte bound caps the memory one connection can pin. A frame is
 always admitted to an empty queue, so a single frame larger than the
-bound cannot wedge a connection.
+bound cannot wedge a connection. The queue is a slice with a head index:
+when the consumed prefix passes 32 slots and half the slice, the live tail
+is slid to the front, so a connection that never fully drains (one frame
+always queued) holds a backing array proportional to its live frames, not
+to every frame it has ever been sent.
 
 A push that would take the queue past its bound waits for the writer to
 make room (backpressure; this absorbs bursts such as a resume replay),

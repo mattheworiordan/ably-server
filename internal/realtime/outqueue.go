@@ -62,6 +62,10 @@ type outQueue struct {
 	ready chan struct{}
 }
 
+// compactMinHead is the dead-prefix length below which pop never compacts,
+// so a short queue does not shuffle its slice on every pop.
+const compactMinHead = 32
+
 func newOutQueue(maxBytes int64, timeout time.Duration) *outQueue {
 	return &outQueue{max: maxBytes, timeout: timeout, ready: make(chan struct{}, 1)}
 }
@@ -170,6 +174,16 @@ func (q *outQueue) pop() (outFrame, bool) {
 		} else {
 			q.frames = q.frames[:0]
 		}
+	} else if q.head > compactMinHead && q.head > len(q.frames)/2 {
+		// A queue that never fully drains would otherwise grow its
+		// backing array by one slot per frame ever pushed. Slide the live
+		// tail to the front once the dead prefix is over half the slice;
+		// each slot is moved at most once per halving, so pop stays O(1)
+		// amortised.
+		n := copy(q.frames, q.frames[q.head:])
+		clear(q.frames[n:])
+		q.frames = q.frames[:n]
+		q.head = 0
 	}
 	q.wakeLocked()
 	return f, true
