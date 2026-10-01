@@ -578,7 +578,7 @@ lets the conductor read each box's clock offset at the start and end of a run
 (`GET /v1/clock`); the run record prints them and the run fails if one is above
 5 ms. A box that cannot measure is recorded as "not measured" and only the
 negative-latency check guards against skew on it. The conductor also takes
-`--fault-hook CMD --fault-at D --time-limit D --log --state`; add them by
+`--fault-hook CMD --fault-kind node-kill|bus-kill|other --fault-at D --time-limit D --log --state`; add them by
 setting `CONDUCTOR_CMD` (the tokens `{SCENARIO}` and `{RUN_ID}` are replaced).
 `NODE_VCPU` and `NODE_MEMORY_GB` default from `NODE_INSTANCE_TYPE` (vCPUs from
 the size, memory at 2 GiB per vCPU, which holds for the c7i family); set them

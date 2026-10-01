@@ -192,6 +192,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	startDelay := fs.Duration("start-delay", 10*time.Second, "time between sending jobs and the ramp start")
 	poll := fs.Duration("poll", 10*time.Second, "status and node-metrics interval")
 	faultHook := fs.String("fault-hook", "", "shell command run at --fault-at into the hold (kill a node, kill a NATS server)")
+	faultKind := fs.String("fault-kind", "", "what --fault-hook does, which decides the gates a successful fault relaxes: "+strings.Join(loadgen.FaultKinds(), " | ")+" (required with --fault-hook; see bench/aws/README.md)")
 	faultAt := fs.Duration("fault-at", 5*time.Minute, "offset into the hold for --fault-hook")
 	timeLimit := fs.Duration("time-limit", 0, "hard limit for the whole run (default planned length + 5m)")
 	onTimeout := fs.String("on-timeout", "", "shell command run when the time limit is hit (for instance the teardown script)")
@@ -286,7 +287,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	rec, err := loadgen.RunConductor(ctx, loadgen.ConductorConfig{
 		Scenario: sc, Multiplier: sf.multiplier, Scale: sf.scale, RunID: id, RunTag: tag, Inventory: inv,
 		ResultsDir: *results, RunDir: runDir, LogFile: *logFile, StateFile: *stateFile, StartDelay: *startDelay, Poll: *poll,
-		FaultHook: *faultHook, FaultAt: *faultAt, TimeLimit: *timeLimit, OnTimeout: *onTimeout,
+		FaultHook: *faultHook, FaultKind: *faultKind, FaultAt: *faultAt, TimeLimit: *timeLimit, OnTimeout: *onTimeout,
 		Format: *format, Out: stdout, ServerIdleTimeout: idleTimeout.conductorIdle(), AllowUnmeasured: *allowUnmeasured,
 	})
 	if err != nil {
