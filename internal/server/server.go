@@ -81,7 +81,6 @@ const (
 	publishLanesEnv     = "ABLY_SERVER_PUBLISH_LANES"
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
-	publishLingerMinEnv = "ABLY_SERVER_PUBLISH_LINGER_MIN"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
 
 	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
@@ -210,11 +209,6 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
-	publishLingerMinDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMinEnv), file.PublishLingerMin, 0)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
 	publishQueueMaxDefault, err := config.DefaultInt(opts.Getenv(publishQueueMaxEnv), file.PublishQueueMax, postgres.DefaultPublishQueueMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
@@ -281,7 +275,6 @@ func Run(ctx context.Context, opts Opts) int {
 	publishLanes := fs.Int("publish-lanes", publishLanesDefault, "cluster mode: publish lanes for leading-edge batching; a channel always uses the same lane; 0 commits every publish in its own transaction (DESIGN.md §6.3) (env: "+publishLanesEnv+")")
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
-	publishLingerMin := fs.Duration("publish-linger-min", publishLingerMinDefault, "cluster mode: how long an idle lane holds its first publish so others can join its commit; 0 commits at once (DESIGN.md §6.3) (env: "+publishLingerMinEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
 	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
 	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
@@ -326,10 +319,6 @@ func Run(ctx context.Context, opts Opts) int {
 	})
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
-		return 2
-	}
-	if *publishLingerMin < 0 {
-		fmt.Fprintln(opts.Out, "--publish-linger-min must not be negative")
 		return 2
 	}
 	syncSource, err := core.ParsePresenceSyncSource(*presenceSyncSource)
@@ -440,7 +429,6 @@ func Run(ctx context.Context, opts Opts) int {
 			Lanes:     *publishLanes,
 			BatchMax:  *publishBatchMax,
 			LingerMax: *publishLingerMax,
-			LingerMin: *publishLingerMin,
 			QueueMax:  *publishQueueMax,
 
 			PresenceUnbatched: !*presenceBatching,

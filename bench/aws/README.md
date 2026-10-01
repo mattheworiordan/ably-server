@@ -306,7 +306,7 @@ footprint.
 `summary.md` and `summary.json` carry what a quoted run needs to prove
 what it was: the server flags in effect as the nodes report them
 (`ably_publish_lanes`, `ably_publish_linger_max_seconds`,
-`ably_publish_linger_min_seconds`, `ably_bus_info{bus,mode}`,
+`ably_bus_info{bus,mode}`,
 `ably_storage_shards`, and `ably_bus_sweep_interval_seconds` if a node
 exports it; none does yet, and the summary says "not exported"), each
 box's clock offset and CPU, the nodes sampled, and the coverage of every

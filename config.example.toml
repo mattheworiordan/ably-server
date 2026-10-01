@@ -116,14 +116,10 @@
 # here reads as unset, so turn batching off with --publish-lanes=0 or
 # ABLY_SERVER_PUBLISH_LANES=0.
 # (env: ABLY_SERVER_PUBLISH_LANES, ABLY_SERVER_PUBLISH_BATCH_MAX,
-# ABLY_SERVER_PUBLISH_LINGER_MAX, ABLY_SERVER_PUBLISH_LINGER_MIN,
-# ABLY_SERVER_PUBLISH_QUEUE_MAX). publish-linger-min makes an idle lane
-# hold its first publish that long so others can join its commit: larger
-# batches for up to that much added latency; "0s" commits at once.
+# ABLY_SERVER_PUBLISH_LINGER_MAX, ABLY_SERVER_PUBLISH_QUEUE_MAX).
 # publish-lanes = 4
 # publish-batch-max = 200
 # publish-linger-max = "5ms"
-# publish-linger-min = "0s"
 # publish-queue-max = 10000
 
 # The presence path (DESIGN.md §12.4, §12.5). presence-sync-source picks

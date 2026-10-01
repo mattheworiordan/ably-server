@@ -63,12 +63,10 @@ type File struct {
 	MessageRetention   string `toml:"message-retention"`
 	PersistedRetention string `toml:"persisted-retention"`
 	// Publish batching for the cluster-mode write path (DESIGN.md §6.3,
-	// §9). Zero means absent; publish-linger-max and publish-linger-min
-	// are duration strings.
+	// §9). Zero means absent; publish-linger-max is a duration string.
 	PublishLanes     int    `toml:"publish-lanes"`
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
-	PublishLingerMin string `toml:"publish-linger-min"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
 	// The presence path (DESIGN.md §12.4, §12.5, §9): the SYNC source
 	// ("local" or "store"), whether presence writes join the publish
