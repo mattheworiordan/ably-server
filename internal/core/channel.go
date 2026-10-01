@@ -210,15 +210,19 @@ func (c *Channel) idle(now int64, timeout time.Duration) bool {
 }
 
 // HasSubscribers reports whether anything in this process receives the
-// channel's cms: an open Stream (an attachment), a presence member this
-// node has seen enter and not leave, whose LEAVE must still arrive for
-// eviction to proceed, or the local presence member set (presence.go),
-// seeded or seeding, which folds every delivered presence cm and is
-// served to the next attach's SYNC, so a cm lost on the bus must still
-// be swept into it (DESIGN.md §7.2, §12.4). A channel bound only for a
-// REST operation, or kept bound after its last detach with no member
-// set, has none. Implements storage.SubscriberReporter; the cluster
-// bus's watermark sweep reads only channels that have subscribers.
+// channel's cms: an open Stream (an attachment) or a presence member
+// this node has seen enter and not leave, whose LEAVE must still arrive
+// for eviction to proceed. A channel bound only for a REST operation or
+// kept bound after its last detach has none. Implements
+// storage.SubscriberReporter; with --bus-sweep-scope=subscribed the
+// cluster bus's watermark sweep reads only channels that have
+// subscribers (DESIGN.md §7.2).
+//
+// A channel found with none also drops its local presence member set
+// (presence.go, DESIGN.md §12.4), so the next attach's SYNC seeds it
+// again from the store. The set is folded from the delivered cms, and
+// the sweep is what repairs one lost on the bus; a channel the sweep
+// skips must not keep a set that could be missing an operation.
 func (c *Channel) HasSubscribers() bool {
 	c.life.Lock()
 	refs := c.refs
@@ -228,7 +232,13 @@ func (c *Channel) HasSubscribers() bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.members) > 0 || c.pv.seeded || c.pv.seeding != nil
+	if len(c.members) > 0 {
+		return true
+	}
+	if c.pv.seeded || c.pv.seeding != nil {
+		c.dropMemberViewLocked()
+	}
+	return false
 }
 
 // Name returns the channel name.

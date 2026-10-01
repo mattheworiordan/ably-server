@@ -1696,6 +1696,9 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	if err := cs.commitWrite(ctx, tx, cm, &busWrite{serial: channelSerial, prev: prev, kind: storage.KindPresence, rows: rows}); err != nil {
 		return nil, false, err
 	}
+	if cs.rows != nil {
+		cs.rows.add(cs.name) // advance_channel_serial made or found the row
+	}
 	return cm, false, nil
 }
 

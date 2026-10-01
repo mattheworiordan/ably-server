@@ -351,6 +351,13 @@ func (c *Channel) seedMembers(ctx context.Context) error {
 func (c *Channel) Discontinuity() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.dropMemberViewLocked()
+}
+
+// dropMemberViewLocked drops the local member set so the next SYNC seeds
+// it again; a seed read in flight is discarded (its gen is stale).
+// Called with c.mu held.
+func (c *Channel) dropMemberViewLocked() {
 	seeding := c.pv.seeding
 	c.pv = memberView{gen: c.pv.gen + 1, seeding: seeding, builds: c.pv.builds}
 }

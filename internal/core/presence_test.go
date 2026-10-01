@@ -547,52 +547,67 @@ func TestPresenceSyncDiscontinuityDuringWait(t *testing.T) {
 	}
 }
 
-// TestChannelLocalMemberSetCountsAsSubscribed: the local member set is
-// state folded from the delivered cms and kept for the next attach's
-// SYNC, so a channel that holds one, or is seeding one, has a subscriber
-// for the bus sweep's scope (DESIGN.md §7.2, §12.4) even with no
-// attachment and no member of its own: a presence cm lost on the bus
-// must still be swept into the set. Without a set (none seeded yet, one
-// dropped by a discontinuity, or store mode) it has none.
-func TestChannelLocalMemberSetCountsAsSubscribed(t *testing.T) {
+// TestChannelWithoutSubscribersDropsMemberSet: the local member set is
+// folded from the delivered cms, and the bus sweep is what repairs one
+// lost on the bus, but with --bus-sweep-scope=subscribed the sweep skips
+// a channel with no attachment and no member of its own (DESIGN.md §7.2,
+// §12.4). So such a channel drops its set when the sweep finds it
+// without subscribers, and the next attach's SYNC seeds afresh from the
+// store: an operation lost while nobody was attached is not served
+// stale. While an attachment is open, or a member of this node's
+// remains, the set is kept and the channel counts as subscribed.
+func TestChannelWithoutSubscribersDropsMemberSet(t *testing.T) {
 	ctx := context.Background()
 	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
 	c, _ := testChannel(t, store, "005")
-	if c.HasSubscribers() {
-		t.Fatal("a channel with no attachment, member or member set reports subscribers")
-	}
 
-	// A seed read in flight counts: the attach that started it is about
-	// to be served from the set.
-	store.release, store.entered = make(chan struct{}), make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		_, err := c.PresenceSync(ctx)
-		done <- err
-	}()
-	<-store.entered
-	if !c.HasSubscribers() {
-		t.Error("a channel seeding its member set reports no subscribers")
+	// An attachment seeds the set; while it is open the set is kept.
+	if _, err := c.pin(ctx, true); err != nil {
+		t.Fatal(err)
 	}
-	close(store.release)
-	if err := <-done; err != nil {
+	if _, err := c.PresenceSync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !c.HasSubscribers() {
-		t.Error("a channel holding a seeded member set reports no subscribers")
+		t.Fatal("a channel with an open attachment reports no subscribers")
+	}
+	if _, err := c.PresenceSync(ctx); err != nil || store.calls.Load() != 1 {
+		t.Fatalf("SYNC with the attachment open: %d store reads (err %v), want the one seed", store.calls.Load(), err)
 	}
 
-	c.Discontinuity()
+	// A member of this node's keeps the channel subscribed, and the set
+	// with it, after the attachment closes.
+	c.Append(presCM("006", op(protocol.PresenceEnter, "c2", "bob", "b")))
+	c.unpin(true)
+	if !c.HasSubscribers() {
+		t.Fatal("a channel with a tracked presence member reports no subscribers")
+	}
+	if !c.pv.seeded {
+		t.Fatal("the member set was dropped while the channel still had a subscriber")
+	}
+
+	// bob leaves; nobody is attached. The sweep's check drops the set.
+	c.Append(presCM("007", op(protocol.PresenceLeave, "c2", "bob", "")))
 	if c.HasSubscribers() {
-		t.Error("a channel whose member set was dropped still reports subscribers")
+		t.Fatal("a channel with no attachment and no member reports subscribers")
+	}
+	if c.pv.seeded {
+		t.Fatal("a channel the sweep skips kept its member set")
 	}
 
-	storeMode, _ := testChannel(t, store, "005")
-	storeMode.syncSource = PresenceSyncStore
-	if _, err := storeMode.PresenceSync(ctx); err != nil {
+	// alice's LEAVE is lost on the bus while nobody is attached (the store
+	// has it, this node never delivered it). The next attach's SYNC seeds
+	// again and does not serve alice.
+	store.members, store.asOf = nil, "008"
+	if _, err := c.pin(ctx, true); err != nil {
 		t.Fatal(err)
 	}
-	if storeMode.HasSubscribers() {
-		t.Error("store mode keeps no member set, yet the channel reports subscribers")
+	snap, err := c.PresenceSync(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(snap.Members) != 0 || store.calls.Load() != 2 {
+		t.Errorf("SYNC after re-attach = %v with %d store reads, want empty from a fresh seed (2 reads)", setOf(snap.Members), store.calls.Load())
+	}
+	c.unpin(true)
 }

@@ -1723,16 +1723,18 @@ The `postgres` and `nats` buses share one delivery point
   treated as lost, not late.
 - **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
   only bound channels with a subscriber on this node: an open
-  attachment, a presence member the node has seen enter and not leave
-  (whose LEAVE eviction waits for), or a local presence member set
-  (§12.4) the node keeps for the channel. The member set counts because
-  it is state folded from the delivered cms, kept after the last detach
-  for the next attach's `SYNC`: a presence cm lost while the channel had
-  no attachment would otherwise stay missing from it, unswept, and be
-  served to that attach. Sweeping it repairs the set within two
-  intervals of the loss, as for a subscribed channel; in `store` mode
-  (`--presence-sync-source=store`) no set is kept and only the first two
-  count. `bound` sweeps every bound channel,
+  attachment, or a presence member the node has seen enter and not leave
+  (whose LEAVE eviction waits for). A channel the sweep finds with
+  neither also drops its local presence member set (§12.4): that set is
+  folded from the delivered cms, so a presence cm lost while nothing was
+  attached would stay missing from it, unswept, and be served to the
+  next attach. The next attach seeds the set again from the store
+  instead (one `Members` read, the cost of a channel coming back from no
+  subscribers). An attach with the default modes includes
+  `PRESENCE_SUBSCRIBE`, so it seeds a set even on a channel with no
+  presence; dropping the set rather than sweeping it keeps such a
+  channel out of the sweep once its last attachment closes. `bound`
+  sweeps every bound channel,
   the behaviour before the scope existed. A channel bound only by a REST
   request, or kept bound after its last detach until eviction, has
   nobody on this node a lost cm could be late for, so reading it is
@@ -2297,7 +2299,9 @@ name = "persisted:presence_fixtures"
     the node's member set), `store` (`--presence-sync-source=store`),
     `fallback` (a store read because seeding the member set failed); and
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
-    the store, at most one per channel bind.
+    the store: one per channel bind, plus one after a skipped bus gap
+    (§7.2) and one each time a channel comes back from no subscribers
+    under `--bus-sweep-scope=subscribed` (§12.4).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
@@ -2561,10 +2565,11 @@ of the store's set as of a serial:
   connection's read loop, so it never waits: an out-of-date snapshot is
   rebuilt at once.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
-  While the set exists the channel counts as subscribed for the bus
-  sweep (`--bus-sweep-scope=subscribed`, §7.2), even with no attachment
-  left, so a lost presence cm is repaired in the set rather than left
-  out of it for the next attach.
+  With `--bus-sweep-scope=subscribed` (§7.2) the set is also dropped
+  when the sweep finds the channel with no attachment and no member of
+  this node's, since the sweep no longer repairs a cm lost on the bus
+  for it; the next attach seeds again. So a channel seeds once per bind
+  and once more each time it comes back from no subscribers.
   If the seed read fails, that `SYNC` is read from the store and the next
   one tries to seed again. If the backend skips cms it cannot deliver (a
   chaining bus's gap the log no longer holds, §7.2), it tells the channel,
