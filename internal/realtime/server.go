@@ -101,7 +101,7 @@ type Server struct {
 	// used by Shutdown to disconnect them gracefully on SIGTERM (DESIGN.md
 	// §11); byKey indexes them by connectionId (the identity a
 	// connectionKey authenticates) so a REST publish-on-behalf can resolve
-	// a connectionKey to its connection (DESIGN.md §13, ResolveConnectionKey).
+	// a connectionKey to its connection (DESIGN.md §3.2, §8, ResolveConnectionKey).
 	mu    sync.Mutex
 	conns map[*connection]struct{}
 	byKey map[string]*connection
@@ -494,7 +494,7 @@ func (s *Server) stopReaper() {
 
 // ResolveConnectionKey resolves a REST publish's connectionKey to the live
 // connection it names, returning that connection's connectionId (DESIGN.md
-// §13). ok is false when the key doesn't authenticate (VerifyConnectionKey)
+// §3.2, §8). ok is false when the key doesn't authenticate (VerifyConnectionKey)
 // or no live connection on this node holds the connectionId it names — the
 // caller maps that to Ably error 40006 (invalid connectionKey). Resolution is
 // per-node only: connection-state and the registry are process-local

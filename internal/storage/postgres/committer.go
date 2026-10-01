@@ -35,11 +35,9 @@ func validText(s string) bool {
 // fail a batch. Under Options.BindOnWrite the channel's row is created
 // here if this store has never seen it, so a batch never has to insert
 // one; otherwise a missing row is created by the batch's
-// publish_batch_lock, in the same round trip that locks the rows. (The
-// comments in migration 0003 predate this and call that path a fallback
-// that never waits; DESIGN.md §6.3 "Channel rows" is current: the insert
-// can wait for another transaction's uncommitted insert of the same new
-// name, never deadlocking.)
+// publish_batch_lock, in the same round trip that locks the rows. That
+// insert can wait for another transaction's uncommitted insert of the same
+// new name, and never deadlocks (DESIGN.md §6.3 "Channel rows").
 func (cs *channelStore) storeBatched(ctx context.Context, lanes *laneSet, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if !validText(cs.name) {
 		return nil, false, storage.ErrInvalidChannelName

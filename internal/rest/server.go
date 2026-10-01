@@ -34,7 +34,7 @@ import (
 )
 
 // ConnectionResolver resolves a REST publish's connectionKey to the live
-// realtime connection it names (DESIGN.md §13). The realtime Server
+// realtime connection it names (DESIGN.md §3.2, §8). The realtime Server
 // implements it against its in-process connection registry; ok is false for
 // a key no live connection on this node holds (which the publish path maps
 // to Ably error 40006). It is an interface so the REST package does not
@@ -52,7 +52,7 @@ type Server struct {
 	ready   storage.Pinger
 	metrics *metrics.Metrics
 	// conns resolves a publish's connectionKey to a live connection for
-	// publish-on-behalf (DESIGN.md §13); nil in deployments/tests without a
+	// publish-on-behalf (DESIGN.md §3.2, §8); nil in deployments/tests without a
 	// realtime endpoint, in which case any connectionKey is unresolvable.
 	conns ConnectionResolver
 	// tracer is nil unless OTEL tracing is enabled; guarded on every use.
@@ -148,7 +148,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.ClientID = cid
-		// Publish-on-behalf (DESIGN.md §13): a connectionKey names a live
+		// Publish-on-behalf (DESIGN.md §3.2, §8): a connectionKey names a live
 		// realtime connection whose connectionId the stored/delivered message
 		// inherits. Resolve it against this node's registry and strip the key
 		// so it is never persisted or delivered (mirrors the reference, which
@@ -1570,7 +1570,7 @@ func requestClientIDParam(r *http.Request) (string, error) {
 }
 
 // resolveConnectionKey resolves a publish's connectionKey to the target
-// connection's connectionId (DESIGN.md §13). It returns ok=false — surfaced
+// connection's connectionId (DESIGN.md §3.2, §8). It returns ok=false — surfaced
 // by the caller as Ably 40006 — when no resolver is configured or no live
 // connection on this node holds the key.
 func (s *Server) resolveConnectionKey(key string) (connID string, ok bool) {

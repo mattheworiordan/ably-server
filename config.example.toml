@@ -138,7 +138,7 @@
 # UPDATE). Every node sharing a database should use the same mode.
 # presence-sync-source = "local"
 # presence-batching = true
-# presence-max-inflight = 16
+# presence-max-inflight = 0
 # presence-lease-mode = "node"
 
 # Window to disconnect existing connections on SIGTERM, as a duration

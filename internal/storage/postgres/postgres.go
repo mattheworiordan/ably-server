@@ -1263,14 +1263,21 @@ func (cs *channelStore) advanceSerial(ctx context.Context, tx pgx.Tx) (channelSe
 	return channelSerial, prev, nil
 }
 
-// Store persists one publish atomically: advance the channel's serial
-// via advance_channel_serial (which takes a row-level lock on the
-// channels row and is the per-channel write serialiser), then look up
-// any contained Message.IDs for prior matches (idempotent return on a
-// hit, rolling the advance back), otherwise stamp each Message.Serial,
-// insert one row per Message, and emit a NOTIFY on the broker channel. The cm is
-// delivered to the channel's appender asynchronously by the LISTEN
-// goroutine after the NOTIFY round-trips through the database.
+// Store persists one publish atomically. With publish lanes (the server's
+// default, Options.Batching), it queues the publish on the channel's lane
+// and a batch commits it with the others queued (storeBatched,
+// committer.go, DESIGN.md §6.3). Without lanes it runs the single-publish
+// transaction below: advance the channel's serial via
+// advance_channel_serial (which takes a row-level lock on the channels row
+// and is the per-channel write serialiser), then look up any contained
+// Message.IDs for prior matches (idempotent return on a hit, rolling the
+// advance back), otherwise stamp each Message.Serial, insert one row per
+// Message and run the bus's in-transaction hook. Either way the commit is
+// announced through the Bus (bus.go, DESIGN.md §7.2): the publishing node
+// delivers its own cm to the channel's appender straight after commit, and
+// the other nodes receive it over the bus (a NOTIFY and the LISTEN
+// round-trip on pgnotify, inline over the per-channel postgres or nats
+// subscription otherwise).
 func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
 		return nil, false, errors.New("storage/postgres: Store with no messages")
@@ -1366,8 +1373,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 // latest version from the projection (ErrTargetNotFound if absent),
 // apply the shallow-mixin merge, mint a fresh version serial, insert the
 // merged version row on channel_messages (message_serial = identity),
-// upsert the projection (deleted = TRUE for a delete), and NOTIFY. The
-// cm reaches every node's appender via the LISTEN round-trip, like Store.
+// upsert the projection (deleted = TRUE for a delete), and announce the
+// cm on the bus. It reaches every node's appender the way Store's does.
 func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if mut == nil || !mut.Action.IsMutation() {
 		return nil, false, errors.New("storage/postgres: Mutate requires a mutation action")
@@ -1561,9 +1568,8 @@ func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.
 
 // StorePresence persists a presence publish on channel_messages (kind =
 // presence) and folds it into the presence projection table, all in one
-// transaction, then emits a NOTIFY. The cm reaches the channel's
-// appender via the LISTEN round-trip exactly like a message publish
-// (DESIGN.md §12.2, §12.5); the membership table is authoritative across
+// transaction, then announces the cm on the bus. It reaches the channel's
+// appender exactly like a message publish (DESIGN.md §12.2, §12.5); the membership table is authoritative across
 // nodes the moment the tx commits.
 func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	if len(presence) == 0 {
@@ -1697,9 +1703,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 // StoreAnnotation persists an annotation publish on channel_messages
 // (kind = annotation, message_serial = the TARGET message serial so the
 // channel_messages serial index serves annotations-for-message scans,
-// DESIGN.md §14.1, §14.4), then emits a NOTIFY so the cm reaches every
-// node's appender via the LISTEN round-trip exactly like a message
-// publish. Every target must resolve in the messages projection
+// DESIGN.md §14.1, §14.4), then announces the cm on the bus so it reaches
+// every node's appender exactly like a message publish. Every target must resolve in the messages projection
 // (ErrTargetNotFound otherwise, like a mutation). The returned cm is the
 // annotation summary-fold seam.
 func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {

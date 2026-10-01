@@ -1194,100 +1194,62 @@ gives us pub/sub and the same database serves as the durable store, so
 cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
 a NATS server or cluster for delivery; Postgres stays the store.
 
-Schema sketch:
+Schema. The shipped DDL is the migration files under
+`internal/storage/postgres/migrations/` (`0001_initial.sql` to
+`0004_presence_nodes.sql`); they are the source of truth and each carries
+the reasoning in its header. In outline (columns elided where the
+migrations say more):
 
-```sql
--- The append-only LOG: one row per individual Message or PresenceMessage,
--- both kinds interleaved in one channelSerial namespace (§12.1). The PK
--- groups a publish's Messages under their shared channelSerial; the
--- channelSerial prefix encodes the mint timestamp (§8), so a forward
--- range scan over the PK covers ordered history reads AND time-based
--- retention without a separate created_at column. action is NOT a column
--- — it lives in the payload (nothing scans by it); kind is, because reads
--- filter by it.
-CREATE TABLE channel_messages (
-  channel        TEXT     NOT NULL,
-  channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8) — this cm's position
-  idx            INT      NOT NULL,    -- position within the publish batch
-  id             TEXT,                 -- nullable, client-supplied idempotency key
-  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14)
-  message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
-  payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
-  persisted      BOOLEAN  NOT NULL DEFAULT FALSE,  -- retention class, the level-1 partition key (see Retention)
-  PRIMARY KEY (channel, channel_serial, idx, persisted)
-) PARTITION BY LIST (persisted);  -- each class then PARTITION BY RANGE (channel_serial)
-
--- Idempotency lookup: a non-NULL client-supplied id is unique per
--- channel within the channel's retention. A partitioned table cannot
--- carry a UNIQUE index without the partition key, so this is a plain
--- index and the channels-row lock is the arbiter (see below).
-CREATE INDEX channel_messages_id_idx
-  ON channel_messages (channel, id) WHERE id IS NOT NULL;
-
--- serial → versions: every version of a message in version order, backing
--- GET .../messages/{serial}/versions and update/delete target validation
--- (§13.4). Partial — message rows only; presence rows have no identity.
-CREATE INDEX channel_messages_serial_idx
-  ON channel_messages (channel, message_serial, channel_serial)
-  WHERE message_serial IS NOT NULL;
-
--- Materialised current MESSAGE state: one row per live message holding its
--- latest version — the message-side analogue of the presence table below.
--- UPSERTed in the same transaction as the version's INSERT into
--- channel_messages; a delete sets deleted = true but the row (and its
--- versions in the log) stay queryable (soft delete, §13.2). create_serial
--- keeps the message in its original position for collapsed history.
-CREATE TABLE messages (
-  channel         TEXT    NOT NULL,
-  message_serial  TEXT    NOT NULL,  -- stable identity
-  create_serial   TEXT    NOT NULL,  -- the create's channel_serial:idx (ordering position)
-  version_serial  TEXT    NOT NULL,  -- the latest version's channel_serial:idx
-  deleted         BOOLEAN NOT NULL DEFAULT false,
-  payload         BYTEA   NOT NULL,  -- msgpack of the merged latest Message
-  PRIMARY KEY (channel, message_serial)
-);
-
--- Materialised current PRESENCE state: one row per live member, keyed by
--- connectionId:clientId. ENTER/UPDATE upsert, LEAVE deletes — maintained
--- in the same transaction as the presence cm's INSERT into channel_messages,
--- so the set stays consistent with the log. node_id names the owning node,
--- whose liveness lease drives the dead-node reaper (§12.5).
-CREATE TABLE presence (
-  channel        TEXT        NOT NULL,
-  connection_id  TEXT        NOT NULL,
-  client_id      TEXT        NOT NULL,
-  channel_serial TEXT        NOT NULL,  -- serial of the latest ENTER/UPDATE
-  payload        BYTEA       NOT NULL,  -- msgpack-encoded protocol.PresenceMessage
-  node_id        TEXT        NOT NULL,  -- owning node, for lease bump + reap
-  expires_at     TIMESTAMPTZ NOT NULL,  -- member lease mode: the row's lease; node mode and fixtures: 'infinity'
-  PRIMARY KEY (channel, connection_id, client_id)
-);
--- The reaper's skip scan over member owners and its per-node deletes,
--- and the member-mode bump's per-node select (§12.5).
-CREATE INDEX presence_node_idx ON presence (node_id);
-
--- One liveness lease per node (node lease mode, §12.5): the node renews
--- its row on the bump cadence; the reaper removes the members of a node
--- with no unexpired row, then the row.
-CREATE TABLE presence_nodes (
-  node_id    TEXT        PRIMARY KEY,
-  expires_at TIMESTAMPTZ NOT NULL
-);
-```
-
-The sketch abbreviates partitioning. In the shipped schema (migration
-`0002_partitioned_log`) `channel_messages` and `messages` each carry the
-`persisted` column and are partitioned on two levels, described under
-"Retention" below; `messages` is ranged on `message_serial` and its key
-is `(channel, message_serial, persisted)`.
+- `channels (name PK, channel_serial, initial_channel_serial)`: one row
+  per channel name, holding the serial the next publish continues from
+  (minted under the row lock by `advance_channel_serial` and, batched, by
+  `publish_batch_lock`) and the immutable seed serial a rewind to the
+  channel's beginning attaches at (§4.3). `ensure_channel` creates a row
+  with a fresh seed. Rows are pruned once idle (see "Channel rows"
+  below).
+- `channel_messages`, the append-only LOG: one row per individual
+  `Message`, `PresenceMessage` or annotation (`kind`), all interleaved in
+  one `channel_serial` namespace (§12.1), keyed `(channel, channel_serial,
+  idx, persisted)`. `idx` is the position within the publish; `id` is the
+  client-supplied idempotency key (nullable); `message_serial` is the
+  message identity a row is a version of (NULL for presence); `is_append`
+  marks a streamed append (§13.3); `summary` holds the annotation summary
+  snapshot of an annotation row (§14.2); `payload` is the msgpack
+  `Message` or `PresenceMessage`. The action is in the payload, not a
+  column. Partitioned on two levels (see "Retention"). Indexes:
+  `channel_messages_id_idx (channel, id) WHERE id IS NOT NULL`, a plain
+  index because a partitioned table cannot carry a unique index without
+  its partition key (the `channels` row lock is the arbiter of id
+  uniqueness); and `channel_messages_versions_idx (channel, message_serial,
+  channel_serial, idx) WHERE message_serial IS NOT NULL`, which backs
+  version scans and the update/delete target lookup (§13.4).
+- `messages (channel, message_serial, payload, deleted, persisted)`, keyed
+  `(channel, message_serial, persisted)`: the latest-version projection,
+  one row per message, upserted in the same transaction as the version's
+  log row. A delete sets `deleted`; the row and its versions stay
+  queryable (§13.2). Partitioned like the log, ranged on `message_serial`
+  (the create's serial, which is also the order of collapsed history).
+- `presence (channel, connection_id, client_id, channel_serial, payload,
+  node_id, expires_at)`, keyed `(channel, connection_id, client_id)`: one
+  row per live member, maintained in the same transaction as the presence
+  cm (§12.5); `presence_node_idx (node_id)` serves the reaper and the
+  member-mode lease bump. `presence_nodes (node_id PK, expires_at)` is the
+  per-node liveness lease of node lease mode.
+- `retention_state (key, value)`: the legacy-leaf bound recorded by
+  migration 0002 (below). `schema_migrations (version PK, applied_at)`:
+  the migration tracker.
+- SQL functions: `format_channel_serial`, `next_channel_serial`,
+  `ensure_channel`, `advance_channel_serial` (0001) and
+  `publish_batch_lock` (0003).
 
 Reads over the log (`channel_messages`) add `kind = 'message'` (or
-`'presence'`) to the predicates above. Collapsed message history reads the
-materialised `messages` table ordered by `create_serial`; a version scan
-reads `channel_messages` via `channel_messages_serial_idx`. The retention
-sweep deletes log rows by channel_serial range and, when a message's last
-surviving version ages out, drops its `messages` projection row too. The
-`presence` projection is independent of the log's retention sweep (§12.5).
+`'presence'`) to the predicates. Collapsed message history reads the
+materialised `messages` table ordered by `message_serial`; a version scan
+reads `channel_messages` via `channel_messages_versions_idx`. Retention
+does not delete log rows: it drops whole leaf partitions (below), and a
+message's projection row goes with the leaf that holds its create serial.
+The `presence` projection is independent of the log's retention sweep
+(§12.5).
 
 The DDL ships as versioned migrations under
 `internal/storage/postgres/migrations/*.sql` (e.g. `0001_initial.sql`)

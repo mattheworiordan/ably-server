@@ -495,9 +495,13 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// statefulconnection.ts assertChannel: reuse, update modes, reply
 	// ATTACHED with the current serial). Presence is deliberately not
 	// resynced (the reference does not on an in-place re-attach). An
-	// explicit backwards cursor on a live attachment is ignored for now —
-	// deferred with delta support — and we reply at the current
-	// position (safe: this server never sends deltas).
+	// explicit backwards cursor on a live attachment is ignored for now,
+	// and we reply at the current position. (The server does send append
+	// deltas, DESIGN.md §13.3: to an attachment that has already been
+	// delivered the target message, tracked per attachment in its seen
+	// set, and a full version otherwise. Ignoring the cursor leaves that
+	// set and the stream untouched, which is why replying at the current
+	// position is safe.)
 	if a, exists := c.attachments[name]; exists {
 		serial := a.applyReattach(requested, effective, msg.Params)
 		c.queue(ctx, &protocol.ProtocolMessage{
