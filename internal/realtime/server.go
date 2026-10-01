@@ -125,6 +125,45 @@ type Server struct {
 	reaperDone chan struct{}
 	reaperStop sync.Once
 	reaperWG   sync.WaitGroup
+
+	// appendTracking configures each attachment's seen set for append
+	// delivery (DESIGN.md §13.3); see SetAppendTracking.
+	appendTracking AppendTracking
+}
+
+// AppendTracking configures how attachments remember delivered message
+// serials so a later append can be sent as a delta (DESIGN.md §13.3).
+type AppendTracking struct {
+	// Mutable reports whether a channel is in a namespace with mutable
+	// messages enabled. On such a channel every delivered message is
+	// recorded, so a create's first append is a delta; elsewhere only
+	// messages that carry an append delta are recorded. Nil treats every
+	// channel as mutable.
+	Mutable func(channel string) bool
+	// SeenMax caps the serials one attachment records; the least
+	// recently recorded are evicted first, a generation at a time
+	// (seenSet). Zero or less means DefaultAttachmentSeenMax.
+	SeenMax int
+}
+
+func (t AppendTracking) withDefaults() AppendTracking {
+	if t.SeenMax <= 0 {
+		t.SeenMax = DefaultAttachmentSeenMax
+	}
+	return t
+}
+
+// tracksCreates reports whether an attachment on channel records every
+// delivered message, not only those carrying an append delta.
+func (t AppendTracking) tracksCreates(channel string) bool {
+	return t.Mutable == nil || t.Mutable(channel)
+}
+
+// SetAppendTracking overrides the attachment append-tracking settings
+// (DESIGN.md §13.3, AppendTracking). Intended to be called once, right
+// after NewServer and before the server handles connections.
+func (s *Server) SetAppendTracking(t AppendTracking) {
+	s.appendTracking = t.withDefaults()
 }
 
 // SetRemainPresentFor overrides the presence grace window (DESIGN.md §12.5,
@@ -167,6 +206,7 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 		byKey:             make(map[string]*connection),
 		remainPresentFor:  DefaultRemainPresentFor,
 		reaperDone:        make(chan struct{}),
+		appendTracking:    AppendTracking{}.withDefaults(),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
 			// connection; production deployments terminate TLS at a

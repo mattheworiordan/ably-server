@@ -487,6 +487,52 @@ func TestRunRetentionMalformedIsStartupError(t *testing.T) {
 	}
 }
 
+func TestMutableNamespaces(t *testing.T) {
+	mutable := mutableNamespaces([]config.Namespace{
+		{ID: "mutable", MutableMessages: true},
+		{ID: "persisted", Persisted: true},
+	})
+	for name, want := range map[string]bool{
+		"mutable:room":   true,
+		"mutable:a:b":    true,
+		"mutable":        false, // the default namespace
+		"persisted:room": false,
+		"room":           false,
+		"mutablex:room":  false,
+	} {
+		if got := mutable(name); got != want {
+			t.Errorf("mutable(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestRunAttachmentSeenMaxInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		args       []string
+		env        map[string]string
+		file       string
+		code       int
+	}{
+		{name: "flag zero", args: []string{"--attachment-seen-max=0"}, want: "--attachment-seen-max must be positive", code: 2},
+		{name: "env negative", env: map[string]string{attachSeenMaxEnv: "-1"}, want: "--attachment-seen-max must be positive", code: 2},
+		{name: "env malformed", env: map[string]string{attachSeenMaxEnv: "lots"}, want: "invalid integer", code: 1},
+		{name: "file malformed", file: `attachment-seen-max = "lots"`, want: "attachment-seen-max", code: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--keys=app.key:secret"}, tc.args...)
+			if tc.file != "" {
+				args = append(args, "--config="+writeConfigFile(t, tc.file))
+			}
+			var out bytes.Buffer
+			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
+			if code != tc.code || !strings.Contains(out.String(), tc.want) {
+				t.Errorf("exit = %d, output %q; want %d and %q", code, out.String(), tc.code, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunPublishBatchingMalformedIsStartupError(t *testing.T) {
 	for _, tc := range []struct {
 		name, want string
