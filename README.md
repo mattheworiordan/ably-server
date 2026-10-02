@@ -38,9 +38,27 @@ One Go binary, three storage modes selected by `--mode`:
 
 In every cluster mode Postgres is the store and orders each channel;
 `--bus` only chooses how a committed message reaches the other nodes.
-Start with one Postgres; add NATS when you need it: an unset `--bus` is
-`postgres`, or `nats` once `--nats-url` is set
-([DESIGN.md §7.2](DESIGN.md#72-cluster-bus)).
+An unset `--bus` is inferred: `postgres` with only `--postgres-dsn`,
+`nats` once `--nats-url` is set. `pgnotify` runs only when asked for,
+and `--bus=nats` without `--nats-url` is a startup error
+([DESIGN.md §7.2](DESIGN.md#72-cluster-bus)). Every node of a cluster
+must run the same bus, retentions and persisted namespaces: the first
+node records them in the database and a node that differs is refused at
+startup, so changing one is a stop-update-start step
+([DESIGN.md §11](DESIGN.md#11-lifecycle--operations)).
+
+**Deployment sizes.** Start with one Postgres, add NATS when you need it,
+add shards when one primary's write rate is the limit:
+
+| Size | Infrastructure | When to move up |
+|---|---|---|
+| Small | nodes and one Postgres (the `postgres` bus) | cross-node delivery latency under load, since every remote delivery costs Postgres a wake-up and a read; this size was measured at scale only once, on code older than the current fixes |
+| Large | nodes, one Postgres and a NATS cluster (the `nats` bus) | one primary's write rate is the limit |
+| Very large | nodes, several Postgres databases (a `--postgres-dsn` list) and NATS | the shard count is fixed for the life of the data, so size it up front |
+
+What each size carried in the cloud runs, which code each run was on and
+how the runs were judged is in
+[bench/aws/RESULTS.md](bench/aws/RESULTS.md).
 
 Server processes are stateless: any node can serve any connection.
 There's no peer-to-peer membership or gossip — in `cluster` mode, the
@@ -110,7 +128,7 @@ ably-server --mode cluster
 # setting --nats-url selects it
 ably-server --mode cluster --nats-url nats://nats1:4222,nats://nats2:4222,nats://nats3:4222
 
-# The first-shipped LISTEN/NOTIFY bus, only when asked for; it logs its
+# The single-channel LISTEN/NOTIFY bus, only when asked for; it logs its
 # ceiling (about 1.7k to 1.9k publishes a second cluster-wide) at startup
 ably-server --mode cluster --bus pgnotify
 ```
@@ -122,8 +140,8 @@ model spans channels, so there is no cross-shard transaction. Every node
 must list the same DSNs in the same order, and the list is fixed for the
 life of the data: there is no resharding, no migration between shards
 and no rebalancing, and a node started with a changed list refuses to
-start ([DESIGN.md §6.4](DESIGN.md#64-channel-sharding)). One DSN behaves
-exactly as before.
+start ([DESIGN.md §6.4](DESIGN.md#64-channel-sharding)). One DSN is an
+unsharded deployment.
 
 ```sh
 ably-server --mode cluster --bus nats --nats-url nats://nats1:4222 \

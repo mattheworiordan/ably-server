@@ -139,6 +139,12 @@
 # negative: no bound).
 # presence-max-inflight = 0
 
+# Two settings have no key here and no env var, only a flag:
+# --heartbeat-interval (default 15s) and --presence-remain-for (default
+# 15s, the grace window before an abruptly disconnected member leaves;
+# DESIGN.md §12.5). --addr-file has an env var (ABLY_SERVER_ADDR_FILE)
+# but no key.
+
 # Window to disconnect existing connections on SIGTERM, as a duration
 # string (env: ABLY_SERVER_SHUTDOWN_GRACE).
 # shutdown-grace = "10s"
@@ -206,7 +212,10 @@
 # [[namespaces]] entries mirror the Ably test-app-setup post_apps shape:
 # a namespace `id` plus feature flags. In cluster mode `persisted = true`
 # gives the namespace's channels (names starting "<id>:") the
-# persisted-retention above instead of the continuity window.
+# persisted-retention above instead of the continuity window. The set of
+# persisted namespaces is recorded by the first node and enforced like
+# the retentions: changing it on a running cluster is a stop, UPDATE,
+# start step (DESIGN.md §11 "Operations: what a change requires").
 # `mutableMessages = true` makes an attachment on the namespace's channels
 # remember every delivered message, so the first append to a message it
 # saw created is sent as a delta (DESIGN.md §13.3); on other channels only
