@@ -304,10 +304,10 @@ func (c *connection) takeEntered(channel string) map[string]*protocol.PresenceMe
 func (c *connection) closeEntered() (all map[string]map[string]*protocol.PresenceMessage, owed bool) {
 	c.enteredMu.Lock()
 	defer c.enteredMu.Unlock()
-	all, owed = c.entered, c.reentryOwed
+	all, owed = c.entered, c.reentryOwed > 0
 	c.entered = make(map[string]map[string]*protocol.PresenceMessage)
 	c.presenceClosed = true
-	c.reentryOwed = false
+	c.reentryOwed = 0
 	return all, owed
 }
 
@@ -342,7 +342,9 @@ func (c *connection) adoptPresence(members map[string]map[string]*protocol.Prese
 			}
 		}
 	}
-	c.reentryOwed = c.reentryOwed || owe
+	if owe {
+		c.reentryOwed++
+	}
 	return true
 }
 
@@ -485,7 +487,9 @@ func (c *connection) reenterMembers(ctx context.Context, members map[string]map[
 		c.enteredMu.Unlock()
 		return 0, 0
 	}
-	c.reentryOwed = false // the snapshot below discharges it
+	if c.reentryOwed > 0 {
+		c.reentryOwed-- // the snapshot below discharges one adoption's duty
+	}
 	snap := make(map[string][]*protocol.PresenceMessage, len(members))
 	for channel, set := range members {
 		held := c.entered[channel]

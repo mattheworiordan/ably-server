@@ -99,10 +99,11 @@ type connection struct {
 	enteredMu      sync.Mutex
 	entered        map[string]map[string]*protocol.PresenceMessage
 	presenceClosed bool
-	// reentryOwed, under enteredMu, records adopted grace members this
-	// connection must re-enter and has not yet read for it (adoptPresence,
-	// reenterMembers); teardown hands the duty on with the members.
-	reentryOwed bool
+	// reentryOwed, under enteredMu, counts the adoptions of grace
+	// members this connection must re-enter and has not yet read its set
+	// for (adoptPresence, reenterMembers; each adoption with a duty runs
+	// one re-entry); teardown hands the duty on with the members.
+	reentryOwed int
 
 	// presMu orders this connection's presence writes with a lease-lapse
 	// re-entry of its members (DESIGN.md §12.5): a client's ENTER, UPDATE

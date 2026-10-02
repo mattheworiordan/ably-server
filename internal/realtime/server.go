@@ -500,7 +500,8 @@ func (s *Server) claimGrace(c *connection) {
 	delete(s.grace, c.id)
 	g.fired = true
 	adopted, reenter := s.adoptGraceLocked(c, g)
-	if reenter {
+	spawn := adopted && reenter
+	if spawn {
 		// The re-entry runs off the WebSocket handshake, so it does not
 		// delay CONNECTED (reenterMembers re-enters only what the client
 		// still holds, so its own writes meanwhile are respected). It is
@@ -508,7 +509,7 @@ func (s *Server) claimGrace(c *connection) {
 		// shutting down skips it, as its members go with it.
 		select {
 		case <-s.reaperDone:
-			reenter = false
+			spawn = false
 		default:
 			s.reaperWG.Add(1)
 		}
@@ -519,7 +520,7 @@ func (s *Server) claimGrace(c *connection) {
 		s.scheduleConnectionLeaves(c.id, g.members, reenter)
 		return
 	}
-	if reenter {
+	if spawn {
 		go func() {
 			defer s.reaperWG.Done()
 			s.reenterAdopted(c, g.members)
@@ -552,10 +553,9 @@ func (s *Server) claimGrace(c *connection) {
 // which adoptPresence sets when reenter is true).
 func (s *Server) adoptGraceLocked(c *connection, g *graceLeave) (adopted, reenter bool) {
 	reenter = s.reentering > 0 || g.owed
-	if !c.adoptPresence(g.members, reenter) {
-		return false, false
-	}
-	return true, reenter
+	// A refused adoption (c is tearing down) still reports reenter, so
+	// the entry the members are rescheduled into stays owed.
+	return c.adoptPresence(g.members, reenter), reenter
 }
 
 // reenterAdopted re-enters members a connection adopted from a grace

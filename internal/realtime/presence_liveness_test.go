@@ -621,6 +621,25 @@ func TestGraceEntryCreatedDuringReentryIsOwed(t *testing.T) {
 		t.Fatalf("grace entry = %+v, want the re-entry carried as owed", g2)
 	}
 	g2.timer.Stop()
+
+	// A hand-over refused because the resumed connection is itself
+	// tearing down (fireGrace) still reports the duty, so the entry the
+	// members are rescheduled into stays owed.
+	h.rt.graceMu.Lock()
+	delete(h.rt.grace, "conn-1")
+	adopted, reenter = h.rt.adoptGraceLocked(c, g2) // c's set is closed
+	h.rt.graceMu.Unlock()
+	if adopted || !reenter {
+		t.Fatalf("adopt into a closed connection = %v, reenter = %v; want false, true", adopted, reenter)
+	}
+	h.rt.scheduleConnectionLeaves("conn-1", g2.members, reenter)
+	h.rt.graceMu.Lock()
+	g3 := h.rt.grace["conn-1"]
+	h.rt.graceMu.Unlock()
+	if g3 == nil || !g3.owed {
+		t.Fatalf("rescheduled entry = %+v, want it owed", g3)
+	}
+	g3.timer.Stop()
 }
 
 // TestMergedSetsPreferCommittedRecords: when a grace entry's members
@@ -671,7 +690,9 @@ func (h *livenessHarness) liveConn(t *testing.T, id string) *connection {
 // was never recorded, and it stayed present for as long as the node
 // lived.
 func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
-	const grace = 200 * time.Millisecond
+	// Long enough that the test reliably sees the grace entry before it
+	// fires.
+	const grace = time.Second
 	h := newLivenessServer(t, grace)
 	sub := dial(t, h.srv, "")
 	drainConnected(t, sub)
@@ -1052,5 +1073,48 @@ func TestDiscontinuityWithAFailedSeedKeepsMembers(t *testing.T) {
 	})
 	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
 		t.Fatalf("frame = %v, want the live UPDATE", f.Action)
+	}
+}
+
+// TestOwedSyncForAnEmptySetIsAnAttached: when the owed re-seed (after a
+// failed one on a channel update) finds the set empty, the client's open
+// sync is completed with an ATTACHED without HAS_PRESENCE, the
+// protocol's "no members" (RTP19a). A SYNC with no members is encoded
+// without its presence field, which ably-js skips, so it would have left
+// the sync open.
+func TestOwedSyncForAnEmptySetIsAnAttached(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	pub := dialClient(t, h.srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionSync {
+		t.Fatalf("frame = %v, want the attach SYNC", f.Action)
+	}
+
+	h.store.failMembers.Store(true)
+	ch, err := h.manager.GetChannel(context.Background(), "room")
+	if err != nil {
+		t.Fatalf("GetChannel: %v", err)
+	}
+	ch.Discontinuity(storage.DiscontinuityRetention)
+	if f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second); f.Action != protocol.ActionAttached || f.Flags&protocol.FlagHasPresence == 0 {
+		t.Fatalf("frame = %+v, want the channel update with HAS_PRESENCE", f)
+	}
+	// alice leaves while the sync is open.
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(2),
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceLeave}},
+	})
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence || f.Presence[0].Action != protocol.PresenceLeave {
+		t.Fatalf("frame = %+v, want alice's LEAVE", f)
+	}
+	h.store.failMembers.Store(false)
+	f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second)
+	if f.Action != protocol.ActionAttached || f.Flags&protocol.FlagHasPresence != 0 || f.Error != nil {
+		t.Fatalf("frame = %+v, want an ATTACHED without HAS_PRESENCE or error, completing the sync with no members", f)
 	}
 }
