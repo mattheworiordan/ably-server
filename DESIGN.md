@@ -3015,6 +3015,71 @@ Do not run old and new versions together across this migration: an old
 node would write persisted-namespace rows into the live class, and a
 resume across the resulting hole would be accepted as continuous.
 
+**Operations: what a change requires.** Some settings are recorded by
+the database, which refuses a node that differs; some cannot change once
+data exists; the rest belong to each node. The procedure for each:
+
+| Change | What it requires | Why |
+|---|---|---|
+| The bus (`--bus`, or setting or removing `--nats-url` while `--bus` is unset, which changes the inferred bus) | Stop every node; run the `UPDATE cluster_identity` the refusal prints, in every shard's schema; start every node with the new setting ("Changing a recorded setting" above) | Nodes on different buses do not deliver to each other; `Open` refuses a node whose bus is not the recorded one |
+| A database that recorded `pgnotify` because `--bus` was unset on an earlier version | Set `--bus=pgnotify` explicitly, or change the bus as above ("Upgrading past the bus default") | The inferred bus is now `postgres`, and the recorded `pgnotify` refuses it |
+| `--message-retention` or `--persisted-retention` | Stop, `UPDATE`, start, as for the bus | The node that runs the retention sweep applies its own retentions to everybody's log (§6.3) |
+| The persisted namespaces (a `[[namespaces]]` entry's `persisted`) | Stop, `UPDATE persisted_namespaces`, start. Rows already written keep their class until they age out, and the continuity proof does not cover the namespace until then (§7.2 "Retention") | Same as the retentions; the class is a partition key (§6.3) |
+| The shard list (`--postgres-dsn` with two or more DSNs: order, length or members) | Not supported on databases that hold channels: there is no resharding, migration between shards or rebalancing. A different list needs empty databases, or, while no shard holds channels yet, dropping `shard_identity` in each (§6.4) | `Open` refuses a list that differs from the recorded one, because channels hash to their shard by the list |
+| A database created before migration `0002_partitioned_log` | The offline procedure above ("Upgrading across 0002") | It locks both log tables for the whole migration (§6.3) |
+| Any other migration (`0001`, `0003`, `0004`, `0005`) | A rolling restart. `0004` blocks presence writes for about a second per million member rows while it builds its index | Each takes brief locks or only adds objects (§6.3) |
+| A rolling upgrade on the `nats` bus to the version that added the deployment id | Restart the nodes together, or accept that old and new nodes hear each other only through the predecessor gap fill and the sweep until all are upgraded ("Upgrading to this version") | The subject namespace includes the deployment id |
+| `--publish-lanes` | A rolling restart; nothing is recorded. Size it for the cluster: keep lanes x nodes near 20 committers per primary, per shard with a DSN list (§6.3 "How many lanes") | Each lane of each node is a committer on the primary; too many make every batch shallower |
+| The node count | Add or remove nodes behind the load balancer at any time; then revisit `--publish-lanes` | Nodes hold no state another node needs (above) |
+| `--bus-sweep-interval`, the `--postgres-notify-*` settings, the connection and HTTP settings | A rolling restart; they are per node | Nothing is recorded; a different value on one node changes only that node's latency and load |
+
+**What `/readyz` means.** A 200 says that this node can acknowledge
+publishes and receive other nodes' deliveries now: its Postgres pool
+answers, its bus connection is up and its publish lanes are committing,
+on every database, or on a majority of them with a DSN list. It says
+nothing about the presence lease, which repairs itself (Readiness,
+above), and nothing about whether every channel is served: with a DSN
+list a ready node fails the channels of a minority of down shards with
+50003. Route traffic on it. A 503 on one node is that node's problem
+(its lanes are wedged, or it lost its bus connection); a 503 on every
+node at once is the database, the NATS cluster, or, with two shards,
+either shard.
+
+**Metrics to page on.** A starting point, not thresholds measured in
+production:
+
+- Page: `/readyz` 503 on more than one node, or on one node for more than
+  a minute; `ably_storage_shard_ready{shard} == 0` (that shard's channels
+  are failing with 50003); `ably_publish_nacks_total{reason="commit_failed"}`
+  rising (publishes refused with 50003 after two commit attempts);
+  `ably_storage_retention_errors_total` rising for longer than the hour
+  of partition lookahead allows (once the lookahead runs out, a publish
+  has no partition to land in, §6.3); `ably_presence_lease_lapses_total`
+  rising (a node could not renew its lease, so its members may have been
+  reaped and re-entered, §12.5); `ably_channel_discontinuities_total`
+  rising on more than an isolated channel (clients are being told cms may
+  be missing: a bus outage longer than the retention window, or a gap the
+  log no longer holds, §7.2).
+- Ticket, or page only when sustained:
+  `ably_publish_nacks_total{reason="queue_full"}` (publishers are refused
+  with 42910: over capacity); `ably_slow_consumer_disconnects_total`;
+  `ably_bus_drops_total` and `ably_bus_coalesced_overflow_total`
+  (deliveries left to the gap fill or the sweep, so late);
+  `ably_presence_grace_leave_errors_total` (members left until their
+  node's lease ends); `ably_publish_server_presence_forced_total`;
+  `ably_storage_partition_drop_lock_timeouts_total` (expired leaves kept
+  for a later sweep); `ably_presence_reaps_deferred_total` (expected for
+  one lease window after a start or an outage; sustained, nobody reaps).
+- Investigate at once, as possible misconfiguration or abuse of the bus:
+  `ably_bus_unrouted_total{reason="foreign"}` (another cluster publishes
+  on this NATS cluster) and `ably_bus_malformed_total` (§7.2 "The bus is
+  a trusted network").
+- Capacity, not alerts: `ably_publish_lane_queue_depth`,
+  `ably_publish_commit_seconds`, `ably_publish_batch_size`,
+  `ably_channels_bound`, `ably_storage_log_bytes`, and
+  `ably_storage_channel_rows_dropped_total` against the rate of new
+  channel names (§6.3 "Pruning `channels` rows").
+
 ## 12. Presence
 
 Presence lets clients announce themselves as **members** of a channel —
