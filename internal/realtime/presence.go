@@ -436,17 +436,34 @@ func (c *connection) reenterPresence(ctx context.Context) (entered, failed int) 
 	return c.publishReentries(ctx, snap)
 }
 
-// reenterMembers re-enters the given members (channel -> clientId ->
-// last message) under presMu, as reenterPresence does for the whole
+// reenterMembers re-enters, under presMu, the members of the given set
+// (channel -> clientId) that this connection still holds, each with the
+// connection's own record of it, as reenterPresence does for the whole
 // entered set. Used for members adopted from a grace entry during a
-// re-entry pass.
+// re-entry pass. The connection may be running by then (a hand-over at
+// the grace window's end, or this running after CONNECTED), so a member
+// its client has since left is not brought back, and one it has updated
+// is re-entered with the update, not with the grace entry's copy.
 func (c *connection) reenterMembers(ctx context.Context, members map[string]map[string]*protocol.PresenceMessage) (entered, failed int) {
 	c.presMu.Lock()
 	defer c.presMu.Unlock()
+	c.enteredMu.Lock()
+	if c.presenceClosed {
+		c.enteredMu.Unlock()
+		return 0, 0
+	}
 	snap := make(map[string][]*protocol.PresenceMessage, len(members))
 	for channel, set := range members {
-		snap[channel] = reentries(c.id, set)
+		held := c.entered[channel]
+		cur := make(map[string]*protocol.PresenceMessage, len(set))
+		for clientID := range set {
+			if m := held[clientID]; m != nil {
+				cur[clientID] = m
+			}
+		}
+		snap[channel] = reentries(c.id, cur)
 	}
+	c.enteredMu.Unlock()
 	return c.publishReentries(ctx, snap)
 }
 

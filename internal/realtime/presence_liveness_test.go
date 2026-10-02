@@ -537,8 +537,33 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 
 	// The resume claims the grace entry while the second pass runs, and
 	// re-enters what it adopted: the subscriber sees alice's ENTER again.
+	// That re-entry is held in the store too, and the resume's CONNECTED
+	// does not wait for it: it runs off the handshake.
+	aliceHeld, aliceRelease := make(chan struct{}), make(chan struct{})
+	var holdAlice atomic.Bool
+	holdAlice.Store(true)
+	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+		if storage.IsPresenceReentry(ctx) && len(p) > 0 {
+			switch {
+			case p[0].ClientID == "bob":
+				release := make(chan struct{})
+				held <- release
+				<-release
+			case p[0].ClientID == "alice" && holdAlice.CompareAndSwap(true, false):
+				close(aliceHeld)
+				<-aliceRelease
+			}
+		}
+		return store()
+	})
 	pub2 := dialResumeClientID(t, h.srv, connected.ConnectionDetails.ConnectionKey, "alice")
 	drainConnected(t, pub2)
+	select {
+	case <-aliceHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the resumed connection never re-entered alice")
+	}
+	close(aliceRelease)
 	f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
 	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
 		t.Fatalf("frame = %+v, want alice re-entered by the resumed connection", f)
@@ -837,5 +862,93 @@ func TestDetachAfterQueuedEnterLeavesTheMember(t *testing.T) {
 	conn.enteredMu.Unlock()
 	if n != 0 {
 		t.Fatalf("entered set holds %d channels after the DETACH, want none", n)
+	}
+}
+
+// TestReenterAdoptedUsesTheConnectionsOwnRecord: a re-entry of members
+// adopted from a grace entry re-enters only those the connection still
+// holds, with its own record of each (DESIGN.md §12.5). The connection
+// may be running by then, so a member its client has left since the
+// hand-over is not brought back, and one it has updated keeps the
+// update; replaying the grace entry's copy did both wrong.
+func TestReenterAdoptedUsesTheConnectionsOwnRecord(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	pub := dialClient(t, h.srv, "*")
+	connected := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+	attach(t, pub, "room", protocol.FlagPresence)
+	conn := h.liveConn(t, connected.ConnectionID)
+	for i, p := range []*protocol.PresenceMessage{
+		{Action: protocol.PresenceEnter, ClientID: "alice", Data: "old"},
+		{Action: protocol.PresenceUpdate, ClientID: "alice", Data: "new"},
+	} {
+		sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+			Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(int64(i + 1)),
+			Presence: []*protocol.PresenceMessage{p},
+		})
+		if f := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionAck {
+			t.Fatalf("frame = %v, want ACK", f.Action)
+		}
+		if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
+			t.Fatalf("frame = %v, want PRESENCE", f.Action)
+		}
+	}
+
+	// The grace entry's copy: alice before her update, and bob, whom the
+	// client has left since.
+	n, f := conn.reenterMembers(context.Background(), map[string]map[string]*protocol.PresenceMessage{
+		"room": {
+			"alice": {Action: protocol.PresenceEnter, ClientID: "alice", Data: "old"},
+			"bob":   {Action: protocol.PresenceEnter, ClientID: "bob", Data: "gone"},
+		},
+	})
+	if n != 1 || f != 0 {
+		t.Fatalf("re-entered %d, failed %d; want 1 and 0", n, f)
+	}
+	got := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if got.Action != protocol.ActionPresence || len(got.Presence) != 1 || got.Presence[0].ClientID != "alice" || got.Presence[0].Data != "new" {
+		t.Fatalf("frame = %+v, want alice re-entered with her update only", got)
+	}
+}
+
+// TestDiscontinuityWithAFailedSeedKeepsMembers: a channel update whose
+// presence re-seed fails, after its retries, still carries HAS_PRESENCE
+// (with no SYNC), so the SDK keeps its members until a later sync rather
+// than taking the set as empty and leaving every member (RTP19a).
+func TestDiscontinuityWithAFailedSeedKeepsMembers(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	pub := dialClient(t, h.srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionSync {
+		t.Fatalf("frame = %v, want the attach SYNC", f.Action)
+	}
+
+	h.store.failMembers.Store(true)
+	ch, err := h.manager.GetChannel(context.Background(), "room")
+	if err != nil {
+		t.Fatalf("GetChannel: %v", err)
+	}
+	ch.Discontinuity(storage.DiscontinuityRetention)
+	update := readFrame(t, sub, protocol.FormatJSON, 3*time.Second)
+	if update.Action != protocol.ActionAttached || update.Error == nil || update.Error.Code != 80016 {
+		t.Fatalf("frame = %+v, want the 80016 channel update", update)
+	}
+	if update.Flags&protocol.FlagHasPresence == 0 {
+		t.Fatalf("flags = %d, want HAS_PRESENCE although the re-seed failed", update.Flags)
+	}
+	h.store.failMembers.Store(false)
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(2),
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceUpdate, Data: "x"}},
+	})
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
+		t.Fatalf("frame = %v, want the live UPDATE next (no SYNC)", f.Action)
 	}
 }

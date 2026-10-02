@@ -453,23 +453,29 @@ var errMessagesExpired = protocol.ErrorInfo{
 // PRESENCE_SUBSCRIBE attachment also gets the presence set again, as on
 // attach: HAS_PRESENCE and a SYNC when the set has members, so the SDK
 // replaces its set rather than clearing it (RTP19a); the channel dropped
-// its local set with the marker, so the snapshot is read afresh.
-// Returns false if a send failed.
+// its local set with the marker, so the snapshot is read afresh, with
+// retries (discontinuitySnapshot). If every read fails, the ATTACHED
+// still carries HAS_PRESENCE, with no SYNC, so the SDK keeps its members
+// rather than leaving them all. Returns false if a send failed.
 func (a *attachment) signalDiscontinuity(serial string) bool {
-	var snap *core.PresenceSnapshot
+	var (
+		snap       *core.PresenceSnapshot
+		seedFailed bool
+	)
 	if a.hasMode(protocol.FlagPresenceSubscribe) {
-		var err error
-		if snap, err = a.stream.Channel().PresenceSync(a.ctx); err != nil {
-			if a.ctx.Err() != nil {
-				return false
-			}
-			a.logger.Warn("presence sync after a discontinuity: Members failed; skipping sync", "err", err)
-			snap = nil
+		var ok bool
+		if snap, ok = a.discontinuitySnapshot(); !ok {
+			return false
 		}
+		seedFailed = snap == nil
 	}
 	hasSync := snap != nil && len(snap.Members) > 0
 	flags := a.modeSet()
-	if hasSync {
+	if hasSync || seedFailed {
+		// With the set unknown, HAS_PRESENCE and no SYNC: the SDK starts
+		// a sync and keeps its members until one completes (the next
+		// update or attach). Without the flag it would take the set as
+		// empty and synthesise a LEAVE for every member (RTP19a).
 		flags |= protocol.FlagHasPresence
 	}
 	a.setCurSerial(serial)
@@ -485,6 +491,41 @@ func (a *attachment) signalDiscontinuity(serial string) bool {
 		return false
 	}
 	return !hasSync || a.sendSync(snap)
+}
+
+// discontinuitySyncAttempts and discontinuitySyncBackoff bound the
+// presence re-seed of a channel update (signalDiscontinuity): up to four
+// reads, 100 ms, 200 ms and 400 ms apart.
+const (
+	discontinuitySyncAttempts = 4
+	discontinuitySyncBackoff  = 100 * time.Millisecond
+)
+
+// discontinuitySnapshot reads the presence set for a channel update,
+// retrying a failed read with backoff (discontinuitySyncAttempts). It
+// returns nil if every read failed, and ok false if the attachment
+// ended meanwhile.
+func (a *attachment) discontinuitySnapshot() (snap *core.PresenceSnapshot, ok bool) {
+	backoff := discontinuitySyncBackoff
+	for attempt := 1; ; attempt++ {
+		snap, err := a.stream.Channel().PresenceSync(a.ctx)
+		if err == nil {
+			return snap, true
+		}
+		if a.ctx.Err() != nil {
+			return nil, false
+		}
+		if attempt == discontinuitySyncAttempts {
+			a.logger.Warn("presence sync after a discontinuity: Members failed; sending HAS_PRESENCE without a SYNC", "attempts", attempt, "err", err)
+			return nil, true
+		}
+		select {
+		case <-time.After(backoff):
+		case <-a.ctx.Done():
+			return nil, false
+		}
+		backoff *= 2
+	}
 }
 
 // forward delivers one ChannelMessage to the connection as the wire

@@ -509,9 +509,9 @@ type rangeRead struct {
 	cms         []*protocol.ChannelMessage
 	full        bool
 	// unproven is set when the read cannot prove it holds every cm past
-	// after (DESIGN.md §7.2): after is below the channel's retention
-	// floor, the channel has moved past it, and the cm at after is gone
-	// from the log. Partitions are dropped oldest first, so while the cm
+	// after (DESIGN.md §7.2, unprovenRead): after is below the channel's
+	// retention floor, the cm at after is gone from the log, and the
+	// channel has moved past it or lost its channels row (pruned). Partitions are dropped oldest first, so while the cm
 	// at the mark is held, so is every cm after it; once it is gone, cms
 	// between it and the oldest one returned may have aged out too.
 	// current is the channel's serial as of the read, set when the read
@@ -798,13 +798,16 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 // (rangeRead.unproven); for the others neither is read. A channel with no
 // cms past its mark comes back as one row with a NULL serial.
 //
-// The outer scan repeats the subquery's bounds on channel_serial so the
-// planner can prune leaves there too. Both range queries run with
-// pgx.QueryExecModeExec (an unnamed statement, planned for the actual
-// parameters on every call), so the planner prunes the leaves that lie
-// entirely below the mark; a named,
-// cached statement switches to a generic plan after five executions, and
-// a generic plan locks every leaf (DESIGN.md §6.3).
+// The outer scan repeats the subquery's bounds on channel_serial. Both
+// range queries run with pgx.QueryExecModeExec (an unnamed statement,
+// planned for the actual parameters on every call); a named, cached
+// statement switches to a generic plan after five executions, and a
+// generic plan locks every leaf. That lets sqlLoadRange, whose bounds
+// are literal parameters, prune the leaves entirely below the mark.
+// This query cannot: its bounds come from unnest through a materialised
+// CTE, so the planner opens (ACCESS SHARE) every leaf whatever the marks,
+// and a leaf a drop holds waits it out (DESIGN.md §6.3; the drop gives
+// up after its lock timeout).
 const sqlLoadRangeMany = `
 WITH t AS MATERIALIZED (
 	SELECT u.name, u.after, u.upto,

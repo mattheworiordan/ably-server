@@ -492,6 +492,19 @@ func (s *Server) claimGrace(c *connection) {
 	delete(s.grace, c.id)
 	g.fired = true
 	adopted, reenter := s.adoptGraceLocked(c, g)
+	if reenter {
+		// The re-entry runs off the WebSocket handshake, so it does not
+		// delay CONNECTED (reenterMembers re-enters only what the client
+		// still holds, so its own writes meanwhile are respected). It is
+		// counted in reaperWG, so Shutdown waits for it; a node already
+		// shutting down skips it, as its members go with it.
+		select {
+		case <-s.reaperDone:
+			reenter = false
+		default:
+			s.reaperWG.Add(1)
+		}
+	}
 	s.graceMu.Unlock()
 	g.finish()
 	if !adopted {
@@ -499,7 +512,10 @@ func (s *Server) claimGrace(c *connection) {
 		return
 	}
 	if reenter {
-		s.reenterAdopted(c, g.members)
+		go func() {
+			defer s.reaperWG.Done()
+			s.reenterAdopted(c, g.members)
+		}()
 	}
 }
 
