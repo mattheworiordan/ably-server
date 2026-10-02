@@ -1585,8 +1585,13 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   (`ably_publish_server_presence_forced_total`): the bound gives way only
   for a channel whose earlier publishes are themselves stuck. A
   publish on the same channel queued after it was turned away can still
-  commit before it; for a teardown or grace LEAVE that is another member's
-  operation, since the departed connection writes nothing more. (The
+  commit before it (a stated gap: the overflowed LEAVE reserves no place
+  in the channel's order). For a teardown or grace LEAVE that later
+  publish is another member's operation, since the departed connection
+  writes nothing more, and the LEAVE removes only its own member key
+  (`connectionId:clientId`), so it cannot remove the member another
+  connection entered; subscribers can see the two events in the other
+  order. (The
   reaper's LEAVEs and lease-lapse re-entries never join a batch, §12.5.)
 
 **Channel rows.** A channel's `channels` row (its serial and initial
@@ -2621,8 +2626,12 @@ like any key the file format does not define.
   the lanes.
 - `--presence-lease-mode` (`presence-lease-mode`): presence liveness is
   always one lease per node, the `node` default (§12.5); `member`, a
-  lease on every member row, is gone. A rolling upgrade from a node
-  that ran `member` is safe (§12.5 "Upgrading from member lease mode").
+  lease on every member row, is gone. `member` renewed all of a node's
+  member rows with one `UPDATE` per bump: at 100k members a node that
+  rewrote and row-locked 100k rows every 10 s, which convoyed with the
+  presence batches writing the same rows (§6.3). A rolling upgrade from a
+  node that ran `member` is safe (§12.5 "Upgrading from member lease
+  mode").
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -3196,8 +3205,10 @@ of the store's set as of a serial:
   disk backends deliver each presence cm under the lock that mints it,
   so their cms also arrive in serial order.
 
-The store's set stays authoritative (§12.5): `GET .../presence` and the
-delayed-LEAVE checks always read the store.
+The store's set stays authoritative (§12.5): `GET .../presence` always
+reads the store. The grace-window LEAVE after an abrupt disconnect reads
+neither the store nor this cache: it uses the departed connection's own
+record of the members it entered (§12.5 "Liveness").
 Series: `ably_presence_syncs_total{snapshot}`,
 `ably_presence_sync_seeds_total` (§10).
 
@@ -3229,11 +3240,10 @@ into it transactionally and `Members` reads it (§6). Per backend:
   full lane) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
   per database (`--presence-max-inflight`, default 4 x `--publish-lanes`
-  (8 at the default 2 lanes), 16 when batching is off; server-synthesised LEAVEs are exempt (in the
-  lanes they have a bound of their own, §6.3), so a mass disconnect with
-  batching off can still hold
-  many pool connections with LEAVEs, as before the bound existed): one
-  beyond the bound is refused at once with
+  (8 at the default 2 lanes), 16 when batching is off; server-synthesised
+  LEAVEs are exempt (in the lanes they have a bound of their own, §6.3),
+  so a mass disconnect with batching off can still hold many pool
+  connections with LEAVEs): one beyond the bound is refused at once with
   Ably error **42910** (a NACK; the client should back off and retry) and
   counted in `ably_publish_nacks_total{reason="presence_inflight"}`, so a
   convoy on one hot room cannot starve the pool that `SYNC` seeds, binds
@@ -3262,8 +3272,9 @@ Departure:
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
   immediately. It hands the members it still holds (its own record of
-  what it entered, with each member's last state; no store read) to the
-  server, keyed by `connectionId`, for `remainPresentFor`. If a
+  what it entered, with each member's last state, holding only operations
+  the store committed, see *Re-entry*; no store read) to the server,
+  keyed by `connectionId`, for `remainPresentFor`. If a
   connection resumes that `connectionId` in the window (§4.3, §8), it
   takes the members over: it owns them from then on, so its own DETACH,
   CLOSE or drop leaves them, and no LEAVE is written for the dropped
@@ -3283,10 +3294,9 @@ Departure:
   The registry is the whole answer because a resume only ever reaches the
   node that issued the connectionKey: the key's HMAC secret is per process
   (§8), so a resume on another node gets a fresh `connectionId` and
-  80018. An earlier version re-read the store at write time and compared
-  member serials, to catch a resume that re-entered on another node; that
-  case cannot occur, the comparison protected nothing the registry does
-  not, and its store read could fail (it did, under load) and drop the
+  80018. The LEAVE therefore does not re-read the store at write time: a
+  read could only catch a resume that re-entered on another node, which
+  cannot occur, and a store read can fail under load and drop the
   LEAVE.
 
 Because the server holds no other per-connection state across disconnects
@@ -3310,26 +3320,20 @@ the normal publish path (a fresh presence publish, announced on the bus
 to every node's appender). Postgres row locking means exactly one
 node's `DELETE ... RETURNING` yields a given row, so each LEAVE is
 published once. The lease is one per node, a row in `presence_nodes
-(node_id, expires_at)`:
+(node_id, expires_at)`.
 
-- The bump is one upsert of that row, so its cost
-  does not grow with the node's members and it never writes or locks a
-  member row; a member row's own `expires_at` is `'infinity'`. A node is
-  **alive** while its row exists with `expires_at` no more than one bump
-  interval in the past (`expires_at >= now() - 10s`: the margin absorbs
-  clock skew between nodes and a bump that is late by a tick), and dead
-  otherwise. The reaper lists the node ids that own members (a skip scan
-  over `presence_node_idx`, one index probe per distinct owner) with no
-  live lease, plus the dead lease rows, and for each deletes the
-  node's members in chunks of 1000, re-checking the lease in every chunk
-  so a node that renews part way stops being reaped; once every chunk is
-  deleted it publishes their LEAVEs, then deletes the node's lease row
-  once it owns no member.
-- The retired member lease mode (§9 "Removed settings") instead put a
-  lease on every member row, renewed by one `UPDATE` of all of the
-  node's rows per bump: at 100k members per node that rewrote and
-  row-locked 100k rows every 10 s, which convoyed with presence batches
-  writing the same rows (§6.3).
+The bump is one upsert of that row, so its cost does not grow with the
+node's members and it never writes or locks a member row; a member row's
+own `expires_at` is `'infinity'`. A node is **alive** while its row
+exists with `expires_at` no more than one bump interval in the past
+(`expires_at >= now() - 10s`: the margin absorbs clock skew between nodes
+and a bump that is late by a tick), and dead otherwise. The reaper lists
+the node ids that own members (a skip scan over `presence_node_idx`, one
+index probe per distinct owner) with no live lease, plus the dead lease
+rows, and for each deletes the node's members in chunks of 1000,
+re-checking the lease in every chunk so a node that renews part way
+stops being reaped; once every chunk is deleted it publishes their
+LEAVEs, then deletes the node's lease row once it owns no member.
 
 *Node identity.* A node id is random per process (40 bits, minted at
 `postgres.Open`; a sharded node uses one id on every shard and keeps a
