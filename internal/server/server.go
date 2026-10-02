@@ -1097,6 +1097,7 @@ func (c clusterOptions) postgresOptions() (postgres.Options, error) {
 	}
 	opts := c.options()
 	opts.Bus = bus
+	opts.BusInferred = c.bus == ""
 	switch bus {
 	case postgres.BusPostgres:
 		mode, err := postgres.ParseNotifyMode(c.notifyMode)

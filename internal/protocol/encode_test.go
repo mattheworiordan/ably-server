@@ -281,3 +281,50 @@ func TestActionString(t *testing.T) {
 		t.Errorf("unknown action string = %q, want contains %q", got, "unknown")
 	}
 }
+
+// TestEmptySyncCarriesAnEmptyPresenceArray: a SYNC with no members is
+// encoded with an explicit empty presence array in both formats, since
+// an SDK skips a SYNC whose presence field is absent (ably-js) and the
+// sync it is waiting on would never complete. Other frames still omit an
+// empty presence field.
+func TestEmptySyncCarriesAnEmptyPresenceArray(t *testing.T) {
+	ch := "room"
+	sync := &ProtocolMessage{Action: ActionSync, Channel: &ch, ChannelSerial: "s1:"}
+	for _, f := range []Format{FormatJSON, FormatMsgpack} {
+		data, err := Marshal(sync, f)
+		if err != nil {
+			t.Fatalf("%s: Marshal: %v", f, err)
+		}
+		var raw map[string]any
+		if f == FormatJSON {
+			err = json.Unmarshal(data, &raw)
+		} else {
+			err = msgpack.Unmarshal(data, &raw)
+		}
+		if err != nil {
+			t.Fatalf("%s: decode: %v", f, err)
+		}
+		p, ok := raw["presence"].([]any)
+		if !ok || len(p) != 0 || raw["channelSerial"] != "s1:" || raw["channel"] != "room" {
+			t.Errorf("%s: SYNC = %v, want channel, channelSerial and an empty presence array", f, raw)
+		}
+		var back ProtocolMessage
+		if err := Unmarshal(data, f, &back); err != nil || back.Action != ActionSync || back.ChannelSerial != "s1:" {
+			t.Errorf("%s: round trip = %+v (%v)", f, back, err)
+		}
+
+		other, err := Marshal(&ProtocolMessage{Action: ActionAttached, Channel: &ch}, f)
+		if err != nil {
+			t.Fatalf("%s: Marshal ATTACHED: %v", f, err)
+		}
+		var oraw map[string]any
+		if f == FormatJSON {
+			err = json.Unmarshal(other, &oraw)
+		} else {
+			err = msgpack.Unmarshal(other, &oraw)
+		}
+		if _, has := oraw["presence"]; err != nil || has {
+			t.Errorf("%s: ATTACHED = %v (%v), want no presence field", f, oraw, err)
+		}
+	}
+}

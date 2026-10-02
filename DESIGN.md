@@ -504,7 +504,7 @@ client                        server
   │   ◀───── MESSAGE … (live) ───────────────────│
   │
   │ ── DETACH ──▶
-  │                              │ remove from Channel
+  │                              │ leave presence (after queued writes), remove from Channel
   │   ◀──── DETACHED ────────────│
 ```
 
@@ -1422,18 +1422,23 @@ leaf lives one more tick at most.
    it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
    are bounded below by the delivery mark they start from, on the outer
    scan as well as the subquery, and run as unnamed statements planned
-   for the actual parameters (a cached statement would switch to a
-   generic plan after five executions, and a generic plan locks every
-   leaf). The single-channel read without a continuity check, used by the
-   gap fill and catch-up of one channel, takes its bounds as plain
+   for the actual parameters. For the single-channel read (`sqlLoadRange`,
+   the gap fill's and catch-up's unchecked read) the bounds are literal
    parameters, so the planner prunes every leaf that lies entirely below
    the mark and a read from a recent mark never locks a leaf a drop is
-   waiting on. The batched read, used by the reconcile, the sweep's
-   catch-up and every read that carries the continuity check (§7.2), takes
-   its bounds from arrays, which the planner cannot prune by: it opens
-   every leaf of the log, so a drop that queues behind it waits out its
-   1 s lock timeout and is retried on the next drop tick, and each such
-   read plans across every leaf. No
+   waiting on. The batched read (`sqlLoadRangeMany`: reconcile, the
+   sweep's catch-up, and every checked read, including a checked gap
+   fill) takes its bounds from `unnest` of arrays through a materialised
+   CTE, so the planner cannot prune at plan time and opens every leaf
+   (an `ACCESS SHARE` lock on each), whatever the marks; a leaf a drop
+   holds in `ACCESS EXCLUSIVE` therefore makes such a read wait. The
+   drop runs `DETACH PARTITION CONCURRENTLY` before `DROP` and the drop
+   gives up after its 1 s `lock_timeout`, so the wait is short and the
+   drop retries next tick; the cost accepted is that every reconcile
+   chunk plans across every leaf. Per-channel reads with literal bounds
+   for the checked or old-mark case would avoid it; not built. A cached
+   statement would switch to a generic plan after five executions, and a
+   generic plan locks every leaf. No
    retention floor is applied to the range: every cm after the mark is
    wanted whatever its age, and a floor above the mark would hide cms the
    log still holds while the continuity check (§7.2) reports nothing
@@ -1609,17 +1614,16 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   (`ably_publish_server_presence_forced_total`): the bound gives way only
   for a channel whose earlier publishes are themselves stuck. A
   publish on the same channel queued after it was turned away can still
-  commit before it (a stated gap: the overflowed LEAVE reserves no place
-  in the channel's order). For a teardown or grace LEAVE that later
-  publish is usually another member's operation, since the departed
-  connection writes nothing more, and the LEAVE removes only its own
-  member key (`connectionId:clientId`), so it cannot remove a member
-  another connection entered; subscribers can see the two events in the
-  other order. The exception is a resume: a resumed connection keeps its
-  `connectionId`, so if it resumes just after its grace window fired and
-  re-enters while the overflowed grace LEAVE is still waiting, the LEAVE
-  can commit after the ENTER and remove the resumed member. (The
-  reaper's LEAVEs and lease-lapse re-entries never join a batch, §12.5.)
+  commit before it; for a teardown or grace LEAVE that is usually another
+  member's operation, since the departed connection writes nothing more.
+  The argument does not hold across a resume: a resume keeps the
+  connectionId, so a grace LEAVE turned away and written around the lane
+  can race an ENTER of the same member from the resumed connection, when
+  the resume lands just after the window ended, and then remove it. The
+  member is then absent although its connection is live, until the client
+  next updates it or re-attaches. Reserving the LEAVE's lane position
+  instead would close it; that is not built. (The reaper's LEAVEs and
+  lease-lapse re-entries never join a batch, §12.5.)
 
 **Channel rows.** A channel's `channels` row (its serial and initial
 serial) is created by the first write or bind that needs it. A batched
@@ -1680,14 +1684,20 @@ and so none survives:
   serial. The first publish after the idle period announces the new seed
   as its predecessor, which is ahead of the mark, so the delivery point
   holds it and the gap fill reads it from the log about 100 ms later
-  (§7.2); that one cm is delivered late and none is lost. The gap fill's
-  continuity check (§7.2 "Retention") can then signal a discontinuity
-  that is spurious: the cm at the mark aged out long ago, and the sweep
-  stops refreshing the node's proof of continuity once it finds no
-  `channels` row, so a node that held the channel bound through the whole
-  idle period can no longer prove that nothing came after its mark. The
-  client is told cms may be missing when none are (§7.2: the signal can
-  be spurious, never missing).
+  (§7.2); that one cm is delivered late, none is lost, and no
+  discontinuity is signalled. The fill from the old mark is a plain read,
+  with no continuity check, because the node still holds a recent proof
+  that nothing was past its mark: while the row is gone, each sweep that
+  finds no row for a bound channel the node had caught up on proves it
+  again at the time of the read (no row means no publish since the
+  prune, as a publish recreates the row), provided the previous sweep of
+  the channel is inside its retention window (a cm committed after that
+  sweep would have kept the row from being pruned until it, too, aged
+  out). A node that was not sweeping the channel meanwhile (no subscriber
+  on it, off the bus, or `--bus-sweep-interval` longer than the
+  retention) holds no such proof; its checked fill finds the mark's cm
+  gone and signals a discontinuity, since it cannot know what happened
+  after the mark.
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
 
@@ -2070,25 +2080,37 @@ The `postgres` and `nats` buses share one delivery point
   the marker sends its client an `ATTACHED` without `RESUMED`, error
   80016, at its current `channelSerial`, followed for a
   `PRESENCE_SUBSCRIBE` attachment by the re-seeded set (`HAS_PRESENCE`
-  and a `SYNC` when it has members). The cms in the gap are not
+  and a `SYNC` when it has members). A failed re-seed read is retried
+  (four reads, 100, 200 and 400 ms apart); if every one fails, the
+  `ATTACHED` still carries `HAS_PRESENCE`, so the SDK starts a sync and
+  keeps its members rather than taking the set as empty and leaving every
+  member (RTP19a), and the attachment retries the read every second and
+  sends the `SYNC` once one succeeds, an empty set included (a `SYNC`
+  with no members carries `presence: []` on the wire, §12.4). Until then
+  the SDK's sync is open:
+  `presence.get()` waits, and a member that left in the gap is removed
+  only when the sync completes. The `SYNC` holds the set as of its read,
+  at or after the cms delivered so far. The cms in the gap are not
   replayed; the client is told so that it can reconcile (§4.3). A gap
   the bus revealed (a held cm's predecessor) that the log no longer has
   is signalled the same way, at the point of the skip. The signal can
   be spurious, and is never missing provided every publish commits
-  within the one-second clock margin of minting its serial (the mint
-  holds the channel's row lock until commit); a transaction stalled
-  longer than that between the two, and longer than the window, could
-  escape it. Two cases are spurious, signalled although nothing was
-  lost, because the log does not record what preceded the new cm: a
-  channel last proven caught up longer than the retention window ago,
-  whose last cm has aged out and which then received a cm while the node
-  was off the bus (on `pgnotify`, which has no sweep, "last proven" is
-  the bind); and, with the node on the bus, the first cm on a bound
-  channel whose `channels` row was pruned after it idled past the
-  longest retention (§6.3 "Pruning `channels` rows"), since the sweep
-  stops proving a channel once it finds no row. A spurious signal costs the client a reconcile, and an
-  SDK re-enters its own presence members on an `ATTACHED` without
-  `RESUMED` (RTP17i). Counted in
+  within the clock margin of minting its serial (below). It is spurious
+  for a channel last proven caught up longer than the retention window
+  ago, whose last cm has aged out and which then received a cm while the
+  node was off the bus, or while it was not sweeping the channel (no
+  subscriber on it, "Sweep scope" below): nothing was lost, but the log
+  does not record what preceded the new cm. A node on the bus that is
+  sweeping the channel does not hit this when the channel's row is
+  pruned: a sweep that finds no row proves the channel again (§6.3
+  "Pruning `channels` rows"). On `pgnotify`, which has no sweep, "last
+  proven" is the bind. The proof assumes a publish commits within the
+  one-second clock margin of minting its serial (the mint holds the
+  channel's row lock until commit); a transaction stalled longer than
+  that between the two, and longer than the window, could escape it. A
+  spurious signal costs the client a reconcile, and an SDK re-enters its
+  own presence members on an `ATTACHED` without `RESUMED` (RTP17i).
+  Counted in
   `ably_channel_discontinuities_total{reason}` (§10).
 - **Sweep scope.** The sweep reads only bound channels with a subscriber
   on this node: an open
@@ -2223,7 +2245,17 @@ emits no NOTIFY.
 **The bus is a trusted network.** A receiver delivers the body an
 envelope carries without reading the log: that is what makes the bus
 fast. So whoever can publish to the NATS subjects can put a message in
-front of every subscriber of a channel. Run NATS on a private network,
+front of every subscriber of a channel. A NATS publisher is fully
+trusted: the deployment id travels in plain text in every envelope and
+is mixed into the subject hash, so anyone who can read the NATS cluster
+can forge an envelope that passes the checks below. A forged inline cm
+whose predecessor is the receiver's mark is appended unverified, and a
+forged serial up to 5 minutes ahead makes a gap fill treat the log as
+authoritative up to it: its bus body is delivered and the mark jumps, so
+the channel's genuine cms below it are dropped as duplicates for up to 5
+minutes, and the forger can repeat it. The checks below guard against
+a buggy sender, not a hostile one; NATS without authentication (the
+default) is open to this. Run NATS on a private network,
 or authenticated and encrypted: `nats://user:pass@host` and `tls://host`
 URLs work, and `--nats-creds` (a credentials file: user JWT and NKey
 seed), `--nats-tls-ca`, `--nats-tls-cert` and `--nats-tls-key` (PEM
@@ -2931,18 +2963,28 @@ nothing. Deleting the row instead makes the next node record its own
 settings and a new deployment id.
 
 *Upgrading past the bus default.* Before the bus was inferred (§7.2), a
-node started without `--bus` ran `pgnotify`. Two cases follow. A
-database that recorded `pgnotify` (a node of a version that has the
-identity row ran it) refuses a node of this version started the same
-way, which infers `postgres`, and the refusal names the difference. A
-database from a version before the identity row has no row at all, so
-the first upgraded node records whatever it runs and nothing refuses it,
-while the old nodes check nothing: an upgraded node that infers
-`postgres` NOTIFYs on per-channel names the old `pgnotify` nodes never
-LISTEN on, and `pgnotify` has no sweep, so the old nodes' subscribers
-never receive the upgraded nodes' publishes during the rollout. When
-upgrading a cluster that ran without `--bus`, set `--bus=pgnotify` on the
-new nodes for the rollout, then change the bus with the steps above.
+node started without `--bus` ran `pgnotify`. Two cases:
+
+- A database whose record says `pgnotify` (written by a node of a
+  version that had the record but not the inference): a node of this
+  version started without `--bus` infers `postgres` and is refused by
+  the comparison above, the refusal naming the difference.
+- A database with no record that already holds `channels` rows: it
+  served a version from before the record, whose nodes ran `pgnotify`
+  and do not check the record. A node that inferred its bus would record
+  `postgres` (or `nats`), and during a rolling upgrade its publishes
+  would never reach subscribers on the older nodes (pgnotify has no
+  predecessor chain and no sweep to repair them), while theirs would
+  reach it only through its sweep. So a node with no `--bus` is refused
+  on such a database, before anything is recorded, with a message that
+  says the database predates the bus setting and its nodes ran
+  `pgnotify`. Set `--bus=pgnotify` on every node to keep the cluster
+  together while it is upgraded (it is then recorded), or stop every
+  node and start them all with `--bus=postgres` or `--bus=nats`. An
+  explicit `--bus` is taken as that decision and recorded. A database
+  with no `channels` row is treated as new. The signal is the rows, not
+  the migration history, so a database whose every row has been pruned
+  (§6.3; a channel with a presence member is never pruned) looks new.
 
 *Upgrading to this version.* A database without the row records the
 settings of the first upgraded node; nodes of earlier versions do not
@@ -3252,7 +3294,10 @@ action `PRESENT`. The `channelSerial` field doubles as the sync cursor:
 `<serial>:<cursor>` while pages follow, `<serial>:` (empty cursor part)
 on the final page to mark completion. At the scale we target the set
 usually fits a single frame; the cursor protocol allows paging for larger
-sets.
+sets. A `SYNC` with no members (a client-initiated `SYNC` on an empty
+channel, or the owed `SYNC` after a channel update, §7.2) carries
+`presence: []` rather than omitting the field, in both formats: ably-js
+skips a `SYNC` with no presence field, so the sync would not complete.
 
 Consistency between the snapshot and live delivery is resolved by the
 **client's merge**, exactly as in Ably: every PresenceMessage carries a
@@ -3376,7 +3421,19 @@ Departure:
 
 - **Explicit LEAVE, DETACH, clean CLOSE, or graceful shutdown (§11)** — a
   deliberate departure, processed as an immediate LEAVE publish (no grace):
-  the connection is not coming back, so there is nothing to wait for.
+  the connection is not coming back, so there is nothing to wait for. A
+  DETACH's LEAVE runs on the connection's publish worker, after every
+  presence write the connection sent before the DETACH, and `DETACHED`
+  is sent once it is done (so it also follows the ACKs of the frames
+  before it). Run on the read goroutine, it could overtake an ENTER still
+  queued behind an earlier publish, which then committed after the LEAVE
+  and left its member present on the detached channel until the
+  connection ended. A DETACH LEAVE that fails puts its members back as
+  uncertain, so the connection's own departure still leaves them. The
+  price is that `DETACHED` waits for the connection's queued writes; if
+  they take longer than the SDK's request timeout (10 s in ably-js), the
+  SDK returns the channel to attached (RTL5f) and, when the late
+  `DETACHED` arrives, re-attaches (RTL13a).
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
   immediately. It hands the members it still holds (its own record of
@@ -3535,14 +3592,58 @@ window (a resume would take them over expecting them present; they still
 leave at the window's end; a grace LEAVE already written, or members a
 resume has since taken over, are skipped, so this cannot undo the resumed
 client's own LEAVE). It works on 32 connections or grace entries at a
-time. A connection's entered set records an operation only once the
-store has committed it: a LEAVE the store refused keeps its member, so
-the member still leaves with the connection, and an ENTER the store
-refused is never re-entered. The pass takes its two snapshots (grace
-entries, then live connections) together under the grace lock, and a
-grace entry a resume claims while the pass is running is re-entered by
-the claiming connection itself, since the pass may already have passed
-both the entry and the connection. Each ENTER is
+time. A connection's entered set follows the store's answer to each
+presence write. A committed operation is recorded. One the store turned
+away before writing anything (42910: a full lane queue or the presence
+in-flight bound; 40010, a channel name the store cannot hold; a
+malformed client-supplied id) is not. One whose outcome is unknown (a
+timeout, a 50003, any other failure) is recorded as *uncertain*: an
+ENTER or UPDATE for a member not yet held records it, and a LEAVE turns
+a held member uncertain. Every LEAVE path (DETACH, teardown, grace)
+covers an uncertain member, since the write may have committed; if it
+did not, the LEAVE stores nothing, but subscribers see a LEAVE for a
+member they never saw enter (ably-js emits a `leave` event for it). A
+re-entry skips an uncertain member, since the client was told the
+operation failed. When two sets merge (a resume's hand-over, a second
+drop in the window) a committed record is kept over an uncertain one.
+The records are copies taken before the store sees the messages: a batch
+the caller stopped waiting for still stamps them while it commits. So a refused LEAVE still leaves with the
+connection, and a refused ENTER is never re-entered. The client's
+presence write runs on a context the connection's teardown does not
+cancel, bounded by 10 s (`DefaultPresenceWriteTimeout`): teardown
+cancels the connection's context, then waits for the publish worker
+before it takes the entered set, so an ENTER whose batch was in flight
+when the connection dropped is answered and recorded first and gets its
+LEAVE. (On the connection's own context such an ENTER committed, the
+caller saw only the context's error, and the member was never left: it
+stayed until its node died.) Once teardown has begun, the publish worker
+drops the tasks still queued rather than run them, so at most the one
+in flight holds teardown up to its bound. The pass counts itself in and takes its two
+snapshots (grace entries, then live connections) in one step under the
+grace lock, and a resume's hand-over of a grace entry (at the resume, or
+at the window's end if the resume landed while the dropped connection was
+still tearing down) is one step under the same lock with reading the
+count of passes running. So either a pass took its snapshots before the
+hand-over, and then it is still running (the count is not zero, and the
+resumed connection re-enters what it adopted itself) or it finished
+having re-entered the entry; or it takes them after, and then its
+snapshot holds the resumed connection with the adopted members. It is a
+count, not a flag, because the lapse hook can fire again during a long
+pass and the passes overlap; one ending must not hide another. A grace
+entry created or extended while a pass is running is in no pass's
+snapshot, and the pass may have read the dropped connection after its
+teardown took its members, so such an entry is marked owed and its
+adopter re-enters it too. A connection that has adopted members to
+re-enter and drops before its re-entry has read its set hands the duty
+on with them: the grace entry its teardown creates is marked owed too,
+as is the entry members are rescheduled into when a hand-over finds the
+resumed connection itself tearing down.
+The adopter's re-entry runs off the resume's WebSocket handshake, so it
+does not delay `CONNECTED`, and re-enters only
+the adopted members the connection still holds, each with the
+connection's own record of it: the connection may already be running
+(always so at the window's end), and a LEAVE or UPDATE its client has
+sent since is respected rather than replayed over. Each ENTER is
 written in a transaction of its own, after the publishes of its channel
 already queued or in flight on the lane, and leaves out every member that
 is in the table once the channel's row lock is held (the read waits for a

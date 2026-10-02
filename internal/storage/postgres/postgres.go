@@ -156,6 +156,14 @@ type Options struct {
 	// unset. Postgres is the store whichever bus is chosen.
 	Bus string
 
+	// BusInferred reports that the server inferred Bus because --bus was
+	// unset (DESIGN.md §7.2, §11). A database that already holds
+	// channels but has no cluster identity record served an earlier
+	// version, whose nodes ran pgnotify when --bus was unset; Open then
+	// refuses to record an inferred bus, since the upgraded nodes would
+	// not deliver to the ones still running.
+	BusInferred bool
+
 	// NATSURL is the NATS server URL for BusNATS; a comma-separated list
 	// of the servers of one NATS cluster is accepted. Required when Bus
 	// is BusNATS.
@@ -425,7 +433,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 			message:             retention.Message,
 			persisted:           retention.Persisted,
 			persistedNamespaces: normalizeNamespaces(opts.PersistedNamespaces),
-		})
+		}, opts.BusInferred)
 		if err != nil {
 			pool.Close()
 			return nil, fmt.Errorf("storage/postgres: %w", err)
@@ -1286,6 +1294,10 @@ type channelStore struct {
 	gapBackoff     time.Duration
 	overflowArmed  bool   // a forced fill is armed after a hold overflow
 	sweptWatermark string // the channel's watermark at the previous sweep
+	// sweptAt is the database time (clockSerial) of the last sweep that
+	// read the channel's row, or proved the channel with the row absent
+	// (sweepWatermarks).
+	sweptAt string
 
 	// Delivery counters for tests (guarded by hwmMu).
 	delivered, duplicates, held, gapFills, sweepCatchUps, holdOverflows int

@@ -509,9 +509,9 @@ type rangeRead struct {
 	cms         []*protocol.ChannelMessage
 	full        bool
 	// unproven is set when the read cannot prove it holds every cm past
-	// after (DESIGN.md §7.2): after is below the channel's retention
-	// floor, the channel has moved past it, and the cm at after is gone
-	// from the log. Partitions are dropped oldest first, so while the cm
+	// after (DESIGN.md §7.2, unprovenRead): after is below the channel's
+	// retention floor, the cm at after is gone from the log, and the
+	// channel has moved past it or lost its channels row (pruned). Partitions are dropped oldest first, so while the cm
 	// at the mark is held, so is every cm after it; once it is gone, cms
 	// between it and the oldest one returned may have aged out too.
 	// current is the channel's serial as of the read, set when the read
@@ -798,13 +798,16 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 // (rangeRead.unproven); for the others neither is read. A channel with no
 // cms past its mark comes back as one row with a NULL serial.
 //
-// The outer scan repeats the subquery's bounds on channel_serial so the
-// planner can prune leaves there too. Both range queries run with
-// pgx.QueryExecModeExec (an unnamed statement, planned for the actual
-// parameters on every call), so the planner prunes the leaves that lie
-// entirely below the mark; a named,
-// cached statement switches to a generic plan after five executions, and
-// a generic plan locks every leaf (DESIGN.md §6.3).
+// The outer scan repeats the subquery's bounds on channel_serial. Both
+// range queries run with pgx.QueryExecModeExec (an unnamed statement,
+// planned for the actual parameters on every call); a named, cached
+// statement switches to a generic plan after five executions, and a
+// generic plan locks every leaf. That lets sqlLoadRange, whose bounds
+// are literal parameters, prune the leaves entirely below the mark.
+// This query cannot: its bounds come from unnest through a materialised
+// CTE, so the planner opens (ACCESS SHARE) every leaf whatever the marks,
+// and a leaf a drop holds waits it out (DESIGN.md §6.3; the drop gives
+// up after its lock timeout).
 const sqlLoadRangeMany = `
 WITH t AS MATERIALIZED (
 	SELECT u.name, u.after, u.upto,
@@ -1015,12 +1018,14 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("storage/postgres: read watermarks: %w", err)
 		}
+		found := make(map[string]bool, len(chunk))
 		for rows.Next() {
 			var name, watermark string
 			if err := rows.Scan(&name, &watermark); err != nil {
 				rows.Close()
 				return fmt.Errorf("storage/postgres: scan watermark: %w", err)
 			}
+			found[name] = true
 			cs := byName[name]
 			cs.hwmMu.Lock()
 			if cs.seeded && !cs.released && cs.sweptWatermark > cs.lastSeen {
@@ -1029,12 +1034,42 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 			if cs.seeded && cs.lastSeen >= watermark {
 				cs.markProvenLocked(readAt)
 			}
-			cs.sweptWatermark = watermark
+			cs.sweptWatermark, cs.sweptAt = watermark, readAt
 			cs.hwmMu.Unlock()
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("storage/postgres: watermark rows: %w", err)
+		}
+		// A bound channel with no row was pruned after idling past
+		// retention (DESIGN.md §6.3), and nothing has been published on it
+		// since: a publish recreates the row, and the read's snapshot is
+		// after readAt. Nothing was published between the previous sweep
+		// and the prune either, provided that sweep (sweptAt) is inside the
+		// channel's retention window: a cm committed after it would carry
+		// a serial at or above it, and the prune only takes a row whose
+		// serial is older than the longest retention. So if the node had
+		// caught up to the last watermark it read, nothing is past its
+		// mark as of readAt, and this sweep becomes the previous one for
+		// the next. Without this the proof aged out with the row, and the
+		// first publish after the prune, whose predecessor is the
+		// recreated row's fresh seed, sent a checked gap fill from the old
+		// mark that found the anchor gone and signalled a discontinuity on
+		// every node with the channel bound, although nothing was lost.
+		// Sweeps further apart than the retention window prove nothing,
+		// and the checked read decides as before.
+		floorNow := time.Now()
+		for _, name := range names {
+			if found[name] {
+				continue
+			}
+			cs := byName[name]
+			cs.hwmMu.Lock()
+			if cs.seeded && !cs.released && cs.lastSeen >= cs.sweptWatermark && cs.sweptAt != "" && cs.sweptAt >= cs.RetainedSince(floorNow) {
+				cs.markProvenLocked(readAt)
+				cs.sweptAt = readAt
+			}
+			cs.hwmMu.Unlock()
 		}
 	}
 	for start := 0; start < len(behind); start += reconcileChunk {

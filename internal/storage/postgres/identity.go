@@ -72,7 +72,14 @@ func normalizeNamespaces(ns []string) []string {
 // A lone Storage, and shard 0 of a list, mint the deployment id when the
 // row is absent; every other shard must be given shard 0's (slot.
 // deploymentID) and refuses a row that records another.
-func checkClusterIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlot, want clusterSettings) (string, error) {
+//
+// busInferred is set when the server chose want.bus itself (--bus
+// unset). With no row, a schema that already holds channels served a
+// version from before the row existed, whose nodes ran pgnotify when
+// --bus was unset (the only default then), so recording the inferred bus
+// would split a rolling upgrade into two halves that never deliver to
+// each other; the node is refused instead (errPredatesBus).
+func checkClusterIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlot, want clusterSettings, busInferred bool) (string, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("cluster identity: %w", err)
@@ -98,6 +105,15 @@ func checkClusterIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlo
 		FROM `+tbl).Scan(&got.deploymentID, &got.bus, &msgMs, &pMs, &got.persistedNamespaces, &got.minVersion)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
+		if busInferred {
+			var used bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+pgx.Identifier{schema, "channels"}.Sanitize()+`)`).Scan(&used); err != nil {
+				return "", fmt.Errorf("cluster identity: read channels: %w", err)
+			}
+			if used {
+				return "", errPredatesBus(want.bus)
+			}
+		}
 		id := slot.deploymentID
 		if id == "" {
 			if slot.index > 0 {
@@ -131,6 +147,15 @@ func checkClusterIdentity(ctx context.Context, pool *pgxpool.Pool, slot shardSlo
 		return "", err
 	}
 	return got.deploymentID, nil
+}
+
+// errPredatesBus is the refusal of a node that inferred bus on a database
+// that served an earlier version (checkClusterIdentity, DESIGN.md §11).
+func errPredatesBus(bus string) error {
+	return fmt.Errorf("this database predates the --bus setting: it holds channels but no cluster identity record, so its nodes ran an earlier version, "+
+		"and a node of an earlier version started without --bus ran --bus=pgnotify, the only default then. This node was started without --bus and inferred --bus=%s, "+
+		"which does not deliver to pgnotify nodes. To keep the cluster together while it is upgraded, start this node (and every other) with --bus=pgnotify; "+
+		"to move to --bus=postgres or --bus=nats, stop every node first, then start them all with that bus (DESIGN.md §11)", bus)
 }
 
 // compareCluster refuses a node whose settings differ from the recorded

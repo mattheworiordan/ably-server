@@ -36,28 +36,36 @@ func TestAgentClockEndpoint(t *testing.T) {
 	}
 }
 
+// TestAgentHostEndpoint: /v1/host serves this box's CPU reading, taken
+// while the request is served, so it lies between a reading taken before
+// the request and one taken after. (The test used to read its reference
+// after the request and require the served reading to be at least it,
+// which fails whenever a CPU tick passes between the two reads.)
 func TestAgentHostEndpoint(t *testing.T) {
 	a := NewAgent(context.Background(), nil)
 	srv := httptest.NewServer(a.Handler())
 	defer srv.Close()
+	before, berr := ReadHostCPU()
 	resp, err := http.Get(srv.URL + "/v1/host")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	want, werr := ReadHostCPU()
-	if werr != nil {
+	if berr != nil {
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Fatalf("no /proc/stat: HTTP %d, want 501", resp.StatusCode)
 		}
 		return
 	}
-	// want is read after the endpoint answered, so its cumulative counters
-	// are at least the endpoint's; a tick between the two reads makes
-	// want.Total larger, never smaller. (The old check had this the wrong
-	// way round and failed whenever a jiffy elapsed between the reads.)
 	var h HostCPU
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&h) != nil || h.CPUs != want.CPUs || h.Total > want.Total || h.Total == 0 {
-		t.Fatalf("HTTP %d host %+v, want CPUs %d and a total at most %d", resp.StatusCode, h, want.CPUs, want.Total)
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&h) != nil {
+		t.Fatalf("HTTP %d, want 200 and a host reading", resp.StatusCode)
+	}
+	after, err := ReadHostCPU()
+	if err != nil {
+		t.Fatalf("read /proc/stat after the request: %v", err)
+	}
+	if h.CPUs != before.CPUs || h.Total < before.Total || h.Total > after.Total || h.Busy < before.Busy || h.Busy > after.Busy {
+		t.Fatalf("host %+v, want a reading between %+v and %+v", h, before, after)
 	}
 }

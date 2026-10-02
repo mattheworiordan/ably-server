@@ -90,13 +90,20 @@ type connection struct {
 	// per channel: channel -> clientId -> a copy of the member's last
 	// ENTER/UPDATE/PRESENT. Used to synthesise LEAVE on DETACH and on
 	// connection teardown, and to re-enter the members after a presence
-	// lease lapse (DESIGN.md §12.5). The read goroutine writes it; the
-	// lease-lapse re-entry and a grace hand-over read or extend it from
-	// other goroutines, so enteredMu guards it. presenceClosed, set under
+	// lease lapse (DESIGN.md §12.5). The publish worker writes it (a
+	// client's presence write, a DETACH's leave); the lease-lapse
+	// re-entry and a grace hand-over read or extend it from other
+	// goroutines, and teardown takes it once the worker has stopped, so
+	// enteredMu guards it. presenceClosed, set under
 	// enteredMu when teardown takes the set, ends both.
 	enteredMu      sync.Mutex
 	entered        map[string]map[string]*protocol.PresenceMessage
 	presenceClosed bool
+	// reentryOwed, under enteredMu, counts the adoptions of grace
+	// members this connection must re-enter and has not yet read its set
+	// for (adoptPresence, reenterMembers; each adoption with a duty runs
+	// one re-entry); teardown hands the duty on with the members.
+	reentryOwed int
 
 	// presMu orders this connection's presence writes with a lease-lapse
 	// re-entry of its members (DESIGN.md §12.5): a client's ENTER, UPDATE
@@ -261,6 +268,13 @@ func (c *connection) publishLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case task := <-c.publishQ:
+			// select picks at random when both are ready: once the
+			// connection is ending, queued tasks are dropped rather than
+			// run (a presence write runs on a context teardown does not
+			// cancel, so each would hold teardown up to its timeout).
+			if ctx.Err() != nil {
+				return
+			}
 			task()
 		}
 	}
@@ -625,7 +639,7 @@ func (c *connection) reconcileAttachmentCapabilities(ctx context.Context) {
 		}
 		a.stop()
 		delete(c.attachments, name)
-		c.leaveChannel(ctx, name)
+		c.leaveChannelOrdered(ctx, name)
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:  protocol.ActionError,
 			Channel: new(name),
@@ -638,7 +652,8 @@ func (c *connection) reconcileAttachmentCapabilities(ctx context.Context) {
 	}
 }
 
-// handleDetach stops the matching attachment (waiting for its goroutine
+// handleDetach leaves the presence members this connection entered on
+// the channel, stops the matching attachment (waiting for its goroutine
 // to exit so no further MESSAGE frames slip past the DETACHED ack) and
 // queues DETACHED. DETACH for a channel with no live attachment is
 // idempotent — we still ack so the client can transition cleanly.
@@ -648,8 +663,12 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 		return
 	}
 	// Detaching from a channel leaves any presence members this
-	// connection entered on it (DESIGN.md §12.5).
-	c.leaveChannel(ctx, name)
+	// connection entered on it (DESIGN.md §12.5), after every presence
+	// write the connection queued before the DETACH, so an ENTER still
+	// waiting on the publish worker is left too rather than recorded
+	// after the leave. DETACHED is queued once that is done, so it also
+	// follows the ACKs of the frames before it.
+	c.leaveChannelOrdered(ctx, name)
 	if a, ok := c.attachments[name]; ok {
 		a.stop()
 		delete(c.attachments, name)

@@ -145,6 +145,22 @@ func TestNodeLeaseBumpLeavesMemberRows(t *testing.T) {
 			if !ok || !lease1.After(lease0) {
 				t.Errorf("node lease = %v (row %v), want renewed past %v", lease1, ok, lease0)
 			}
+
+			// Control: the row-version check sees a rewrite. (The retired
+			// member lease mode, which rewrote every row per bump, used to
+			// be this test's control.)
+			if _, err := sa.pool.Exec(context.Background(), `UPDATE presence SET expires_at = expires_at WHERE node_id = $1`, sa.node); err != nil {
+				t.Fatalf("rewrite member rows: %v", err)
+			}
+			rewritten := 0
+			for k, v := range memberRowVersions(t, sa, sa.node) {
+				if after[k] != v {
+					rewritten++
+				}
+			}
+			if rewritten != n {
+				t.Errorf("control: an UPDATE of every member row shows %d of %d rows rewritten, want all", rewritten, n)
+			}
 		})
 	}
 }
