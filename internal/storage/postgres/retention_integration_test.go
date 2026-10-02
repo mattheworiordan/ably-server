@@ -509,9 +509,14 @@ func TestRetentionRangeReadsDoNotLockExpiredLeaves(t *testing.T) {
 		t.Fatalf("lock old leaf: %v", err)
 	}
 
+	// A mark ten seconds old: the leaves entirely below it are pruned by
+	// the planner, so the read never asks for the locked hour-old leaf. (A
+	// mark older than the leaf would, and must: every cm after a mark is
+	// wanted whatever its age, DESIGN.md §6.3.)
+	mark := fmt.Sprintf("%014d", time.Now().Add(-10*time.Second).UnixMilli())
 	for i := range 8 {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		n, err := s.LoadRangeAfter(rctx, "room", "")
+		n, err := s.LoadRangeAfter(rctx, "room", mark)
 		cancel()
 		if err != nil {
 			t.Fatalf("range read %d blocked or failed with an expired leaf locked: %v", i, err)

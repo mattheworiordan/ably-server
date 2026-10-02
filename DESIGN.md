@@ -1396,14 +1396,19 @@ leaf lives one more tick at most.
    (counted in `ably_storage_partition_drop_lock_timeouts_total`, not
    retried in the same sweep) and the next drop tick's by-name pass drops
    it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
-   are bounded below by the channel's retention floor (the same bound a
-   resume is checked against), and run as unnamed statements planned for
-   the actual parameters, so the planner prunes the leaves older than
-   retention and the reads never lock a leaf a drop is waiting on, except that a checked catch-up (§7.2) also asks whether the cm at the mark still exists, which touches the one leaf that would hold it. A
-   cached statement would switch to a generic plan after five executions,
-   and a generic plan locks every leaf. A cm older than the floor is
-   outside the retention the channel promises; a gap fill that would have
-   reached below it does not.
+   are bounded below by the delivery mark they start from, on the outer
+   scan as well as the subquery, and run as unnamed statements planned
+   for the actual parameters, so the planner prunes every leaf that lies
+   entirely below the mark and a read from a recent mark never locks a
+   leaf a drop is waiting on. A cached statement would switch to a generic
+   plan after five executions, and a generic plan locks every leaf. No
+   retention floor is applied to the range: every cm after the mark is
+   wanted whatever its age, and a floor above the mark would hide cms the
+   log still holds while the continuity check (§7.2) reports nothing
+   missed. A read from a mark older than retention therefore touches the
+   leaves it needs, including the one that would hold the cm at the mark,
+   which the check asks about; that is rare (a channel caught up from a
+   mark that old) and correct.
 
 A resume whose cursor was minted before now minus the channel's retention
 is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
@@ -1994,9 +1999,11 @@ The `postgres` and `nats` buses share one delivery point
   held, so is every later cm of the channel. This holds per class: a
   namespace moved between classes by a configuration change has rows in
   both, and is not covered until its older rows have aged out. When the
-  channel has moved past the mark and the cm at the mark is gone, the
-  read cannot prove that nothing aged out between the mark and the
-  oldest cm it returned. The node then signals a **discontinuity** to
+  cm at the mark is gone and the channel has either moved past the mark
+  or lost its `channels` row (pruned after idling past retention, §6.3,
+  so nothing records what happened after the mark), the read cannot
+  prove that nothing aged out between the mark and the oldest cm it
+  returned. The node then signals a **discontinuity** to
   the channel before the cms that survived (`storage.Discontinuous`, in
   delivery order under the mark's lock), delivers the survivors, and,
   once an unbounded read has reached the end of the log, moves the mark

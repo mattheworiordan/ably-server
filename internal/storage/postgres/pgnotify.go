@@ -326,7 +326,10 @@ func (cs *channelStore) readMissed(ctx context.Context, after string, check bool
 		if err != nil {
 			return r, err
 		}
-		r.current, check = current, current > after
+		// Nothing to prove if the channel has not moved past the mark; a
+		// channel with no row (pruned after idling past retention) is
+		// unprovable, as in unprovenRead.
+		r.current, check = current, current == "" || current > after
 	}
 	cms, err := cs.loadAfter(ctx, after)
 	if err != nil {
