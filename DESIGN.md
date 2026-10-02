@@ -1422,10 +1422,18 @@ leaf lives one more tick at most.
    it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
    are bounded below by the delivery mark they start from, on the outer
    scan as well as the subquery, and run as unnamed statements planned
-   for the actual parameters, so the planner prunes every leaf that lies
-   entirely below the mark and a read from a recent mark never locks a
-   leaf a drop is waiting on. A cached statement would switch to a generic
-   plan after five executions, and a generic plan locks every leaf. No
+   for the actual parameters (a cached statement would switch to a
+   generic plan after five executions, and a generic plan locks every
+   leaf). The single-channel read without a continuity check, used by the
+   gap fill and catch-up of one channel, takes its bounds as plain
+   parameters, so the planner prunes every leaf that lies entirely below
+   the mark and a read from a recent mark never locks a leaf a drop is
+   waiting on. The batched read, used by the reconcile, the sweep's
+   catch-up and every read that carries the continuity check (§7.2), takes
+   its bounds from arrays, which the planner cannot prune by: it opens
+   every leaf of the log, so a drop that queues behind it waits out its
+   1 s lock timeout and is retried on the next drop tick, and each such
+   read plans across every leaf. No
    retention floor is applied to the range: every cm after the mark is
    wanted whatever its age, and a floor above the mark would hide cms the
    log still holds while the continuity check (§7.2) reports nothing
@@ -1603,11 +1611,14 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   publish on the same channel queued after it was turned away can still
   commit before it (a stated gap: the overflowed LEAVE reserves no place
   in the channel's order). For a teardown or grace LEAVE that later
-  publish is another member's operation, since the departed connection
-  writes nothing more, and the LEAVE removes only its own member key
-  (`connectionId:clientId`), so it cannot remove the member another
-  connection entered; subscribers can see the two events in the other
-  order. (The
+  publish is usually another member's operation, since the departed
+  connection writes nothing more, and the LEAVE removes only its own
+  member key (`connectionId:clientId`), so it cannot remove a member
+  another connection entered; subscribers can see the two events in the
+  other order. The exception is a resume: a resumed connection keeps its
+  `connectionId`, so if it resumes just after its grace window fired and
+  re-enters while the overflowed grace LEAVE is still waiting, the LEAVE
+  can commit after the ENTER and remove the resumed member. (The
   reaper's LEAVEs and lease-lapse re-entries never join a batch, §12.5.)
 
 **Channel rows.** A channel's `channels` row (its serial and initial
@@ -2063,15 +2074,19 @@ The `postgres` and `nats` buses share one delivery point
   replayed; the client is told so that it can reconcile (§4.3). A gap
   the bus revealed (a held cm's predecessor) that the log no longer has
   is signalled the same way, at the point of the skip. The signal can
-  be spurious, never missing: a channel last proven caught up longer
-  than the retention window ago, whose last cm has aged out and which
-  then received a cm while the node was off the bus, is signalled
-  although nothing was lost, because the log does not record what
-  preceded the new cm. On `pgnotify`, which has no sweep, "last proven"
-  is the bind. The proof assumes a publish commits within the one-second
-  clock margin of minting its serial (the mint holds the channel's row
-  lock until commit); a transaction stalled longer than that between the
-  two, and longer than the window, could escape it. A spurious signal costs the client a reconcile, and an
+  be spurious, and is never missing provided every publish commits
+  within the one-second clock margin of minting its serial (the mint
+  holds the channel's row lock until commit); a transaction stalled
+  longer than that between the two, and longer than the window, could
+  escape it. Two cases are spurious, signalled although nothing was
+  lost, because the log does not record what preceded the new cm: a
+  channel last proven caught up longer than the retention window ago,
+  whose last cm has aged out and which then received a cm while the node
+  was off the bus (on `pgnotify`, which has no sweep, "last proven" is
+  the bind); and, with the node on the bus, the first cm on a bound
+  channel whose `channels` row was pruned after it idled past the
+  longest retention (§6.3 "Pruning `channels` rows"), since the sweep
+  stops proving a channel once it finds no row. A spurious signal costs the client a reconcile, and an
   SDK re-enters its own presence members on an `ATTACHED` without
   `RESUMED` (RTP17i). Counted in
   `ably_channel_discontinuities_total{reason}` (§10).
@@ -2916,11 +2931,18 @@ nothing. Deleting the row instead makes the next node record its own
 settings and a new deployment id.
 
 *Upgrading past the bus default.* Before the bus was inferred (§7.2), a
-node started without `--bus` ran `pgnotify`, and its database records
-`pgnotify`. A node of this version started the same way infers
-`postgres` and is refused, the refusal naming the difference. Set
-`--bus=pgnotify` to keep the old bus, or move to `postgres` with the
-steps above.
+node started without `--bus` ran `pgnotify`. Two cases follow. A
+database that recorded `pgnotify` (a node of a version that has the
+identity row ran it) refuses a node of this version started the same
+way, which infers `postgres`, and the refusal names the difference. A
+database from a version before the identity row has no row at all, so
+the first upgraded node records whatever it runs and nothing refuses it,
+while the old nodes check nothing: an upgraded node that infers
+`postgres` NOTIFYs on per-channel names the old `pgnotify` nodes never
+LISTEN on, and `pgnotify` has no sweep, so the old nodes' subscribers
+never receive the upgraded nodes' publishes during the rollout. When
+upgrading a cluster that ran without `--bus`, set `--bus=pgnotify` on the
+new nodes for the rollout, then change the bus with the steps above.
 
 *Upgrading to this version.* A database without the row records the
 settings of the first upgraded node; nodes of earlier versions do not
@@ -3038,7 +3060,7 @@ data exists; the rest belong to each node. The procedure for each:
 | Change | What it requires | Why |
 |---|---|---|
 | The bus (`--bus`, or setting or removing `--nats-url` while `--bus` is unset, which changes the inferred bus) | Stop every node; run the `UPDATE cluster_identity` the refusal prints, in every shard's schema; start every node with the new setting ("Changing a recorded setting" above) | Nodes on different buses do not deliver to each other; `Open` refuses a node whose bus is not the recorded one |
-| A database that recorded `pgnotify` because `--bus` was unset on an earlier version | Set `--bus=pgnotify` explicitly, or change the bus as above ("Upgrading past the bus default") | The inferred bus is now `postgres`, and the recorded `pgnotify` refuses it |
+| A cluster that ran with `--bus` unset on an earlier version (so on `pgnotify`) | Roll out with `--bus=pgnotify` set explicitly, then change the bus as above ("Upgrading past the bus default") | The inferred bus is `postgres`; a recorded `pgnotify` refuses it, and a database with no identity row yet would let upgraded nodes stop delivering to the old ones |
 | `--message-retention` or `--persisted-retention` | Stop, `UPDATE`, start, as for the bus | The node that runs the retention sweep applies its own retentions to everybody's log (§6.3) |
 | The persisted namespaces (a `[[namespaces]]` entry's `persisted`) | Stop, `UPDATE persisted_namespaces`, start. Rows already written keep their class until they age out, and the continuity proof does not cover the namespace until then (§7.2 "Retention") | Same as the retentions; the class is a partition key (§6.3) |
 | The shard list (`--postgres-dsn` with two or more DSNs: order, length or members) | Not supported on databases that hold channels: there is no resharding, migration between shards or rebalancing. A different list needs empty databases, or, while no shard holds channels yet, dropping `shard_identity` in each (§6.4) | `Open` refuses a list that differs from the recorded one, because channels hash to their shard by the list |
