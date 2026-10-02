@@ -145,6 +145,13 @@ message, in batch order, each the message's stable identity `serial` (§8)
 .../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
 surfaces.
 
+**A publish whose caller gives up.** A REST publish whose request is
+cancelled or times out while its batch is already committing may still
+be stored (§6.3): the client sees an error for a message that is in the
+log and is delivered. A retry that carries the same client-supplied
+message `id` is deduplicated (§8); a retry without one stores the message
+a second time. Clients that retry should supply ids.
+
 **Request and message size limits.** Every REST request body is read
 through `http.MaxBytesReader` with one cap, `protocol.MaxRequestBodyBytes`
 (2 MiB): publish, mutation, annotation, `requestToken` and the discarded
@@ -180,7 +187,7 @@ auth, takes a fast path that changes no behaviour:
   (no escape sequences) is decoded without reflection, then normalised
   exactly as `Message.UnmarshalJSON` would (for example base64 data).
   Every other body, including any malformed one, is decoded by
-  `encoding/json` as before; a fuzz test checks the two agree.
+  `encoding/json`; a fuzz test checks the two agree.
 - The body is read into one buffer of its declared `Content-Length`, and
   a JSON response whose strings need no escaping is written directly,
   byte-identical to `encoding/json`'s output.
@@ -515,8 +522,11 @@ continuity holds by construction: no message is missed and none is
 duplicated. Presence is **not** resynced on an in-place re-attach. An
 explicit backwards `channelSerial` cursor on a live attachment is ignored
 for now (it exists to drive delta-fill recovery, deferred with delta
-support); the reply is at the current position, which is safe because this
-server never emits deltas.
+support); the reply is at the current position. The server does send
+append deltas (§13.3), to an attachment that has already been delivered
+the target message, which it tracks per attachment; ignoring the cursor
+leaves that record and the stream untouched, which is why replying at the
+current position is safe.
 
 `ATTACHED` is the **first** frame the server emits in response to `ATTACH`;
 any replay or live messages follow it. Its fields:
@@ -715,7 +725,7 @@ The starting cursor depends on how the attachment was created:
                     │   │  - Attachments: cursors on the list │
                     │   └─────────────────────────────────────┘
                     │            │                ▲           │
-                    │            ▼                │ NOTIFY    │
+                    │            ▼                │ bus       │
                     │      Storage iface  ────────┘ (cluster) │
                     │            │                            │
                     └────────────┼────────────────────────────┘
@@ -757,8 +767,8 @@ internal/realtime/      # WebSocket upgrade, connection loop, attachment cursor,
 internal/rest/          # HTTP handlers + router
 internal/core/          # Channel + ChannelManager (live entry list)
 internal/storage/       # Storage interface + memory / bbolt / postgres backends
-                        #   (the postgres backend carries the cluster bus: pgnotify
-                        #   by default, the rebuilt postgres bus, or NATS, §7.2)
+                        #   (the postgres backend carries the cluster bus: the
+                        #   postgres bus, NATS, or pgnotify, §7.2)
 internal/serial/        # channelSerial minting + global ordering
 internal/id/            # connection IDs, message IDs
 internal/compatgate/    # known-failures diff logic behind cmd/compat-gate
@@ -837,10 +847,11 @@ last of them takes to queue its frame:
 
 `BenchmarkFanoutEnqueue` (`internal/realtime`) measures one publish to
 20,000 attachments, from the publish to every frame queued, on 8 cores
-of a laptop: about 41 ms (msgpack) and 36 ms (JSON) on the code before
-these changes (the same benchmark run on a copy of the earlier tree), and
-about 7 ms for either with them. The socket writes that follow are not
-in it.
+of a laptop: about 7 ms for either wire format. Without the three
+measures above (that is, with one wake channel per entry, the wake-up
+under the lock and one encode per attachment) the same benchmark took
+about 41 ms (msgpack) and 36 ms (JSON). The socket writes that follow
+are not in it.
 
 The first `ATTACH` to a name (or the first publish, or any REST read)
 creates the Channel and binds it: `storage.Channel(name, channel)`
@@ -1040,8 +1051,8 @@ happens off the read goroutine and never blocks decoding of the next
 frame. The worker calls `channel.Publish(ctx, msgs)` (or `Mutate` /
 `PublishPresence`), which returns once storage has committed; the link
 onto the local linked list happens asynchronously via the Appender
-callback the storage holds (synchronous in memory/bbolt, NOTIFY-driven in
-Postgres — see §7). Only then does the worker emit the frame's `ACK` (or
+callback the storage holds (synchronous in memory/bbolt, through the
+cluster bus in cluster mode — see §7). Only then does the worker emit the frame's `ACK` (or
 `NACK` on failure), echoing the publish `msgSerial`.
 
 A single FIFO worker per connection is deliberate: it keeps this
@@ -1130,9 +1141,11 @@ the store's watermark. Per backend: memory keeps its channelStore (it is
 the only copy of the data) and drops only the binding; bbolt drops the
 channelStore unless it still holds presence members (its presence set is
 in memory only), in which case it keeps it unbound; Postgres drops the
-channelStore and its LISTEN dispatch entry (the shared LISTEN connection
-listens on one broker channel, so there is nothing to UNLISTEN per Ably
-channel).
+channelStore and its bus subscription: an UNLISTEN of the channel's own
+notification channel on the `postgres` bus, a NATS unsubscribe on
+`nats`, and on `pgnotify`, whose one LISTEN connection listens on a
+single broker channel, only the dispatch entry (§7.2 "Release and
+re-bind").
 
 Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
@@ -1545,7 +1558,10 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   deduplicated; a publish that carried no id may, rarely, be stored twice
   if the client retries one whose COMMIT did land. Publishes caught by
   shutdown get the same error.
-- ACKs are per publish, sent when its batch commits.
+- ACKs are per publish, sent when its batch commits. A publish whose
+  caller stops waiting while it is queued is dropped from the queue; once
+  its batch has started it may still commit, so the caller's error does
+  not mean the publish was not stored (§2.2).
 - **Presence in a batch.** Each presence publish is a cm like a message
   publish: it gets one channelSerial in queue order, names its
   predecessor for the chaining buses, and its ids are checked for
@@ -1724,7 +1740,7 @@ own (a multi-host URL, or a key=value DSN) stays one DSN; a list of two
 or more therefore needs URL-form DSNs. An empty entry or a repeated DSN
 is refused at startup, as is a value that looks like a list of key=value
 DSNs. The shard count is the list length. One DSN behaves as without
-sharding: the server opens one database as before, with no routing layer
+sharding: the server opens one database, with no routing layer
 between the channel and its store; the only additions are one read at
 startup (below) and the `ably_storage_shards` gauge.
 
@@ -2857,7 +2873,7 @@ name = "persisted:presence_fixtures"
 ## 11. Lifecycle & operations
 
 **Startup.** Each backend bootstraps its storage at `Open` time. The
-bbolt backend creates the two top-level buckets if missing (§6.2).
+bbolt backend creates its buckets if missing (§6.2).
 The Postgres backend runs the auto-migrate sweep described in §6.3 —
 a session-scoped advisory lock serialises N concurrently-starting
 nodes so only one applies migrations, the rest observe the
@@ -3135,7 +3151,7 @@ over two connections is two distinct members.
 
 Messages and presence share **one ordered stream and one channelSerial
 namespace**, so a single live list, a single Appender, and a single
-NOTIFY path serve both. channelSerials are sortable cursors, not a dense
+bus path serve both. channelSerials are sortable cursors, not a dense
 sequence, so the presence cms interleaved among data cms simply occupy
 their own serials; a message-history scan skips them and a
 presence-history scan skips data cms (the `kind` selector on
@@ -3587,7 +3603,8 @@ constants at implementation (`create = 0`, `update = 1`, `delete = 2`,
 matches Ably: `serial`, `action`, and a `version` object
 (`{serial, timestamp, clientId, description, metadata}`).
 
-Mutations ride the **same stream and Append/NOTIFY path** as any publish
+Mutations ride the **same stream and Append path** (through the bus in
+cluster mode) as any publish
 (§7): they are `kind = message` cms distinguished only by `action`
 (presence stays `kind = presence`, §12.1). Nothing on the live linked
 list or in storage is rewritten in place — a mutation is purely
@@ -3800,9 +3817,10 @@ it reaches the Appender.
 That snapshot is what makes cluster delivery deterministic: every node —
 including ones that never witnessed earlier annotations — emits the
 summary for a given annotation cm from the cm itself, off the normal
-Append/NOTIFY path (§7.2). No node ever publishes a separate rollup, so
-there is no duplicate-summary problem and no cross-node coordination
-beyond the existing per-channel advisory lock. There is no debounce:
+Append path and the bus (§7.2). No node ever publishes a separate
+rollup, so there is no duplicate-summary problem and no cross-node
+coordination beyond the lock that mints the channel's serial (the
+`channels` row lock in cluster mode, §6.3). There is no debounce:
 one summary delivery per annotation, which Ably's conflation latitude
 permits (only the *latest* summary a subscriber holds matters).
 
@@ -3962,7 +3980,7 @@ database, and the child gets the list with the schema set on each DSN.
   bbolt and Postgres backends — table-driven contract tests).
 - **Integration**: spin up the binary against ably-go's existing test suite
   (or a curated subset) to validate SDK compatibility.
-- **Cluster**: Postgres + 2 server processes in Docker Compose; tests cover
+- **Cluster**: Postgres + 3 server processes in Docker Compose; tests cover
   cross-node publish and `channelSerial`-based replay on reconnect to a
   different node.
 - **Per bus** (§7.2): the storage contract suite runs on every cluster bus
