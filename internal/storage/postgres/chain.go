@@ -1034,7 +1034,7 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 			if cs.seeded && cs.lastSeen >= watermark {
 				cs.markProvenLocked(readAt)
 			}
-			cs.sweptWatermark = watermark
+			cs.sweptWatermark, cs.sweptAt = watermark, readAt
 			cs.hwmMu.Unlock()
 		}
 		rows.Close()
@@ -1044,22 +1044,30 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		// A bound channel with no row was pruned after idling past
 		// retention (DESIGN.md §6.3), and nothing has been published on it
 		// since: a publish recreates the row, and the read's snapshot is
-		// after readAt. If the node had caught up to the last watermark it
-		// read, nothing is past its mark as of readAt, so the proof stays
-		// fresh while the row is gone. Without this the proof aged out
-		// with the row, and the first publish after the prune, whose
-		// predecessor is the recreated row's fresh seed, sent a checked
-		// gap fill from the old mark that found the anchor gone and
-		// signalled a discontinuity on every node with the channel bound,
-		// although nothing was lost.
+		// after readAt. Nothing was published between the previous sweep
+		// and the prune either, provided that sweep (sweptAt) is inside the
+		// channel's retention window: a cm committed after it would carry
+		// a serial at or above it, and the prune only takes a row whose
+		// serial is older than the longest retention. So if the node had
+		// caught up to the last watermark it read, nothing is past its
+		// mark as of readAt, and this sweep becomes the previous one for
+		// the next. Without this the proof aged out with the row, and the
+		// first publish after the prune, whose predecessor is the
+		// recreated row's fresh seed, sent a checked gap fill from the old
+		// mark that found the anchor gone and signalled a discontinuity on
+		// every node with the channel bound, although nothing was lost.
+		// Sweeps further apart than the retention window prove nothing,
+		// and the checked read decides as before.
+		floorNow := time.Now()
 		for _, name := range names {
 			if found[name] {
 				continue
 			}
 			cs := byName[name]
 			cs.hwmMu.Lock()
-			if cs.seeded && !cs.released && cs.lastSeen >= cs.sweptWatermark {
+			if cs.seeded && !cs.released && cs.lastSeen >= cs.sweptWatermark && cs.sweptAt != "" && cs.sweptAt >= cs.RetainedSince(floorNow) {
 				cs.markProvenLocked(readAt)
+				cs.sweptAt = readAt
 			}
 			cs.hwmMu.Unlock()
 		}

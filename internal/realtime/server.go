@@ -4,7 +4,6 @@ package realtime
 import (
 	"context"
 	"crypto/rand"
-	"maps"
 	"net/http"
 	"strconv"
 	"sync"
@@ -419,10 +418,12 @@ type graceLeave struct {
 	timer   *time.Timer
 	fired   bool // under Server.graceMu: the timer ran, or Shutdown or a resume claimed the entry
 	// owed, under Server.graceMu, records that the entry was created or
-	// extended while a re-entry pass was running: the pass may have read
+	// extended while a re-entry pass was running (the pass may have read
 	// the dropped connection after its teardown took the set, and the
-	// entry is not in the pass's snapshot, so a connection that adopts
-	// the members re-enters them itself.
+	// entry is not in the pass's snapshot), or that the dropped connection
+	// had adopted members it had not yet re-entered (connection.
+	// reentryOwed): a connection that adopts the members re-enters them
+	// itself.
 	owed bool
 
 	// mu orders a lease-lapse re-entry of these members with their
@@ -451,7 +452,10 @@ func (g *graceLeave) finish() {
 // that issued the connectionKey (DESIGN.md §8), so this node's
 // registry is the whole answer. A second drop of the same connectionId
 // within the window merges into the pending entry and restarts its wait.
-func (s *Server) scheduleConnectionLeaves(connID string, members map[string]map[string]*protocol.PresenceMessage) {
+//
+// owed reports that the members include adopted ones the dropped
+// connection had still to re-enter (graceLeave.owed).
+func (s *Server) scheduleConnectionLeaves(connID string, members map[string]map[string]*protocol.PresenceMessage, owed bool) {
 	s.graceMu.Lock()
 	defer s.graceMu.Unlock()
 	select {
@@ -466,15 +470,19 @@ func (s *Server) scheduleConnectionLeaves(connID string, members map[string]map[
 				g.members[channel] = held
 				continue
 			}
-			maps.Copy(set, held)
+			for clientID, m := range held {
+				if preferRecord(set[clientID], m) {
+					set[clientID] = m
+				}
+			}
 		}
-		g.owed = g.owed || s.reentering > 0
+		g.owed = g.owed || owed || s.reentering > 0
 		g.timer.Reset(s.remainPresentFor)
 		return
 	}
 	// No entry, or one whose timer has already fired: that fire handles
 	// its own members.
-	g := &graceLeave{connID: connID, members: members, owed: s.reentering > 0}
+	g := &graceLeave{connID: connID, members: members, owed: owed || s.reentering > 0}
 	s.grace[connID] = g
 	g.timer = time.AfterFunc(s.remainPresentFor, func() { s.fireGrace(g) })
 }
@@ -508,7 +516,7 @@ func (s *Server) claimGrace(c *connection) {
 	s.graceMu.Unlock()
 	g.finish()
 	if !adopted {
-		s.scheduleConnectionLeaves(c.id, g.members)
+		s.scheduleConnectionLeaves(c.id, g.members, reenter)
 		return
 	}
 	if reenter {
@@ -539,12 +547,15 @@ func (s *Server) claimGrace(c *connection) {
 // Reading the count before the hand-over, as an earlier version did,
 // left a pass starting between the read and the hand-over in neither
 // case. g.owed adds the entries created while a pass was running, which
-// no pass's snapshot holds.
+// no pass's snapshot holds, and those handed on by an adopter that
+// dropped before its own re-entry read its set (connection.reentryOwed,
+// which adoptPresence sets when reenter is true).
 func (s *Server) adoptGraceLocked(c *connection, g *graceLeave) (adopted, reenter bool) {
-	if !c.adoptPresence(g.members) {
+	reenter = s.reentering > 0 || g.owed
+	if !c.adoptPresence(g.members, reenter) {
 		return false, false
 	}
-	return true, s.reentering > 0 || g.owed
+	return true, reenter
 }
 
 // reenterAdopted re-enters members a connection adopted from a grace
@@ -606,7 +617,7 @@ func (s *Server) fireGrace(g *graceLeave) {
 	if live != nil {
 		g.finish()
 		if !adopted {
-			s.scheduleConnectionLeaves(g.connID, g.members)
+			s.scheduleConnectionLeaves(g.connID, g.members, reenter)
 			return
 		}
 		if reenter {

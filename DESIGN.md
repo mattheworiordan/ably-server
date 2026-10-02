@@ -1659,10 +1659,14 @@ and so none survives:
   that nothing was past its mark: while the row is gone, each sweep that
   finds no row for a bound channel the node had caught up on proves it
   again at the time of the read (no row means no publish since the
-  prune, as a publish recreates the row). A node that was not sweeping
-  the channel meanwhile (no subscriber on it, or off the bus) holds no
-  such proof; its checked fill finds the mark's cm gone and signals a
-  discontinuity, since it cannot know what happened after the mark.
+  prune, as a publish recreates the row), provided the previous sweep of
+  the channel is inside its retention window (a cm committed after that
+  sweep would have kept the row from being pruned until it, too, aged
+  out). A node that was not sweeping the channel meanwhile (no subscriber
+  on it, off the bus, or `--bus-sweep-interval` longer than the
+  retention) holds no such proof; its checked fill finds the mark's cm
+  gone and signals a discontinuity, since it cannot know what happened
+  after the mark.
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
 
@@ -2044,9 +2048,13 @@ The `postgres` and `nats` buses share one delivery point
   `PRESENCE_SUBSCRIBE` attachment by the re-seeded set (`HAS_PRESENCE`
   and a `SYNC` when it has members). A failed re-seed read is retried
   (four reads, 100, 200 and 400 ms apart); if every one fails, the
-  `ATTACHED` still carries `HAS_PRESENCE`, with no `SYNC`, so the SDK
-  starts a sync and keeps its members until a later one completes,
-  rather than taking the set as empty and leaving every member (RTP19a). The cms in the gap are not
+  `ATTACHED` still carries `HAS_PRESENCE`, so the SDK starts a sync and
+  keeps its members rather than taking the set as empty and leaving every
+  member (RTP19a), and the attachment retries the read every second and
+  sends the `SYNC` once one succeeds. Until then the SDK's sync is open:
+  `presence.get()` waits, and a member that left in the gap is removed
+  only when the sync completes. The `SYNC` holds the set as of its read,
+  at or after the cms delivered so far. The cms in the gap are not
   replayed; the client is told so that it can reconcile (§4.3). A gap
   the bus revealed (a held cm's predecessor) that the log no longer has
   is signalled the same way, at the point of the skip. The signal can
@@ -3298,7 +3306,11 @@ Departure:
   queued behind an earlier publish, which then committed after the LEAVE
   and left its member present on the detached channel until the
   connection ended. A DETACH LEAVE that fails puts its members back as
-  uncertain, so the connection's own departure still leaves them.
+  uncertain, so the connection's own departure still leaves them. The
+  price is that `DETACHED` waits for the connection's queued writes; if
+  they take longer than the SDK's request timeout (10 s in ably-js), the
+  SDK returns the channel to attached (RTL5f) and, when the late
+  `DETACHED` arrives, re-attaches (RTL13a).
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
   immediately. It hands the members it still holds (its own record of
@@ -3466,13 +3478,19 @@ client's own LEAVE). It works on 32 connections or grace entries at a
 time. A connection's entered set follows the store's answer to each
 presence write. A committed operation is recorded. One the store turned
 away before writing anything (42910: a full lane queue or the presence
-in-flight bound) is not. One whose outcome is unknown (a timeout, a
-50003, any other failure) is recorded as *uncertain*: an ENTER or UPDATE
-for a member not yet held records it, and a LEAVE turns a held member
-uncertain. Every LEAVE path (DETACH, teardown, grace) covers an
-uncertain member, since the write may have committed and a LEAVE of an
-absent member is harmless; a re-entry skips it, since the client was
-told the operation failed. So a refused LEAVE still leaves with the
+in-flight bound; 40010, a channel name the store cannot hold; a
+malformed client-supplied id) is not. One whose outcome is unknown (a
+timeout, a 50003, any other failure) is recorded as *uncertain*: an
+ENTER or UPDATE for a member not yet held records it, and a LEAVE turns
+a held member uncertain. Every LEAVE path (DETACH, teardown, grace)
+covers an uncertain member, since the write may have committed; if it
+did not, the LEAVE stores nothing, but subscribers see a LEAVE for a
+member they never saw enter (ably-js emits a `leave` event for it). A
+re-entry skips an uncertain member, since the client was told the
+operation failed. When two sets merge (a resume's hand-over, a second
+drop in the window) a committed record is kept over an uncertain one.
+The records are copies taken before the store sees the messages: a batch
+the caller stopped waiting for still stamps them while it commits. So a refused LEAVE still leaves with the
 connection, and a refused ENTER is never re-entered. The client's
 presence write runs on a context the connection's teardown does not
 cancel, bounded by 10 s (`DefaultPresenceWriteTimeout`): teardown
@@ -3481,7 +3499,9 @@ before it takes the entered set, so an ENTER whose batch was in flight
 when the connection dropped is answered and recorded first and gets its
 LEAVE. (On the connection's own context such an ENTER committed, the
 caller saw only the context's error, and the member was never left: it
-stayed until its node died.) The pass counts itself in and takes its two
+stayed until its node died.) Once teardown has begun, the publish worker
+drops the tasks still queued rather than run them, so at most the one
+in flight holds teardown up to its bound. The pass counts itself in and takes its two
 snapshots (grace entries, then live connections) in one step under the
 grace lock, and a resume's hand-over of a grace entry (at the resume, or
 at the window's end if the resume landed while the dropped connection was
@@ -3496,8 +3516,11 @@ pass and the passes overlap; one ending must not hide another. A grace
 entry created or extended while a pass is running is in no pass's
 snapshot, and the pass may have read the dropped connection after its
 teardown took its members, so such an entry is marked owed and its
-adopter re-enters it too. The adopter's re-entry runs off the resume's
-WebSocket handshake, so it does not delay `CONNECTED`, and re-enters only
+adopter re-enters it too. A connection that has adopted members to
+re-enter and drops before its re-entry has read its set hands the duty
+on with them: the grace entry its teardown creates is marked owed too.
+The adopter's re-entry runs off the resume's WebSocket handshake, so it
+does not delay `CONNECTED`, and re-enters only
 the adopted members the connection still holds, each with the
 connection's own record of it: the connection may already be running
 (always so at the window's end), and a LEAVE or UPDATE its client has

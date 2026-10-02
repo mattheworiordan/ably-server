@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -97,6 +98,14 @@ type attachment struct {
 	echo    bool
 	metrics *metrics.Metrics
 	logger  *logging.Logger
+
+	// syncOwed is set by a channel update whose presence re-seed failed
+	// (signalDiscontinuity): the client was sent HAS_PRESENCE with no
+	// SYNC and is waiting for one, so the run loop retries the read every
+	// owedSyncRetry and sends the SYNC once it succeeds (nextLive).
+	// syncTried is when it last tried. Touched only by the run goroutine.
+	syncOwed  bool
+	syncTried time.Time
 
 	// appendModeFull is set when the subscriber requested
 	// appendMode=full: it always receives full rolled-up versions rather
@@ -414,7 +423,7 @@ func (a *attachment) run() {
 	}
 
 	for {
-		cm, err := a.stream.Next(a.ctx)
+		cm, err := a.nextLive()
 		if err != nil {
 			return
 		}
@@ -433,6 +442,49 @@ func (a *attachment) run() {
 		}
 	}
 }
+
+// owedSyncRetry is how often an attachment owed a SYNC (syncOwed)
+// retries the presence read.
+const owedSyncRetry = time.Second
+
+// nextLive returns the next live cm, as stream.Next. While a SYNC is owed
+// (syncOwed) it wakes every owedSyncRetry, and before each cm once that
+// long has passed, to retry the presence read, and sends the SYNC once
+// the read succeeds. A SYNC sent mid-stream holds the set as of the read,
+// which is at or after the cms delivered so far: a cm behind it that
+// arrives later replays an operation the set already reflects, which
+// the SDK applies idempotently. An error ends the attachment.
+func (a *attachment) nextLive() (*protocol.ChannelMessage, error) {
+	for a.syncOwed {
+		if wait := owedSyncRetry - time.Since(a.syncTried); wait > 0 {
+			ctx, cancel := context.WithTimeout(a.ctx, wait)
+			cm, err := a.stream.Next(ctx)
+			cancel()
+			if err == nil {
+				return cm, nil
+			}
+			if a.ctx.Err() != nil {
+				return nil, err
+			}
+		}
+		a.syncTried = time.Now()
+		snap, err := a.stream.Channel().PresenceSync(a.ctx)
+		if err != nil {
+			if a.ctx.Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+		a.syncOwed = false
+		if !a.sendSync(snap) {
+			return nil, errAttachmentSend
+		}
+	}
+	return a.stream.Next(a.ctx)
+}
+
+// errAttachmentSend ends an attachment whose frame could not be queued.
+var errAttachmentSend = errors.New("realtime: attachment frame not queued")
 
 // errMessagesExpired is the ATTACHED error of a channel update sent for
 // a discontinuity (DESIGN.md §7.2): the code a resume older than the
@@ -455,8 +507,9 @@ var errMessagesExpired = protocol.ErrorInfo{
 // replaces its set rather than clearing it (RTP19a); the channel dropped
 // its local set with the marker, so the snapshot is read afresh, with
 // retries (discontinuitySnapshot). If every read fails, the ATTACHED
-// still carries HAS_PRESENCE, with no SYNC, so the SDK keeps its members
-// rather than leaving them all. Returns false if a send failed.
+// still carries HAS_PRESENCE, so the SDK keeps its members rather than
+// leaving them all, and the SYNC follows once a later read succeeds
+// (nextLive). Returns false if a send failed.
 func (a *attachment) signalDiscontinuity(serial string) bool {
 	var (
 		snap       *core.PresenceSnapshot
@@ -472,12 +525,14 @@ func (a *attachment) signalDiscontinuity(serial string) bool {
 	hasSync := snap != nil && len(snap.Members) > 0
 	flags := a.modeSet()
 	if hasSync || seedFailed {
-		// With the set unknown, HAS_PRESENCE and no SYNC: the SDK starts
-		// a sync and keeps its members until one completes (the next
-		// update or attach). Without the flag it would take the set as
-		// empty and synthesise a LEAVE for every member (RTP19a).
+		// With the set unknown, HAS_PRESENCE and no SYNC yet: the SDK
+		// starts a sync and keeps its members until it completes, which
+		// the run loop sends once a read succeeds (syncOwed). Without the
+		// flag it would take the set as empty and synthesise a LEAVE for
+		// every member (RTP19a).
 		flags |= protocol.FlagHasPresence
 	}
+	a.syncOwed, a.syncTried = seedFailed, time.Now()
 	a.setCurSerial(serial)
 	errInfo := errMessagesExpired
 	if !a.send(&protocol.ProtocolMessage{
@@ -516,7 +571,7 @@ func (a *attachment) discontinuitySnapshot() (snap *core.PresenceSnapshot, ok bo
 			return nil, false
 		}
 		if attempt == discontinuitySyncAttempts {
-			a.logger.Warn("presence sync after a discontinuity: Members failed; sending HAS_PRESENCE without a SYNC", "attempts", attempt, "err", err)
+			a.logger.Warn("presence sync after a discontinuity: Members failed; sending HAS_PRESENCE and the SYNC once a read succeeds", "attempts", attempt, "err", err)
 			return nil, true
 		}
 		select {

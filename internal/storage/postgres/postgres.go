@@ -1294,6 +1294,10 @@ type channelStore struct {
 	gapBackoff     time.Duration
 	overflowArmed  bool   // a forced fill is armed after a hold overflow
 	sweptWatermark string // the channel's watermark at the previous sweep
+	// sweptAt is the database time (clockSerial) of the last sweep that
+	// read the channel's row, or proved the channel with the row absent
+	// (sweepWatermarks).
+	sweptAt string
 
 	// Delivery counters for tests (guarded by hwmMu).
 	delivered, duplicates, held, gapFills, sweepCatchUps, holdOverflows int

@@ -99,6 +99,10 @@ type connection struct {
 	enteredMu      sync.Mutex
 	entered        map[string]map[string]*protocol.PresenceMessage
 	presenceClosed bool
+	// reentryOwed, under enteredMu, records adopted grace members this
+	// connection must re-enter and has not yet read for it (adoptPresence,
+	// reenterMembers); teardown hands the duty on with the members.
+	reentryOwed bool
 
 	// presMu orders this connection's presence writes with a lease-lapse
 	// re-entry of its members (DESIGN.md §12.5): a client's ENTER, UPDATE
@@ -263,6 +267,13 @@ func (c *connection) publishLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case task := <-c.publishQ:
+			// select picks at random when both are ready: once the
+			// connection is ending, queued tasks are dropped rather than
+			// run (a presence write runs on a context teardown does not
+			// cancel, so each would hold teardown up to its timeout).
+			if ctx.Err() != nil {
+				return
+			}
 			task()
 		}
 	}

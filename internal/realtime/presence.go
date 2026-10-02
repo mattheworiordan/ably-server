@@ -101,19 +101,26 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	timeout := c.srv.presenceWriteTimeoutOrDefault()
 	c.enqueuePublish(ctx, func() {
 		c.presMu.Lock()
+		// The records are built from copies taken before the store sees
+		// the messages: a batch the caller stopped waiting for still
+		// stamps them (serial, timestamp) while it commits.
+		recs := make([]protocol.PresenceMessage, len(presence))
+		for i, p := range presence {
+			recs[i] = *p
+		}
 		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		_, _, err := ch.PublishPresence(wctx, presence)
 		cancel()
 		switch {
 		case err == nil:
-			for _, p := range presence {
-				c.recordPresence(channel, p)
+			for i := range recs {
+				c.recordPresence(channel, &recs[i])
 			}
 		case presenceRefused(err):
 			// Nothing was stored: the set is unchanged.
 		default:
-			for _, p := range presence {
-				c.recordUncertain(channel, p)
+			for i := range recs {
+				c.recordUncertain(channel, &recs[i])
 			}
 		}
 		c.presMu.Unlock()
@@ -151,12 +158,14 @@ func (s *Server) presenceWriteTimeoutOrDefault() time.Duration {
 
 // presenceRefused reports whether a presence write failed before the
 // store wrote anything: the backend turned it away (a full lane queue or
-// the presence in-flight bound, storage.ErrOverloaded) or could not
-// store the channel's name. Every other failure, a timeout or a
-// cancelled wait, storage.ErrUnavailable ("most likely not stored"), is
-// treated as possibly committed (DESIGN.md §12.5).
+// the presence in-flight bound, storage.ErrOverloaded), could not store
+// the channel's name, or refused a client-supplied id. Every other
+// failure, a timeout or a cancelled wait, storage.ErrUnavailable ("most
+// likely not stored"), is treated as possibly committed (DESIGN.md
+// §12.5).
 func presenceRefused(err error) bool {
-	return errors.Is(err, storage.ErrOverloaded) || errors.Is(err, storage.ErrInvalidChannelName)
+	return errors.Is(err, storage.ErrOverloaded) || errors.Is(err, storage.ErrInvalidChannelName) ||
+		errors.Is(err, storage.ErrInvalidMessageID)
 }
 
 // presenceID mints the Ably-form id a genuine presence message carries:
@@ -229,10 +238,21 @@ func (c *connection) recordPresence(channel string, p *protocol.PresenceMessage)
 
 // uncertainAction marks an entered-set record whose presence is unknown
 // (recordUncertain): the member may or may not be in the store. Every
-// LEAVE path covers it (a LEAVE of a member that is absent is harmless),
-// and a lapse re-entry skips it (reentries), since the client was told
-// the operation failed. A committed operation replaces the record.
+// LEAVE path covers it (a LEAVE of a member that is absent stores
+// nothing, though subscribers see a LEAVE for a member they never saw
+// enter), and a lapse re-entry skips it (reentries), since the client
+// was told the operation failed. A committed operation replaces the
+// record, and a committed record is preferred to an uncertain one when
+// two sets merge (preferRecord).
 const uncertainAction = protocol.PresenceAbsent
+
+// preferRecord reports whether next should replace held, the record a
+// set already has for the same member, when two sets merge (a grace
+// hand-over, a second drop in the window): a committed record is kept
+// over an uncertain one, otherwise the newer wins.
+func preferRecord(held, next *protocol.PresenceMessage) bool {
+	return held == nil || held.Action == uncertainAction || next.Action != uncertainAction
+}
 
 // recordUncertain updates the entered set for a presence operation whose
 // outcome is unknown (DESIGN.md §12.5): the write timed out, or failed
@@ -279,14 +299,16 @@ func (c *connection) takeEntered(channel string) map[string]*protocol.PresenceMe
 
 // closeEntered removes and returns every member this connection holds
 // and closes the set, so neither a lapse re-entry nor a grace hand-over
-// touches it after teardown.
-func (c *connection) closeEntered() map[string]map[string]*protocol.PresenceMessage {
+// touches it after teardown. owed reports a re-entry of adopted members
+// that was due and had not taken its snapshot yet (reentryOwed).
+func (c *connection) closeEntered() (all map[string]map[string]*protocol.PresenceMessage, owed bool) {
 	c.enteredMu.Lock()
 	defer c.enteredMu.Unlock()
-	all := c.entered
+	all, owed = c.entered, c.reentryOwed
 	c.entered = make(map[string]map[string]*protocol.PresenceMessage)
 	c.presenceClosed = true
-	return all
+	c.reentryOwed = false
+	return all, owed
 }
 
 // adoptPresence hands members held for a dropped connection's grace
@@ -295,7 +317,12 @@ func (c *connection) closeEntered() map[string]map[string]*protocol.PresenceMess
 // re-entry cover them. A member the connection already holds keeps its
 // own state. It reports false, adopting nothing, if this connection's
 // teardown has already taken its set.
-func (c *connection) adoptPresence(members map[string]map[string]*protocol.PresenceMessage) bool {
+//
+// owe records that the connection must re-enter what it adopted
+// (adoptGraceLocked): until reenterMembers has taken its snapshot, the
+// duty passes with the members to a grace entry if this connection drops
+// first (closeEntered).
+func (c *connection) adoptPresence(members map[string]map[string]*protocol.PresenceMessage, owe bool) bool {
 	c.enteredMu.Lock()
 	defer c.enteredMu.Unlock()
 	if c.presenceClosed {
@@ -308,11 +335,14 @@ func (c *connection) adoptPresence(members map[string]map[string]*protocol.Prese
 			c.entered[channel] = set
 		}
 		for clientID, m := range held {
-			if _, ok := set[clientID]; !ok {
+			// A record the connection already holds is its own, newer
+			// state, unless it is uncertain and the adopted one committed.
+			if cur, ok := set[clientID]; !ok || (cur.Action == uncertainAction && m.Action != uncertainAction) {
 				set[clientID] = m
 			}
 		}
 	}
+	c.reentryOwed = c.reentryOwed || owe
 	return true
 }
 
@@ -374,6 +404,9 @@ func (c *connection) leaveChannelOrdered(ctx context.Context, channel string) {
 	}) {
 		return
 	}
+	// ctx is cancelled only once the read loop has returned, so in
+	// practice this waits for the worker; the second case keeps the wait
+	// tied to the connection's life all the same.
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -387,7 +420,7 @@ func (c *connection) leaveChannelOrdered(ctx context.Context, channel string) {
 func (c *connection) emitTeardownLeaves() {
 	c.presMu.Lock()
 	defer c.presMu.Unlock()
-	all := c.closeEntered()
+	all, _ := c.closeEntered() // leaving them: nothing to re-enter
 	if len(all) == 0 {
 		return
 	}
@@ -407,11 +440,11 @@ func (c *connection) emitTeardownLeaves() {
 func (c *connection) scheduleTeardownLeaves() {
 	c.presMu.Lock()
 	defer c.presMu.Unlock()
-	all := c.closeEntered()
+	all, owed := c.closeEntered()
 	if len(all) == 0 {
 		return
 	}
-	c.srv.scheduleConnectionLeaves(c.id, all)
+	c.srv.scheduleConnectionLeaves(c.id, all, owed)
 }
 
 // reenterPresence publishes an ENTER, with its last data, for every
@@ -452,6 +485,7 @@ func (c *connection) reenterMembers(ctx context.Context, members map[string]map[
 		c.enteredMu.Unlock()
 		return 0, 0
 	}
+	c.reentryOwed = false // the snapshot below discharges it
 	snap := make(map[string][]*protocol.PresenceMessage, len(members))
 	for channel, set := range members {
 		held := c.entered[channel]

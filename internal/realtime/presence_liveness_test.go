@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,7 +41,11 @@ type faultyStorage struct {
 	storeHook atomic.Pointer[func()]
 }
 
-type presenceHookFunc func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error)
+type presenceHookFunc func(ctx context.Context, p []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error)
+
+// storeFunc writes presence messages to the memory backend: by default
+// the ones the hook was given (store(nil)), or others (store(copies)).
+type storeFunc func(p []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error)
 
 func (s *faultyStorage) setPresenceHook(f presenceHookFunc) {
 	if f == nil {
@@ -84,8 +89,11 @@ func (c *faultyChannel) StorePresence(ctx context.Context, p []*protocol.Presenc
 		return nil, false, errInjected
 	}
 	if h := c.s.presenceHook.Load(); h != nil {
-		return (*h)(ctx, p, func() (*protocol.ChannelMessage, bool, error) {
-			return c.ChannelStore.StorePresence(context.WithoutCancel(ctx), p)
+		return (*h)(ctx, p, func(q []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+			if q == nil {
+				q = p
+			}
+			return c.ChannelStore.StorePresence(context.WithoutCancel(ctx), q)
 		})
 	}
 	return c.ChannelStore.StorePresence(ctx, p)
@@ -492,13 +500,13 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 
 	// Every re-entry of bob waits for the test to release it.
 	held := make(chan chan struct{}, 2)
-	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
 		if storage.IsPresenceReentry(ctx) && len(p) > 0 && p[0].ClientID == "bob" {
 			release := make(chan struct{})
 			held <- release
 			<-release
 		}
-		return store()
+		return store(nil)
 	})
 	t.Cleanup(func() { h.store.setPresenceHook(nil) })
 	pass := func() chan struct{} {
@@ -542,7 +550,7 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 	aliceHeld, aliceRelease := make(chan struct{}), make(chan struct{})
 	var holdAlice atomic.Bool
 	holdAlice.Store(true)
-	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
 		if storage.IsPresenceReentry(ctx) && len(p) > 0 {
 			switch {
 			case p[0].ClientID == "bob":
@@ -554,7 +562,7 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 				<-aliceRelease
 			}
 		}
-		return store()
+		return store(nil)
 	})
 	pub2 := dialResumeClientID(t, h.srv, connected.ConnectionDetails.ConnectionKey, "alice")
 	drainConnected(t, pub2)
@@ -582,7 +590,7 @@ func TestGraceEntryCreatedDuringReentryIsOwed(t *testing.T) {
 	h.rt.graceMu.Unlock()
 	h.rt.scheduleConnectionLeaves("conn-1", map[string]map[string]*protocol.PresenceMessage{
 		"room": {"alice": {Action: protocol.PresenceEnter, ClientID: "alice"}},
-	})
+	}, false)
 	h.rt.graceMu.Lock()
 	h.rt.reentering-- // and has ended
 	g := h.rt.grace["conn-1"]
@@ -598,6 +606,46 @@ func TestGraceEntryCreatedDuringReentryIsOwed(t *testing.T) {
 		t.Fatalf("adopt = %v, reenter = %v, want both", adopted, reenter)
 	}
 	g.timer.Stop()
+
+	// The adopter drops before its re-entry has read its set: the duty
+	// passes to the next grace entry, with no pass running any more.
+	all, owed := c.closeEntered()
+	if !owed || len(all["room"]) != 1 {
+		t.Fatalf("teardown took %v, owed %v; want alice and the re-entry still owed", all, owed)
+	}
+	h.rt.scheduleConnectionLeaves("conn-1", all, owed)
+	h.rt.graceMu.Lock()
+	g2 := h.rt.grace["conn-1"]
+	h.rt.graceMu.Unlock()
+	if g2 == nil || !g2.owed {
+		t.Fatalf("grace entry = %+v, want the re-entry carried as owed", g2)
+	}
+	g2.timer.Stop()
+}
+
+// TestMergedSetsPreferCommittedRecords: when a grace entry's members
+// merge with another set (a second drop in the window, a hand-over to a
+// resumed connection), a committed record is kept over an uncertain one
+// for the same member, so the member is still re-entered after a lapse.
+func TestMergedSetsPreferCommittedRecords(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	committed := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "alice", Data: "c"}
+	uncertain := &protocol.PresenceMessage{Action: uncertainAction, ClientID: "alice", Data: "u"}
+	h.rt.scheduleConnectionLeaves("conn-1", map[string]map[string]*protocol.PresenceMessage{"room": {"alice": committed}}, false)
+	h.rt.scheduleConnectionLeaves("conn-1", map[string]map[string]*protocol.PresenceMessage{"room": {"alice": uncertain}}, false)
+	h.rt.graceMu.Lock()
+	g := h.rt.grace["conn-1"]
+	got := g.members["room"]["alice"]
+	h.rt.graceMu.Unlock()
+	g.timer.Stop()
+	if got != committed {
+		t.Errorf("grace merge kept %+v, want the committed record", got)
+	}
+	c := &connection{id: "conn-1", entered: map[string]map[string]*protocol.PresenceMessage{"room": {"alice": uncertain}}}
+	c.adoptPresence(map[string]map[string]*protocol.PresenceMessage{"room": {"alice": committed}}, false)
+	if got := c.entered["room"]["alice"]; got != committed {
+		t.Errorf("adoption kept %+v, want the committed record over the connection's uncertain one", got)
+	}
 }
 
 // liveConn returns the server's live connection with connectionId id.
@@ -615,12 +663,13 @@ func (h *livenessHarness) liveConn(t *testing.T, id string) *connection {
 // TestEnterCommittedAfterTeardownIsLeft: an ENTER whose batch is still in
 // flight when the connection drops commits after the teardown has
 // cancelled the connection's context. The store call does not run on
-// that context (handlePresence), so the commit is answered, the member
-// is recorded before teardown takes the entered set, and the grace
-// window ends with its LEAVE (DESIGN.md §12.5). Run on the connection's
-// context, the call answered with the context's error, the committed
-// member was never recorded, and it stayed present for as long as the
-// node lived.
+// that context (handlePresence), so the commit is answered and the member
+// recorded as entered (not merely uncertain) before teardown takes the
+// entered set, and the grace window ends with its LEAVE (DESIGN.md
+// §12.5). Run on the connection's context, the call answered with the
+// context's error; before uncertain records existed the committed member
+// was never recorded, and it stayed present for as long as the node
+// lived.
 func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
 	const grace = 200 * time.Millisecond
 	h := newLivenessServer(t, grace)
@@ -637,10 +686,10 @@ func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
 	// error if the caller has given up meanwhile.
 	inFlight := make(chan struct{})
 	release := make(chan struct{})
-	h.store.setPresenceHook(func(ctx context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+	h.store.setPresenceHook(func(ctx context.Context, _ []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
 		close(inFlight)
 		<-release
-		cm, idem, err := store()
+		cm, idem, err := store(nil)
 		if err == nil && ctx.Err() != nil {
 			return nil, false, ctx.Err()
 		}
@@ -670,6 +719,21 @@ func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
 	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence || f.Presence[0].Action != protocol.PresenceEnter {
 		t.Fatalf("frame = %+v, want alice's ENTER", f)
 	}
+	// The teardown held alice for the grace window as committed: the
+	// write's answer was its commit, not the connection's cancellation.
+	var held *protocol.PresenceMessage
+	deadline := time.Now().Add(2 * time.Second)
+	for held == nil && time.Now().Before(deadline) {
+		h.rt.graceMu.Lock()
+		if g := h.rt.grace[connected.ConnectionID]; g != nil {
+			held = g.members["room"]["alice"]
+		}
+		h.rt.graceMu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if held == nil || held.Action != protocol.PresenceEnter {
+		t.Fatalf("grace record = %+v, want alice held as entered", held)
+	}
 	f := readFrame(t, sub, protocol.FormatJSON, grace+3*time.Second)
 	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceLeave || f.Presence[0].ClientID != "alice" {
 		t.Fatalf("frame = %+v, want alice's grace LEAVE", f)
@@ -685,6 +749,8 @@ func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
 // A write the store refused before storing anything (42910) records
 // nothing.
 func TestUncertainPresenceOutcome(t *testing.T) {
+	var stamping sync.WaitGroup
+	t.Cleanup(stamping.Wait)
 	for _, tc := range []struct {
 		name string
 		hook presenceHookFunc
@@ -694,8 +760,8 @@ func TestUncertainPresenceOutcome(t *testing.T) {
 	}{
 		{
 			name: "unavailable",
-			hook: func(_ context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
-				if _, _, err := store(); err != nil {
+			hook: func(_ context.Context, _ []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
+				if _, _, err := store(nil); err != nil {
 					return nil, false, err
 				}
 				return nil, false, storage.ErrUnavailable
@@ -704,9 +770,9 @@ func TestUncertainPresenceOutcome(t *testing.T) {
 		},
 		{
 			name: "timeout",
-			hook: func(ctx context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+			hook: func(ctx context.Context, _ []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
 				<-ctx.Done()
-				if _, _, err := store(); err != nil {
+				if _, _, err := store(nil); err != nil {
 					return nil, false, err
 				}
 				return nil, false, ctx.Err()
@@ -714,8 +780,36 @@ func TestUncertainPresenceOutcome(t *testing.T) {
 			committed: true,
 		},
 		{
+			// As the Postgres lanes do: the caller stops waiting, and the
+			// batch goes on to stamp the messages while it commits. The
+			// record must not be read from them (run under -race).
+			name: "stamped after the timeout",
+			hook: func(ctx context.Context, p []*protocol.PresenceMessage, store storeFunc) (*protocol.ChannelMessage, bool, error) {
+				<-ctx.Done()
+				// The backend keeps what it stores; it gets copies, so only
+				// the caller's messages are stamped late.
+				cp := make([]*protocol.PresenceMessage, len(p))
+				for i, m := range p {
+					c := *m
+					cp[i] = &c
+				}
+				if _, _, err := store(cp); err != nil {
+					return nil, false, err
+				}
+				stamping.Add(1)
+				go func() {
+					defer stamping.Done()
+					time.Sleep(20 * time.Millisecond)
+					p[0].Timestamp = 1
+					p[0].Serial = "stamped"
+				}()
+				return nil, false, ctx.Err()
+			},
+			committed: true,
+		},
+		{
 			name: "refused",
-			hook: func(context.Context, []*protocol.PresenceMessage, func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+			hook: func(context.Context, []*protocol.PresenceMessage, storeFunc) (*protocol.ChannelMessage, bool, error) {
 				return nil, false, storage.ErrOverloaded
 			},
 		},
@@ -741,6 +835,7 @@ func TestUncertainPresenceOutcome(t *testing.T) {
 			}
 			h.store.setPresenceHook(nil)
 
+			stamping.Wait()
 			conn.enteredMu.Lock()
 			rec := conn.entered["room"]["alice"]
 			conn.enteredMu.Unlock()
@@ -914,9 +1009,10 @@ func TestReenterAdoptedUsesTheConnectionsOwnRecord(t *testing.T) {
 }
 
 // TestDiscontinuityWithAFailedSeedKeepsMembers: a channel update whose
-// presence re-seed fails, after its retries, still carries HAS_PRESENCE
-// (with no SYNC), so the SDK keeps its members until a later sync rather
-// than taking the set as empty and leaving every member (RTP19a).
+// presence re-seed fails, after its retries, still carries HAS_PRESENCE,
+// so the SDK keeps its members rather than taking the set as empty and
+// leaving every member (RTP19a); the SYNC it then waits for is sent once
+// a read succeeds.
 func TestDiscontinuityWithAFailedSeedKeepsMembers(t *testing.T) {
 	h := newLivenessServer(t, time.Hour)
 	pub := dialClient(t, h.srv, "alice")
@@ -943,12 +1039,18 @@ func TestDiscontinuityWithAFailedSeedKeepsMembers(t *testing.T) {
 	if update.Flags&protocol.FlagHasPresence == 0 {
 		t.Fatalf("flags = %d, want HAS_PRESENCE although the re-seed failed", update.Flags)
 	}
+	// Once the store answers again, the owed SYNC follows (the client
+	// is waiting for it to complete its sync), on a quiet channel too.
 	h.store.failMembers.Store(false)
+	f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second)
+	if f.Action != protocol.ActionSync || len(f.Presence) != 1 || f.Presence[0].ClientID != "alice" || !strings.HasSuffix(f.ChannelSerial, ":") {
+		t.Fatalf("frame = %v %+v (serial %q), want the owed SYNC of alice, complete", f.Action, f.Presence, f.ChannelSerial)
+	}
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(2),
 		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceUpdate, Data: "x"}},
 	})
 	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
-		t.Fatalf("frame = %v, want the live UPDATE next (no SYNC)", f.Action)
+		t.Fatalf("frame = %v, want the live UPDATE", f.Action)
 	}
 }

@@ -324,73 +324,91 @@ func TestCatchUpAfterTheChannelsRowWasPrunedSignals(t *testing.T) {
 // discontinuity (DESIGN.md §6.3 "Pruning channels rows", §7.2). Before
 // the sweep proved a missing row, the proof aged out with it, the fill
 // was checked, found the mark's cm gone, and signalled 80016 on every
-// node although nothing was lost.
+// node although nothing was lost. Sweeps further apart than the retention
+// window prove nothing (a cm could have been published and pruned
+// between them), so with one sweep after five minutes the signal stays.
 func TestFirstPublishAfterThePruneIsContinuous(t *testing.T) {
 	c := pgtest.Start(t)
-	dsn := c.FreshSchemaDSN(t)
-	ctx := context.Background()
-
-	open := func() *Storage {
-		opts := pgBusOptions(dsn)
-		opts.SweepInterval = time.Hour // swept by hand below
-		opts.Retention = Retention{Message: 2 * time.Minute}
-		// With the publish lanes, as the server runs, a publish that
-		// recreates the row chains on its fresh seed.
-		opts.Batching = Batching{Lanes: 1}
-		s, err := Open(ctx, opts)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Close() })
-		return s
-	}
-	b, other := open(), open()
-	recB, recO := &discontinuityRecorder{}, &discontinuityRecorder{}
-	ch, err := b.Channel(ctx, "room", recB)
-	if err != nil {
-		t.Fatalf("B binds room: %v", err)
-	}
-	if _, err := other.Channel(ctx, "room", recO); err != nil {
-		t.Fatalf("other binds room: %v", err)
-	}
-	csB, csO := b.boundStore("room"), other.boundStore("room")
-	m1 := publish(t, ctx, ch, "m1")
-	for _, cs := range []*channelStore{csB, csO} {
-		waitFor(t, 5*time.Second, "m1 to be delivered", func() bool { return cs.watermark() == m1 })
-	}
-	sweep := func() {
-		t.Helper()
-		for _, s := range []*Storage{b, other} {
-			if err := s.sweepWatermarks(ctx); err != nil {
-				t.Fatalf("sweep: %v", err)
+	for _, tc := range []struct {
+		name     string
+		minutes  []int // the clock skew at each sweep after the prune
+		wantDisc bool
+	}{
+		{"swept every minute", []int{1, 2, 3, 4, 5}, false},
+		{"one sweep after five minutes", []int{5}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := c.FreshSchemaDSN(t)
+			ctx := context.Background()
+			open := func() *Storage {
+				opts := pgBusOptions(dsn)
+				opts.SweepInterval = time.Hour // swept by hand below
+				opts.Retention = Retention{Message: 2 * time.Minute}
+				// With the publish lanes, as the server runs, a publish
+				// that recreates the row chains on its fresh seed.
+				opts.Batching = Batching{Lanes: 1}
+				s, err := Open(ctx, opts)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				t.Cleanup(func() { _ = s.Close() })
+				return s
 			}
-		}
-	}
-	sweep()
+			b, other := open(), open()
+			recB, recO := &discontinuityRecorder{}, &discontinuityRecorder{}
+			ch, err := b.Channel(ctx, "room", recB)
+			if err != nil {
+				t.Fatalf("B binds room: %v", err)
+			}
+			if _, err := other.Channel(ctx, "room", recO); err != nil {
+				t.Fatalf("other binds room: %v", err)
+			}
+			csB, csO := b.boundStore("room"), other.boundStore("room")
+			m1 := publish(t, ctx, ch, "m1")
+			for _, cs := range []*channelStore{csB, csO} {
+				waitFor(t, 5*time.Second, "m1 to be delivered", func() bool { return cs.watermark() == m1 })
+			}
+			sweep := func() {
+				t.Helper()
+				for _, s := range []*Storage{b, other} {
+					if err := s.sweepWatermarks(ctx); err != nil {
+						t.Fatalf("sweep: %v", err)
+					}
+				}
+			}
+			sweep()
 
-	// The channel idles past retention and is pruned: its row and its
-	// aged-out log go. The nodes keep sweeping meanwhile.
-	if _, err := b.pool.Exec(ctx, `DELETE FROM channel_messages WHERE channel = 'room'`); err != nil {
-		t.Fatalf("delete log rows: %v", err)
-	}
-	if _, err := b.pool.Exec(ctx, `DELETE FROM channels WHERE name = 'room'`); err != nil {
-		t.Fatalf("delete channels row: %v", err)
-	}
-	b.SetClockSkew(5 * time.Minute)
-	other.SetClockSkew(5 * time.Minute)
-	sweep()
+			// The channel idles past retention and is pruned: its row and
+			// its aged-out log go.
+			if _, err := b.pool.Exec(ctx, `DELETE FROM channel_messages WHERE channel = 'room'`); err != nil {
+				t.Fatalf("delete log rows: %v", err)
+			}
+			if _, err := b.pool.Exec(ctx, `DELETE FROM channels WHERE name = 'room'`); err != nil {
+				t.Fatalf("delete channels row: %v", err)
+			}
+			for _, minute := range tc.minutes {
+				b.SetClockSkew(time.Duration(minute) * time.Minute)
+				other.SetClockSkew(time.Duration(minute) * time.Minute)
+				sweep()
+			}
 
-	m2 := publish(t, ctx, ch, "m2")
-	for name, n := range map[string]struct {
-		cs  *channelStore
-		rec *discontinuityRecorder
-	}{"B": {csB, recB}, "other": {csO, recO}} {
-		waitFor(t, 5*time.Second, name+" to deliver m2", func() bool { return n.cs.watermark() == m2 })
-		n.cs.hwmMu.Lock() // Append runs under hwmMu
-		got, disc := append([]string(nil), n.rec.serials...), n.rec.discontinuities
-		n.cs.hwmMu.Unlock()
-		if disc != 0 || len(got) != 2 || got[0] != m1 || got[1] != m2 {
-			t.Errorf("%s delivered %v with %d discontinuities, want [%s %s] and none", name, got, disc, m1, m2)
-		}
+			m2 := publish(t, ctx, ch, "m2")
+			want := []string{m1, m2}
+			if tc.wantDisc {
+				want = []string{m1, "|", m2}
+			}
+			for name, n := range map[string]struct {
+				cs  *channelStore
+				rec *discontinuityRecorder
+			}{"B": {csB, recB}, "other": {csO, recO}} {
+				waitFor(t, 5*time.Second, name+" to deliver m2", func() bool { return n.cs.watermark() == m2 })
+				n.cs.hwmMu.Lock() // Append runs under hwmMu
+				got := append([]string(nil), n.rec.serials...)
+				n.cs.hwmMu.Unlock()
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("%s delivered %v, want %v", name, got, want)
+				}
+			}
+		})
 	}
 }
