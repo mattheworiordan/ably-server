@@ -437,6 +437,12 @@ func TestRefusedLeaveKeepsMemberForGraceLeave(t *testing.T) {
 // by the pass (the entry already claimed, the connection already done, or
 // registered after the pass took its snapshot), so the claiming
 // connection re-enters the members it adopted itself (DESIGN.md §12.5).
+// The passes here are real ReenterPresence calls held mid-pass by a
+// store hook. Two overlap, as when the lapse hook fires again during a
+// long pass, and the first ends before the resume: the second is still
+// running, so the claimant must still re-enter. With a flag rather than a
+// count of running passes, the first pass's end cleared it and the
+// claimant did not.
 func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 	h := newLivenessServer(t, time.Hour)
 	sub := dial(t, h.srv, "")
@@ -452,6 +458,13 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
 		t.Fatalf("frame = %v, want ENTER", f.Action)
 	}
+	// bob stays connected, on another channel; his re-entry is what holds
+	// each pass open.
+	bob := dialClient(t, h.srv, "bob")
+	drainConnected(t, bob)
+	attach(t, bob, "lobby", protocol.FlagPresence)
+	enter(t, bob, "lobby", 1)
+
 	_ = pub.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -467,17 +480,52 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// A re-entry pass is under way (its snapshots already taken).
-	h.rt.graceMu.Lock()
-	h.rt.reentering = true
-	h.rt.graceMu.Unlock()
-	t.Cleanup(func() {
-		h.rt.graceMu.Lock()
-		h.rt.reentering = false
-		h.rt.graceMu.Unlock()
+	// Every re-entry of bob waits for the test to release it.
+	held := make(chan chan struct{}, 2)
+	h.store.setPresenceHook(func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+		if storage.IsPresenceReentry(ctx) && len(p) > 0 && p[0].ClientID == "bob" {
+			release := make(chan struct{})
+			held <- release
+			<-release
+		}
+		return store()
 	})
+	t.Cleanup(func() { h.store.setPresenceHook(nil) })
+	pass := func() chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.rt.ReenterPresence(context.Background())
+		}()
+		return done
+	}
+	nextHeld := func() chan struct{} {
+		select {
+		case release := <-held:
+			return release
+		case <-time.After(2 * time.Second):
+			t.Fatal("no re-entry pass reached bob")
+			return nil
+		}
+	}
+	// The first pass holds bob's re-entry in the store, and with it bob's
+	// presence lock, so the second waits on that lock behind it.
+	done1 := pass()
+	release1 := nextHeld()
+	done2 := pass()
+	// Each pass re-entered alice's grace-held members.
+	for range 2 {
+		if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence || f.Presence[0].ClientID != "alice" {
+			t.Fatalf("frame = %+v, want alice re-entered by a pass", f)
+		}
+	}
+	// The first pass ends; the second reaches bob's store and is held there.
+	close(release1)
+	<-done1
+	release2 := nextHeld()
+	t.Cleanup(func() { close(release2); <-done2 })
 
-	// The resume claims the grace entry and, because a pass is running,
+	// The resume claims the grace entry while the second pass runs, and
 	// re-enters what it adopted: the subscriber sees alice's ENTER again.
 	pub2 := dialResumeClientID(t, h.srv, connected.ConnectionDetails.ConnectionKey, "alice")
 	drainConnected(t, pub2)
@@ -485,6 +533,36 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
 		t.Fatalf("frame = %+v, want alice re-entered by the resumed connection", f)
 	}
+}
+
+// TestGraceEntryCreatedDuringReentryIsOwed: a connection that drops while
+// a re-entry pass is running may be read by the pass after its teardown
+// took its set, and its grace entry is in no pass's snapshot. The entry
+// is marked owed, so the connection that resumes it re-enters the members
+// even after the pass has ended (DESIGN.md §12.5).
+func TestGraceEntryCreatedDuringReentryIsOwed(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	h.rt.graceMu.Lock()
+	h.rt.reentering++ // a pass is running
+	h.rt.graceMu.Unlock()
+	h.rt.scheduleConnectionLeaves("conn-1", map[string]map[string]*protocol.PresenceMessage{
+		"room": {"alice": {Action: protocol.PresenceEnter, ClientID: "alice"}},
+	})
+	h.rt.graceMu.Lock()
+	h.rt.reentering-- // and has ended
+	g := h.rt.grace["conn-1"]
+	h.rt.graceMu.Unlock()
+	if g == nil || !g.owed {
+		t.Fatalf("grace entry = %+v, want one marked owed", g)
+	}
+	c := &connection{id: "conn-1", entered: make(map[string]map[string]*protocol.PresenceMessage)}
+	h.rt.graceMu.Lock()
+	adopted, reenter := h.rt.adoptGraceLocked(c, g)
+	h.rt.graceMu.Unlock()
+	if !adopted || !reenter {
+		t.Fatalf("adopt = %v, reenter = %v, want both", adopted, reenter)
+	}
+	g.timer.Stop()
 }
 
 // liveConn returns the server's live connection with connectionId id.

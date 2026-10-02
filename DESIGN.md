@@ -3408,11 +3408,22 @@ before it takes the entered set, so an ENTER whose batch was in flight
 when the connection dropped is answered and recorded first and gets its
 LEAVE. (On the connection's own context such an ENTER committed, the
 caller saw only the context's error, and the member was never left: it
-stayed until its node died.) The pass takes its two snapshots (grace
-entries, then live connections) together under the grace lock, and a
-grace entry a resume claims while the pass is running is re-entered by
-the claiming connection itself, since the pass may already have passed
-both the entry and the connection. Each ENTER is
+stayed until its node died.) The pass counts itself in and takes its two
+snapshots (grace entries, then live connections) in one step under the
+grace lock, and a resume's hand-over of a grace entry (at the resume, or
+at the window's end if the resume landed while the dropped connection was
+still tearing down) is one step under the same lock with reading the
+count of passes running. So either a pass took its snapshots before the
+hand-over, and then it is still running (the count is not zero, and the
+resumed connection re-enters what it adopted itself) or it finished
+having re-entered the entry; or it takes them after, and then its
+snapshot holds the resumed connection with the adopted members. It is a
+count, not a flag, because the lapse hook can fire again during a long
+pass and the passes overlap; one ending must not hide another. A grace
+entry created or extended while a pass is running is in no pass's
+snapshot, and the pass may have read the dropped connection after its
+teardown took its members, so such an entry is marked owed and its
+adopter re-enters it too. Each ENTER is
 written in a transaction of its own, after the publishes of its channel
 already queued or in flight on the lane, and leaves out every member that
 is in the table once the channel's row lock is held (the read waits for a
