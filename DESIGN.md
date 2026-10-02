@@ -2496,7 +2496,8 @@ live stream sends the same `ATTACHED` mid-stream (§4.3, §7.2).
 
 CLI flags (each with an `ABLY_SERVER_*` env var equivalent, named by
 upper-casing and underscoring the flag — e.g. `--log-format` is
-`ABLY_SERVER_LOG_FORMAT`):
+`ABLY_SERVER_LOG_FORMAT` — except `--heartbeat-interval` and
+`--presence-remain-for`, which are flags only):
 
 ```
 --mode {memory|disk|cluster}  default: memory
@@ -2535,6 +2536,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
 --presence-max-inflight 0     cluster mode: presence writes committed outside the lanes at once per database; 0 = 4 x --publish-lanes (16 with --publish-lanes=0), negative = no bound (§12.5)
+--heartbeat-interval 15s      server HEARTBEAT cadence, advertised as maxIdleInterval (§2.1); flag only
+--presence-remain-for 15s     grace window before an abruptly disconnected member's LEAVE is written (§12.5); flag only
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2546,7 +2549,9 @@ reader polling the path never sees a partial address.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
-(`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
+except `--config`, `--addr-file`, `--heartbeat-interval` and
+`--presence-remain-for` (API keys go in `[[keys]]`, below): `mode`,
+`listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `nats-creds`, `nats-tls-ca`, `nats-tls-cert`,
 `nats-tls-key`, `postgres-notify-mode`, `postgres-notify-window`,
 `postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
@@ -2555,11 +2560,11 @@ Configuration may also be supplied via an optional TOML config file
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
 `attachment-seen-max`, `message-retention`, `persisted-retention`,
 `publish-lanes`, `publish-batch-max`, `publish-linger-max`,
-`publish-queue-max`, `presence-max-inflight` — `shutdown-grace`,
+`publish-queue-max` and `presence-max-inflight`, with `shutdown-grace`,
 `postgres-notify-window`, `bus-sweep-interval`, `channel-idle-timeout`,
 `conn-write-timeout`, `http-idle-timeout`, the retentions and
-`publish-linger-max` as duration strings, e.g. `"10s"`, the sizes and
-counts as integers). That every one of these keys reaches the options
+`publish-linger-max` as duration strings, e.g. `"10s"`, and the sizes
+and counts as integers. That every one of these keys reaches the options
 the server runs with, by flag, env var and file, is a table test
 (`TestSettingsReachOptions`). API keys are declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
