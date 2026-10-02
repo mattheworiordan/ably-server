@@ -317,8 +317,10 @@ func (c *connection) adoptPresence(members map[string]map[string]*protocol.Prese
 }
 
 // leaveChannel synthesises a LEAVE for every member this connection
-// entered on channel and clears them from the entered set. Used on
-// DETACH. Best-effort: a publish failure is logged, not surfaced.
+// entered on channel and clears them from the entered set. Run on the
+// publish worker (leaveChannelOrdered). A LEAVE that fails is logged, and
+// its members go back into the set as uncertain (recordUncertain), so the
+// connection's teardown still leaves them.
 func (c *connection) leaveChannel(ctx context.Context, channel string) {
 	c.presMu.Lock()
 	defer c.presMu.Unlock()
@@ -326,7 +328,56 @@ func (c *connection) leaveChannel(ctx context.Context, channel string) {
 	if len(set) == 0 {
 		return
 	}
-	c.publishLeaves(ctx, channel, set)
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.srv.presenceWriteTimeoutOrDefault())
+	defer cancel()
+	if err := c.publishLeaves(wctx, channel, set); err != nil {
+		c.restoreUncertain(channel, set)
+	}
+}
+
+// restoreUncertain puts members whose LEAVE failed back into the entered
+// set as uncertain (recordUncertain), unless the set holds them again.
+func (c *connection) restoreUncertain(channel string, members map[string]*protocol.PresenceMessage) {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	if c.presenceClosed {
+		return
+	}
+	set := c.entered[channel]
+	if set == nil {
+		set = make(map[string]*protocol.PresenceMessage, len(members))
+		c.entered[channel] = set
+	}
+	for clientID, m := range members {
+		if _, ok := set[clientID]; ok {
+			continue
+		}
+		cp := *m
+		cp.Action = uncertainAction
+		set[clientID] = &cp
+	}
+}
+
+// leaveChannelOrdered runs leaveChannel for a DETACH (or a capability
+// change that ends the attachment) on the publish worker and waits for
+// it, so it follows every presence write this connection queued before
+// it (DESIGN.md §12.5). Run on the read goroutine, before it stops the
+// attachment and queues DETACHED: an ENTER still queued behind an
+// earlier publish would otherwise commit after the leave and leave its
+// member present on a channel the client has detached from. If the
+// connection is ending first, its teardown leaves the members instead.
+func (c *connection) leaveChannelOrdered(ctx context.Context, channel string) {
+	done := make(chan struct{})
+	if !c.enqueuePublish(ctx, func() {
+		defer close(done)
+		c.leaveChannel(ctx, channel)
+	}) {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // emitTeardownLeaves synthesises LEAVE for every member still held by
@@ -343,7 +394,7 @@ func (c *connection) emitTeardownLeaves() {
 	ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
 	defer cancel()
 	for channel, set := range all {
-		c.publishLeaves(ctx, channel, set)
+		_ = c.publishLeaves(ctx, channel, set) // logged; the connection is gone
 	}
 }
 
@@ -448,16 +499,18 @@ func reentries(connID string, set map[string]*protocol.PresenceMessage) []*proto
 }
 
 // publishLeaves publishes one LEAVE per member in set onto channel,
-// stamped with this connection's id.
-func (c *connection) publishLeaves(ctx context.Context, channel string, set map[string]*protocol.PresenceMessage) {
+// stamped with this connection's id. A failure is logged and returned.
+func (c *connection) publishLeaves(ctx context.Context, channel string, set map[string]*protocol.PresenceMessage) error {
 	ch, err := c.manager.GetChannel(ctx, channel)
 	if err != nil {
-		c.logger.Warn("teardown leave: GetChannel failed", "channel", channel, "err", err)
-		return
+		c.logger.Warn("presence leave: GetChannel failed", "channel", channel, "err", err)
+		return err
 	}
 	if _, _, err := ch.PublishPresence(storage.WithServerPresence(ctx), leavesFor(c.id, set)); err != nil {
-		c.logger.Warn("teardown leave publish failed", "channel", channel, "err", err)
+		c.logger.Warn("presence leave publish failed", "channel", channel, "err", err)
+		return err
 	}
+	return nil
 }
 
 // leavesFor returns a synthesised LEAVE for each member in set, stamped

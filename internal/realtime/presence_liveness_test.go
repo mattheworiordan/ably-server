@@ -35,6 +35,9 @@ type faultyStorage struct {
 	// the operation to the memory backend, and the hook decides when to
 	// call it and what to return.
 	presenceHook atomic.Pointer[presenceHookFunc]
+	// storeHook, when set, runs before every message Store (a test
+	// blocks the publish worker with it).
+	storeHook atomic.Pointer[func()]
 }
 
 type presenceHookFunc func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error)
@@ -67,6 +70,13 @@ func (c *faultyChannel) Members(ctx context.Context) ([]*protocol.PresenceMessag
 		return nil, "", errInjected
 	}
 	return c.ChannelStore.Members(ctx)
+}
+
+func (c *faultyChannel) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	if h := c.s.storeHook.Load(); h != nil {
+		(*h)()
+	}
+	return c.ChannelStore.Store(ctx, msgs)
 }
 
 func (c *faultyChannel) StorePresence(ctx context.Context, p []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
@@ -749,5 +759,83 @@ func TestUncertainPresenceOutcome(t *testing.T) {
 				t.Fatalf("frame = %+v, want alice's LEAVE", f)
 			}
 		})
+	}
+}
+
+// TestDetachAfterQueuedEnterLeavesTheMember: an ENTER queued on the
+// publish worker behind an earlier publish, followed at once by a
+// DETACH, must not leave its member present on the detached channel.
+// The DETACH's leave runs on the worker after the ENTER (DESIGN.md
+// §12.5), so the member is entered and then left, and DETACHED follows.
+// Run on the read goroutine, the leave found nothing yet to leave, the
+// ENTER committed afterwards, and the member stayed until the connection
+// closed.
+func TestDetachAfterQueuedEnterLeavesTheMember(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	pub := dialClient(t, h.srv, "alice")
+	connected := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+	attach(t, pub, "room", protocol.FlagPresence)
+	conn := h.liveConn(t, connected.ConnectionID)
+
+	// A publish on another channel holds the worker in the store.
+	inFlight, release := make(chan struct{}), make(chan struct{})
+	var once atomic.Bool
+	hook := func() {
+		if once.CompareAndSwap(false, true) {
+			close(inFlight)
+			<-release
+		}
+	}
+	h.store.storeHook.Store(&hook)
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionMessage, Channel: new("other"), MsgSerial: msgSerialPtr(1),
+		Messages: []*protocol.Message{{Name: "m", Data: "x"}},
+	})
+	select {
+	case <-inFlight:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the publish never reached the store")
+	}
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(2),
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
+	})
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionDetach, Channel: new("room")})
+	time.Sleep(100 * time.Millisecond) // let the DETACH reach the read goroutine
+	close(release)
+
+	var acks int
+	for detached := false; !detached || acks < 2; {
+		f := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+		switch f.Action {
+		case protocol.ActionAck:
+			acks++
+		case protocol.ActionDetached:
+			detached = true
+		default:
+			t.Fatalf("publisher frame %v, want ACKs and DETACHED", f.Action)
+		}
+	}
+	for _, want := range []protocol.PresenceAction{protocol.PresenceEnter, protocol.PresenceLeave} {
+		f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+		if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != want || f.Presence[0].ClientID != "alice" {
+			t.Fatalf("subscriber frame %+v, want alice's %v", f, want)
+		}
+	}
+	ch, err := h.manager.GetChannel(context.Background(), "room")
+	if err != nil {
+		t.Fatalf("GetChannel: %v", err)
+	}
+	if members, _, err := ch.Members(context.Background()); err != nil || len(members) != 0 {
+		t.Fatalf("members after the DETACH = %v (err %v), want none", members, err)
+	}
+	conn.enteredMu.Lock()
+	n := len(conn.entered)
+	conn.enteredMu.Unlock()
+	if n != 0 {
+		t.Fatalf("entered set holds %d channels after the DETACH, want none", n)
 	}
 }

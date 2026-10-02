@@ -497,7 +497,7 @@ client                        server
   │   ◀───── MESSAGE … (live) ───────────────────│
   │
   │ ── DETACH ──▶
-  │                              │ remove from Channel
+  │                              │ leave presence (after queued writes), remove from Channel
   │   ◀──── DETACHED ────────────│
 ```
 
@@ -3252,7 +3252,15 @@ Departure:
 
 - **Explicit LEAVE, DETACH, clean CLOSE, or graceful shutdown (§11)** — a
   deliberate departure, processed as an immediate LEAVE publish (no grace):
-  the connection is not coming back, so there is nothing to wait for.
+  the connection is not coming back, so there is nothing to wait for. A
+  DETACH's LEAVE runs on the connection's publish worker, after every
+  presence write the connection sent before the DETACH, and `DETACHED`
+  is sent once it is done (so it also follows the ACKs of the frames
+  before it). Run on the read goroutine, it could overtake an ENTER still
+  queued behind an earlier publish, which then committed after the LEAVE
+  and left its member present on the detached channel until the
+  connection ended. A DETACH LEAVE that fails puts its members back as
+  uncertain, so the connection's own departure still leaves them.
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
   immediately. It hands the members it still holds (its own record of
