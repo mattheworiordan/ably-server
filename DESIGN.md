@@ -1899,12 +1899,13 @@ run on Postgres alone; `--nats-url` with `--bus=postgres` or
 `--bus=pgnotify` is allowed, and the unused URL is named in a startup
 warning (§9).
 
-The `postgres` bus is now the default, and it is the least
-fleet-measured of the three on this code: the scale runs measured it in
-one run, on the earlier ("night one") code at 0.25x scale, and not since
-the continuity, presence and bounds fixes on this branch. Its integration
-and contract suites run in CI on every change; its capacity at scale is
-not yet shown.
+The `postgres` bus, the inferred default with one Postgres, is the least
+fleet-measured of the three. The cloud scale runs measured it at 0.25x of
+the largest account's message shape only, on code that predates the
+write-path, continuity, presence and bounds fixes, where it carried the
+load with no violation but missed the latency gates
+(`bench/aws/RESULTS.md`); it has not been measured at scale since. Its
+integration and contract suites run in CI on every change.
 
 **The publish path, common to every bus.** The publish transaction mints
 the serial under the channels-row lock and writes the rows. The bus then
@@ -1918,8 +1919,10 @@ trip before `COMMIT`.
 
 #### pgnotify
 
-The bus as first shipped, and the default until the bus was inferred
-(above). The publish transaction emits
+One global notification channel for the whole cluster. It runs only when
+`--bus=pgnotify` is given (above), and a database that recorded it keeps
+it until the bus is changed deliberately (§11). The publish transaction
+emits
 `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`. Every
 node's LISTEN goroutine, including the publisher's, receives every
 notification, looks up the local `ChannelStore` for that channel, reads
@@ -1986,8 +1989,8 @@ The `postgres` and `nats` buses share one delivery point
 - **Reconcile.** After the bus connection comes back, the channels in the
   sweep scope (below: by default the bound channels with a subscriber on
   this node) are caught up from their mark, 500 channels per query, after
-  a random wait of up to a quarter of the sweep interval (7.5 s at the
-  default). A node runs at most 4 of these batched catch-up queries (the
+  a random wait of up to a quarter of the sweep interval, capped at 10 s
+  (7.5 s at the default). A node runs at most 4 of these batched catch-up queries (the
   reconcile's and the sweep's) at once, over all its shards. A cluster-wide
   bus blip reaches every node at the same moment; without the scope, the
   wait and the bound, every node would read every channel it holds
@@ -2292,6 +2295,12 @@ stream were continuous.
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 | Receiver off the bus for longer than the retention window | the log cannot prove continuity; the node signals a discontinuity on the channel (`ATTACHED` without `RESUMED`, error 80016) and re-seeds its presence set; cms in the gap are not replayed (§4.3, §12.4) | same | same | same |
+| A bus message forged by a sender inside the bus's network | a notification carries only channel and serial; the cm is read back from the log, so a forgery costs a read | the inline rows of a NOTIFY are delivered without a read; whoever can connect to the database can NOTIFY, so the database's access control is the trust boundary | a wake-up only causes a log read | the body is delivered without a log read: the bus is a trusted network (above, "The bus is a trusted network"); malformed and far-future serials and other clusters' envelopes are dropped and counted |
+
+The last row is the trust statement: every bus but `pgnotify` and
+coalesced `postgres` delivers a body it did not read from the log, so
+the bus's network (NATS) or the database's access control (transactional
+`postgres`) must admit only this cluster's nodes.
 
 Worst case for the chained buses is about two sweep intervals late,
 counted from the moment the channel has a subscriber on the receiving
