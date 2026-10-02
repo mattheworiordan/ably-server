@@ -113,6 +113,11 @@ func TestBusResolution(t *testing.T) {
 					if opts.Bus != wantBus {
 						t.Errorf("bus = %q, want %q", opts.Bus, wantBus)
 					}
+					// An inferred bus is flagged, so a database that served
+					// an earlier version refuses it (DESIGN.md §11).
+					if opts.BusInferred != (bus == "") {
+						t.Errorf("BusInferred = %v, want %v", opts.BusInferred, bus == "")
+					}
 					if withURL && wantBus == postgres.BusNATS && opts.NATSURL != url {
 						t.Errorf("NATSURL = %q, want %q", opts.NATSURL, url)
 					}

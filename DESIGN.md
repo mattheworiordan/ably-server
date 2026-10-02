@@ -2864,11 +2864,28 @@ nothing. Deleting the row instead makes the next node record its own
 settings and a new deployment id.
 
 *Upgrading past the bus default.* Before the bus was inferred (§7.2), a
-node started without `--bus` ran `pgnotify`, and its database records
-`pgnotify`. A node of this version started the same way infers
-`postgres` and is refused, the refusal naming the difference. Set
-`--bus=pgnotify` to keep the old bus, or move to `postgres` with the
-steps above.
+node started without `--bus` ran `pgnotify`. Two cases:
+
+- A database whose record says `pgnotify` (written by a node of a
+  version that had the record but not the inference): a node of this
+  version started without `--bus` infers `postgres` and is refused by
+  the comparison above, the refusal naming the difference.
+- A database with no record that already holds `channels` rows: it
+  served a version from before the record, whose nodes ran `pgnotify`
+  and do not check the record. A node that inferred its bus would record
+  `postgres` (or `nats`), and during a rolling upgrade its publishes
+  would never reach subscribers on the older nodes (pgnotify has no
+  predecessor chain and no sweep to repair them), while theirs would
+  reach it only through its sweep. So a node with no `--bus` is refused
+  on such a database, before anything is recorded, with a message that
+  says the database predates the bus setting and its nodes ran
+  `pgnotify`. Set `--bus=pgnotify` on every node to keep the cluster
+  together while it is upgraded (it is then recorded), or stop every
+  node and start them all with `--bus=postgres` or `--bus=nats`. An
+  explicit `--bus` is taken as that decision and recorded. A database
+  with no `channels` row is treated as new. The signal is the rows, not
+  the migration history, so a database whose every row has been pruned
+  (§6.3; a channel with a presence member is never pruned) looks new.
 
 *Upgrading to this version.* A database without the row records the
 settings of the first upgraded node; nodes of earlier versions do not
