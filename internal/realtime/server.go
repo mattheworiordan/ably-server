@@ -120,6 +120,11 @@ type Server struct {
 	// shorten it.
 	remainPresentFor time.Duration
 
+	// presenceWriteTimeout bounds one client presence write
+	// (handlePresence); zero means DefaultPresenceWriteTimeout. Tests
+	// shorten it.
+	presenceWriteTimeout time.Duration
+
 	// reaperDone is closed by Shutdown to abandon any pending delayed
 	// presence LEAVEs (their members go with the departing node).
 	// reaperStop guards the close against a double Shutdown.
@@ -681,6 +686,9 @@ func (s *Server) reenterGrace(ctx context.Context, g *graceLeave) (entered, fail
 	}
 	s.graceMu.Unlock()
 	for channel, enters := range snap {
+		if len(enters) == 0 {
+			continue // every member uncertain (reentries)
+		}
 		var cm *protocol.ChannelMessage
 		ch, err := s.manager.GetChannel(ctx, channel)
 		if err == nil {

@@ -3390,10 +3390,25 @@ window (a resume would take them over expecting them present; they still
 leave at the window's end; a grace LEAVE already written, or members a
 resume has since taken over, are skipped, so this cannot undo the resumed
 client's own LEAVE). It works on 32 connections or grace entries at a
-time. A connection's entered set records an operation only once the
-store has committed it: a LEAVE the store refused keeps its member, so
-the member still leaves with the connection, and an ENTER the store
-refused is never re-entered. The pass takes its two snapshots (grace
+time. A connection's entered set follows the store's answer to each
+presence write. A committed operation is recorded. One the store turned
+away before writing anything (42910: a full lane queue or the presence
+in-flight bound) is not. One whose outcome is unknown (a timeout, a
+50003, any other failure) is recorded as *uncertain*: an ENTER or UPDATE
+for a member not yet held records it, and a LEAVE turns a held member
+uncertain. Every LEAVE path (DETACH, teardown, grace) covers an
+uncertain member, since the write may have committed and a LEAVE of an
+absent member is harmless; a re-entry skips it, since the client was
+told the operation failed. So a refused LEAVE still leaves with the
+connection, and a refused ENTER is never re-entered. The client's
+presence write runs on a context the connection's teardown does not
+cancel, bounded by 10 s (`DefaultPresenceWriteTimeout`): teardown
+cancels the connection's context, then waits for the publish worker
+before it takes the entered set, so an ENTER whose batch was in flight
+when the connection dropped is answered and recorded first and gets its
+LEAVE. (On the connection's own context such an ENTER committed, the
+caller saw only the context's error, and the member was never left: it
+stayed until its node died.) The pass takes its two snapshots (grace
 entries, then live connections) together under the grace lock, and a
 grace entry a resume claims while the pass is running is re-entered by
 the claiming connection itself, since the pass may already have passed

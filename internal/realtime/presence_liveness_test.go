@@ -31,6 +31,20 @@ type faultyStorage struct {
 	storage.Storage
 	failMembers  atomic.Bool
 	failPresence atomic.Bool
+	// presenceHook, when set, wraps every StorePresence: store writes
+	// the operation to the memory backend, and the hook decides when to
+	// call it and what to return.
+	presenceHook atomic.Pointer[presenceHookFunc]
+}
+
+type presenceHookFunc func(ctx context.Context, p []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error)
+
+func (s *faultyStorage) setPresenceHook(f presenceHookFunc) {
+	if f == nil {
+		s.presenceHook.Store(nil)
+		return
+	}
+	s.presenceHook.Store(&f)
 }
 
 func (s *faultyStorage) Channel(ctx context.Context, name string, a storage.Appender) (storage.ChannelStore, error) {
@@ -58,6 +72,11 @@ func (c *faultyChannel) Members(ctx context.Context) ([]*protocol.PresenceMessag
 func (c *faultyChannel) StorePresence(ctx context.Context, p []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	if c.s.failPresence.Load() {
 		return nil, false, errInjected
+	}
+	if h := c.s.presenceHook.Load(); h != nil {
+		return (*h)(ctx, p, func() (*protocol.ChannelMessage, bool, error) {
+			return c.ChannelStore.StorePresence(context.WithoutCancel(ctx), p)
+		})
 	}
 	return c.ChannelStore.StorePresence(ctx, p)
 }
@@ -465,5 +484,192 @@ func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
 	f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
 	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
 		t.Fatalf("frame = %+v, want alice re-entered by the resumed connection", f)
+	}
+}
+
+// liveConn returns the server's live connection with connectionId id.
+func (h *livenessHarness) liveConn(t *testing.T, id string) *connection {
+	t.Helper()
+	h.rt.mu.Lock()
+	defer h.rt.mu.Unlock()
+	c := h.rt.byKey[id]
+	if c == nil {
+		t.Fatalf("no live connection %q", id)
+	}
+	return c
+}
+
+// TestEnterCommittedAfterTeardownIsLeft: an ENTER whose batch is still in
+// flight when the connection drops commits after the teardown has
+// cancelled the connection's context. The store call does not run on
+// that context (handlePresence), so the commit is answered, the member
+// is recorded before teardown takes the entered set, and the grace
+// window ends with its LEAVE (DESIGN.md §12.5). Run on the connection's
+// context, the call answered with the context's error, the committed
+// member was never recorded, and it stayed present for as long as the
+// node lived.
+func TestEnterCommittedAfterTeardownIsLeft(t *testing.T) {
+	const grace = 200 * time.Millisecond
+	h := newLivenessServer(t, grace)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	pub := dialClient(t, h.srv, "alice")
+	connected := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+	attach(t, pub, "room", protocol.FlagPresence)
+	conn := h.liveConn(t, connected.ConnectionID)
+
+	// The ENTER's batch stalls until the test releases it, then commits
+	// and, as the Postgres lanes do, answers with the caller's context
+	// error if the caller has given up meanwhile.
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	h.store.setPresenceHook(func(ctx context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+		close(inFlight)
+		<-release
+		cm, idem, err := store()
+		if err == nil && ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return cm, idem, err
+	})
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(1),
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
+	})
+	select {
+	case <-inFlight:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the ENTER never reached the store")
+	}
+
+	// The connection drops; its teardown cancels the connection's context
+	// and then waits for the publish worker.
+	_ = pub.Close()
+	select {
+	case <-conn.loopCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connection's context was never cancelled")
+	}
+	h.store.setPresenceHook(nil)
+	close(release)
+
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence || f.Presence[0].Action != protocol.PresenceEnter {
+		t.Fatalf("frame = %+v, want alice's ENTER", f)
+	}
+	f := readFrame(t, sub, protocol.FormatJSON, grace+3*time.Second)
+	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceLeave || f.Presence[0].ClientID != "alice" {
+		t.Fatalf("frame = %+v, want alice's grace LEAVE", f)
+	}
+}
+
+// TestUncertainPresenceOutcome: a presence write whose outcome is
+// unknown, a store error that does not prove nothing was stored or a
+// write that outlived the presence write timeout, is NACKed, and its
+// member is recorded as uncertain (DESIGN.md §12.5): the connection's
+// LEAVE still covers it, since the write may have committed, but a lapse
+// re-entry does not bring it back, since the client was told it failed.
+// A write the store refused before storing anything (42910) records
+// nothing.
+func TestUncertainPresenceOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook presenceHookFunc
+		// committed: the hook stored the ENTER, so the subscriber sees it
+		// and the connection must leave it.
+		committed bool
+	}{
+		{
+			name: "unavailable",
+			hook: func(_ context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+				if _, _, err := store(); err != nil {
+					return nil, false, err
+				}
+				return nil, false, storage.ErrUnavailable
+			},
+			committed: true,
+		},
+		{
+			name: "timeout",
+			hook: func(ctx context.Context, _ []*protocol.PresenceMessage, store func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+				<-ctx.Done()
+				if _, _, err := store(); err != nil {
+					return nil, false, err
+				}
+				return nil, false, ctx.Err()
+			},
+			committed: true,
+		},
+		{
+			name: "refused",
+			hook: func(context.Context, []*protocol.PresenceMessage, func() (*protocol.ChannelMessage, bool, error)) (*protocol.ChannelMessage, bool, error) {
+				return nil, false, storage.ErrOverloaded
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newLivenessServer(t, time.Hour)
+			h.rt.presenceWriteTimeout = 200 * time.Millisecond
+			sub := dial(t, h.srv, "")
+			drainConnected(t, sub)
+			attach(t, sub, "room", 0)
+			pub := dialClient(t, h.srv, "alice")
+			connected := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+			attach(t, pub, "room", protocol.FlagPresence)
+			conn := h.liveConn(t, connected.ConnectionID)
+
+			h.store.setPresenceHook(tc.hook)
+			sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+				Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(1),
+				Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "d"}},
+			})
+			if f := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionNack {
+				t.Fatalf("frame = %v, want NACK", f.Action)
+			}
+			h.store.setPresenceHook(nil)
+
+			conn.enteredMu.Lock()
+			rec := conn.entered["room"]["alice"]
+			conn.enteredMu.Unlock()
+			switch {
+			case !tc.committed && rec != nil:
+				t.Fatalf("refused ENTER recorded as %+v, want nothing", rec)
+			case tc.committed && (rec == nil || rec.Action != uncertainAction):
+				t.Fatalf("record = %+v, want alice recorded as uncertain", rec)
+			}
+			if !tc.committed {
+				return
+			}
+			if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence || f.Presence[0].Action != protocol.PresenceEnter {
+				t.Fatalf("frame = %+v, want alice's ENTER", f)
+			}
+
+			// A lapse re-entry leaves the uncertain member alone.
+			h.rt.ReenterPresence(context.Background())
+			if err := sub.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+				t.Fatalf("SetReadDeadline: %v", err)
+			}
+			if _, data, err := sub.ReadMessage(); err == nil {
+				t.Fatalf("frame after the re-entry pass: %s (want none)", data)
+			}
+			_ = sub.Close()
+			sub2 := dial(t, h.srv, "")
+			drainConnected(t, sub2)
+			attach(t, sub2, "room", 0)
+			if f := readFrame(t, sub2, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionSync {
+				t.Fatalf("frame = %v, want the SYNC of alice", f.Action)
+			}
+
+			// A clean close leaves her.
+			sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionClose})
+			if f := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionClosed {
+				t.Fatalf("frame = %v, want CLOSED", f.Action)
+			}
+			_ = pub.Close()
+			f := readFrame(t, sub2, protocol.FormatJSON, 2*time.Second)
+			if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceLeave || f.Presence[0].ClientID != "alice" {
+				t.Fatalf("frame = %+v, want alice's LEAVE", f)
+			}
+		})
 	}
 }

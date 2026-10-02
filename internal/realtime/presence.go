@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -79,22 +80,40 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	// message (this PRESENCE frame), not the members it carries.
 	//
 	// The entered set (teardown LEAVE, grace LEAVE and lapse re-entry,
-	// DESIGN.md §12.5) is updated only once the store has committed the
-	// operation, under presMu with the write, so it reflects committed
-	// presence: an ENTER the store refused is not re-entered after a
-	// lease lapse, and a LEAVE the store refused (42910, 50003) keeps its
-	// member in the set, so the member still gets its synthesised LEAVE
-	// when the connection ends. A DETACH or a re-entry takes presMu too,
-	// so it sees the set as of the last committed write.
+	// DESIGN.md §12.5) is updated from the store's answer, under presMu
+	// with the write, so it reflects what the store holds: a committed
+	// operation is recorded as such (recordPresence), one the store
+	// refused before storing anything is not recorded, and one whose
+	// outcome is unknown is recorded as uncertain (recordUncertain), so a
+	// LEAVE follows it but a lapse re-entry does not bring it back. A
+	// DETACH or a re-entry takes presMu too, so it sees the set as of the
+	// last answered write.
+	//
+	// The store call runs on a context that the connection's teardown does
+	// not cancel, bounded by presenceWriteTimeout: teardown cancels the
+	// connection's context while a batch may be in flight, and a write the
+	// caller abandoned can still commit, which would leave a member no
+	// LEAVE path knows of. Teardown waits for this worker (loops.Wait)
+	// before it takes the entered set, so the answer is recorded first.
 	channel := msg.GetChannel()
 	presence := msg.Presence
 	ch := a.channel
+	timeout := c.srv.presenceWriteTimeoutOrDefault()
 	c.enqueuePublish(ctx, func() {
 		c.presMu.Lock()
-		_, _, err := ch.PublishPresence(ctx, presence)
-		if err == nil {
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		_, _, err := ch.PublishPresence(wctx, presence)
+		cancel()
+		switch {
+		case err == nil:
 			for _, p := range presence {
 				c.recordPresence(channel, p)
+			}
+		case presenceRefused(err):
+			// Nothing was stored: the set is unchanged.
+		default:
+			for _, p := range presence {
+				c.recordUncertain(channel, p)
 			}
 		}
 		c.presMu.Unlock()
@@ -113,6 +132,31 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 			Count:     1,
 		})
 	})
+}
+
+// DefaultPresenceWriteTimeout bounds one client presence write on the
+// publish worker (handlePresence). The write runs on a context the
+// connection's teardown does not cancel, so this is what bounds how long
+// a stalled store holds up that teardown.
+const DefaultPresenceWriteTimeout = 10 * time.Second
+
+// presenceWriteTimeoutOrDefault returns the server's presence write
+// bound, DefaultPresenceWriteTimeout unless a test set one.
+func (s *Server) presenceWriteTimeoutOrDefault() time.Duration {
+	if s == nil || s.presenceWriteTimeout <= 0 {
+		return DefaultPresenceWriteTimeout
+	}
+	return s.presenceWriteTimeout
+}
+
+// presenceRefused reports whether a presence write failed before the
+// store wrote anything: the backend turned it away (a full lane queue or
+// the presence in-flight bound, storage.ErrOverloaded) or could not
+// store the channel's name. Every other failure, a timeout or a
+// cancelled wait, storage.ErrUnavailable ("most likely not stored"), is
+// treated as possibly committed (DESIGN.md §12.5).
+func presenceRefused(err error) bool {
+	return errors.Is(err, storage.ErrOverloaded) || errors.Is(err, storage.ErrInvalidChannelName)
 }
 
 // presenceID mints the Ably-form id a genuine presence message carries:
@@ -179,6 +223,47 @@ func (c *connection) recordPresence(channel string, p *protocol.PresenceMessage)
 			c.entered[channel] = set
 		}
 		cp := *p
+		set[p.ClientID] = &cp
+	}
+}
+
+// uncertainAction marks an entered-set record whose presence is unknown
+// (recordUncertain): the member may or may not be in the store. Every
+// LEAVE path covers it (a LEAVE of a member that is absent is harmless),
+// and a lapse re-entry skips it (reentries), since the client was told
+// the operation failed. A committed operation replaces the record.
+const uncertainAction = protocol.PresenceAbsent
+
+// recordUncertain updates the entered set for a presence operation whose
+// outcome is unknown (DESIGN.md §12.5): the write timed out, or failed
+// in a way that does not prove nothing was stored. An ENTER, UPDATE or
+// PRESENT for a member the set does not hold records it as uncertain, so
+// the connection's LEAVE paths still cover it if the write committed; a
+// member the set already holds is present whatever the outcome and keeps
+// its record. A LEAVE or ABSENT turns a held member uncertain: it may
+// have left, so it must not be re-entered, but it is still left.
+func (c *connection) recordUncertain(channel string, p *protocol.PresenceMessage) {
+	c.enteredMu.Lock()
+	defer c.enteredMu.Unlock()
+	set := c.entered[channel]
+	held := set[p.ClientID]
+	switch p.Action {
+	case protocol.PresenceLeave, protocol.PresenceAbsent:
+		if held != nil {
+			cp := *held
+			cp.Action = uncertainAction
+			set[p.ClientID] = &cp
+		}
+	default: // Enter, Update, Present
+		if held != nil {
+			return
+		}
+		if set == nil {
+			set = make(map[string]*protocol.PresenceMessage)
+			c.entered[channel] = set
+		}
+		cp := *p
+		cp.Action = uncertainAction
 		set[p.ClientID] = &cp
 	}
 }
@@ -319,6 +404,9 @@ func (c *connection) reenterMembers(ctx context.Context, members map[string]map[
 // Called with presMu held.
 func (c *connection) publishReentries(ctx context.Context, snap map[string][]*protocol.PresenceMessage) (entered, failed int) {
 	for channel, enters := range snap {
+		if len(enters) == 0 {
+			continue // every member uncertain (reentries)
+		}
 		var cm *protocol.ChannelMessage
 		ch, err := c.manager.GetChannel(ctx, channel)
 		if err == nil {
@@ -339,10 +427,14 @@ func (c *connection) publishReentries(ctx context.Context, snap map[string][]*pr
 
 // reentries returns a server-synthesised ENTER for each member in set,
 // stamped with connID and carrying the member's last data, encoding and
-// extras (DESIGN.md §12.5).
+// extras (DESIGN.md §12.5). An uncertain record (recordUncertain) is
+// left out.
 func reentries(connID string, set map[string]*protocol.PresenceMessage) []*protocol.PresenceMessage {
 	enters := make([]*protocol.PresenceMessage, 0, len(set))
 	for _, m := range set {
+		if m.Action == uncertainAction {
+			continue // the client was told the operation failed
+		}
 		enters = append(enters, &protocol.PresenceMessage{
 			Action:       protocol.PresenceEnter,
 			ClientID:     m.ClientID,
