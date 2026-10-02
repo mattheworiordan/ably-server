@@ -314,3 +314,83 @@ func TestCatchUpAfterTheChannelsRowWasPrunedSignals(t *testing.T) {
 		t.Fatalf("discontinuities = %d, want 1 (mark %s, row pruned)", rec.discontinuities, mark)
 	}
 }
+
+// TestFirstPublishAfterThePruneIsContinuous: a subscribed, caught-up
+// channel idles past retention and its channels row is pruned while the
+// nodes stay on the bus. The sweep keeps proving it (no row means nothing
+// published since the prune), so the first publish afterwards, whose
+// predecessor is the recreated row's fresh seed and which is therefore
+// held and filled from the old mark, is delivered on every node with no
+// discontinuity (DESIGN.md §6.3 "Pruning channels rows", §7.2). Before
+// the sweep proved a missing row, the proof aged out with it, the fill
+// was checked, found the mark's cm gone, and signalled 80016 on every
+// node although nothing was lost.
+func TestFirstPublishAfterThePruneIsContinuous(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	open := func() *Storage {
+		opts := pgBusOptions(dsn)
+		opts.SweepInterval = time.Hour // swept by hand below
+		opts.Retention = Retention{Message: 2 * time.Minute}
+		// With the publish lanes, as the server runs, a publish that
+		// recreates the row chains on its fresh seed.
+		opts.Batching = Batching{Lanes: 1}
+		s, err := Open(ctx, opts)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	b, other := open(), open()
+	recB, recO := &discontinuityRecorder{}, &discontinuityRecorder{}
+	ch, err := b.Channel(ctx, "room", recB)
+	if err != nil {
+		t.Fatalf("B binds room: %v", err)
+	}
+	if _, err := other.Channel(ctx, "room", recO); err != nil {
+		t.Fatalf("other binds room: %v", err)
+	}
+	csB, csO := b.boundStore("room"), other.boundStore("room")
+	m1 := publish(t, ctx, ch, "m1")
+	for _, cs := range []*channelStore{csB, csO} {
+		waitFor(t, 5*time.Second, "m1 to be delivered", func() bool { return cs.watermark() == m1 })
+	}
+	sweep := func() {
+		t.Helper()
+		for _, s := range []*Storage{b, other} {
+			if err := s.sweepWatermarks(ctx); err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+		}
+	}
+	sweep()
+
+	// The channel idles past retention and is pruned: its row and its
+	// aged-out log go. The nodes keep sweeping meanwhile.
+	if _, err := b.pool.Exec(ctx, `DELETE FROM channel_messages WHERE channel = 'room'`); err != nil {
+		t.Fatalf("delete log rows: %v", err)
+	}
+	if _, err := b.pool.Exec(ctx, `DELETE FROM channels WHERE name = 'room'`); err != nil {
+		t.Fatalf("delete channels row: %v", err)
+	}
+	b.SetClockSkew(5 * time.Minute)
+	other.SetClockSkew(5 * time.Minute)
+	sweep()
+
+	m2 := publish(t, ctx, ch, "m2")
+	for name, n := range map[string]struct {
+		cs  *channelStore
+		rec *discontinuityRecorder
+	}{"B": {csB, recB}, "other": {csO, recO}} {
+		waitFor(t, 5*time.Second, name+" to deliver m2", func() bool { return n.cs.watermark() == m2 })
+		n.cs.hwmMu.Lock() // Append runs under hwmMu
+		got, disc := append([]string(nil), n.rec.serials...), n.rec.discontinuities
+		n.cs.hwmMu.Unlock()
+		if disc != 0 || len(got) != 2 || got[0] != m1 || got[1] != m2 {
+			t.Errorf("%s delivered %v with %d discontinuities, want [%s %s] and none", name, got, disc, m1, m2)
+		}
+	}
+}

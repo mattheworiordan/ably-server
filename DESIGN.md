@@ -1634,7 +1634,15 @@ and so none survives:
   as its predecessor, which is ahead of the mark, so the delivery point
   holds it and the gap fill reads it from the log about 100 ms later
   (§7.2); that one cm is delivered late, none is lost, and no
-  discontinuity is signalled because the log read returns the cm.
+  discontinuity is signalled. The fill from the old mark is a plain read,
+  with no continuity check, because the node still holds a recent proof
+  that nothing was past its mark: while the row is gone, each sweep that
+  finds no row for a bound channel the node had caught up on proves it
+  again at the time of the read (no row means no publish since the
+  prune, as a publish recreates the row). A node that was not sweeping
+  the channel meanwhile (no subscriber on it, or off the bus) holds no
+  such proof; its checked fill finds the mark's cm gone and signals a
+  discontinuity, since it cannot know what happened after the mark.
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
 
@@ -2022,8 +2030,10 @@ The `postgres` and `nats` buses share one delivery point
   than the retention window ago, whose last cm has aged out and which
   then received a cm while the node was off the bus, is signalled
   although nothing was lost, because the log does not record what
-  preceded the new cm. On `pgnotify`, which has no sweep, "last proven"
-  is the bind. The proof assumes a publish commits within the one-second
+  preceded the new cm. A node on the bus that is sweeping the channel
+  does not hit this when the channel's row is pruned: a sweep that finds
+  no row proves the channel again (§6.3 "Pruning `channels` rows"). On
+  `pgnotify`, which has no sweep, "last proven" is the bind. The proof assumes a publish commits within the one-second
   clock margin of minting its serial (the mint holds the channel's row
   lock until commit); a transaction stalled longer than that between the
   two, and longer than the window, could escape it. A spurious signal costs the client a reconcile, and an

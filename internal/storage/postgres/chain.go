@@ -1015,12 +1015,14 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("storage/postgres: read watermarks: %w", err)
 		}
+		found := make(map[string]bool, len(chunk))
 		for rows.Next() {
 			var name, watermark string
 			if err := rows.Scan(&name, &watermark); err != nil {
 				rows.Close()
 				return fmt.Errorf("storage/postgres: scan watermark: %w", err)
 			}
+			found[name] = true
 			cs := byName[name]
 			cs.hwmMu.Lock()
 			if cs.seeded && !cs.released && cs.sweptWatermark > cs.lastSeen {
@@ -1035,6 +1037,28 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("storage/postgres: watermark rows: %w", err)
+		}
+		// A bound channel with no row was pruned after idling past
+		// retention (DESIGN.md §6.3), and nothing has been published on it
+		// since: a publish recreates the row, and the read's snapshot is
+		// after readAt. If the node had caught up to the last watermark it
+		// read, nothing is past its mark as of readAt, so the proof stays
+		// fresh while the row is gone. Without this the proof aged out
+		// with the row, and the first publish after the prune, whose
+		// predecessor is the recreated row's fresh seed, sent a checked
+		// gap fill from the old mark that found the anchor gone and
+		// signalled a discontinuity on every node with the channel bound,
+		// although nothing was lost.
+		for _, name := range names {
+			if found[name] {
+				continue
+			}
+			cs := byName[name]
+			cs.hwmMu.Lock()
+			if cs.seeded && !cs.released && cs.lastSeen >= cs.sweptWatermark {
+				cs.markProvenLocked(readAt)
+			}
+			cs.hwmMu.Unlock()
 		}
 	}
 	for start := 0; start < len(behind); start += reconcileChunk {
