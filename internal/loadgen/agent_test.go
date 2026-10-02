@@ -52,8 +52,12 @@ func TestAgentHostEndpoint(t *testing.T) {
 		}
 		return
 	}
+	// want is read after the endpoint answered, so its cumulative counters
+	// are at least the endpoint's; a tick between the two reads makes
+	// want.Total larger, never smaller. (The old check had this the wrong
+	// way round and failed whenever a jiffy elapsed between the reads.)
 	var h HostCPU
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&h) != nil || h.CPUs != want.CPUs || h.Total < want.Total {
-		t.Fatalf("HTTP %d host %+v, want about %+v", resp.StatusCode, h, want)
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&h) != nil || h.CPUs != want.CPUs || h.Total > want.Total || h.Total == 0 {
+		t.Fatalf("HTTP %d host %+v, want CPUs %d and a total at most %d", resp.StatusCode, h, want.CPUs, want.Total)
 	}
 }
