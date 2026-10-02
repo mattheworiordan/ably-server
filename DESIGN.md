@@ -1051,6 +1051,15 @@ out-of-order or premature ack corrupts its pending-publish accounting).
 Validation rejections are enqueued through the same worker so their `NACK`
 stays ordered behind any still-in-flight publishes.
 
+`ACK` / `NACK` are ordered only against each other. A connection attached
+with `SUBSCRIBE` / `PRESENCE_SUBSCRIBE` to a channel it publishes on also
+receives its own `MESSAGE` echo (unless `echo=false`, §2.1) or `PRESENCE`
+echo (always). Its attachment queues the echo as soon as the cm is linked
+onto the live list (§4.4); the worker queues the `ACK` after the commit
+returns. The two goroutines are not ordered, so the echo may reach the
+client before or after the `ACK` of the same publish. The Ably protocol
+does not order them either, and SDKs do not depend on it.
+
 An inbound `MESSAGE` / `PRESENCE` `msgSerial` must be monotonic per
 connection. A frame whose `msgSerial` repeats or goes backward is a client
 retransmit — e.g. the SDK re-flushing a queued publish with the same

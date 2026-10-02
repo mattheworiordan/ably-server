@@ -108,24 +108,68 @@ func TestShutdownPacesDisconnects(t *testing.T) {
 
 // TestShutdownSynthesisesPresenceLeave: the graceful shutdown close path
 // still drives the connection-loop teardown, which synthesises presence
-// LEAVEs — after Shutdown the member is gone from the channel's presence
-// set (DESIGN.md §12.5, §11).
+// LEAVEs: after Shutdown the member is gone from the channel's presence
+// set, a subscriber elsewhere sees exactly one LEAVE for it, and the
+// departing connection's last frame is DISCONNECTED (DESIGN.md §12.5,
+// §11).
+//
+// alice attaches with PRESENCE_SUBSCRIBE, as an SDK does, so her ENTER
+// draws two frames on her own connection: the ACK, queued by the publish
+// worker once the store commits (§5.2), and her own PRESENCE echo,
+// queued by her attachment as soon as the cm is linked onto the live
+// list (§12.2, §4.4). The two are queued by different goroutines, and
+// neither the server (§5.2) nor the Ably protocol orders an ACK against
+// a MESSAGE/PRESENCE delivery (only ACKs against each other, by
+// msgSerial), so they may arrive in either order. The test accepts
+// both; asserting ACK first failed on loaded CI runners when the worker
+// was descheduled between the commit and queueing the ACK.
 func TestShutdownSynthesisesPresenceLeave(t *testing.T) {
 	srv, rt, manager := newShutdownServer(t, time.Hour)
+
+	// The observer connects through a second front end over the same
+	// core, which is not shut down, so it is still attached when alice's
+	// teardown LEAVE is published, whatever order Shutdown closes in.
+	parsed, err := auth.ParseAPIKey(testKey)
+	if err != nil {
+		t.Fatalf("parse api key: %v", err)
+	}
+	obsRT := NewServer([]auth.APIKey{parsed}, manager, time.Hour, logging.New(slog.DiscardHandler), nil, nil)
+	obsMux := http.NewServeMux()
+	obsMux.HandleFunc("GET /", obsRT.HandleWebSocket)
+	obsSrv := httptest.NewServer(obsMux)
+	t.Cleanup(obsSrv.Close)
+	obs := dial(t, obsSrv, "")
+	drainConnected(t, obs)
+	attach(t, obs, "room", protocol.FlagPresenceSubscribe)
 
 	ws := dialClient(t, srv, "alice")
 	drainConnected(t, ws)
 	attach(t, ws, "room", protocol.FlagPresence|protocol.FlagPresenceSubscribe)
 
-	// Enter presence and confirm the member is in the set before shutdown.
+	// Enter presence; the ACK and the self-echo may arrive in either order.
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   new("room"),
 		MsgSerial: msgSerialPtr(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "hi"}},
 	})
-	if ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
-		t.Fatalf("enter frame = %v, want ACK", ack.Action)
+	var acked, echoed bool
+	for range 2 {
+		f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+		switch {
+		case f.Action == protocol.ActionAck && !acked:
+			if f.GetMsgSerial() != 1 || f.Count != 1 {
+				t.Fatalf("enter ACK msgSerial/count = %d/%d, want 1/1", f.GetMsgSerial(), f.Count)
+			}
+			acked = true
+		case f.Action == protocol.ActionPresence && !echoed:
+			if len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
+				t.Fatalf("enter echo = %+v, want one ENTER for alice", f.Presence)
+			}
+			echoed = true
+		default:
+			t.Fatalf("enter frame = %v, want one ACK and one PRESENCE echo", f.Action)
+		}
 	}
 
 	ch, err := manager.GetChannel(context.Background(), "room")
@@ -135,16 +179,51 @@ func TestShutdownSynthesisesPresenceLeave(t *testing.T) {
 	if !waitMember(t, ch, "alice", true, time.Second) {
 		t.Fatal("alice not present after ENTER")
 	}
+	if f := readFrame(t, obs, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence ||
+		len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
+		t.Fatalf("observer frame = %v %+v, want alice's ENTER", f.Action, f.Presence)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	rt.Shutdown(ctx)
 
-	// Teardown runs asynchronously as the connection loop exits; the
-	// synthesised LEAVE should remove alice from the presence set.
+	// DISCONNECTED is alice's last frame: the write loop closes the socket
+	// right after writing it (§11), before teardown publishes the LEAVE, so
+	// her own LEAVE echo never reaches her.
+	var last *protocol.ProtocolMessage
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+		var m protocol.ProtocolMessage
+		if err := protocol.Unmarshal(data, protocol.FormatJSON, &m); err != nil {
+			t.Fatalf("unmarshal %q: %v", data, err)
+		}
+		last = &m
+	}
+	if last == nil || last.Action != protocol.ActionDisconnected {
+		t.Fatalf("alice's last frame = %+v, want DISCONNECTED", last)
+	}
+
+	// Teardown runs as the connection loop exits; the synthesised LEAVE
+	// removes alice from the presence set.
 	if waitMember(t, ch, "alice", false, 2*time.Second) {
 		t.Fatal("alice still present after shutdown; teardown LEAVE not synthesised")
 	}
+
+	// The observer sees exactly one LEAVE for alice, synthesised (no id).
+	f := readFrame(t, obs, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 ||
+		f.Presence[0].Action != protocol.PresenceLeave || f.Presence[0].ClientID != "alice" {
+		t.Fatalf("observer frame = %v %+v, want alice's LEAVE", f.Action, f.Presence)
+	}
+	if f.Presence[0].ID != "" {
+		t.Errorf("teardown LEAVE id = %q, want none (synthesised, RTP2b1)", f.Presence[0].ID)
+	}
+	expectNoFrame(t, obs, 300*time.Millisecond)
 }
 
 // waitMember polls the channel's presence set until clientID's presence
