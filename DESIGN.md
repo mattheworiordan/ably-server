@@ -3011,6 +3011,9 @@ name = "persisted:presence_fixtures"
     that delivered no set: `closed` (the attachment or its connection
     ended while the snapshot was being obtained, logged at debug level)
     or `error` (the snapshot could not be read, logged as a warning).
+    After a channel update, `error` is counted once when every retry
+    has failed; the `SYNC` is then owed and follows once a later read
+    succeeds (§7.2).
   - Cluster mode only, the Postgres connection pool (§6.3):
     `ably_storage_pool_max_conns`, `ably_storage_pool_acquired_conns`,
     `ably_storage_pool_idle_conns` (gauges) and

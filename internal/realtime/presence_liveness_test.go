@@ -1130,3 +1130,49 @@ func TestOwedSyncForAnEmptySetCompletesTheSync(t *testing.T) {
 		t.Fatalf("frame %s, want a complete SYNC carrying an empty presence array", raw)
 	}
 }
+
+// TestDiscontinuityFailedSeedCountedOnce: a channel update whose
+// presence re-seed fails on every retry counts one skipped SYNC as an
+// error (ably_presence_syncs_skipped_total, DESIGN.md §10), and the
+// retries of the owed read that follow do not count again; the owed SYNC
+// still arrives once the store answers.
+func TestDiscontinuityFailedSeedCountedOnce(t *testing.T) {
+	const series = `ably_presence_syncs_skipped_total{reason="error"}`
+	h := newLivenessServer(t, time.Hour)
+	pub := dialClient(t, h.srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionSync {
+		t.Fatalf("frame = %v, want the attach SYNC", f.Action)
+	}
+	if line := h.metricLine(t, series); line != "" {
+		t.Fatalf("before the update: %q, want no skipped SYNC", line)
+	}
+
+	h.store.failMembers.Store(true)
+	ch, err := h.manager.GetChannel(context.Background(), "room")
+	if err != nil {
+		t.Fatalf("GetChannel: %v", err)
+	}
+	ch.Discontinuity(storage.DiscontinuityRetention)
+	if f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second); f.Action != protocol.ActionAttached || f.Flags&protocol.FlagHasPresence == 0 {
+		t.Fatalf("frame = %+v, want the channel update with HAS_PRESENCE", f)
+	}
+	if line := h.metricLine(t, series); line != series+" 1" {
+		t.Fatalf("after the failed re-seed: %q, want %q", line, series+" 1")
+	}
+	// Let the owed read fail at least twice more (it retries every
+	// owedSyncRetry), then let it succeed.
+	time.Sleep(2*owedSyncRetry + 200*time.Millisecond)
+	h.store.failMembers.Store(false)
+	if f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second); f.Action != protocol.ActionSync {
+		t.Fatalf("frame = %v, want the owed SYNC", f.Action)
+	}
+	if line := h.metricLine(t, series); line != series+" 1" {
+		t.Errorf("after the owed SYNC: %q, want %q (owed retries are not counted)", line, series+" 1")
+	}
+}

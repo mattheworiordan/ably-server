@@ -604,7 +604,7 @@ func (a *attachment) discontinuitySnapshot() (snap *core.PresenceSnapshot, ok bo
 			return snap, true
 		}
 		if a.ctx.Err() != nil {
-			a.metrics.PresenceSyncSkipped("closed")
+			a.syncSkipped(a.ctx, err)
 			return nil, false
 		}
 		if attempt == discontinuitySyncAttempts {
@@ -617,7 +617,7 @@ func (a *attachment) discontinuitySnapshot() (snap *core.PresenceSnapshot, ok bo
 		select {
 		case <-time.After(backoff):
 		case <-a.ctx.Done():
-			a.metrics.PresenceSyncSkipped("closed")
+			a.syncSkipped(a.ctx, err)
 			return nil, false
 		}
 		backoff *= 2
