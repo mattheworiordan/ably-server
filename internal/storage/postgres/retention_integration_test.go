@@ -455,12 +455,22 @@ func TestRetentionDropTimesOutOnAHeldLeafAndRetries(t *testing.T) {
 	}
 }
 
-// TestRetentionRangeReadsDoNotLockExpiredLeaves: the chain's log range
-// reads are bounded below by the channel's retention floor, so they prune
-// (and never lock) a leaf older than retention. An ACCESS EXCLUSIVE lock
-// held on such a leaf, as a drop waiting its turn would be, must not
-// stall them. Eight reads, past the point where a cached statement would
-// switch to a generic plan, which locks every leaf.
+// TestRetentionRangeReadsDoNotLockExpiredLeaves: the chain's
+// single-channel range read (sqlLoadRange, LoadRangeAfter) is bounded
+// below by its mark, so from a recent mark it prunes (and never locks) a
+// leaf entirely below the mark. An ACCESS EXCLUSIVE lock held on such a
+// leaf, as a drop waiting its turn would be, must not stall it. Eight
+// reads, past the point where a cached statement would switch to a
+// generic plan, which locks every leaf.
+//
+// The shape changed with 2e03e05: the read used to start at mark "" and
+// rely on a retention floor applied to the range to prune the old leaf.
+// The floor is gone (it hid cms the log still held, DESIGN.md §6.3), so
+// the read now starts from a mark ten seconds old; a mark older than the
+// leaf asks for it, and must. Only the single-channel read is covered:
+// the batched read (sqlLoadRangeMany: reconcile, sweep catch-up, checked
+// reads) takes its bounds from unnest and opens every leaf whatever the
+// marks, a cost DESIGN.md §6.3 states.
 func TestRetentionRangeReadsDoNotLockExpiredLeaves(t *testing.T) {
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
@@ -509,9 +519,14 @@ func TestRetentionRangeReadsDoNotLockExpiredLeaves(t *testing.T) {
 		t.Fatalf("lock old leaf: %v", err)
 	}
 
+	// A mark ten seconds old: the leaves entirely below it are pruned by
+	// the planner, so the read never asks for the locked hour-old leaf. (A
+	// mark older than the leaf would, and must: every cm after a mark is
+	// wanted whatever its age, DESIGN.md §6.3.)
+	mark := fmt.Sprintf("%014d", time.Now().Add(-10*time.Second).UnixMilli())
 	for i := range 8 {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		n, err := s.LoadRangeAfter(rctx, "room", "")
+		n, err := s.LoadRangeAfter(rctx, "room", mark)
 		cancel()
 		if err != nil {
 			t.Fatalf("range read %d blocked or failed with an expired leaf locked: %v", i, err)

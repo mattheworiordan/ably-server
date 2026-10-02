@@ -1,8 +1,9 @@
 package postgres
 
 // The pgnotify bus (DESIGN.md §7.2): the cluster broker as shipped
-// before the bus seam, kept as the default and as the "before" picture
-// for the scale runs. Every publish NOTIFYs the one global channel
+// before the bus seam, kept as an explicit choice (--bus=pgnotify; the
+// server never infers it) and as the "before" picture for the scale
+// runs. Every publish NOTIFYs the one global channel
 // "ably_channel" inside its transaction; one LISTEN goroutine per node
 // receives every notification, reads the cm back by (channel, serial)
 // and delivers it. The mechanics below are main's, moved here from
@@ -325,7 +326,10 @@ func (cs *channelStore) readMissed(ctx context.Context, after string, check bool
 		if err != nil {
 			return r, err
 		}
-		r.current, check = current, current > after
+		// Nothing to prove if the channel has not moved past the mark; a
+		// channel with no row (pruned after idling past retention) is
+		// unprovable, as in unprovenRead.
+		r.current, check = current, current == "" || current > after
 	}
 	cms, err := cs.loadAfter(ctx, after)
 	if err != nil {

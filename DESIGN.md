@@ -133,7 +133,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres` and `--bus=pgnotify`: LISTEN; §7.2) and every publish lane is completing its commits; with a `--postgres-dsn` list, unless all three hold on a majority of the shards (§6.4, §11) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -144,6 +144,13 @@ message, in batch order, each the message's stable identity `serial` (§8)
 — the value a client uses to address the message via `PATCH` / `GET
 .../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
 surfaces.
+
+**A publish whose caller gives up.** A REST publish whose request is
+cancelled or times out while its batch is already committing may still
+be stored (§6.3): the client sees an error for a message that is in the
+log and is delivered. A retry that carries the same client-supplied
+message `id` is deduplicated (§8); a retry without one stores the message
+a second time. Clients that retry should supply ids.
 
 **Request and message size limits.** Every REST request body is read
 through `http.MaxBytesReader` with one cap, `protocol.MaxRequestBodyBytes`
@@ -180,7 +187,7 @@ auth, takes a fast path that changes no behaviour:
   (no escape sequences) is decoded without reflection, then normalised
   exactly as `Message.UnmarshalJSON` would (for example base64 data).
   Every other body, including any malformed one, is decoded by
-  `encoding/json` as before; a fuzz test checks the two agree.
+  `encoding/json`; a fuzz test checks the two agree.
 - The body is read into one buffer of its declared `Content-Length`, and
   a JSON response whose strings need no escaping is written directly,
   byte-identical to `encoding/json`'s output.
@@ -497,7 +504,7 @@ client                        server
   │   ◀───── MESSAGE … (live) ───────────────────│
   │
   │ ── DETACH ──▶
-  │                              │ remove from Channel
+  │                              │ leave presence (after queued writes), remove from Channel
   │   ◀──── DETACHED ────────────│
 ```
 
@@ -515,8 +522,11 @@ continuity holds by construction: no message is missed and none is
 duplicated. Presence is **not** resynced on an in-place re-attach. An
 explicit backwards `channelSerial` cursor on a live attachment is ignored
 for now (it exists to drive delta-fill recovery, deferred with delta
-support); the reply is at the current position, which is safe because this
-server never emits deltas.
+support); the reply is at the current position. The server does send
+append deltas (§13.3), to an attachment that has already been delivered
+the target message, which it tracks per attachment; ignoring the cursor
+leaves that record and the stream untouched, which is why replying at the
+current position is safe.
 
 `ATTACHED` is the **first** frame the server emits in response to `ATTACH`;
 any replay or live messages follow it. Its fields:
@@ -732,7 +742,7 @@ The starting cursor depends on how the attachment was created:
                     │   │  - Attachments: cursors on the list │
                     │   └─────────────────────────────────────┘
                     │            │                ▲           │
-                    │            ▼                │ NOTIFY    │
+                    │            ▼                │ bus       │
                     │      Storage iface  ────────┘ (cluster) │
                     │            │                            │
                     └────────────┼────────────────────────────┘
@@ -774,8 +784,8 @@ internal/realtime/      # WebSocket upgrade, connection loop, attachment cursor,
 internal/rest/          # HTTP handlers + router
 internal/core/          # Channel + ChannelManager (live entry list)
 internal/storage/       # Storage interface + memory / bbolt / postgres backends
-                        #   (the postgres backend carries the cluster bus: pgnotify
-                        #   by default, the rebuilt postgres bus, or NATS, §7.2)
+                        #   (the postgres backend carries the cluster bus: the
+                        #   postgres bus, NATS, or pgnotify, §7.2)
 internal/serial/        # channelSerial minting + global ordering
 internal/id/            # connection IDs, message IDs
 internal/compatgate/    # known-failures diff logic behind cmd/compat-gate
@@ -960,11 +970,12 @@ last of them takes to queue its frame:
 
 `BenchmarkFanoutEnqueue` (`internal/realtime`) measures one publish to
 20,000 attachments, from the publish to every frame queued, on 8 cores
-of a laptop: about 41 ms (msgpack) and 36 ms (JSON) on the code before
-these changes (the same benchmark run on a copy of the earlier tree),
-about 7 to 8 ms for either with the wake slots and encode-once, and
-about 2 to 2.5 ms with the fan-out pool (8 workers). The socket writes
-that follow are not in it.
+of a laptop: about 7 ms for either wire format with the fan-out pool
+disabled, and about 2 to 2.5 ms with the pool (8 workers). Without the
+wake slots, the wake-up outside the lock and the encode-once above (that
+is, with one wake channel per entry, the wake-up under the lock and one
+encode per attachment) the same benchmark took about 41 ms (msgpack) and
+36 ms (JSON). The socket writes that follow are not in it.
 
 The first `ATTACH` to a name (or the first publish, or any REST read)
 creates the Channel and binds it: `storage.Channel(name, channel)`
@@ -995,7 +1006,6 @@ the nodes with members receive it on the bus like any other cm. A node
 that holds a Channel for the name (an attachment, a presence member, or
 a Channel not yet evicted) sends its REST publishes down the normal path,
 so its local member set sees them in order with the presence cms.
-`--publish-bind-on-write=true` restores binding on every publish.
 `ably_channel_unbound_publishes_total` counts the publishes that take
 this path.
 
@@ -1012,6 +1022,13 @@ evicts a Channel once all of these hold:
   grace window after an abrupt disconnect, §12.5, fixture members, and
   members on other nodes whose ENTER reached this node), and
 - it has been in that state for the idle timeout.
+
+A discontinuity (§7.2) clears that member set along with the presence
+view: a member whose LEAVE fell in the gap would otherwise hold the
+channel bound for the life of the process. The set restarts from the
+cms delivered after the gap, so a member that entered before it and is
+still present no longer holds the channel; the cost is at most an
+eviction and a rebind, which seeds from the store.
 
 Eviction drops the Channel (its live list and the storage facet pointer)
 and calls `Storage.Release(ctx, name)`, which unbinds the Appender and
@@ -1163,8 +1180,8 @@ happens off the read goroutine and never blocks decoding of the next
 frame. The worker calls `channel.Publish(ctx, msgs)` (or `Mutate` /
 `PublishPresence`), which returns once storage has committed; the link
 onto the local linked list happens asynchronously via the Appender
-callback the storage holds (synchronous in memory/bbolt, NOTIFY-driven in
-Postgres — see §7). Only then does the worker emit the frame's `ACK` (or
+callback the storage holds (synchronous in memory/bbolt, through the
+cluster bus in cluster mode — see §7). Only then does the worker emit the frame's `ACK` (or
 `NACK` on failure), echoing the publish `msgSerial`.
 
 A single FIFO worker per connection is deliberate: it keeps this
@@ -1173,6 +1190,15 @@ connection's channel appends in publish order and emits `ACK` / `NACK` in
 out-of-order or premature ack corrupts its pending-publish accounting).
 Validation rejections are enqueued through the same worker so their `NACK`
 stays ordered behind any still-in-flight publishes.
+
+`ACK` / `NACK` are ordered only against each other. A connection attached
+with `SUBSCRIBE` / `PRESENCE_SUBSCRIBE` to a channel it publishes on also
+receives its own `MESSAGE` echo (unless `echo=false`, §2.1) or `PRESENCE`
+echo (always). Its attachment queues the echo as soon as the cm is linked
+onto the live list (§4.4); the worker queues the `ACK` after the commit
+returns. The two goroutines are not ordered, so the echo may reach the
+client before or after the `ACK` of the same publish. The Ably protocol
+does not order them either, and SDKs do not depend on it.
 
 An inbound `MESSAGE` / `PRESENCE` `msgSerial` must be monotonic per
 connection. A frame whose `msgSerial` repeats or goes backward is a client
@@ -1253,9 +1279,11 @@ the store's watermark. Per backend: memory keeps its channelStore (it is
 the only copy of the data) and drops only the binding; bbolt drops the
 channelStore unless it still holds presence members (its presence set is
 in memory only), in which case it keeps it unbound; Postgres drops the
-channelStore and its LISTEN dispatch entry (the shared LISTEN connection
-listens on one broker channel, so there is nothing to UNLISTEN per Ably
-channel).
+channelStore and its bus subscription: an UNLISTEN of the channel's own
+notification channel on the `postgres` bus, a NATS unsubscribe on
+`nats`, and on `pgnotify`, whose one LISTEN connection listens on a
+single broker channel, only the dispatch entry (§7.2 "Release and
+re-bind").
 
 Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
@@ -1337,9 +1365,10 @@ cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
 a NATS server or cluster for delivery; Postgres stays the store.
 
 Schema. The shipped DDL is the migration files under
-`internal/storage/postgres/migrations/` (`0001_initial.sql` to
-`0004_presence_nodes.sql`); they are the source of truth and each carries
-the reasoning in its header. In outline (columns elided where the
+`internal/storage/postgres/migrations/` (`0001_initial.sql`,
+`0002_partitioned_log.sql`, `0003_publish_batch.sql`,
+`0004_presence_nodes.sql` and `0005_cluster_identity.sql`); they are the
+source of truth and each carries the reasoning in its header. In outline (columns elided where the
 migrations say more):
 
 - `channels (name PK, channel_serial, initial_channel_serial)`: one row
@@ -1374,12 +1403,19 @@ migrations say more):
 - `presence (channel, connection_id, client_id, channel_serial, payload,
   node_id, expires_at)`, keyed `(channel, connection_id, client_id)`: one
   row per live member, maintained in the same transaction as the presence
-  cm (§12.5); `presence_node_idx (node_id)` serves the reaper and the
-  member-mode lease bump. `presence_nodes (node_id PK, expires_at)` is the
-  per-node liveness lease of node lease mode.
+  cm (§12.5); `presence_node_idx (node_id)` serves the reaper.
+  `presence_nodes (node_id PK, expires_at)` is the per-node liveness
+  lease.
 - `retention_state (key, value)`: the legacy-leaf bound recorded by
   migration 0002 (below). `schema_migrations (version PK, applied_at)`:
   the migration tracker.
+- `cluster_identity` (0005): one row recording what every node of the
+  cluster must agree on (the bus, both retentions, the persisted
+  namespaces, a minimum server version) and the deployment id the nats
+  bus scopes its subjects with. The migration creates the table empty;
+  the first node to open the schema writes the row (§11).
+- `shard_identity`: created by `Open`, not by a migration, and only in
+  the databases of a `--postgres-dsn` list (§6.4).
 - SQL functions: `format_channel_serial`, `next_channel_serial`,
   `ensure_channel`, `advance_channel_serial` (0001) and
   `publish_batch_lock` (0003).
@@ -1427,8 +1463,11 @@ nothing; the timeout bounds the wait for a lock, not the time a
 migration holds the locks it did get.
 
 **`0002_partitioned_log` is the one migration that cannot run under
-traffic**, and the only one that needs an offline step; the others
-(`0001`, `0003`, `0004`) take brief locks or only add objects. It takes
+traffic**, and the only one that needs an offline step. The others take
+brief locks or only add objects: `0001` and `0005` create objects,
+`0003` adds a function, and `0004` builds `presence_node_idx` under a
+`SHARE` lock on `presence`, which blocks presence writes for about a
+second per million member rows while it builds. It takes
 `ACCESS EXCLUSIVE` on both log tables for the whole transaction, so every
 node, old or new, blocks on every publish until it ends. On a populated
 log it attaches the old table as one leaf, which validates every row
@@ -1519,14 +1558,32 @@ leaf lives one more tick at most.
    (counted in `ably_storage_partition_drop_lock_timeouts_total`, not
    retried in the same sweep) and the next drop tick's by-name pass drops
    it. The chain's log range reads (gap fill, catch-up, reconcile, §7.2)
-   are bounded below by the channel's retention floor (the same bound a
-   resume is checked against), and run as unnamed statements planned for
-   the actual parameters, so the planner prunes the leaves older than
-   retention and the reads never lock a leaf a drop is waiting on, except that a checked catch-up (§7.2) also asks whether the cm at the mark still exists, which touches the one leaf that would hold it. A
-   cached statement would switch to a generic plan after five executions,
-   and a generic plan locks every leaf. A cm older than the floor is
-   outside the retention the channel promises; a gap fill that would have
-   reached below it does not.
+   are bounded below by the delivery mark they start from, on the outer
+   scan as well as the subquery, and run as unnamed statements planned
+   for the actual parameters. For the single-channel read (`sqlLoadRange`,
+   the gap fill's and catch-up's unchecked read) the bounds are literal
+   parameters, so the planner prunes every leaf that lies entirely below
+   the mark and a read from a recent mark never locks a leaf a drop is
+   waiting on. The batched read (`sqlLoadRangeMany`: reconcile, the
+   sweep's catch-up, and every checked read, including a checked gap
+   fill) takes its bounds from `unnest` of arrays through a materialised
+   CTE, so the planner cannot prune at plan time and opens every leaf
+   (an `ACCESS SHARE` lock on each), whatever the marks; a leaf a drop
+   holds in `ACCESS EXCLUSIVE` therefore makes such a read wait. The
+   drop runs `DETACH PARTITION CONCURRENTLY` before `DROP` and the drop
+   gives up after its 1 s `lock_timeout`, so the wait is short and the
+   drop retries next tick; the cost accepted is that every reconcile
+   chunk plans across every leaf. Per-channel reads with literal bounds
+   for the checked or old-mark case would avoid it; not built. A cached
+   statement would switch to a generic plan after five executions, and a
+   generic plan locks every leaf. No
+   retention floor is applied to the range: every cm after the mark is
+   wanted whatever its age, and a floor above the mark would hide cms the
+   log still holds while the continuity check (§7.2) reports nothing
+   missed. A read from a mark older than retention therefore touches the
+   leaves it needs, including the one that would hold the cm at the mark,
+   which the check asks about; that is rare (a channel caught up from a
+   mark that old) and correct.
 
 A resume whose cursor was minted before now minus the channel's retention
 is refused as a discontinuity (§4.3). "Now" is the node's clock corrected
@@ -1549,10 +1606,14 @@ presence rows are bounded by live membership (§12.5), and a `channels` row
 is one small row per channel name, pruned once the channel has been idle
 past every retention (see "Channel rows" below).
 
-Every node must run with the same retention settings, since whichever node
-sweeps applies its own. Changing a channel's class (editing a namespace's
-`persisted` flag) applies to new writes; rows already written age out with
-the class they were written in.
+Every node must run with the same retention settings and the same
+persisted namespaces, since whichever node sweeps applies its own. The
+database enforces this: the first node records them in `cluster_identity`
+and `Open` refuses a node that differs (§11). Changing a channel's class
+(editing a namespace's `persisted` flag) is therefore a recorded-setting
+change (§11 "Changing a recorded setting"); once made, it applies to new
+writes, and rows already written age out with the class they were written
+in.
 
 A database created before migration `0002_partitioned_log` keeps its rows:
 a non-empty old table becomes one leaf of the live class covering
@@ -1570,16 +1631,17 @@ Series (§10): `ably_storage_partitions_created_total{table}`,
 alike) can be committed together with other publishes of the same node in
 one transaction. This is how one Postgres primary carries tens of
 thousands of writes a second: the cost of a commit is shared by every
-publish in it. It is on by default (`--publish-lanes=4`) with every bus
+publish in it. It is on by default (`--publish-lanes=2`) with every bus
 (§7.2); `--publish-lanes=0` commits every publish in its own transaction.
 A presence operation (`StorePresence`, §12.2) joins the same lanes and
-batches (`--presence-batching`, default true), so ENTERs and LEAVEs from
+batches, so ENTERs and LEAVEs from
 many rooms share one commit and a room's row lock is taken once per
 batch, not once per operation (§12.5). Mutations and annotations are not
 batched.
 
 The policy is leading edge, not a fixed window. A node has
-`--publish-lanes` lanes (default 4); a channel's name hashes
+`--publish-lanes` lanes (default 2, see "How many lanes" below); a
+channel's name hashes
 to one lane, so all of a node's publishes to one channel share a lane and
 keep their order. Per lane:
 
@@ -1595,16 +1657,7 @@ keep their order. Per lane:
    flight longer than `--publish-linger-max` (default 5 ms), the queued
    publishes of other channels start a second batch, so a stalled commit
    delays only the channels in it (at most two batches per lane).
-4. `--publish-linger-min` (default 0, off) puts a floor under step 1:
-   an idle lane holds its first publish until it has waited that long, or
-   `--publish-batch-max` publishes are queued, so publishes arriving
-   meanwhile share its commit. Publishes that have already waited behind
-   an in-flight commit for longer are not held again. It trades up to that
-   much ACK latency for deeper batches when many lanes across many nodes
-   each find little queued (measured: 1.2 to 4 publishes a commit with 4
-   lanes on 10 to 20 nodes, where one primary needs about 30 to reach its
-   rate).
-5. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
+4. The queue is bounded (`--publish-queue-max`, default 10,000 per lane).
    Beyond it a publish is refused at once with Ably error **42910** (HTTP
    429 on REST, a NACK on realtime): nothing is stored and the client
    should back off and retry. Presence the server synthesises is exempt
@@ -1656,7 +1709,10 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   deduplicated; a publish that carried no id may, rarely, be stored twice
   if the client retries one whose COMMIT did land. Publishes caught by
   shutdown get the same error.
-- ACKs are per publish, sent when its batch commits.
+- ACKs are per publish, sent when its batch commits. A publish whose
+  caller stops waiting while it is queued is dropped from the queue; once
+  its batch has started it may still commit, so the caller's error does
+  not mean the publish was not stored (§2.2).
 - **Presence in a batch.** Each presence publish is a cm like a message
   publish: it gets one channelSerial in queue order, names its
   predecessor for the chaining buses, and its ids are checked for
@@ -1666,13 +1722,12 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   writer wins: an ENTER then a LEAVE of one member in the same batch
   removes it, a LEAVE then an ENTER keeps it with the ENTER's data. The
   fold is then one `DELETE` for the members that left and one
-  `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node and, in
-  member lease mode, a fresh lease, else `'infinity'`; or the fixture
-  sentinel and an `'infinity'` lease, §12.5). Every
+  `INSERT ... ON CONFLICT DO UPDATE` for the rest (owning node, or the
+  fixture sentinel, and an `'infinity'` lease, §12.5). Every
   writer of a room's `presence` rows holds the room's channels row lock
-  first, so two batches never contend on them; the lease bump and the
-  reaper, which do not, skip rows locked by a writer (`FOR UPDATE SKIP
-  LOCKED`), so neither can deadlock with a batch.
+  first, so two batches never contend on them; the reaper, which does
+  not, skips rows locked by a writer (`FOR UPDATE SKIP LOCKED`), so it
+  cannot deadlock with a batch, and the lease bump writes no member row.
   A retried batch re-checks presence ids like message ids. A synthesised
   LEAVE or a fixture ENTER has no id, so it may be stored twice if the
   first attempt's COMMIT landed: a second LEAVE for a member already
@@ -1681,11 +1736,11 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   even past `--publish-queue-max`, and still
   committed if its bounded caller stops waiting first: nothing retries
   it, and a dropped LEAVE would leave its member behind (for as long as
-  its node lives, in node lease mode). It has a bound of its own, 8 x
+  its node lives). It has a bound of its own, 8 x
   `--publish-queue-max` of it queued per lane, so a commit that stalls
   during a mass disconnect cannot grow the queue without limit. Beyond
   that bound it is not refused but written in a transaction of its own,
-  as with `--presence-batching=false`, once the publishes of its channel
+  as with `--publish-lanes=0`, once the publishes of its channel
   that were queued or in flight on the lane when it was turned away have
   completed (so it never overtakes an earlier operation on the channel,
   such as the ENTER of the member it removes), and once one of the
@@ -1697,9 +1752,16 @@ Inside a batch, in two round trips (migration `0003_publish_batch`):
   (`ably_publish_server_presence_forced_total`): the bound gives way only
   for a channel whose earlier publishes are themselves stuck. A
   publish on the same channel queued after it was turned away can still
-  commit before it; for a teardown or grace LEAVE that is another member's
-  operation, since the departed connection writes nothing more. (The
-  reaper's LEAVEs and lease-lapse re-entries never join a batch, §12.5.)
+  commit before it; for a teardown or grace LEAVE that is usually another
+  member's operation, since the departed connection writes nothing more.
+  The argument does not hold across a resume: a resume keeps the
+  connectionId, so a grace LEAVE turned away and written around the lane
+  can race an ENTER of the same member from the resumed connection, when
+  the resume lands just after the window ended, and then remove it. The
+  member is then absent although its connection is live, until the client
+  next updates it or re-attaches. Reserving the LEAVE's lane position
+  instead would close it; that is not built. (The reaper's LEAVEs and
+  lease-lapse re-entries never join a batch, §12.5.)
 
 **Channel rows.** A channel's `channels` row (its serial and initial
 serial) is created by the first write or bind that needs it. A batched
@@ -1720,10 +1782,7 @@ writes a new row version and waits for the row lock of a channel another
 node is publishing on. A known name whose row has since been pruned (see
 below) reads no row, and the bind falls back to `ensure_channel`, which
 creates it. Either read comes after
-the bus subscription, so the bind misses nothing (§7.2). With
-`--publish-bind-on-write=true` the earlier behaviour returns: every bind
-runs `ensure_channel`, and a batched publish (message or presence)
-creates a missing row in a statement of its own before it is queued.
+the bus subscription, so the bind misses nothing (§7.2).
 
 **Pruning `channels` rows.** One row per channel name ever used is
 unbounded: a workload that touches millions of distinct names an hour
@@ -1748,7 +1807,7 @@ is a blocking operation on a hot table), so a tick that finds nothing to
 prune scans the table once.
 
 Consequences of deleting a row, none of which loses a message, since by
-the predicate no cm of the channel is older than the longest retention
+the predicate every cm of the channel is older than the longest retention
 and so none survives:
 
 - A later publish recreates the row through `publish_batch_lock` (or
@@ -1764,9 +1823,34 @@ and so none survives:
   as its predecessor, which is ahead of the mark, so the delivery point
   holds it and the gap fill reads it from the log about 100 ms later
   (§7.2); that one cm is delivered late, none is lost, and no
-  discontinuity is signalled because the log read returns the cm.
+  discontinuity is signalled. The fill from the old mark is a plain read,
+  with no continuity check, because the node still holds a recent proof
+  that nothing was past its mark: while the row is gone, each sweep that
+  finds no row for a bound channel the node had caught up on proves it
+  again at the time of the read (no row means no publish since the
+  prune, as a publish recreates the row), provided the previous sweep of
+  the channel is inside its retention window (a cm committed after that
+  sweep would have kept the row from being pruned until it, too, aged
+  out). A node that was not sweeping the channel meanwhile (no subscriber
+  on it, off the bus, or `--bus-sweep-interval` longer than the
+  retention) holds no such proof; its checked fill finds the mark's cm
+  gone and signals a discontinuity, since it cannot know what happened
+  after the mark.
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
+
+**How many lanes.** Each lane of each node is a committer on the
+primary, so the lane count is a cluster setting as much as a node one:
+more committers than the primary needs only make each batch shallower.
+Measured on one primary in the scale runs: with 10 nodes, 4 lanes
+committed 38.0k writes/s, 2 lanes 51.9k and 1 lane 46.6k (capped per
+node: one lane is one commit at a time); with 20 nodes, 2 lanes
+committed 43.1k. So the right value falls as nodes are added. The
+default is 2, the value every quoted write result used. Rule of thumb:
+keep lanes x nodes near 20 committers per primary (a 40-node cluster on
+one primary wants 1 lane per node; with channel sharding, §6.4, count
+per database). Adapting the number of commit slots to the load, which
+would remove the setting, is the proper fix and is not built.
 
 What it costs: a publish's latency floor is still one commit before its
 ACK (plus the wait for the in-flight batch, at most about one commit
@@ -1778,15 +1862,15 @@ width across channels, not depth per channel. Cluster write throughput is
 still one primary's per database; channel sharding (§6.4) spreads
 channels over several.
 
-Series (§10): `ably_publish_lanes`, `ably_publish_linger_max_seconds` and
-`ably_publish_linger_min_seconds` (gauges: the configuration in effect),
+Series (§10): `ably_publish_lanes` and `ably_publish_linger_max_seconds`
+(gauges: the configuration in effect),
 `ably_publish_batch_size` (histogram),
 `ably_publish_commits_total`, `ably_publish_commit_seconds` (histogram),
 `ably_publish_lane_queue_depth{lane}`, `ably_publish_deferred_total`,
 `ably_publish_batch_retries_total` and
 `ably_publish_nacks_total{reason}` (`queue_full`, `commit_failed`, and
-`presence_inflight` for an unbatched presence write refused over its
-in-flight bound, §12.5), `ably_publish_server_presence_unbatched_total`
+`presence_inflight` for a presence write refused over its in-flight
+bound with `--publish-lanes=0`, §12.5), `ably_publish_server_presence_unbatched_total`
 (server-synthesised presence written outside a full lane, above) and
 `ably_publish_server_presence_forced_total` (queued past the bound
 because its channel's earlier publishes were stuck), `ably_storage_channel_rows_dropped_total` and
@@ -1815,7 +1899,7 @@ own (a multi-host URL, or a key=value DSN) stays one DSN; a list of two
 or more therefore needs URL-form DSNs. An empty entry or a repeated DSN
 is refused at startup, as is a value that looks like a list of key=value
 DSNs. The shard count is the list length. One DSN behaves as without
-sharding: the server opens one database as before, with no routing layer
+sharding: the server opens one database, with no routing layer
 between the channel and its store; the only additions are one read at
 startup (below) and the `ably_storage_shards` gauge.
 
@@ -1847,7 +1931,7 @@ does once, a sharded node does once per shard, against that shard only.
 | Bus watermark sweep and reconnect reconcile (the `channels` scans, §7.2) | account-wide | per shard, over the node's channels bound on that shard; at most 4 batched catch-up queries in flight per node, over all its shards |
 | `pgnotify` LISTEN, `postgres` bus LISTENs | account-wide | per shard: a channel's NOTIFY is sent and heard on its own shard |
 | `nats` bus | per channel | unchanged; one NATS connection per shard, and a channel's subject is only published and subscribed by its shard |
-| `/readyz` | account-wide | ready while shard 0 and a majority of the shards are reachable, each with its pool, its bus and its publish lanes (§11); the error names the shard; see "A shard that is down" below |
+| `/readyz` | account-wide | ready while a majority of the shards are reachable (with two shards, both), each with its pool, its bus and its publish lanes (§11); the error names the shard; see "A shard that is down" below |
 | `ably_bus_*` series | account-wide | summed over shards; connected only while every shard's bus is |
 | `ably_storage_*`, `ably_publish_*` series | account-wide | one set per shard, labelled `shard` |
 | `GET /stats` stub | account-wide | touches no storage |
@@ -1885,10 +1969,14 @@ that shard's channels, but it can serve the rest, and every node loses the
 same shard at the same moment. If one shard down took a node out of
 rotation, the load balancer would drain the whole fleet and the healthy
 shards' channels would become unreachable too. So `/readyz` (the
-`Sharded` `Ping`) pings every shard at once and reports ready while
-shard 0 and a majority of the shards answer; a node that reaches no more
-than half of them, or not shard 0 (where it checks the list it was given
-at startup), leaves rotation. With two shards a majority is both. Each
+`Sharded` `Ping`) pings every shard at once and reports ready while a
+majority of the shards answer; a node that reaches no more than half of
+them leaves rotation. With two shards a majority is both, so either
+shard down takes the node out of rotation; three or more shards are what
+keep one down shard from draining the fleet. Shard 0 has no special
+place in readiness: it matters only at startup, where `Open` checks the
+shard list's identity against it (above), and a node already running
+does not need it to serve the other shards' channels. Each
 shard's result is `ably_storage_shard_ready{shard}` (1 or 0, as of the
 last readiness check).
 
@@ -1967,18 +2055,39 @@ In cluster mode Postgres is always the store: it mints each channel's
 serials under the `channels` row lock, holds the log that serves resume
 and history, and commits every publish before the ACK. The **bus** is
 only how a committed cm reaches the other nodes that hold its channel.
-`--bus` selects it; the rest of the server does not change. The bus sits
+`--bus` selects it (or, unset, the rule below infers it); the rest of the
+server does not change. The bus sits
 behind a small seam inside the postgres backend
 (`internal/storage/postgres/bus.go`).
 
 | `--bus` | How a committed cm reaches other nodes | Extra infrastructure | What bounds it |
 |---|---|---|---|
-| `pgnotify` (default) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
-| `postgres` | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
-| `nats` | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel, fanned into a fixed set of dispatch workers | a NATS core server or cluster | One primary's commit rate |
+| `pgnotify` (only when asked for) | A `pg_notify` inside the publish transaction on one global channel; every node receives every notification and reads each cm back | none | The notify commit lock (below) and one read-back loop per node |
+| `postgres` (default with only `--postgres-dsn`) | Per-channel LISTEN; the cm inline in the payload; one ordered worker per channel. `--postgres-notify-mode=coalesced` (default) sends a wake-up outside the transaction; `transactional` keeps one NOTIFY per write inside it | none | One primary's commit rate, and Postgres's own cost of delivering notifications |
+| `nats` (default when `--nats-url` is set) | After commit, the cm (or a pointer) is published to the channel's NATS subject; nodes subscribe per bound channel, fanned into a fixed set of dispatch workers | a NATS core server or cluster | One primary's commit rate |
 
-`pgnotify` is the default so the shipped behaviour stays the default
-until the deployment sizes are written from measured numbers.
+**Choosing the bus: start with one Postgres; add NATS when you need
+it.** When nothing sets `--bus` (flag, env or file), cluster mode infers
+it from what is configured: with only `--postgres-dsn` the bus is
+`postgres`, coalesced, which needs no other infrastructure; with
+`--nats-url` set it is `nats`. An explicit `--bus` overrides the
+inference. `pgnotify` is never inferred. It must be asked for, and a node
+that runs it logs a warning at startup naming its measured ceiling:
+about 1,700 to 1,900 publishes a second across the whole cluster in the
+scale runs, however many nodes, set by the notify commit lock and the
+single read-back loop (below). `--bus=nats` without `--nats-url` is a
+startup error whose message says what the NATS bus is for and how to
+run on Postgres alone; `--nats-url` with `--bus=postgres` or
+`--bus=pgnotify` is allowed, and the unused URL is named in a startup
+warning (§9).
+
+The `postgres` bus, the inferred default with one Postgres, is the least
+fleet-measured of the three. The cloud scale runs measured it at 0.25x of
+the largest account's message shape only, on code that predates the
+write-path, continuity, presence and bounds fixes, where it carried the
+load with no violation but missed the latency gates
+(`bench/aws/RESULTS.md`); it has not been measured at scale since. Its
+integration and contract suites run in CI on every change.
 
 **The publish path, common to every bus.** The publish transaction mints
 the serial under the channels-row lock and writes the rows. The bus then
@@ -1992,7 +2101,10 @@ trip before `COMMIT`.
 
 #### pgnotify
 
-The bus as shipped. The publish transaction emits
+One global notification channel for the whole cluster. It runs only when
+`--bus=pgnotify` is given (above), and a database that recorded it keeps
+it until the bus is changed deliberately (§11). The publish transaction
+emits
 `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`. Every
 node's LISTEN goroutine, including the publisher's, receives every
 notification, looks up the local `ChannelStore` for that channel, reads
@@ -2059,8 +2171,8 @@ The `postgres` and `nats` buses share one delivery point
 - **Reconcile.** After the bus connection comes back, the channels in the
   sweep scope (below: by default the bound channels with a subscriber on
   this node) are caught up from their mark, 500 channels per query, after
-  a random wait of up to a quarter of the sweep interval (7.5 s at the
-  default). A node runs at most 4 of these batched catch-up queries (the
+  a random wait of up to a quarter of the sweep interval, capped at 10 s
+  (7.5 s at the default). A node runs at most 4 of these batched catch-up queries (the
   reconcile's and the sweep's) at once, over all its shards. A cluster-wide
   bus blip reaches every node at the same moment; without the scope, the
   wait and the bound, every node would read every channel it holds
@@ -2093,9 +2205,11 @@ The `postgres` and `nats` buses share one delivery point
   held, so is every later cm of the channel. This holds per class: a
   namespace moved between classes by a configuration change has rows in
   both, and is not covered until its older rows have aged out. When the
-  channel has moved past the mark and the cm at the mark is gone, the
-  read cannot prove that nothing aged out between the mark and the
-  oldest cm it returned. The node then signals a **discontinuity** to
+  cm at the mark is gone and the channel has either moved past the mark
+  or lost its `channels` row (pruned after idling past retention, §6.3,
+  so nothing records what happened after the mark), the read cannot
+  prove that nothing aged out between the mark and the oldest cm it
+  returned. The node then signals a **discontinuity** to
   the channel before the cms that survived (`storage.Discontinuous`, in
   delivery order under the mark's lock), delivers the survivors, and,
   once an unbounded read has reached the end of the log, moves the mark
@@ -2106,24 +2220,40 @@ The `postgres` and `nats` buses share one delivery point
   the marker sends its client an `ATTACHED` without `RESUMED`, error
   80016, at its current `channelSerial`, followed for a
   `PRESENCE_SUBSCRIBE` attachment by the re-seeded set (`HAS_PRESENCE`
-  and a `SYNC` when it has members). The cms in the gap are not
+  and a `SYNC` when it has members). A failed re-seed read is retried
+  (four reads, 100, 200 and 400 ms apart); if every one fails, the
+  `ATTACHED` still carries `HAS_PRESENCE`, so the SDK starts a sync and
+  keeps its members rather than taking the set as empty and leaving every
+  member (RTP19a), and the attachment retries the read every second and
+  sends the `SYNC` once one succeeds, an empty set included (a `SYNC`
+  with no members carries `presence: []` on the wire, §12.4). Until then
+  the SDK's sync is open:
+  `presence.get()` waits, and a member that left in the gap is removed
+  only when the sync completes. The `SYNC` holds the set as of its read,
+  at or after the cms delivered so far. The cms in the gap are not
   replayed; the client is told so that it can reconcile (§4.3). A gap
   the bus revealed (a held cm's predecessor) that the log no longer has
   is signalled the same way, at the point of the skip. The signal can
-  be spurious, never missing: a channel last proven caught up longer
-  than the retention window ago, whose last cm has aged out and which
-  then received a cm while the node was off the bus, is signalled
-  although nothing was lost, because the log does not record what
-  preceded the new cm. On `pgnotify`, which has no sweep, "last proven"
-  is the bind. The proof assumes a publish commits within the one-second
-  clock margin of minting its serial (the mint holds the channel's row
-  lock until commit); a transaction stalled longer than that between the
-  two, and longer than the window, could escape it. A spurious signal costs the client a reconcile, and an
-  SDK re-enters its own presence members on an `ATTACHED` without
-  `RESUMED` (RTP17i). Counted in
+  be spurious, and is never missing provided every publish commits
+  within the clock margin of minting its serial (below). It is spurious
+  for a channel last proven caught up longer than the retention window
+  ago, whose last cm has aged out and which then received a cm while the
+  node was off the bus, or while it was not sweeping the channel (no
+  subscriber on it, "Sweep scope" below): nothing was lost, but the log
+  does not record what preceded the new cm. A node on the bus that is
+  sweeping the channel does not hit this when the channel's row is
+  pruned: a sweep that finds no row proves the channel again (§6.3
+  "Pruning `channels` rows"). On `pgnotify`, which has no sweep, "last
+  proven" is the bind. The proof assumes a publish commits within the
+  one-second clock margin of minting its serial (the mint holds the
+  channel's row lock until commit); a transaction stalled longer than
+  that between the two, and longer than the window, could escape it. A
+  spurious signal costs the client a reconcile, and an SDK re-enters its
+  own presence members on an `ATTACHED` without `RESUMED` (RTP17i).
+  Counted in
   `ably_channel_discontinuities_total{reason}` (§10).
-- **Sweep scope.** `--bus-sweep-scope=subscribed` (the default) sweeps
-  only bound channels with a subscriber on this node: an open
+- **Sweep scope.** The sweep reads only bound channels with a subscriber
+  on this node: an open
   attachment, or a presence member the node has seen enter and not leave
   (whose LEAVE eviction waits for). A channel the sweep finds with
   neither also drops its local presence member set (§12.4): that set is
@@ -2137,13 +2267,11 @@ The `postgres` and `nats` buses share one delivery point
   as a live presence event. An attach with the default modes includes
   `PRESENCE_SUBSCRIBE`, so it seeds a set even on a channel with no
   presence; dropping the set rather than sweeping it keeps such a
-  channel out of the sweep once its last attachment closes. `bound`
-  sweeps every bound channel,
-  the behaviour before the scope existed. A channel bound only by a REST
-  request, or kept bound after its last detach until eviction, has
+  channel out of the sweep once its last attachment closes. A channel
+  bound only by a REST request, or kept bound after its last detach until eviction, has
   nobody on this node a lost cm could be late for, so reading it is
-  waste: in a 15-minute shape-D run the full sweep was about a quarter of
-  Postgres's time. The bound: a lost bus message on a subscribed channel
+  waste: in a 15-minute shape-D run, sweeping every bound channel took
+  about a quarter of Postgres's time. The bound: a lost bus message on a subscribed channel
   with no later cm is delivered up to two intervals late (60 s at the
   default). On a channel with no local subscriber nothing is waiting for
   it. The binding goes on receiving the bus, so a later cm's predecessor
@@ -2257,7 +2385,17 @@ emits no NOTIFY.
 **The bus is a trusted network.** A receiver delivers the body an
 envelope carries without reading the log: that is what makes the bus
 fast. So whoever can publish to the NATS subjects can put a message in
-front of every subscriber of a channel. Run NATS on a private network,
+front of every subscriber of a channel. A NATS publisher is fully
+trusted: the deployment id travels in plain text in every envelope and
+is mixed into the subject hash, so anyone who can read the NATS cluster
+can forge an envelope that passes the checks below. A forged inline cm
+whose predecessor is the receiver's mark is appended unverified, and a
+forged serial up to 5 minutes ahead makes a gap fill treat the log as
+authoritative up to it: its bus body is delivered and the mark jumps, so
+the channel's genuine cms below it are dropped as duplicates for up to 5
+minutes, and the forger can repeat it. The checks below guard against
+a buggy sender, not a hostile one; NATS without authentication (the
+default) is open to this. Run NATS on a private network,
 or authenticated and encrypted: `nats://user:pass@host` and `tls://host`
 URLs work, and `--nats-creds` (a credentials file: user JWT and NKey
 seed), `--nats-tls-ca`, `--nats-tls-cert` and `--nats-tls-key` (PEM
@@ -2301,7 +2439,11 @@ chain repairs from the log. `ably_bus_receive_queue_depth` is the number
 of messages waiting across the queues. The queues bound messages, not
 bytes: at most 16 × 8,192 messages are buffered, each no larger than
 `--nats-inline-max-bytes` (a pointer is small), against nats.go's
-default of 64 MiB per subscription before the fan-in.
+default of 64 MiB per subscription before the fan-in. In bytes that is
+up to about 32 GiB (16 × 8,192 cms at the 256 KiB default inline cap) if
+every buffered cm were at the cap; small cms keep it far lower, and a
+node short of memory should lower `--nats-inline-max-bytes`, which also
+lowers the bound.
 
 `--nats-url` may list the servers of one NATS cluster, comma-separated.
 The client connects to one, learns the others from the cluster, and on a
@@ -2315,11 +2457,13 @@ not lost: the next message's predecessor or the sweep recovers it. A slow
 consumer that NATS drops messages for counts in `ably_bus_drops_total`
 and is repaired the same way.
 
-**Readiness.** In `nats` mode `/readyz` returns 503 while the node has no
-NATS connection, and in `postgres` mode while its LISTEN connection is
-down: the node cannot receive cross-node deliveries, so it leaves
-rotation until it reconnects and reconciles. `pgnotify` reports ready
-while the pool pings, as before.
+**Readiness.** The bus is one of the three conditions `/readyz` checks
+(the full predicate is in §11). In `nats` mode `/readyz` returns 503 while the node has no
+NATS connection, and in `postgres` and `pgnotify` mode while its LISTEN
+connection is down: the node cannot receive cross-node deliveries, so it
+leaves rotation until it reconnects. On every bus the reconnect then
+reconciles the bound channels; the node is ready again from the
+reconnect, as it was before the outage, while that reconcile runs.
 
 #### Release and re-bind
 
@@ -2359,6 +2503,12 @@ stream were continuous.
 | Read of a pointer or gap fails | the channel is marked; its log is replayed from the mark before any later cm is delivered alone, retried on each notification until it succeeds | retried from the log with backoff | same | same |
 | Postgres primary fails over | publishes NACK; nothing acknowledged is lost | same | same | same |
 | Receiver off the bus for longer than the retention window | the log cannot prove continuity; the node signals a discontinuity on the channel (`ATTACHED` without `RESUMED`, error 80016) and re-seeds its presence set; cms in the gap are not replayed (§4.3, §12.4) | same | same | same |
+| A bus message forged by a sender inside the bus's network | a notification carries only channel and serial; the cm is read back from the log, so a forgery costs a read | the inline rows of a NOTIFY are delivered without a read; whoever can connect to the database can NOTIFY, so the database's access control is the trust boundary | a wake-up only causes a log read | the body is delivered without a log read: the bus is a trusted network (above, "The bus is a trusted network"); malformed and far-future serials and other clusters' envelopes are dropped and counted |
+
+The last row is the trust statement: every bus but `pgnotify` and
+coalesced `postgres` delivers a body it did not read from the log, so
+the bus's network (NATS) or the database's access control (transactional
+`postgres`) must admit only this cluster's nodes.
 
 Worst case for the chained buses is about two sweep intervals late,
 counted from the moment the channel has a subscriber on the receiving
@@ -2549,7 +2699,8 @@ live stream sends the same `ATTACHED` mid-stream (§4.3, §7.2).
 
 CLI flags (each with an `ABLY_SERVER_*` env var equivalent, named by
 upper-casing and underscoring the flag — e.g. `--log-format` is
-`ABLY_SERVER_LOG_FORMAT`):
+`ABLY_SERVER_LOG_FORMAT` — except `--heartbeat-interval` and
+`--presence-remain-for`, which are flags only):
 
 ```
 --mode {memory|disk|cluster}  default: memory
@@ -2557,8 +2708,8 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --keys                        appId.keyId:keySecret (repeatable; ABLY_SERVER_KEYS is comma-separated)
 --data-dir ./data             disk mode only
 --postgres-dsn  postgres://…  cluster mode only; a comma-separated list of URL DSNs shards channels (§6.4)
---bus {pgnotify|postgres|nats}  cluster mode cross-node bus (§7.2); default: pgnotify
---nats-url nats://…           --bus=nats only; a comma-separated list of one NATS cluster's servers
+--bus {postgres|nats|pgnotify}  cluster mode cross-node bus (§7.2); default: nats with --nats-url, else postgres
+--nats-url nats://…           the nats bus's servers (a comma-separated list of one NATS cluster); with --bus unset it selects nats
 --nats-inline-max-bytes 262144  largest cm the NATS bus carries inline; larger ones go as pointers
 --nats-creds                  --bus=nats: NATS credentials file (user JWT and NKey seed); nats://user:pass@host URLs also work (§7.2)
 --nats-tls-ca                 --bus=nats: PEM CA the NATS server's certificate chains to; tls:// URLs also work
@@ -2566,8 +2717,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --postgres-notify-mode {coalesced|transactional}  --bus=postgres only; default: coalesced
 --postgres-notify-window 50ms   coalescing window (coalesced mode)
 --postgres-notify-max-pending 65536  cap on channels pending a coalesced wake-up per node
---bus-sweep-interval 0s       chaining buses' safety-net sweep; 0 = bus default (30s) (§7.2)
---bus-sweep-scope subscribed  channels that sweep reads: subscribed (an attachment or presence member here) or bound (all)
+--bus-sweep-interval 0s       chaining buses' safety-net sweep of channels with a local subscriber; 0 = bus default (30s) (§7.2)
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info              one of: trace, debug, info, warn, error
 --log-format {text|json}
@@ -2586,16 +2736,13 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --delivery-fanout-threshold 1000  attachments on one channel above which the fan-out pool delivers its live cms; leaves at half (§5.1)
 --message-retention 2m        cluster mode: continuity window, the log retention of non-persisted channels (§6.3)
 --persisted-retention 24h     cluster mode: log retention of channels in a persisted namespace (§6.3)
---publish-lanes 4             cluster mode: publish batching lanes; 0 = one transaction per publish (§6.3)
+--publish-lanes 2             cluster mode: publish batching lanes; 0 = one transaction per publish; keep lanes x nodes near 20 per primary (§6.3)
 --publish-batch-max 200       cluster mode: most publishes in one batch transaction
 --publish-linger-max 5ms      cluster mode: in-flight time after which other channels start a second batch
---publish-linger-min 0s       cluster mode: how long an idle lane holds its first publish; 0 = leading edge (§6.3)
 --publish-queue-max 10000     cluster mode: queued publishes per lane before 42910
---publish-bind-on-write false cluster mode: true binds a channel on every REST publish (§5.1, §6.3)
---presence-sync-source local  where an attach's presence SYNC comes from: local (the node's member set) or store (§12.4)
---presence-batching true      cluster mode: presence writes join the publish lanes' batches (§6.3, §12.5)
---presence-max-inflight 0     cluster mode: unbatched presence writes in flight per database before 42910; 0 = 4 x --publish-lanes, negative = no bound (§12.5)
---presence-lease-mode node    cluster mode: presence liveness lease per node (node) or per member row (member) (§12.5)
+--presence-max-inflight 0     cluster mode: presence writes committed outside the lanes at once per database; 0 = 4 x --publish-lanes (16 with --publish-lanes=0), negative = no bound (§12.5)
+--heartbeat-interval 15s      server HEARTBEAT cadence, advertised as maxIdleInterval (§2.1); flag only
+--presence-remain-for 15s     grace window before an abruptly disconnected member's LEAVE is written (§12.5); flag only
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -2607,23 +2754,25 @@ reader polling the path never sees a partial address.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
-(`mode`, `listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
+except `--config`, `--addr-file`, `--heartbeat-interval` and
+`--presence-remain-for` (API keys go in `[[keys]]`, below): `mode`,
+`listen`, `data-dir`, `postgres-dsn`, `bus`, `nats-url`,
 `nats-inline-max-bytes`, `nats-creds`, `nats-tls-ca`, `nats-tls-cert`,
 `nats-tls-key`, `postgres-notify-mode`, `postgres-notify-window`,
-`postgres-notify-max-pending`, `bus-sweep-interval`, `bus-sweep-scope`, `shutdown-grace`,
+`postgres-notify-max-pending`, `bus-sweep-interval`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
 `channel-idle-timeout`, `conn-outbound-max-bytes`, `conn-write-timeout`,
 `ws-read-buffer-size`, `ws-write-buffer-size`, `http-idle-timeout`,
-`attachment-seen-max`, `delivery-fanout-pool`, `delivery-fanout-threshold`,
-`message-retention`, `persisted-retention`, `publish-lanes`,
-`publish-batch-max`, `publish-linger-max`, `publish-linger-min`,
-`publish-queue-max`, `publish-bind-on-write`, `presence-sync-source`,
-`presence-batching`, `presence-max-inflight`, `presence-lease-mode` —
-`shutdown-grace`, `postgres-notify-window`, `bus-sweep-interval`,
-`channel-idle-timeout`, `conn-write-timeout`, `http-idle-timeout`, the
-retentions, `publish-linger-max` and `publish-linger-min` as duration strings, e.g. `"10s"`,
-the sizes and counts as integers). API keys are
-declared as structured
+`attachment-seen-max`, `delivery-fanout-pool`,
+`delivery-fanout-threshold`, `message-retention`, `persisted-retention`,
+`publish-lanes`, `publish-batch-max`, `publish-linger-max`,
+`publish-queue-max` and `presence-max-inflight`, with `shutdown-grace`,
+`postgres-notify-window`, `bus-sweep-interval`, `channel-idle-timeout`,
+`conn-write-timeout`, `http-idle-timeout`, the retentions and
+`publish-linger-max` as duration strings, e.g. `"10s"`, and the sizes
+and counts as integers. That every one of these keys reaches the options
+the server runs with, by flag, env var and file, is a table test
+(`TestSettingsReachOptions`). API keys are declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
 `x-ably-capability`-format JSON object string (§3.1) that scopes what the
 key grants; omitting it grants the full capability, like a `--keys` flag
@@ -2642,12 +2791,58 @@ highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.
 
+**The bus default: start with one Postgres; add NATS when you need it.**
+In cluster mode an unset `--bus` is `postgres` with only `--postgres-dsn`
+and `nats` when `--nats-url` is set; an explicit `--bus` wins.
+`pgnotify` is never a default: it runs only when asked for, and then
+logs its measured ceiling at startup. `--bus=nats` with no `--nats-url`
+is a startup error (§7.2 "Choosing the bus").
+
 A bus setting the chosen `--bus` does not use (a `--nats-*` setting under
 `pgnotify` or `postgres`, a `--postgres-notify-*` setting under `pgnotify`
-or `nats`, `--bus-sweep-*` under `pgnotify`), given by flag, env or file,
+or `nats`, `--bus-sweep-interval` under `pgnotify`), given by flag, env or file,
 is named in a warning at startup rather than dropped silently. The bus,
 the retentions and the persisted namespaces must be the same on every
 node of a cluster, which the database enforces at startup (§11).
+
+**Removed settings.** The settings below existed to switch a fix off for
+an A/B comparison in the scale proof; each was removed once the fix was
+measured, and the behaviour it selected by default is now the only one.
+A flag from this list is now a startup error. Its env var is not read
+and, if set, is named in a warning at startup; so is a TOML key from it,
+like any key the file format does not define.
+
+- `--publish-bind-on-write` (`publish-bind-on-write`): replaced by the
+  write-only publish path (§5.1) and in-batch channel row creation (§6.3,
+  "Channel rows"), which were its `false` default.
+- `--bus-sweep-scope` (`bus-sweep-scope`): the sweep always reads only
+  the bound channels with a local subscriber, its `subscribed` default
+  (§7.2 "Sweep scope"); `bound` is gone.
+- `--publish-linger-min` (`publish-linger-min`) and its gauge
+  `ably_publish_linger_min_seconds`: an idle lane always commits its first
+  publish at once, the leading edge that was its `0s` default (§6.3
+  "Publish batching"). A linger floor gave no measured gain in the scale
+  runs; the batch depth it aimed at is set by the lane count instead
+  (§6.3 "How many lanes").
+- `--presence-sync-source` (`presence-sync-source`): a node always serves
+  an attach's presence `SYNC` from its own member set, the `local`
+  default (§12.4), and reads the store only when seeding that set fails
+  (`ably_presence_syncs_total{snapshot="fallback"}`); `store`, a store
+  read per attach, is gone with its `snapshot="store"` series value.
+- `--presence-batching` (`presence-batching`): presence writes always join
+  the publish lanes' batches when there are lanes, its `true` default
+  (§6.3 "Presence in a batch"). Turning batching off for everything,
+  `--publish-lanes=0`, is the one way to commit presence on its own, and
+  `--presence-max-inflight` stays to bound the writes committed outside
+  the lanes.
+- `--presence-lease-mode` (`presence-lease-mode`): presence liveness is
+  always one lease per node, the `node` default (§12.5); `member`, a
+  lease on every member row, is gone. `member` renewed all of a node's
+  member rows with one `UPDATE` per bump: at 100k members a node that
+  rewrote and row-locked 100k rows every 10 s, which convoyed with the
+  presence batches writing the same rows (§6.3). A rolling upgrade from a
+  node that ran `member` is safe (§12.5 "Upgrading from member lease
+  mode").
 
 The config file additionally carries the startup fixtures — everything
 the server boots with is visible in one file, structured like the Ably
@@ -2746,14 +2941,15 @@ name = "persisted:presence_fixtures"
     (gauges). `table` is `channel_messages` or `messages`.
   - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres
     shards (§6.4); 1 for a single DSN. With two or more,
-    `ably_storage_shard_ready{shard}` (gauge), 1 while the shard (and its
-    bus) answered the last readiness check, else 0. With two or more shards every
+    `ably_storage_shard_ready{shard}` (gauge), 1 while the shard met
+    every readiness condition (pool ping, bus, publish lanes; §11) at the
+    last readiness check, else 0. With two or more shards every
     `ably_storage_*` and `ably_publish_*` series above carries a `shard`
     label (the shard's index in the `--postgres-dsn` list), and the
     `ably_bus_*` series below are summed over shards.
   - Cluster mode only, from publish batching (§6.3):
-    `ably_publish_lanes`, `ably_publish_linger_max_seconds`,
-    `ably_publish_linger_min_seconds` (gauges, the configuration),
+    `ably_publish_lanes`, `ably_publish_linger_max_seconds` (gauges, the
+    configuration),
     `ably_publish_batch_size`, `ably_publish_commit_seconds` (histograms),
     `ably_publish_commits_total`, `ably_publish_deferred_total`,
     `ably_publish_batch_retries_total`, `ably_publish_nacks_total{reason}`,
@@ -2829,12 +3025,11 @@ name = "persisted:presence_fixtures"
     the SYNC snapshots served, by how each was obtained: `cached` (the
     channel's current snapshot), `waited` (rebuilt by another attach
     after waiting out the refresh window), `built` (rebuilt from
-    the node's member set), `store` (`--presence-sync-source=store`),
-    `fallback` (a store read because seeding the member set failed); and
+    the node's member set), `fallback` (a store read because seeding the member set failed); and
     `ably_presence_sync_seeds_total` (counter), the member sets seeded from
     the store: at most one per channel bind, plus one after a skipped bus
     gap (§7.2) and one after each sweep that found the channel with no
-    subscribers under `--bus-sweep-scope=subscribed` (§12.4).
+    subscribers (§12.4).
 
   In cluster mode the bus (§7.2) adds `ably_bus_*` series, also process-wide:
   - `ably_bus_info{bus,mode}` (gauge, always 1) — the bus and the postgres
@@ -2909,7 +3104,7 @@ name = "persisted:presence_fixtures"
 ## 11. Lifecycle & operations
 
 **Startup.** Each backend bootstraps its storage at `Open` time. The
-bbolt backend creates the two top-level buckets if missing (§6.2).
+bbolt backend creates its buckets if missing (§6.2).
 The Postgres backend runs the auto-migrate sweep described in §6.3 —
 a session-scoped advisory lock serialises N concurrently-starting
 nodes so only one applies migrations, the rest observe the
@@ -2951,6 +3146,30 @@ overwrite the record on every start, and the check would protect
 nothing. Deleting the row instead makes the next node record its own
 settings and a new deployment id.
 
+*Upgrading past the bus default.* Before the bus was inferred (§7.2), a
+node started without `--bus` ran `pgnotify`. Two cases:
+
+- A database whose record says `pgnotify` (written by a node of a
+  version that had the record but not the inference): a node of this
+  version started without `--bus` infers `postgres` and is refused by
+  the comparison above, the refusal naming the difference.
+- A database with no record that already holds `channels` rows: it
+  served a version from before the record, whose nodes ran `pgnotify`
+  and do not check the record. A node that inferred its bus would record
+  `postgres` (or `nats`), and during a rolling upgrade its publishes
+  would never reach subscribers on the older nodes (pgnotify has no
+  predecessor chain and no sweep to repair them), while theirs would
+  reach it only through its sweep. So a node with no `--bus` is refused
+  on such a database, before anything is recorded, with a message that
+  says the database predates the bus setting and its nodes ran
+  `pgnotify`. Set `--bus=pgnotify` on every node to keep the cluster
+  together while it is upgraded (it is then recorded), or stop every
+  node and start them all with `--bus=postgres` or `--bus=nats`. An
+  explicit `--bus` is taken as that decision and recorded. A database
+  with no `channels` row is treated as new. The signal is the rows, not
+  the migration history, so a database whose every row has been pruned
+  (§6.3; a channel with a presence member is never pruned) looks new.
+
 *Upgrading to this version.* A database without the row records the
 settings of the first upgraded node; nodes of earlier versions do not
 check. On the nats bus the deployment id changes the subjects, so during
@@ -2959,8 +3178,8 @@ messages; their cms still reach each other, late, by the next cm's
 predecessor or the sweep (§7.2). Restart the nodes of a nats cluster
 together to avoid the window.
 
-**A shard that is down** (§6.4): the node stays in rotation while shard 0
-and a majority of the shards answer, and the down shard's channels fail
+**A shard that is down** (§6.4): the node stays in rotation while a
+majority of the shards answer (with two shards, both), and the down shard's channels fail
 fast with 50003 until it is back. `ably_storage_shard_ready{shard}` says
 which shard. Nothing needs doing on the nodes when it returns: the pool
 reconnects on the next call, and its channels' subscribers resume from
@@ -2995,10 +3214,8 @@ should route on. In `memory` and `disk` mode it is always 200. In
 these hold, each within the probe's 2 s:
 
 - the Postgres pool answers a ping;
-- the bus is connected: the LISTEN connection for `--bus=postgres`, the
-  NATS connection for `--bus=nats` (§7.2); `pgnotify` does not gate
-  readiness on its LISTEN connection, which re-dials and reconciles on
-  its own;
+- the bus is connected: the LISTEN connection for `--bus=postgres` and
+  `--bus=pgnotify`, the NATS connection for `--bus=nats` (§7.2);
 - every publish lane is completing its commits: no lane's oldest queued
   publish has waited longer than one commit attempt (15 s), and no batch
   has been committing for longer than two (a commit and its retry). A
@@ -3006,8 +3223,10 @@ these hold, each within the probe's 2 s:
   still pings, but cannot ACK a publish; this takes it out of rotation.
   The error names the lane.
 
-With several Postgres shards (§6.4) each condition must hold on every
-shard, and the error names the shard. Readiness is independent of the
+With several Postgres shards (§6.4) the conditions are checked on every
+shard, and the node is ready while all three hold on a majority of them
+(with two shards, both; "A shard that is down" above); the error names
+each failing shard. Shard 0 has no special place in readiness. Readiness is independent of the
 presence lease (§12.5): the lease bump runs on its own timer whatever the
 traffic, so an idle node never lapses, and a lapsed lease is repaired by
 re-entry rather than by leaving rotation.
@@ -3059,6 +3278,71 @@ rolling restarts). This is an offline step, not a rolling one (§6.3):
 Do not run old and new versions together across this migration: an old
 node would write persisted-namespace rows into the live class, and a
 resume across the resulting hole would be accepted as continuous.
+
+**Operations: what a change requires.** Some settings are recorded by
+the database, which refuses a node that differs; some cannot change once
+data exists; the rest belong to each node. The procedure for each:
+
+| Change | What it requires | Why |
+|---|---|---|
+| The bus (`--bus`, or setting or removing `--nats-url` while `--bus` is unset, which changes the inferred bus) | Stop every node; run the `UPDATE cluster_identity` the refusal prints, in every shard's schema; start every node with the new setting ("Changing a recorded setting" above) | Nodes on different buses do not deliver to each other; `Open` refuses a node whose bus is not the recorded one |
+| A cluster that ran with `--bus` unset on an earlier version (so on `pgnotify`) | Roll out with `--bus=pgnotify` set explicitly, then change the bus as above ("Upgrading past the bus default") | The inferred bus is `postgres`; a recorded `pgnotify` refuses it, and a database with no identity row yet would let upgraded nodes stop delivering to the old ones |
+| `--message-retention` or `--persisted-retention` | Stop, `UPDATE`, start, as for the bus | The node that runs the retention sweep applies its own retentions to everybody's log (§6.3) |
+| The persisted namespaces (a `[[namespaces]]` entry's `persisted`) | Stop, `UPDATE persisted_namespaces`, start. Rows already written keep their class until they age out, and the continuity proof does not cover the namespace until then (§7.2 "Retention") | Same as the retentions; the class is a partition key (§6.3) |
+| The shard list (`--postgres-dsn` with two or more DSNs: order, length or members) | Not supported on databases that hold channels: there is no resharding, migration between shards or rebalancing. A different list needs empty databases, or, while no shard holds channels yet, dropping `shard_identity` in each (§6.4) | `Open` refuses a list that differs from the recorded one, because channels hash to their shard by the list |
+| A database created before migration `0002_partitioned_log` | The offline procedure above ("Upgrading across 0002") | It locks both log tables for the whole migration (§6.3) |
+| Any other migration (`0001`, `0003`, `0004`, `0005`) | A rolling restart. `0004` blocks presence writes for about a second per million member rows while it builds its index | Each takes brief locks or only adds objects (§6.3) |
+| A rolling upgrade on the `nats` bus to the version that added the deployment id | Restart the nodes together, or accept that old and new nodes hear each other only through the predecessor gap fill and the sweep until all are upgraded ("Upgrading to this version") | The subject namespace includes the deployment id |
+| `--publish-lanes` | A rolling restart; nothing is recorded. Size it for the cluster: keep lanes x nodes near 20 committers per primary, per shard with a DSN list (§6.3 "How many lanes") | Each lane of each node is a committer on the primary; too many make every batch shallower |
+| The node count | Add or remove nodes behind the load balancer at any time; then revisit `--publish-lanes` | Nodes hold no state another node needs (above) |
+| `--bus-sweep-interval`, the `--postgres-notify-*` settings, the connection and HTTP settings | A rolling restart; they are per node | Nothing is recorded; a different value on one node changes only that node's latency and load |
+
+**What `/readyz` means.** A 200 says that this node can acknowledge
+publishes and receive other nodes' deliveries now: its Postgres pool
+answers, its bus connection is up and its publish lanes are committing,
+on every database, or on a majority of them with a DSN list. It says
+nothing about the presence lease, which repairs itself (Readiness,
+above), and nothing about whether every channel is served: with a DSN
+list a ready node fails the channels of a minority of down shards with
+50003. Route traffic on it. A 503 on one node is that node's problem
+(its lanes are wedged, or it lost its bus connection); a 503 on every
+node at once is the database, the NATS cluster, or, with two shards,
+either shard.
+
+**Metrics to page on.** A starting point, not thresholds measured in
+production:
+
+- Page: `/readyz` 503 on more than one node, or on one node for more than
+  a minute; `ably_storage_shard_ready{shard} == 0` (that shard's channels
+  are failing with 50003); `ably_publish_nacks_total{reason="commit_failed"}`
+  rising (publishes refused with 50003 after two commit attempts);
+  `ably_storage_retention_errors_total` rising for longer than the hour
+  of partition lookahead allows (once the lookahead runs out, a publish
+  has no partition to land in, §6.3); `ably_presence_lease_lapses_total`
+  rising (a node could not renew its lease, so its members may have been
+  reaped and re-entered, §12.5); `ably_channel_discontinuities_total`
+  rising on more than an isolated channel (clients are being told cms may
+  be missing: a bus outage longer than the retention window, or a gap the
+  log no longer holds, §7.2).
+- Ticket, or page only when sustained:
+  `ably_publish_nacks_total{reason="queue_full"}` (publishers are refused
+  with 42910: over capacity); `ably_slow_consumer_disconnects_total`;
+  `ably_bus_drops_total` and `ably_bus_coalesced_overflow_total`
+  (deliveries left to the gap fill or the sweep, so late);
+  `ably_presence_grace_leave_errors_total` (members left until their
+  node's lease ends); `ably_publish_server_presence_forced_total`;
+  `ably_storage_partition_drop_lock_timeouts_total` (expired leaves kept
+  for a later sweep); `ably_presence_reaps_deferred_total` (expected for
+  one lease window after a start or an outage; sustained, nobody reaps).
+- Investigate at once, as possible misconfiguration or abuse of the bus:
+  `ably_bus_unrouted_total{reason="foreign"}` (another cluster publishes
+  on this NATS cluster) and `ably_bus_malformed_total` (§7.2 "The bus is
+  a trusted network").
+- Capacity, not alerts: `ably_publish_lane_queue_depth`,
+  `ably_publish_commit_seconds`, `ably_publish_batch_size`,
+  `ably_channels_bound`, `ably_storage_log_bytes`, and
+  `ably_storage_channel_rows_dropped_total` against the rate of new
+  channel names (§6.3 "Pruning `channels` rows").
 
 ## 12. Presence
 
@@ -3115,7 +3399,7 @@ over two connections is two distinct members.
 
 Messages and presence share **one ordered stream and one channelSerial
 namespace**, so a single live list, a single Appender, and a single
-NOTIFY path serve both. channelSerials are sortable cursors, not a dense
+bus path serve both. channelSerials are sortable cursors, not a dense
 sequence, so the presence cms interleaved among data cms simply occupy
 their own serials; a message-history scan skips them and a
 presence-history scan skips data cms (the `kind` selector on
@@ -3194,7 +3478,10 @@ action `PRESENT`. The `channelSerial` field doubles as the sync cursor:
 `<serial>:<cursor>` while pages follow, `<serial>:` (empty cursor part)
 on the final page to mark completion. At the scale we target the set
 usually fits a single frame; the cursor protocol allows paging for larger
-sets.
+sets. A `SYNC` with no members (a client-initiated `SYNC` on an empty
+channel, or the owed `SYNC` after a channel update, §7.2) carries
+`presence: []` rather than omitting the field, in both formats: ably-js
+skips a `SYNC` with no presence field, so the sync would not complete.
 
 Consistency between the snapshot and live delivery is resolved by the
 **client's merge**, exactly as in Ably: every PresenceMessage carries a
@@ -3208,9 +3495,8 @@ attach point: an SDK takes the set as final once the sync ends
 (`presence.get()` returns it), so operations the snapshot misses cannot
 follow in a later frame.
 
-**Where the snapshot comes from** (`--presence-sync-source`, default
-`local`). In `local` mode a node serves `SYNC` from its own copy of the
-channel's member set, held by the node's `core.Channel` (§5.1) as a cache
+**Where the snapshot comes from.** A node serves `SYNC` from its own copy
+of the channel's member set, held by the node's `core.Channel` (§5.1) as a cache
 of the store's set as of a serial:
 
 - It is **seeded** from `Members` the first time a `SYNC` needs it after
@@ -3248,8 +3534,7 @@ of the store's set as of a serial:
   connection's read loop, so it never waits: an out-of-date snapshot is
   rebuilt at once.
 - Eviction (§5.1) drops the set with the channel; a rebind seeds afresh.
-  With `--bus-sweep-scope=subscribed` (§7.2) the set is also dropped
-  when the sweep finds the channel with no attachment and no member of
+  The set is also dropped when the bus sweep (§7.2) finds the channel with no attachment and no member of
   this node's, since the sweep no longer repairs a cm lost on the bus
   for it; the next attach seeds again. So a channel seeds on its first
   presence `SYNC` after a bind, and again on the first one after a sweep
@@ -3265,11 +3550,13 @@ of the store's set as of a serial:
   disk backends deliver each presence cm under the lock that mints it,
   so their cms also arrive in serial order.
 
-A snapshot that cannot be obtained skips the `SYNC`: the `ATTACHED`
-then carries no `HAS_PRESENCE`. When the attachment has already ended
-(its connection closed while it waited), that is expected and only
-counted; a failed store read is logged
-(`ably_presence_syncs_skipped_total{reason}`, §10).
+A snapshot that cannot be obtained on attach skips the `SYNC`: the
+`ATTACHED` then carries no `HAS_PRESENCE`. After a channel update the
+read is retried, and if every try fails the `ATTACHED` carries
+`HAS_PRESENCE` and the `SYNC` is owed until a later read succeeds
+(§7.2). When the attachment has already ended (its connection closed
+while it waited), that is expected and only counted; a failed store read
+is logged (`ably_presence_syncs_skipped_total{reason}`, §10).
 
 The set goes out as one `SYNC` frame. For a 2,000-member room the
 frames measured locally were up to about 512 KB (msgpack,
@@ -3280,9 +3567,10 @@ would also need a sync id the SDKs parse: ably-js matches the cursor with
 `^[\w-]+:`, which a channelSerial containing `@` never matches, so it
 ends the sync at the first page.
 
-In `store` mode every `SYNC` reads `Members` from the store, as before the
-local set existed. Either way the store's set stays authoritative (§12.5):
-`GET .../presence` and the delayed-LEAVE checks always read the store.
+The store's set stays authoritative (§12.5): `GET .../presence` always
+reads the store. The grace-window LEAVE after an abrupt disconnect reads
+neither the store nor this cache: it uses the departed connection's own
+record of the members it entered (§12.5 "Liveness").
 Series: `ably_presence_syncs_total{snapshot}`,
 `ably_presence_sync_seeds_total` (§10).
 
@@ -3306,18 +3594,18 @@ into it transactionally and `Members` reads it (§6). Per backend:
   ENTERs. `SYNC` is served from the node's member set, seeded from
   `Members` once per channel bind and maintained from delivered cms
   (§12.4); it is a cache of this table, never a second source of truth.
-  Presence writes join the publish lanes' batches (`--presence-batching`,
-  default true; §6.3 "Presence in a batch"), so one room's row lock is
-  taken once per batch rather than once per ENTER or LEAVE. A presence
-  write committed in its own transaction (`--presence-batching=false`, or
-  `--publish-lanes=0`) holds a pool connection for the whole transaction,
+  Presence writes join the publish lanes' batches (§6.3 "Presence in a
+  batch"), so one room's row lock is taken once per batch rather than
+  once per ENTER or LEAVE. A presence write committed in its own
+  transaction (every one with `--publish-lanes=0`; with lanes, a
+  lease-lapse re-entry or a server-synthesised LEAVE written around a
+  full lane) holds a pool connection for the whole transaction,
   including any wait on the room's row lock, so those writes are bounded
-  per database (`--presence-max-inflight`, default 4 x `--publish-lanes`,
-  16 when batching is off; server-synthesised LEAVEs are exempt (in the
-  lanes they have a bound of their own, §6.3), so a mass disconnect with
-  batching off can still hold
-  many pool connections with LEAVEs, as before the bound existed): one
-  beyond the bound is refused at once with
+  per database (`--presence-max-inflight`, default 4 x `--publish-lanes`
+  (8 at the default 2 lanes), 16 when batching is off; server-synthesised
+  LEAVEs are exempt (in the lanes they have a bound of their own, §6.3),
+  so a mass disconnect with batching off can still hold many pool
+  connections with LEAVEs): one beyond the bound is refused at once with
   Ably error **42910** (a NACK; the client should back off and retry) and
   counted in `ably_publish_nacks_total{reason="presence_inflight"}`, so a
   convoy on one hot room cannot starve the pool that `SYNC` seeds, binds
@@ -3342,12 +3630,25 @@ Departure:
 
 - **Explicit LEAVE, DETACH, clean CLOSE, or graceful shutdown (§11)** — a
   deliberate departure, processed as an immediate LEAVE publish (no grace):
-  the connection is not coming back, so there is nothing to wait for.
+  the connection is not coming back, so there is nothing to wait for. A
+  DETACH's LEAVE runs on the connection's publish worker, after every
+  presence write the connection sent before the DETACH, and `DETACHED`
+  is sent once it is done (so it also follows the ACKs of the frames
+  before it). Run on the read goroutine, it could overtake an ENTER still
+  queued behind an earlier publish, which then committed after the LEAVE
+  and left its member present on the detached channel until the
+  connection ended. A DETACH LEAVE that fails puts its members back as
+  uncertain, so the connection's own departure still leaves them. The
+  price is that `DETACHED` waits for the connection's queued writes; if
+  they take longer than the SDK's request timeout (10 s in ably-js), the
+  SDK returns the channel to attached (RTL5f) and, when the late
+  `DETACHED` arrives, re-attaches (RTL13a).
 - **Abrupt disconnect (transport read error, heartbeat/token-expiry
   disconnect)** — when the connection loop exits it does *not* leave
   immediately. It hands the members it still holds (its own record of
-  what it entered, with each member's last state; no store read) to the
-  server, keyed by `connectionId`, for `remainPresentFor`. If a
+  what it entered, with each member's last state, holding only operations
+  the store committed, see *Re-entry*; no store read) to the server,
+  keyed by `connectionId`, for `remainPresentFor`. If a
   connection resumes that `connectionId` in the window (§4.3, §8), it
   takes the members over: it owns them from then on, so its own DETACH,
   CLOSE or drop leaves them, and no LEAVE is written for the dropped
@@ -3367,10 +3668,9 @@ Departure:
   The registry is the whole answer because a resume only ever reaches the
   node that issued the connectionKey: the key's HMAC secret is per process
   (§8), so a resume on another node gets a fresh `connectionId` and
-  80018. An earlier version re-read the store at write time and compared
-  member serials, to catch a resume that re-entered on another node; that
-  case cannot occur, the comparison protected nothing the registry does
-  not, and its store read could fail (it did, under load) and drop the
+  80018. The LEAVE therefore does not re-read the store at write time: a
+  read could only catch a resume that re-entered on another node, which
+  cannot occur, and a store read can fail under load and drop the
   LEAVE.
 
 Because the server holds no other per-connection state across disconnects
@@ -3393,29 +3693,21 @@ removes the members of dead nodes, synthesising a LEAVE for each through
 the normal publish path (a fresh presence publish, announced on the bus
 to every node's appender). Postgres row locking means exactly one
 node's `DELETE ... RETURNING` yields a given row, so each LEAVE is
-published once. `--presence-lease-mode` selects where the lease lives:
+published once. The lease is one per node, a row in `presence_nodes
+(node_id, expires_at)`.
 
-- **node** (the default): one lease per node, a row in `presence_nodes
-  (node_id, expires_at)`. The bump is one upsert of that row, so its cost
-  does not grow with the node's members and it never writes or locks a
-  member row; a member row's own `expires_at` is `'infinity'`. A node is
-  **alive** while its row exists with `expires_at` no more than one bump
-  interval in the past (`expires_at >= now() - 10s`: the margin absorbs
-  clock skew between nodes and a bump that is late by a tick), and dead
-  otherwise. The reaper lists the node ids that own members (a skip scan
-  over `presence_node_idx`, one index probe per distinct owner) with no
-  live lease, plus the dead lease rows, and for each deletes the
-  node's members in chunks of 1000, re-checking the lease in every chunk
-  so a node that renews part way stops being reaped; once every chunk is
-  deleted it publishes their LEAVEs, then deletes the node's lease row
-  once it owns no member.
-- **member**: the behaviour before node leases; every member row carries
-  its own `expires_at`, renewed by one `UPDATE ... WHERE node_id = $node`
-  of all of the node's rows per bump, and the reaper deletes every row
-  whose lease is dead by the same rule (`expires_at < now() - 10s`). At
-  100k members per node that bump rewrites
-  and row-locks 100k rows every 10s, which convoys with presence batches
-  writing the same rows (§6.3). Kept for A/B comparison.
+The bump is one upsert of that row, so its cost does not grow with the
+node's members and it never writes or locks a member row; a member row's
+own `expires_at` is `'infinity'`. A node is **alive** while its row
+exists with `expires_at` no more than one bump interval in the past
+(`expires_at >= now() - 10s`: the margin absorbs clock skew between nodes
+and a bump that is late by a tick), and dead otherwise. The reaper lists
+the node ids that own members (a skip scan over `presence_node_idx`, one
+index probe per distinct owner) with no live lease, plus the dead lease
+rows, and for each deletes the node's members in chunks of 1000,
+re-checking the lease in every chunk so a node that renews part way
+stops being reaped; once every chunk is deleted it publishes their
+LEAVEs, then deletes the node's lease row once it owns no member.
 
 *Node identity.* A node id is random per process (40 bits, minted at
 `postgres.Open`; a sharded node uses one id on every shard and keeps a
@@ -3449,13 +3741,13 @@ never undone by a LEAVE the reaper had not yet published.
 deletes only rows whose node has no live lease, checked in the
 deleting statement. A dead node's members are deleted within the lease
 window after its last renewal plus one bump interval plus one reaper
-interval (30s + 10s + 5s, the same bound as member mode) plus the
+interval (30s + 10s + 5s) plus the
 chunked deletes themselves (about 0.7s for 100k members in a local test
 on a 1M-row table), then their LEAVEs follow at publish throughput.
 Several reaping nodes take different chunks of one dead node at once
-(`SKIP LOCKED`); each deletes and announces only its own. As in member
-mode, a reaper that stops after deleting rows and before publishing their
-LEAVEs loses those LEAVEs. Every reaper statement runs under a
+(`SKIP LOCKED`); each deletes and announces only its own. A reaper that
+stops after deleting rows and before publishing their LEAVEs loses those
+LEAVEs. Every reaper statement runs under a
 `statement_timeout` of half a bump interval: a chunk `DELETE` checks its
 node's lease as of the moment it started, so one that started just
 before the node renewed must not run on into the node's re-entry (below),
@@ -3475,7 +3767,7 @@ one bump interval, well inside the window every reaper waits, so none
 of them is reaped; a node that died meanwhile is reaped one window after
 the reapers came back. A deferred round counts in
 `ably_presence_reaps_deferred_total` and logs at Info, at most once per
-lease window, with the reason. The guard applies in both lease modes.
+lease window, with the reason.
 
 *Lapse and re-entry.* A node that could not renew for longer than the
 window while other nodes could (a stall, a partition of that node
@@ -3509,7 +3801,58 @@ window (a resume would take them over expecting them present; they still
 leave at the window's end; a grace LEAVE already written, or members a
 resume has since taken over, are skipped, so this cannot undo the resumed
 client's own LEAVE). It works on 32 connections or grace entries at a
-time. Each ENTER is
+time. A connection's entered set follows the store's answer to each
+presence write. A committed operation is recorded. One the store turned
+away before writing anything (42910: a full lane queue or the presence
+in-flight bound; 40010, a channel name the store cannot hold; a
+malformed client-supplied id) is not. One whose outcome is unknown (a
+timeout, a 50003, any other failure) is recorded as *uncertain*: an
+ENTER or UPDATE for a member not yet held records it, and a LEAVE turns
+a held member uncertain. Every LEAVE path (DETACH, teardown, grace)
+covers an uncertain member, since the write may have committed; if it
+did not, the LEAVE stores nothing, but subscribers see a LEAVE for a
+member they never saw enter (ably-js emits a `leave` event for it). A
+re-entry skips an uncertain member, since the client was told the
+operation failed. When two sets merge (a resume's hand-over, a second
+drop in the window) a committed record is kept over an uncertain one.
+The records are copies taken before the store sees the messages: a batch
+the caller stopped waiting for still stamps them while it commits. So a refused LEAVE still leaves with the
+connection, and a refused ENTER is never re-entered. The client's
+presence write runs on a context the connection's teardown does not
+cancel, bounded by 10 s (`DefaultPresenceWriteTimeout`): teardown
+cancels the connection's context, then waits for the publish worker
+before it takes the entered set, so an ENTER whose batch was in flight
+when the connection dropped is answered and recorded first and gets its
+LEAVE. (On the connection's own context such an ENTER committed, the
+caller saw only the context's error, and the member was never left: it
+stayed until its node died.) Once teardown has begun, the publish worker
+drops the tasks still queued rather than run them, so at most the one
+in flight holds teardown up to its bound. The pass counts itself in and takes its two
+snapshots (grace entries, then live connections) in one step under the
+grace lock, and a resume's hand-over of a grace entry (at the resume, or
+at the window's end if the resume landed while the dropped connection was
+still tearing down) is one step under the same lock with reading the
+count of passes running. So either a pass took its snapshots before the
+hand-over, and then it is still running (the count is not zero, and the
+resumed connection re-enters what it adopted itself) or it finished
+having re-entered the entry; or it takes them after, and then its
+snapshot holds the resumed connection with the adopted members. It is a
+count, not a flag, because the lapse hook can fire again during a long
+pass and the passes overlap; one ending must not hide another. A grace
+entry created or extended while a pass is running is in no pass's
+snapshot, and the pass may have read the dropped connection after its
+teardown took its members, so such an entry is marked owed and its
+adopter re-enters it too. A connection that has adopted members to
+re-enter and drops before its re-entry has read its set hands the duty
+on with them: the grace entry its teardown creates is marked owed too,
+as is the entry members are rescheduled into when a hand-over finds the
+resumed connection itself tearing down.
+The adopter's re-entry runs off the resume's WebSocket handshake, so it
+does not delay `CONNECTED`, and re-enters only
+the adopted members the connection still holds, each with the
+connection's own record of it: the connection may already be running
+(always so at the window's end), and a LEAVE or UPDATE its client has
+sent since is respected rather than replayed over. Each ENTER is
 written in a transaction of its own, after the publishes of its channel
 already queued or in flight on the lane, and leaves out every member that
 is in the table once the channel's row lock is held (the read waits for a
@@ -3525,27 +3868,22 @@ is logged and leaves that member absent until the client next updates
 it, and one whose connection's write does not finish within 5 s is
 abandoned the same way.
 
-*Mixing modes.* Every node sharing a database should run the same mode,
-but each mode's reaper leaves the other mode's live members alone and
-removes them once their node is dead, so a rolling switch is safe: the
-node-mode reaper takes a member-mode row only once its own lease has
-expired, and the member-mode reaper reaps the members of node-mode nodes
-whose lease row has expired. During a rolling switch a node-mode reaper
-also reads each live member-mode node's rows every round. One case is not
-covered once every node runs member mode: `'infinity'` rows of a node-mode
-node that has no lease row at all (it lost the row in a stall longer than
-the lease window and died before its next bump re-created it, or a write
-committed during its graceful close after the row was deleted). Finding
-them would take a scan of the whole table each round; they need a manual
-`DELETE`.
+*Upgrading from member lease mode.* A node of an earlier version that
+ran the retired member lease mode has no `presence_nodes` row and keeps
+a lease on each of its member rows. The reaper lists such a node as
+having no live lease, but takes a row only if its own `expires_at` is
+`'infinity'` or dead, so the node's live members are left alone during
+a rolling upgrade and reaped, with their LEAVEs, once the node is gone
+and their leases have been dead for a bump interval. Meanwhile the
+reaper reads that node's rows every round.
 
-Both loops skip rows a presence write holds locked (`FOR UPDATE SKIP
+The reaper skips rows a presence write holds locked (`FOR UPDATE SKIP
 LOCKED`): that write is renewing or removing the row anyway, a row
 skipped once is handled on the next round, well inside the lease window,
-and a loop that waited could deadlock with a batched write holding
-several members' rows (§6.3). Static fixture members (above) are owned
-by a sentinel that has no lease row and carry an `'infinity'` lease;
-both reapers skip that owner.
+and a reaper that waited could deadlock with a batched write holding
+several members' rows (§6.3). The bump writes no member row. Static
+fixture members (above) are owned by a sentinel that has no lease row
+and carry an `'infinity'` lease; the reaper skips that owner.
 
 ### 12.6 REST
 
@@ -3597,7 +3935,8 @@ constants at implementation (`create = 0`, `update = 1`, `delete = 2`,
 matches Ably: `serial`, `action`, and a `version` object
 (`{serial, timestamp, clientId, description, metadata}`).
 
-Mutations ride the **same stream and Append/NOTIFY path** as any publish
+Mutations ride the **same stream and Append path** (through the bus in
+cluster mode) as any publish
 (§7): they are `kind = message` cms distinguished only by `action`
 (presence stays `kind = presence`, §12.1). Nothing on the live linked
 list or in storage is rewritten in place — a mutation is purely
@@ -3810,9 +4149,10 @@ it reaches the Appender.
 That snapshot is what makes cluster delivery deterministic: every node —
 including ones that never witnessed earlier annotations — emits the
 summary for a given annotation cm from the cm itself, off the normal
-Append/NOTIFY path (§7.2). No node ever publishes a separate rollup, so
-there is no duplicate-summary problem and no cross-node coordination
-beyond the existing per-channel advisory lock. There is no debounce:
+Append path and the bus (§7.2). No node ever publishes a separate
+rollup, so there is no duplicate-summary problem and no cross-node
+coordination beyond the lock that mints the channel's serial (the
+`channels` row lock in cluster mode, §6.3). There is no debounce:
 one summary delivery per annotation, which Ably's conflation latitude
 permits (only the *latest* summary a subscriber holds matters).
 
@@ -3953,7 +4293,8 @@ runs under `go run`).
 **Cluster-mode children.** With `--child-postgres-dsn` the provisioner
 runs every child in cluster mode instead (`--mode cluster
 --postgres-dsn <dsn with search_path=<schema>> --bus <--child-bus>`, plus
-`--nats-url <--child-nats-url>` for `--child-bus=nats`). Each app gets a
+`--nats-url <--child-nats-url>` for `--child-bus=nats`; `--child-bus`
+defaults to `postgres`). Each app gets a
 fresh schema in that database, created on `POST /apps` and dropped when
 the child is terminated. A schema per app keeps apps apart in Postgres
 and, because the bus hashes the schema into its channel names (§7.2),
@@ -3971,7 +4312,7 @@ database, and the child gets the list with the schema set on each DSN.
   bbolt and Postgres backends — table-driven contract tests).
 - **Integration**: spin up the binary against ably-go's existing test suite
   (or a curated subset) to validate SDK compatibility.
-- **Cluster**: Postgres + 2 server processes in Docker Compose; tests cover
+- **Cluster**: Postgres + 3 server processes in Docker Compose; tests cover
   cross-node publish and `channelSerial`-based replay on reconnect to a
   different node.
 - **Per bus** (§7.2): the storage contract suite runs on every cluster bus

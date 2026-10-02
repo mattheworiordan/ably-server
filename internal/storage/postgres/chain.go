@@ -93,30 +93,6 @@ var catchUpHook atomic.Pointer[func(names []string) (done func())]
 // sweepChunk caps the channel names in one watermark sweep query.
 const sweepChunk = 1000
 
-// Watermark sweep scopes accepted by Options.SweepScope (DESIGN.md
-// §7.2).
-const (
-	// SweepSubscribed sweeps only the bound channels with a subscriber on
-	// this node: an attachment or a tracked presence member
-	// (storage.SubscriberReporter). The default.
-	SweepSubscribed = "subscribed"
-	// SweepBound sweeps every bound channel, the behaviour before sweep
-	// scopes existed.
-	SweepBound = "bound"
-)
-
-// ParseSweepScope validates a sweep scope. The empty string is the
-// default, SweepSubscribed.
-func ParseSweepScope(s string) (string, error) {
-	switch s {
-	case "", SweepSubscribed:
-		return SweepSubscribed, nil
-	case SweepBound:
-		return SweepBound, nil
-	}
-	return "", fmt.Errorf("unknown bus sweep scope %q (valid: %s, %s)", s, SweepSubscribed, SweepBound)
-}
-
 // sweepNamesHook, when set, receives the channel names of each watermark
 // sweep query (tests count what the sweep reads). Nil in production.
 var sweepNamesHook atomic.Pointer[func(names []string)]
@@ -533,9 +509,9 @@ type rangeRead struct {
 	cms         []*protocol.ChannelMessage
 	full        bool
 	// unproven is set when the read cannot prove it holds every cm past
-	// after (DESIGN.md §7.2): after is below the channel's retention
-	// floor, the channel has moved past it, and the cm at after is gone
-	// from the log. Partitions are dropped oldest first, so while the cm
+	// after (DESIGN.md §7.2, unprovenRead): after is below the channel's
+	// retention floor, the cm at after is gone from the log, and the
+	// channel has moved past it or lost its channels row (pruned). Partitions are dropped oldest first, so while the cm
 	// at the mark is held, so is every cm after it; once it is gone, cms
 	// between it and the oldest one returned may have aged out too.
 	// current is the channel's serial as of the read, set when the read
@@ -559,13 +535,13 @@ func (cs *channelStore) readRange(ctx context.Context, after, upTo string, check
 		return (*hook)(cs, after, upTo, check)
 	}
 	if !check {
-		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, cs.rangeFloor(), rangePageSize)
+		cms, err := loadChannelMessagesAfter(ctx, cs.pool, cs.name, after, upTo, rangePageSize)
 		if err != nil {
 			return rangeRead{}, err
 		}
 		return rangeRead{after: after, upTo: upTo, cms: cms, full: len(cms) == rangePageSize}, nil
 	}
-	reads, err := loadRangesChecked(ctx, cs.pool, []rangeRequest{{name: cs.name, after: after, upTo: upTo, floor: cs.rangeFloor(), check: true}})
+	reads, err := loadRangesChecked(ctx, cs.pool, []rangeRequest{{name: cs.name, after: after, upTo: upTo, check: true}})
 	if err != nil {
 		return rangeRead{}, err
 	}
@@ -810,42 +786,48 @@ func (s *Storage) reconcileBound(ctx context.Context) (int, error) {
 	return len(stores), firstErr
 }
 
-// sqlLoadRangeMany reads, for each (channel, after, upTo, floor) tuple,
-// up to $6 cms in (after, upTo] at or above floor (an empty upTo is
-// unbounded), every kind, ascending: one round trip for many channels.
-// The floor is the channel's retention floor (rangeFloor); the bound lets
-// the planner prune the leaves older than retention, so the read takes
-// no lock on a leaf a drop is waiting on (DESIGN.md §6.3). A channel
-// whose check flag is set also gets, once per channel (the materialised
-// CTE) and from the same snapshot as its range, its current serial and
-// whether the cm at after is still in the log (rangeRead.unproven); for
-// the others neither is read. A channel with no cms past its mark comes
-// back as one row with a NULL serial.
+// sqlLoadRangeMany reads, for each (channel, after, upTo) triple, up to
+// $5 cms in (after, upTo] (an empty upTo is unbounded), every kind,
+// ascending: one round trip for many channels. The read's lower bound is
+// the mark itself: every cm after it is wanted, whatever its age, so no
+// retention floor is applied (a floor above the mark would hide cms that
+// are still in the log while the anchor check reports continuity). A
+// channel whose check flag is set also gets, once per channel (the
+// materialised CTE) and from the same snapshot as its range, its current
+// serial and whether the cm at after is still in the log
+// (rangeRead.unproven); for the others neither is read. A channel with no
+// cms past its mark comes back as one row with a NULL serial.
 //
-// Both range queries run with pgx.QueryExecModeExec (an unnamed
-// statement, planned for the actual parameters on every call): a named,
-// cached statement switches to a generic plan after five executions, and
-// a generic plan locks every leaf whether or not runtime pruning skips
-// it, which would defeat the floor.
+// The outer scan repeats the subquery's bounds on channel_serial. Both
+// range queries run with pgx.QueryExecModeExec (an unnamed statement,
+// planned for the actual parameters on every call); a named, cached
+// statement switches to a generic plan after five executions, and a
+// generic plan locks every leaf. That lets sqlLoadRange, whose bounds
+// are literal parameters, prune the leaves entirely below the mark.
+// This query cannot: its bounds come from unnest through a materialised
+// CTE, so the planner opens (ACCESS SHARE) every leaf whatever the marks,
+// and a leaf a drop holds waits it out (DESIGN.md §6.3; the drop gives
+// up after its lock timeout).
 const sqlLoadRangeMany = `
 WITH t AS MATERIALIZED (
-	SELECT u.name, u.after, u.upto, u.floor,
+	SELECT u.name, u.after, u.upto,
 		CASE WHEN u.chk THEN (SELECT c.channel_serial FROM channels c WHERE c.name = u.name) END AS current,
 		CASE WHEN u.chk THEN EXISTS (
 			SELECT 1 FROM channel_messages x WHERE x.channel = u.name AND x.channel_serial = u.after) END AS anchored
-	FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[], $5::text[]) AS u(name, after, upto, chk, floor)
+	FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[]) AS u(name, after, upto, chk)
 )
 SELECT t.name, t.current, t.anchored, m.channel_serial, m.idx, m.kind, m.payload, m.summary
 FROM t
 LEFT JOIN LATERAL (
 	SELECT cm.channel_serial, cm.idx, cm.kind, cm.payload, cm.summary
 	FROM channel_messages cm
-	WHERE cm.channel = t.name AND cm.channel_serial >= t.floor AND cm.channel_serial IN (
+	WHERE cm.channel = t.name AND cm.channel_serial > t.after
+	  AND (t.upto = '' OR cm.channel_serial <= t.upto) AND cm.channel_serial IN (
 		SELECT DISTINCT channel_serial FROM channel_messages
-		WHERE channel = t.name AND channel_serial > t.after AND channel_serial >= t.floor
+		WHERE channel = t.name AND channel_serial > t.after
 		  AND (t.upto = '' OR channel_serial <= t.upto)
 		ORDER BY channel_serial
-		LIMIT $6)
+		LIMIT $5)
 ) m ON true
 ORDER BY t.name, m.channel_serial, m.idx
 `
@@ -853,8 +835,17 @@ ORDER BY t.name, m.channel_serial, m.idx
 // rangeRequest is one channel's part of a batched range read.
 type rangeRequest struct {
 	name, after, upTo string
-	floor             string // the channel's retention floor (rangeFloor): the read's lower bound
-	check             bool   // read the continuity check (rangeRead.unproven)
+	check             bool // read the continuity check (rangeRead.unproven)
+}
+
+// unprovenRead is the continuity verdict of a checked read (DESIGN.md
+// §7.2): the read cannot prove it holds every cm past the mark when the
+// cm at the mark is gone from the log and the channel has either moved
+// past the mark or lost its channels row altogether (pruned after being
+// idle past retention, so what happened after the mark is unknowable).
+// anchored is nil for an unchecked read, which proves nothing either way.
+func unprovenRead(anchored *bool, current, after string) bool {
+	return anchored != nil && !*anchored && (current == "" || current > after)
 }
 
 // loadRangesChecked runs sqlLoadRangeMany for reqs (distinct names) and
@@ -865,12 +856,11 @@ func loadRangesChecked(ctx context.Context, pool *pgxpool.Pool, reqs []rangeRequ
 	byName := make(map[string]rangeRequest, len(reqs))
 	upTos := make([]string, len(reqs))
 	checks := make([]bool, len(reqs))
-	floors := make([]string, len(reqs))
 	for i, q := range reqs {
-		names[i], afters[i], upTos[i], checks[i], floors[i] = q.name, q.after, q.upTo, q.check, q.floor
+		names[i], afters[i], upTos[i], checks[i] = q.name, q.after, q.upTo, q.check
 		byName[q.name] = q
 	}
-	rows, err := pool.Query(ctx, sqlLoadRangeMany, pgx.QueryExecModeExec, names, afters, upTos, checks, floors, rangePageSize)
+	rows, err := pool.Query(ctx, sqlLoadRangeMany, pgx.QueryExecModeExec, names, afters, upTos, checks, rangePageSize)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: batched range read: %w", err)
 	}
@@ -894,9 +884,7 @@ func loadRangesChecked(ctx context.Context, pool *pgxpool.Pool, reqs []rangeRequ
 			if current != nil {
 				r.current = *current
 			}
-			// Checked: the channel moved past the mark, and the cm at the
-			// mark is gone.
-			r.unproven = anchored != nil && !*anchored && r.current > r.after
+			r.unproven = unprovenRead(anchored, r.current, r.after)
 		}
 		if channelSerial != nil {
 			if n := len(r.cms); n == 0 || r.cms[n-1].ChannelSerial != *channelSerial {
@@ -945,7 +933,7 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 			continue
 		}
 		byName[cs.name] = cs
-		reqs = append(reqs, rangeRequest{name: cs.name, after: after, floor: cs.rangeFloor(), check: check})
+		reqs = append(reqs, rangeRequest{name: cs.name, after: after, check: check})
 	}
 	if len(reqs) == 0 {
 		return nil
@@ -981,19 +969,15 @@ func (s *Storage) catchUpMany(ctx context.Context, stores []*channelStore) error
 	return firstErr
 }
 
-// sweepStores returns the bound channels the watermark sweep reads: every
-// one under SweepBound; under SweepSubscribed only those whose appender
-// has a subscriber on this node (an appender that cannot say counts as
-// subscribed). A channel with no local subscriber has nobody a lost cm
+// sweepStores returns the bound channels the watermark sweep reads: those
+// whose appender has a subscriber on this node (an appender that cannot
+// say counts as subscribed). A channel with no local subscriber has nobody a lost cm
 // could be late for: its binding goes on receiving the bus, a later
 // subscriber sees whatever the delivery point appends from then on, and
 // a lost tail is caught up within two sweeps of the channel gaining a
 // subscriber (DESIGN.md §7.2).
 func (s *Storage) sweepStores() []*channelStore {
 	stores := s.boundStores()
-	if s.sweepAll {
-		return stores
-	}
 	kept := stores[:0]
 	for _, cs := range stores {
 		if r, ok := cs.appender.(storage.SubscriberReporter); ok && !r.HasSubscribers() {
@@ -1034,12 +1018,14 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("storage/postgres: read watermarks: %w", err)
 		}
+		found := make(map[string]bool, len(chunk))
 		for rows.Next() {
 			var name, watermark string
 			if err := rows.Scan(&name, &watermark); err != nil {
 				rows.Close()
 				return fmt.Errorf("storage/postgres: scan watermark: %w", err)
 			}
+			found[name] = true
 			cs := byName[name]
 			cs.hwmMu.Lock()
 			if cs.seeded && !cs.released && cs.sweptWatermark > cs.lastSeen {
@@ -1048,12 +1034,42 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 			if cs.seeded && cs.lastSeen >= watermark {
 				cs.markProvenLocked(readAt)
 			}
-			cs.sweptWatermark = watermark
+			cs.sweptWatermark, cs.sweptAt = watermark, readAt
 			cs.hwmMu.Unlock()
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("storage/postgres: watermark rows: %w", err)
+		}
+		// A bound channel with no row was pruned after idling past
+		// retention (DESIGN.md §6.3), and nothing has been published on it
+		// since: a publish recreates the row, and the read's snapshot is
+		// after readAt. Nothing was published between the previous sweep
+		// and the prune either, provided that sweep (sweptAt) is inside the
+		// channel's retention window: a cm committed after it would carry
+		// a serial at or above it, and the prune only takes a row whose
+		// serial is older than the longest retention. So if the node had
+		// caught up to the last watermark it read, nothing is past its
+		// mark as of readAt, and this sweep becomes the previous one for
+		// the next. Without this the proof aged out with the row, and the
+		// first publish after the prune, whose predecessor is the
+		// recreated row's fresh seed, sent a checked gap fill from the old
+		// mark that found the anchor gone and signalled a discontinuity on
+		// every node with the channel bound, although nothing was lost.
+		// Sweeps further apart than the retention window prove nothing,
+		// and the checked read decides as before.
+		floorNow := time.Now()
+		for _, name := range names {
+			if found[name] {
+				continue
+			}
+			cs := byName[name]
+			cs.hwmMu.Lock()
+			if cs.seeded && !cs.released && cs.lastSeen >= cs.sweptWatermark && cs.sweptAt != "" && cs.sweptAt >= cs.RetainedSince(floorNow) {
+				cs.markProvenLocked(readAt)
+				cs.sweptAt = readAt
+			}
+			cs.hwmMu.Unlock()
 		}
 	}
 	for start := 0; start < len(behind); start += reconcileChunk {
@@ -1072,29 +1088,27 @@ func (s *Storage) sweepWatermarks(ctx context.Context) error {
 }
 
 // sqlLoadRange reads the cms on one channel in (after, upTo] ($3 = ""
-// means unbounded) at or above the retention floor $4, up to $5 of them,
-// every kind, ascending. The floor is what lets the planner prune leaves
-// older than retention (see sqlLoadRangeMany).
+// means unbounded), up to $4 of them, every kind, ascending. The lower
+// bound is the mark alone; see sqlLoadRangeMany for why no retention
+// floor is applied and why the query runs as an unnamed statement.
 const sqlLoadRange = `
 SELECT channel_serial, idx, kind, payload, summary FROM channel_messages
-WHERE channel = $1 AND channel_serial >= $4::text AND channel_serial IN (
+WHERE channel = $1 AND channel_serial > $2::text AND ($3::text = '' OR channel_serial <= $3::text) AND channel_serial IN (
 	SELECT DISTINCT channel_serial FROM channel_messages
 	WHERE channel = $1 AND channel_serial > $2::text AND ($3::text = '' OR channel_serial <= $3::text)
-	  AND channel_serial >= $4::text
 	ORDER BY channel_serial
-	LIMIT $5)
+	LIMIT $4)
 ORDER BY channel_serial, idx
 `
 
 // loadChannelMessagesAfter reads up to limit cms on channel with a
-// serial in (after, upTo] (upTo "" means unbounded) and at or above floor
-// (the channel's retention floor, rangeFloor), of every kind,
+// serial in (after, upTo] (upTo "" means unbounded), of every kind,
 // ascending, with annotation summary snapshots. The chained buses' gap
 // fill and catch-up read the log through it; unlike the History-based
 // reconcile of the pgnotify bus it includes annotation cms, which a
 // chain must see to stay unbroken.
-func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo, floor string, limit int) ([]*protocol.ChannelMessage, error) {
-	rows, err := pool.Query(ctx, sqlLoadRange, pgx.QueryExecModeExec, channel, after, upTo, floor, limit)
+func loadChannelMessagesAfter(ctx context.Context, pool *pgxpool.Pool, channel, after, upTo string, limit int) ([]*protocol.ChannelMessage, error) {
+	rows, err := pool.Query(ctx, sqlLoadRange, pgx.QueryExecModeExec, channel, after, upTo, limit)
 	if err != nil {
 		return nil, fmt.Errorf("storage/postgres: load range %s (%s, %s]: %w", channel, after, upTo, err)
 	}

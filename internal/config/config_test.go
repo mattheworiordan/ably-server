@@ -349,6 +349,9 @@ func TestExampleConfigFileDocumentsEveryField(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		tag := field.Tag.Get("toml")
+		if tag == "-" {
+			continue // set by Load, not a file key (File.Unknown)
+		}
 		if tag == "" {
 			t.Fatalf("File.%s has no toml tag; give it one or exempt it here", field.Name)
 		}
@@ -376,5 +379,31 @@ func TestDefaultInt64(t *testing.T) {
 		if (err != nil) != tc.wantErr || got != tc.want {
 			t.Errorf("DefaultInt64(%q, %d, %d) = %d, %v; want %d, err=%v", tc.env, tc.file, tc.fallback, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// TestLoadListsUnknownKeys: a key File does not define, such as a
+// removed setting (DESIGN.md §9 "Removed settings"), is not an error and
+// is listed in File.Unknown so startup can warn about it.
+func TestLoadListsUnknownKeys(t *testing.T) {
+	path := writeTOML(t, `
+mode = "cluster"
+publish-bind-on-write = true
+
+[[namespaces]]
+id = "persisted"
+persisted = true
+colour = "blue"
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.Mode != "cluster" {
+		t.Errorf("Mode = %q, want cluster", f.Mode)
+	}
+	want := []string{"publish-bind-on-write", "namespaces.colour"}
+	if !reflect.DeepEqual(f.Unknown, want) {
+		t.Errorf("Unknown = %q, want %q", f.Unknown, want)
 	}
 }

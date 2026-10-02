@@ -15,36 +15,9 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 )
 
-// Presence lease modes accepted by Options.PresenceLeaseMode (DESIGN.md
-// §12.5).
-const (
-	// PresenceLeaseNode keeps one liveness lease per node, a row in
-	// presence_nodes that the node refreshes on the bump cadence. Member
-	// rows record their owning node and an 'infinity' expires_at, and the
-	// reaper removes the members of every node that has no unexpired
-	// lease. The default.
-	PresenceLeaseNode = "node"
-	// PresenceLeaseMember keeps a lease on every member row, refreshed by
-	// one UPDATE of all of the node's rows per bump: the behaviour before
-	// node leases existed.
-	PresenceLeaseMember = "member"
-)
-
-// ParsePresenceLeaseMode validates a presence lease mode. The empty
-// string is the default, PresenceLeaseNode.
-func ParsePresenceLeaseMode(s string) (string, error) {
-	switch s {
-	case "", PresenceLeaseNode:
-		return PresenceLeaseNode, nil
-	case PresenceLeaseMember:
-		return PresenceLeaseMember, nil
-	}
-	return "", fmt.Errorf("unknown presence lease mode %q (valid: %s, %s)", s, PresenceLeaseNode, PresenceLeaseMember)
-}
-
-// reapChunk caps the members one reaper DELETE removes in node lease
-// mode, so reaping a dead node with many members never holds that many
-// row locks in one statement. A package var so tests can shrink it.
+// reapChunk caps the members one reaper DELETE removes, so reaping a
+// dead node with many members never holds that many row locks in one
+// statement. A package var so tests can shrink it.
 var reapChunk = 1000
 
 // reapLeaveConcurrency bounds the reaper's LEAVE transactions in flight
@@ -54,12 +27,12 @@ var reapChunk = 1000
 const reapLeaveConcurrency = 8
 
 // leaseBumpHook, when set (tests), runs before each lease renewal (the
-// node lease upsert or the member lease UPDATE) with the renewing node's
-// id and can fail it, as a Postgres outage would. Nil in production.
+// node lease upsert) with the renewing node's id and can fail it, as a
+// Postgres outage would. Nil in production.
 var leaseBumpHook atomic.Pointer[func(node string) error]
 
 // deadLeaseGrace is how long past its expiry a lease must be before the
-// reaper treats its node (or, in member mode, its row) as dead: one bump
+// reaper treats its node (or a legacy row's own lease) as dead: one bump
 // interval, which absorbs clock skew between nodes and a bump that is
 // late by up to one tick (DESIGN.md §12.5).
 func deadLeaseGrace() float64 { return presenceLeaseBumpInterval.Seconds() }
@@ -76,14 +49,16 @@ INSERT INTO presence_nodes (node_id, expires_at) VALUES ($1, now() + make_interv
 ON CONFLICT (node_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
 RETURNING (xmax = 0)`
 
-// sqlDeadNodes lists the nodes whose members the node-mode reaper
-// removes: every node id that owns a presence row (a skip scan over
+// sqlDeadNodes lists the nodes whose members the reaper removes: every
+// node id that owns a presence row (a skip scan over
 // presence_node_idx, one index probe per distinct owner) without a live
 // lease row, other than the fixture sentinel, plus every dead lease row,
 // so a dead node with no members left still has its row deleted. A lease
 // is dead once it has been expired for longer than $2 seconds
 // (deadLeaseGrace). A node id with no lease row at all is dead too: a
-// node takes its lease in Open before it writes any member.
+// node takes its lease in Open before it writes any member (the rows of
+// an earlier version's member-mode node, which has no lease row, are
+// still kept while their own leases run: sqlReapNodeChunk).
 const sqlDeadNodes = `
 WITH RECURSIVE owners(node_id) AS (
   (SELECT node_id FROM presence ORDER BY node_id LIMIT 1)
@@ -103,11 +78,14 @@ SELECT node_id FROM presence_nodes WHERE expires_at < now() - make_interval(secs
 // deadLeaseGrace), and returns their keys. The lease
 // is re-checked by every chunk, so a node that renews its lease part way
 // through stops being reaped. Only rows with no lease of their own
-// ('infinity', written in node mode) or a dead one are taken: a
-// member-mode node's rows carry a lease it keeps ahead of now and no
-// presence_nodes row, so a node-mode reaper must not take them while
-// that lease runs. Rows a presence write holds locked are skipped, as
-// in every lease statement, and reaped by a later chunk or round.
+// ('infinity', which every member row is written with) or a dead one are
+// taken: a node of an earlier version that ran the retired member lease
+// mode (DESIGN.md §9 "Removed settings") wrote rows with a lease of
+// their own that it keeps ahead of now and no presence_nodes row, so the
+// reaper must not take them while that lease runs. Once such a node is
+// gone and its rows' leases are dead, they are reaped like any other.
+// Rows a presence write holds locked are skipped, as in every lease
+// statement, and reaped by a later chunk or round.
 const sqlReapNodeChunk = `
 DELETE FROM presence WHERE (channel, connection_id, client_id) IN (
   SELECT channel, connection_id, client_id FROM presence
@@ -125,30 +103,8 @@ DELETE FROM presence_nodes
 WHERE node_id = $1 AND expires_at < now() - make_interval(secs => $2)
   AND NOT EXISTS (SELECT 1 FROM presence WHERE node_id = $1)`
 
-// sqlBumpMemberLeases is the member-mode lease bump: every row this node
-// owns gets a fresh expires_at.
-const sqlBumpMemberLeases = `
-UPDATE presence SET expires_at = now() + make_interval(secs => $2)
-WHERE (channel, connection_id, client_id) IN (
-  SELECT channel, connection_id, client_id FROM presence WHERE node_id = $1 FOR UPDATE SKIP LOCKED)`
-
-// sqlReapMemberLeases is the member-mode reaper: every row whose own
-// lease has been expired for longer than $1 seconds (deadLeaseGrace).
-const sqlReapMemberLeases = `
-DELETE FROM presence WHERE (channel, connection_id, client_id) IN (
-  SELECT channel, connection_id, client_id FROM presence
-  WHERE expires_at < now() - make_interval(secs => $1) FOR UPDATE SKIP LOCKED)
-RETURNING channel, connection_id, client_id`
-
-// sqlExpiredNodeLeases lists the node-mode nodes whose lease row is dead
-// (expired for longer than $1 seconds). The member-mode reaper reaps
-// their members too, so switching a cluster back to member mode does not
-// strand the 'infinity' rows of node-mode nodes that died (or closed with
-// members still owned).
-const sqlExpiredNodeLeases = `SELECT node_id FROM presence_nodes WHERE expires_at < now() - make_interval(secs => $1)`
-
-// takeNodeLease creates or renews this node's lease row (node lease
-// mode), reporting whether the row was missing.
+// takeNodeLease creates or renews this node's lease row, reporting
+// whether the row was missing.
 func (s *Storage) takeNodeLease(ctx context.Context) (created bool, err error) {
 	if hook := leaseBumpHook.Load(); hook != nil {
 		if err := (*hook)(s.node); err != nil {
@@ -160,12 +116,12 @@ func (s *Storage) takeNodeLease(ctx context.Context) (created bool, err error) {
 }
 
 // releaseNodeLease ends this node's lease, the last step of a graceful
-// Close in node lease mode. The node's connections have left by then
+// Close. The node's connections have left by then
 // (DESIGN.md §11), so it normally owns no member and its lease row is
 // deleted. A member it still owns (a delayed LEAVE the shutdown
 // abandoned) keeps the row, marked expired instead, so the next reaper
-// round on any node, in either lease mode, removes the member, publishes
-// its LEAVE and then deletes the row.
+// round on any node removes the member, publishes its LEAVE and then
+// deletes the row.
 func (s *Storage) releaseNodeLease() {
 	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 	defer cancel()
@@ -192,8 +148,7 @@ type leaseRun struct {
 	logged time.Time // when the reaper last logged a deferral
 }
 
-// begin starts a run at Open, which took the lease (node mode) or has
-// just started a node with no member rows yet (member mode).
+// begin starts a run at Open, which took the lease.
 func (r *leaseRun) begin(at time.Time) {
 	r.mu.Lock()
 	r.start, r.last = at, at
@@ -344,10 +299,9 @@ func (n *lapseNotifier) stop() {
 	n.wg.Wait()
 }
 
-// presenceLeaseBumpLoop refreshes this node's presence liveness lease on
-// the bump cadence (DESIGN.md §12.5): in node lease mode its one
-// presence_nodes row, in member lease mode the expires_at of every
-// presence row it owns. A live node thus keeps its lease ahead of now,
+// presenceLeaseBumpLoop refreshes this node's presence liveness lease,
+// its one presence_nodes row, on the bump cadence (DESIGN.md §12.5). A
+// live node thus keeps its lease ahead of now,
 // so only a dead node's members become reapable. The cadence does not
 // depend on traffic: an idle node renews as often as a busy one.
 func (s *Storage) presenceLeaseBumpLoop(ctx context.Context) {
@@ -373,15 +327,7 @@ func (s *Storage) bumpLease(ctx context.Context) {
 	// The database stamps the lease between the statement's start and its
 	// completion; leaseRun.renewed measures conservatively from both.
 	start := time.Now()
-	var (
-		created bool
-		err     error
-	)
-	if s.leaseNode {
-		created, err = s.takeNodeLease(ctx)
-	} else {
-		err = s.bumpMemberLeases(ctx)
-	}
+	created, err := s.takeNodeLease(ctx)
 	if err != nil {
 		s.leaseRun.broken()
 		if ctx.Err() == nil {
@@ -399,27 +345,8 @@ func (s *Storage) bumpLease(ctx context.Context) {
 	s.lapse.lapsed()
 }
 
-// bumpMemberLeases is the member-mode bump: one UPDATE of every row
-// this node owns.
-//
-// Rows another transaction holds locked are skipped rather than waited
-// for: that transaction is a presence write, which stamps a fresh lease
-// or deletes the row, or the reaper. A batched presence write locks
-// several rows in one transaction, so a bump that waited could deadlock
-// with it; a row skipped once is bumped next round, well inside the
-// lease window.
-func (s *Storage) bumpMemberLeases(ctx context.Context) error {
-	if hook := leaseBumpHook.Load(); hook != nil {
-		if err := (*hook)(s.node); err != nil {
-			return err
-		}
-	}
-	_, err := s.pool.Exec(ctx, sqlBumpMemberLeases, s.node, presenceLeaseWindow.Seconds())
-	return err
-}
-
 // presenceReaperLoop periodically removes the members of dead nodes
-// (DESIGN.md §12.5). See reapDeadNodes and reapExpiredMembers. A round
+// (DESIGN.md §12.5). See reapDeadNodes. A round
 // runs only while this node itself holds an unbroken lease of at least
 // one window (leaseRun.reapable).
 func (s *Storage) presenceReaperLoop(ctx context.Context) {
@@ -434,11 +361,7 @@ func (s *Storage) presenceReaperLoop(ctx context.Context) {
 			if !s.mayReap() {
 				continue
 			}
-			if s.leaseNode {
-				s.reapDeadNodes(ctx)
-			} else {
-				s.reapExpiredMembers(ctx)
-			}
+			s.reapDeadNodes(ctx)
 		}
 	}
 }
@@ -460,7 +383,7 @@ func (s *Storage) mayReap() bool {
 // reapedMember is a presence row the reaper deleted, owed a LEAVE.
 type reapedMember struct{ channel, connID, clientID string }
 
-// reapDeadNodes is the node-mode reaper: for each node with no live
+// reapDeadNodes is the reaper: for each node with no live
 // lease it deletes all of the node's members in chunks, then publishes
 // their LEAVEs and deletes the node's lease row (reapNode). When several
 // nodes reap the same dead node at once, the row lock each DELETE takes
@@ -507,8 +430,8 @@ func (s *Storage) reapNodes(ctx context.Context, sql string, args ...any) {
 // reapNode deletes dead node id's members chunk by chunk, then
 // publishes their LEAVEs and drops the node's lease row once it owns no
 // member. Every chunk is deleted before the first LEAVE is published, so
-// the whole set leaves the presence table within one reaper round, as a
-// member-mode reap does, rather than at LEAVE-publish speed.
+// the whole set leaves the presence table within one reaper round rather
+// than at LEAVE-publish speed.
 func (s *Storage) reapNode(ctx context.Context, id string) {
 	var reaped []reapedMember
 	for {
@@ -533,26 +456,6 @@ func (s *Storage) reapNode(ctx context.Context, id string) {
 	if len(reaped) > 0 {
 		s.logger.Info("storage/postgres: reaped the presence members of a dead node", "node", id, "members", len(reaped))
 	}
-}
-
-// reapExpiredMembers is the member-mode reaper: it deletes every row
-// whose own lease is dead in one statement and synthesises a LEAVE for
-// each. Rows another transaction holds locked are skipped (a presence
-// write is renewing or removing them), as in the lease bump, so the
-// reaper cannot deadlock with a batched presence write; a row still
-// lapsed is reaped next round. It then reaps the members of node-mode
-// nodes whose lease row is dead (none in a cluster that only ever ran
-// member mode).
-func (s *Storage) reapExpiredMembers(ctx context.Context) {
-	members, err := s.deleteReturning(ctx, sqlReapMemberLeases, deadLeaseGrace())
-	if err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("storage/postgres: presence reap query failed", "err", err)
-		}
-		return
-	}
-	s.publishReapedLeaves(ctx, members)
-	s.reapNodes(ctx, sqlExpiredNodeLeases, deadLeaseGrace())
 }
 
 // reapStatementTimeout bounds every reaper DELETE, server side: half a

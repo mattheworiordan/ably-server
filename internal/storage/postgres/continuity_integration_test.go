@@ -213,10 +213,10 @@ func TestNATSBusSweepPastRetentionSignalsDiscontinuity(t *testing.T) {
 }
 
 // TestPGNotifyListenOutageLongerThanRetentionSignalsDiscontinuity: the
-// pgnotify bus (the default) has no sweep and reconciles from history
+// pgnotify bus has no sweep and reconciles from history
 // after a LISTEN reconnect. With the LISTEN connection down for longer
 // than retention, the reconcile signals one discontinuity, so a node's
-// local presence member set (--presence-sync-source=local, §12.4) is
+// local presence member set (§12.4) is
 // re-seeded rather than served stale. A quiet channel is not told.
 func TestPGNotifyListenOutageLongerThanRetentionSignalsDiscontinuity(t *testing.T) {
 	// A long first backoff holds the LISTEN connection down while the gap

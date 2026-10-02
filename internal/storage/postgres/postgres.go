@@ -17,7 +17,7 @@
 // Cross-node delivery sits behind a Bus (bus.go, DESIGN.md §7.2),
 // selected by Options.Bus:
 //
-//   - pgnotify (the default, pgnotify.go): the publish transaction
+//   - pgnotify (Options.Bus's zero value, pgnotify.go): the publish transaction
 //     NOTIFYs the one global channel "ably_channel"; a LISTEN goroutine
 //     on every node reads each cm back by (channel, serial) and delivers
 //     it to the channel's appender.
@@ -85,8 +85,8 @@ var (
 )
 
 // Presence liveness lease + dead-node reaper timings (DESIGN.md
-// §12.5). presenceLeaseWindow is how long a lease (a node's, or in
-// member lease mode a member row's) is valid without a refresh;
+// §12.5). presenceLeaseWindow is how long a node's lease is valid
+// without a refresh;
 // presenceLeaseBumpInterval is the cadence at which a live node renews
 // it (comfortably shorter than the window so a live node's members
 // never expire); and presenceReaperInterval is how often each node
@@ -116,10 +116,8 @@ var (
 )
 
 // fixtureNodeID is the sentinel owner recorded on static fixture presence
-// rows (DESIGN.md §9, §12.5). It is not a real node id, so no live node's
-// member-mode lease bump (WHERE node_id = $node) ever touches these rows,
-// and the reapers of both lease modes leave rows with this owner and an
-// 'infinity' lease alone.
+// rows (DESIGN.md §9, §12.5). It is not a real node id and has no lease
+// row, and the reaper leaves rows with this owner alone.
 const fixtureNodeID = "__fixtures__"
 
 // DefaultPostgresSweepInterval is the postgres bus's default watermark
@@ -151,11 +149,20 @@ type Options struct {
 	Logger *logging.Logger
 
 	// Bus selects the cross-node delivery mechanism (DESIGN.md §7.2):
-	// BusPGNotify (the default; the shipped LISTEN/NOTIFY broker),
-	// BusPostgres (per-channel LISTEN, transactional or coalesced) or
-	// BusNATS (NATS core pub/sub). Empty means BusPGNotify. Postgres is
-	// the store whichever bus is chosen.
+	// BusPGNotify (the first-shipped LISTEN/NOTIFY broker), BusPostgres
+	// (per-channel LISTEN, transactional or coalesced) or BusNATS (NATS
+	// core pub/sub). Empty means BusPGNotify, for this package's callers;
+	// the server always sets it, inferring postgres or nats when --bus is
+	// unset. Postgres is the store whichever bus is chosen.
 	Bus string
+
+	// BusInferred reports that the server inferred Bus because --bus was
+	// unset (DESIGN.md §7.2, §11). A database that already holds
+	// channels but has no cluster identity record served an earlier
+	// version, whose nodes ran pgnotify when --bus was unset; Open then
+	// refuses to record an inferred bus, since the upgraded nodes would
+	// not deliver to the ones still running.
+	BusInferred bool
 
 	// NATSURL is the NATS server URL for BusNATS; a comma-separated list
 	// of the servers of one NATS cluster is accepted. Required when Bus
@@ -193,17 +200,12 @@ type Options struct {
 	NotifyMaxPending int
 
 	// SweepInterval is how often a chaining bus (BusPostgres, BusNATS)
-	// compares every bound channel's delivery mark with its committed
-	// serial and catches up a channel that has fallen behind. Zero means
+	// compares the delivery mark of every bound channel with a subscriber
+	// on this node (storage.SubscriberReporter) with its committed serial
+	// and catches up a channel that has fallen behind. Zero means
 	// the bus's default: DefaultPostgresSweepInterval or
 	// DefaultNATSSweepInterval.
 	SweepInterval time.Duration
-
-	// SweepScope selects the bound channels the watermark sweep reads
-	// (DESIGN.md §7.2): SweepSubscribed, only those whose appender reports
-	// a subscriber on this node (storage.SubscriberReporter), or
-	// SweepBound, every bound channel. Empty means SweepSubscribed.
-	SweepScope string
 
 	// Retention configures how long the message log keeps each class of
 	// channel (DESIGN.md §6.3). The zero value applies the defaults.
@@ -222,37 +224,17 @@ type Options struct {
 
 	// Batching configures leading-edge publish batching (DESIGN.md
 	// §6.3). The zero value (Lanes 0) commits every publish in its own
-	// transaction; the server enables 4 lanes by default.
+	// transaction; the server enables DefaultPublishLanes (2) by default.
 	Batching Batching
-
-	// BindOnWrite restores how channel rows were made before the
-	// write-only publish path (the server's --publish-bind-on-write,
-	// DESIGN.md §6.3): every bind runs ensure_channel, and a batched
-	// publish through a store that has not seen its row creates the row
-	// in a statement of its own before it is queued. False (the default)
-	// leaves a missing row to the batch transaction's publish_batch_lock
-	// and lets a bind read a row this node knows exists (rowCache)
-	// without ensure_channel.
-	BindOnWrite bool
 
 	// PresenceMaxInflight bounds the presence writes this Storage runs
 	// in their own transaction at once (those not batched, DESIGN.md
 	// §12.5), so a convoy on one room's row lock cannot hold the whole
 	// pool; a presence write beyond it fails at once with
 	// storage.ErrOverloaded. Zero means DefaultPresenceInflightPerLane x
-	// Batching.Lanes (x DefaultPublishLanes when batching is off);
-	// negative means no bound.
+	// Batching.Lanes, or DefaultPresenceInflightNoLanes when batching is
+	// off; negative means no bound.
 	PresenceMaxInflight int
-
-	// PresenceLeaseMode selects how presence liveness is leased
-	// (DESIGN.md §12.5): PresenceLeaseNode, one lease row per node that
-	// the node renews, or PresenceLeaseMember, a lease on every member
-	// row that the node renews with one UPDATE of all its rows. Empty
-	// means PresenceLeaseNode. Every node sharing a database should run
-	// the same mode; each mode's reaper removes the other's rows of dead
-	// nodes and leaves the other's live ones alone, so a rolling switch
-	// is safe.
-	PresenceLeaseMode string
 
 	// OnPresenceLeaseLapse, when set, is called after this node finds its
 	// presence lease had lapsed (DESIGN.md §12.5): another node may have
@@ -307,7 +289,6 @@ type Storage struct {
 	dsn       string         // retained so a LISTEN goroutine can re-dial on drop
 	series    string         // per-process seriesId, embedded in every minted channelSerial
 	node      string         // per-process node id, owning presence rows for the liveness lease (§12.5)
-	leaseNode bool           // PresenceLeaseNode: liveness is the node's presence_nodes row (§12.5)
 	leaseRun  leaseRun       // this node's own lease renewals, for the reaper guard (§12.5)
 	lmetrics  *leaseMetrics  // ably_presence_* liveness series
 	lapse     *lapseNotifier // calls Options.OnPresenceLeaseLapse; nil when unset
@@ -324,17 +305,14 @@ type Storage struct {
 	metrics   *retentionMetrics
 	lanes     *laneSet // publish batching; nil when off (§6.3)
 	wmetrics  *writeMetrics
-	// bindOnWrite is Options.BindOnWrite; rows remembers channels known to
-	// have a row (nil when bindOnWrite). ensureCalls and rowReads count the
-	// binds that ran ensure_channel and those that read a known row
-	// (ably_storage_channel_binds_total{source}).
-	bindOnWrite           bool
+	// rows remembers channels known to have a row. ensureCalls and
+	// rowReads count the binds that ran ensure_channel and those that read
+	// a known row (ably_storage_channel_binds_total{source}).
 	rows                  *rowCache
 	ensureCalls, rowReads atomic.Uint64
 
-	// presenceLanes is lanes when presence is batched too, else nil;
-	// presenceSlots bounds unbatched presence writes (nil: unbounded).
-	presenceLanes *laneSet
+	// presenceSlots bounds the presence writes committed outside the
+	// lanes (nil: unbounded).
 	presenceSlots chan struct{}
 	// clockOffset is the database clock minus this node's, in ms, as of
 	// the last sweep; RetainedSince applies it (§4.3).
@@ -355,7 +333,6 @@ type Storage struct {
 
 	reconnectBase, reconnectMax time.Duration // LISTEN re-dial backoff, copied at Open
 	sweepInterval               time.Duration // chaining buses' watermark sweep
-	sweepAll                    bool          // sweep every bound channel, not only subscribed ones
 	timing                      chainTiming   // gap-fill tuning, snapshotted by Open
 	catchUpSlots                chan struct{} // bounds batched catch-up queries in flight on the node (chain.go)
 	reconcileJitter             time.Duration // cap on the wait before a reconnect reconcile, copied at Open
@@ -393,14 +370,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		if mode, err = ParseNotifyMode(string(opts.NotifyMode)); err != nil {
 			return nil, fmt.Errorf("storage/postgres: %w", err)
 		}
-	}
-	sweepScope, err := ParseSweepScope(opts.SweepScope)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: %w", err)
-	}
-	leaseMode, err := ParsePresenceLeaseMode(opts.PresenceLeaseMode)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: %w", err)
 	}
 	node := opts.nodeID
 	if node == "" {
@@ -464,7 +433,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 			message:             retention.Message,
 			persisted:           retention.Persisted,
 			persistedNamespaces: normalizeNamespaces(opts.PersistedNamespaces),
-		})
+		}, opts.BusInferred)
 		if err != nil {
 			pool.Close()
 			return nil, fmt.Errorf("storage/postgres: %w", err)
@@ -490,7 +459,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		dsn:             opts.DSN,
 		series:          serial.NewSeriesID(),
 		node:            node,
-		leaseNode:       leaseMode == PresenceLeaseNode,
 		logger:          logger,
 		shard:           slot,
 		ident:           ident,
@@ -499,7 +467,6 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		reconnectBase:   listenReconnectBaseDelay,
 		reconnectMax:    listenReconnectMaxDelay,
 		sweepInterval:   opts.SweepInterval,
-		sweepAll:        sweepScope == SweepBound,
 		timing:          currentChainTiming(),
 		reconcileJitter: reconcileJitterMax,
 		retention:       retention,
@@ -509,7 +476,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		metrics:         newRetentionMetrics(),
 		wmetrics:        newWriteMetrics(),
 		lmetrics:        newLeaseMetrics(),
-		bindOnWrite:     opts.BindOnWrite,
+		rows:            newRowCache(rowCacheSize),
 		channels:        make(map[string]*channelStore),
 		reconcileCh:     make(chan struct{}, 1),
 		loopCtx:         loopCtx,
@@ -539,13 +506,11 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	}
 
 	leaseStart := time.Now()
-	if s.leaseNode {
-		// Take the node's lease before any presence write can run: the
-		// node-mode reaper treats the members of a node without a lease
-		// as orphans (DESIGN.md §12.5).
-		if _, err := s.takeNodeLease(ctx); err != nil {
-			return fail(fmt.Errorf("storage/postgres: take presence lease: %w", err))
-		}
+	// Take the node's lease before any presence write can run: the reaper
+	// treats the members of a node without a lease as orphans (DESIGN.md
+	// §12.5).
+	if _, err := s.takeNodeLease(ctx); err != nil {
+		return fail(fmt.Errorf("storage/postgres: take presence lease: %w", err))
 	}
 	// The reaper guard counts this node's unbroken lease from here: it
 	// reaps nothing for one lease window after Open (§12.5).
@@ -598,15 +563,9 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 
 	if batching.enabled() {
 		s.lanes = newLaneSet(batching, s, s.wmetrics)
-		if !batching.PresenceUnbatched {
-			s.presenceLanes = s.lanes
-		}
 	}
 	if n := presenceMaxInflight(opts.PresenceMaxInflight, batching); n > 0 {
 		s.presenceSlots = make(chan struct{}, n)
-	}
-	if !s.bindOnWrite {
-		s.rows = newRowCache(rowCacheSize)
 	}
 
 	s.wg.Add(3)
@@ -674,7 +633,6 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if err != nil {
 		return fail(unavailable(err))
 	}
-	cs.rowEnsured.Store(true)
 	if hook := channelBindHook.Load(); hook != nil {
 		(*hook)("ensured")
 	}
@@ -776,20 +734,19 @@ func (s *Storage) Release(_ context.Context, name string) error {
 // storage-only or transient store).
 func (s *Storage) newChannelStore(name string, appender storage.Appender) *channelStore {
 	cs := &channelStore{
-		pool:      s.pool,
-		series:    s.series,
-		node:      s.node,
-		leaseNode: s.leaseNode,
-		name:      name,
-		appender:  appender,
-		bus:       s.bus,
-		logger:    s.logger,
-		done:      s.done,
-		ctx:       s.loopCtx,
-		timing:    s.timing,
-		stats:     &s.stats,
+		pool:     s.pool,
+		series:   s.series,
+		node:     s.node,
+		name:     name,
+		appender: appender,
+		bus:      s.bus,
+		logger:   s.logger,
+		done:     s.done,
+		ctx:      s.loopCtx,
+		timing:   s.timing,
+		stats:    &s.stats,
 	}
-	cs.preInsertRow, cs.rows = s.bindOnWrite, s.rows
+	cs.rows = s.rows
 	if s.busKind == BusPostgres {
 		cs.pgChan = pgChannelName(s.namespace, name)
 	}
@@ -797,16 +754,22 @@ func (s *Storage) newChannelStore(name string, appender storage.Appender) *chann
 		cs.ready = make(chan struct{})
 	}
 	s.setRetention(cs)
-	cs.presenceLanes, cs.presenceSlots, cs.wmetrics = s.presenceLanes, s.presenceSlots, s.wmetrics
+	cs.presenceSlots, cs.wmetrics = s.presenceSlots, s.wmetrics
 	return cs
 }
 
-// DefaultPresenceInflightPerLane is the default bound on unbatched
-// presence writes per publish lane (Options.PresenceMaxInflight).
-const DefaultPresenceInflightPerLane = 4
+// DefaultPresenceInflightPerLane is the default bound on presence writes
+// outside the lanes per publish lane, and DefaultPresenceInflightNoLanes
+// the default with batching off (Options.PresenceMaxInflight). The
+// second is a number of its own, not a multiple of DefaultPublishLanes,
+// so the lane default does not move it.
+const (
+	DefaultPresenceInflightPerLane = 4
+	DefaultPresenceInflightNoLanes = 16
+)
 
 // presenceMaxInflight resolves Options.PresenceMaxInflight: the bound
-// on unbatched presence writes, or 0 for none.
+// on presence writes committed outside the lanes, or 0 for none.
 func presenceMaxInflight(n int, b Batching) int {
 	switch {
 	case n < 0:
@@ -816,7 +779,7 @@ func presenceMaxInflight(n int, b Batching) int {
 	case b.enabled():
 		return DefaultPresenceInflightPerLane * b.Lanes
 	default:
-		return DefaultPresenceInflightPerLane * DefaultPublishLanes
+		return DefaultPresenceInflightNoLanes
 	}
 }
 
@@ -845,10 +808,9 @@ func (s *Storage) boundStores() []*channelStore {
 }
 
 // Close stops the background goroutines (the bus and the presence
-// lease-bump and reaper loops), in node lease mode deletes the node's
-// presence lease row (DESIGN.md §12.5), closes the bus and releases the
-// pool. A LISTEN goroutine owns closing its own conn, so Close only
-// cancels and waits.
+// lease-bump and reaper loops), deletes the node's presence lease row
+// (DESIGN.md §12.5), closes the bus and releases the pool. A LISTEN
+// goroutine owns closing its own conn, so Close only cancels and waits.
 func (s *Storage) Close() error { return s.close(true) }
 
 // close is Close; graceful false skips the lease release, leaving the
@@ -864,7 +826,7 @@ func (s *Storage) close(graceful bool) error {
 		s.cancel()
 		s.stopGapTimers()
 		s.wg.Wait()
-		if graceful && s.leaseNode {
+		if graceful {
 			s.releaseNodeLease()
 		}
 		s.bus.close()
@@ -917,8 +879,8 @@ func (s *Storage) Collectors() []prometheus.Collector {
 
 // Ping reports whether the node can serve cluster traffic: the Postgres
 // pool is reachable, the bus is ready (the nats bus is not ready while
-// disconnected from NATS, the postgres bus while its LISTEN connection
-// is down), and every publish lane is completing its batches
+// disconnected from NATS, the postgres and pgnotify buses while their
+// LISTEN connection is down), and every publish lane is completing its batches
 // (laneSet.health). It satisfies storage.Pinger, backing the /readyz
 // check in cluster mode (DESIGN.md §2.2, §7.2, §11).
 func (s *Storage) Ping(ctx context.Context) error {
@@ -1255,16 +1217,13 @@ type channelStore struct {
 	node     string
 	name     string
 	appender storage.Appender
-	// leaseNode is the owning Storage's leaseNode: member rows get an
-	// 'infinity' lease, their node's lease being the one that counts.
-	leaseNode bool
-	bus       Bus
-	logger    *logging.Logger
-	done      <-chan struct{} // the owning Storage's shutdown signal
-	ctx       context.Context // the owning Storage's loop context (nil in unit-test stubs)
-	timing    chainTiming
-	stats     *busStats // the owning Storage's bus counters (nil in unit tests)
-	pgChan    string    // the postgres bus's notification channel (pgChannelName)
+	bus      Bus
+	logger   *logging.Logger
+	done     <-chan struct{} // the owning Storage's shutdown signal
+	ctx      context.Context // the owning Storage's loop context (nil in unit-test stubs)
+	timing   chainTiming
+	stats    *busStats // the owning Storage's bus counters (nil in unit tests)
+	pgChan   string    // the postgres bus's notification channel (pgChannelName)
 
 	// persisted selects the channel's retention class: the value of the
 	// persisted partition key on every row it writes (DESIGN.md §6.3).
@@ -1273,25 +1232,20 @@ type channelStore struct {
 	// retention floor over rows a migration left in the live class. All
 	// feed RetainedSince and the idempotency window.
 	persisted bool
-	// lanes is the storage's publish batcher, nil when batching is off
-	// (DESIGN.md §6.3); rowEnsured records that this channel's channels
-	// row is known to exist. preInsertRow (Options.BindOnWrite) makes a
-	// batched publish create a missing row in its own statement before it
-	// is queued, so the batch never has to; otherwise publish_batch_lock
-	// creates it inside the batch.
-	lanes        *laneSet
-	rowEnsured   atomic.Bool
-	preInsertRow bool
-	rows         *rowCache // the storage's known-row cache (nil under BindOnWrite)
-	retention    time.Duration
-	clock        *atomic.Int64
-	floorMin     string
+	// lanes is the storage's publish batcher, shared by message and
+	// presence publishes, nil when batching is off (DESIGN.md §6.3,
+	// §12.5); a batched publish on a channel with no row yet
+	// creates it inside its batch (publish_batch_lock). rows is the
+	// storage's known-row cache.
+	lanes     *laneSet
+	rows      *rowCache
+	retention time.Duration
+	clock     *atomic.Int64
+	floorMin  string
 
-	// presenceLanes is lanes when presence operations are batched too
-	// (nil otherwise); presenceSlots bounds the presence operations this
-	// Storage runs in their own transaction at once (nil: no bound). Both
-	// DESIGN.md §12.5.
-	presenceLanes *laneSet
+	// presenceSlots bounds the presence operations this Storage runs in
+	// their own transaction at once, outside the lanes (nil: no bound;
+	// DESIGN.md §12.5).
 	presenceSlots chan struct{}
 	wmetrics      *writeMetrics
 
@@ -1341,6 +1295,10 @@ type channelStore struct {
 	gapBackoff     time.Duration
 	overflowArmed  bool   // a forced fill is armed after a hold overflow
 	sweptWatermark string // the channel's watermark at the previous sweep
+	// sweptAt is the database time (clockSerial) of the last sweep that
+	// read the channel's row, or proved the channel with the row absent
+	// (sweepWatermarks).
+	sweptAt string
 
 	// Delivery counters for tests (guarded by hwmMu).
 	delivered, duplicates, held, gapFills, sweepCatchUps, holdOverflows int
@@ -1726,8 +1684,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		return nil, false, err
 	}
 
-	if cs.presenceLanes != nil {
-		return cs.storePresenceBatched(ctx, cs.presenceLanes, presence)
+	if cs.lanes != nil {
+		return cs.storePresenceBatched(ctx, cs.lanes, presence)
 	}
 	if storage.IsPresenceReentry(ctx) {
 		// A lease-lapse re-entry skips members still present (§12.5).
@@ -1821,9 +1779,7 @@ func (cs *channelStore) storePresenceTx(ctx context.Context, presence []*protoco
 		default: // Enter, Update, Present
 			if static {
 				// Static fixture member (DESIGN.md §9, §12.5): a sentinel
-				// owner and an 'infinity' lease so no lease-bump loop claims
-				// it and neither lease mode's reaper deletes it (both skip
-				// the sentinel owner). It belongs to no connection, so nothing ever
+				// owner, which has no lease row and which the reaper skips. It belongs to no connection, so nothing ever
 				// synthesises a LEAVE for it.
 				if _, err := tx.Exec(ctx,
 					`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
@@ -1839,21 +1795,19 @@ func (cs *channelStore) storePresenceTx(ctx context.Context, presence []*protoco
 				}
 				break
 			}
-			// Stamp the owning node (§12.5) and, in member lease mode,
-			// a fresh lease that this node's bump loop keeps ahead while
-			// it lives. In node lease mode the row's liveness is its
+			// Stamp the owning node (§12.5). The row's liveness is its
 			// node's lease, so the row's own is 'infinity'. If the node
 			// dies, the reaper on another node deletes the row once the
-			// lease lapses and emits a synthetic LEAVE.
+			// node's lease lapses and emits a synthetic LEAVE.
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $8 THEN 'infinity'::timestamptz ELSE now() + make_interval(secs => $7) END)
+				 VALUES ($1, $2, $3, $4, $5, $6, 'infinity')
 				 ON CONFLICT (channel, connection_id, client_id)
 				 DO UPDATE SET channel_serial = EXCLUDED.channel_serial,
 				               payload = EXCLUDED.payload,
 				               node_id = EXCLUDED.node_id,
 				               expires_at = EXCLUDED.expires_at`,
-				cs.name, p.ConnectionID, p.ClientID, channelSerial, payload, cs.node, presenceLeaseWindow.Seconds(), cs.leaseNode,
+				cs.name, p.ConnectionID, p.ClientID, channelSerial, payload, cs.node,
 			); err != nil {
 				return nil, false, fmt.Errorf("storage/postgres: presence upsert: %w", err)
 			}

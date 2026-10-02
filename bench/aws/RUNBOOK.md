@@ -242,9 +242,9 @@ Optional, with defaults:
 | `DB_POOL_SIZE`, `MAX_NODES` | 50, 20 | Size `max_connections` (`MAX_NODES x DB_POOL_SIZE + 300`). |
 | `SHARDS` | 1 | Run 8: number of Postgres instances per storage type. |
 | `ACTIVE_STORAGE` | first created | Which storage type the nodes use (`io2` or `gp3`). |
-| `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag, for the shipped image in run 1a). |
+| `BUS` | `nats` | `nats`, `postgres`, `pgnotify`, or `none` (no `--bus` flag: the shipped image in run 1a runs `pgnotify`; a current image infers `postgres`, as `none` passes no NATS URL, DESIGN.md §7.2). The database records the bus the first node ran, and a node on another bus is refused at startup (DESIGN.md §11): see "Changing the bus or the retentions between runs" in section 5.5. |
 | `SERVER_TAG`, `LOADGEN_TAG` | from STATE | Image tags in the registry. |
-| `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). The proof ran with `--publish-lanes=2`: set `ABLY_SERVER_EXTRA_FLAGS="--publish-lanes=2"` to reproduce it. Empty means the code default, which differs (4 on this branch, DESIGN.md §6.3): with 10 to 20 nodes each lane finds little queued, so fewer lanes per node give deeper batches at the same write rate, while a smaller fleet may prefer the default. The run's `summary.md` prints the lane count the nodes reported (`ably_publish_lanes`); quote that, not this table. |
+| `ABLY_SERVER_EXTRA_FLAGS` | empty | Extra node flags (write path, connection layer). The day-two proof ran with `--publish-lanes=2`, which is the code default on the hardened code (DESIGN.md §6.3 "How many lanes"), so empty reproduces it there; every image the proof ran had a default of 4, so set `ABLY_SERVER_EXTRA_FLAGS="--publish-lanes=2"` to pin it against such an image. Keep lanes x nodes near 20 per primary: with more nodes, fewer lanes per node give deeper batches at the same write rate. The run's `summary.md` prints the lane count the nodes reported (`ably_publish_lanes`); quote that, not this table. |
 | `NODE_GOMAXPROCS`, `NODE_GOMEMLIMIT` | unset, `13GiB` | Go runtime settings on the nodes. |
 | `NATS_IP_OFFSET`, `NATS_IMAGE` | 10, `nats:2.11` | NATS servers take the addresses from this offset in the subnet. Every third party image name (`PG_IMAGE`, `PGBENCH_IMAGE`, `NATS_IMAGE`, ...) is resolved through `BASE_IMAGE_REGISTRY`. |
 | `LOADGEN_CMD`, `PUBLISHER_CMD`, `CONDUCTOR_CMD` | see section 7 | The commands run in the `ably-loadgen` image. |
@@ -443,8 +443,8 @@ need next: `bench/aws/80-terminate.sh --yes` (keeps the security group), or
     BUS=nats bench/aws/40-nodes.sh                    # NODE_COUNT nodes
     bench/aws/50-loadgen.sh                           # generators, publishers, conductor, Prometheus, Grafana
 
-`40-nodes.sh` needs a server image that knows `--bus` and `--nats-url` (the
-integration branch). Boxes take about five minutes to finish cloud-init; the
+`40-nodes.sh` needs a server image that knows `--bus` and `--nats-url` (any
+image after `main` at `90dfa15`). Boxes take about five minutes to finish cloud-init; the
 scripts wait for it (`SKIP_BOOT_WAIT=1` to skip).
 
 Check the fleet is up:
@@ -475,6 +475,14 @@ these (the conductor's summary in `results/<run-id>/` has the numbers):
 8. Memory is flat after the ramp (Grafana, "Node process memory").
 
 Record the result in `LOG_FILE` and start the next run only when all eight hold.
+The conductor's own gates are stricter than this list and decide the
+verdict in `summary.md`: deliveries at least 99% of plan outside a fault,
+every generator and publisher box under 70% CPU, every box's clock within
+5 ms of NTP, no unresolved publishes and retries under 1%, coverage of the
+attach-point and tail checks, and, for presence runs, the member-set
+check (bench/aws/README.md, "Pass criteria"). A run that fails one of
+these is not fit to quote, whatever the eight above say. The results
+quoted in RESULTS.md were judged by the earlier, weaker gates.
 
 ### 5.5 Runs
 
@@ -491,6 +499,18 @@ these settings; change the settings, then run the scenario:
 | 6 presence | the presence scenario, `RUN_TIME_LIMIT=30m` |
 | 7 node curve | `NODE_COUNT=5 SCALE_DOWN=1 bench/aws/40-nodes.sh`, then 10, then 20; re-run `55-observability.sh` after each change |
 | 8 shard curve | `SHARDS=3 PG_STORAGE=io2 bench/aws/20-postgres.sh` and `RECONFIGURE=1` with the sharding flag in `ABLY_SERVER_EXTRA_FLAGS` |
+
+**Changing the bus or the retentions between runs.** The first node to
+open a database records its bus, retentions and persisted namespaces in
+`cluster_identity`, and every later node must match (DESIGN.md §11). So
+`BUS=postgres RECONFIGURE=1` against a database that nats nodes have
+already used is refused at startup, with a message naming the
+difference and the `UPDATE` that changes it. Between runs on different
+buses or retentions, start from a fresh database (drop and recreate it,
+in every shard), or stop every node, run the printed `UPDATE` in every
+shard's schema and then reconfigure. A fresh database per run is also
+what the quoted results used. The shard list is fixed the same way
+(`shard_identity`): a run with another `SHARDS` needs fresh databases.
 
 Watch a run from your machine through an SSH tunnel (the UIs listen on the
 conductor's loopback only). The snippets here and in section 6 read `PROJECT_TAG` and

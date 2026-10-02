@@ -67,7 +67,6 @@ const (
 	pgNotifyWindowEnv  = "ABLY_SERVER_POSTGRES_NOTIFY_WINDOW"
 	pgNotifyMaxPendEnv = "ABLY_SERVER_POSTGRES_NOTIFY_MAX_PENDING"
 	busSweepEnv        = "ABLY_SERVER_BUS_SWEEP_INTERVAL"
-	busSweepScopeEnv   = "ABLY_SERVER_BUS_SWEEP_SCOPE"
 	channelIdleEnv     = "ABLY_SERVER_CHANNEL_IDLE_TIMEOUT"
 	connOutboundEnv    = "ABLY_SERVER_CONN_OUTBOUND_MAX_BYTES"
 	connWriteTOEnv     = "ABLY_SERVER_CONN_WRITE_TIMEOUT"
@@ -84,15 +83,23 @@ const (
 	publishLanesEnv     = "ABLY_SERVER_PUBLISH_LANES"
 	publishBatchMaxEnv  = "ABLY_SERVER_PUBLISH_BATCH_MAX"
 	publishLingerMaxEnv = "ABLY_SERVER_PUBLISH_LINGER_MAX"
-	publishLingerMinEnv = "ABLY_SERVER_PUBLISH_LINGER_MIN"
 	publishQueueMaxEnv  = "ABLY_SERVER_PUBLISH_QUEUE_MAX"
-	publishBindEnv      = "ABLY_SERVER_PUBLISH_BIND_ON_WRITE"
 
-	presenceSyncSourceEnv  = "ABLY_SERVER_PRESENCE_SYNC_SOURCE"
-	presenceBatchingEnv    = "ABLY_SERVER_PRESENCE_BATCHING"
 	presenceMaxInflightEnv = "ABLY_SERVER_PRESENCE_MAX_INFLIGHT"
-	presenceLeaseModeEnv   = "ABLY_SERVER_PRESENCE_LEASE_MODE"
 )
+
+// removedEnv are the env vars of the settings retired after the scale
+// proof (DESIGN.md §9 "Removed settings"). Nothing reads them; one that
+// is set is named in a startup warning, as a removed TOML key is, rather
+// than ignored silently.
+var removedEnv = []string{
+	"ABLY_SERVER_PUBLISH_BIND_ON_WRITE",
+	"ABLY_SERVER_BUS_SWEEP_SCOPE",
+	"ABLY_SERVER_PUBLISH_LINGER_MIN",
+	"ABLY_SERVER_PRESENCE_SYNC_SOURCE",
+	"ABLY_SERVER_PRESENCE_BATCHING",
+	"ABLY_SERVER_PRESENCE_LEASE_MODE",
+}
 
 // DefaultHTTPIdleTimeout is how long the HTTP server keeps an idle
 // keep-alive connection open waiting for the next request (DESIGN.md
@@ -126,10 +133,33 @@ type Opts struct {
 	DebugReady chan<- net.Addr
 }
 
-// Run executes the server and returns the process exit code. All
-// inputs are passed via Opts so the function is testable without
-// touching package-level state.
-func Run(ctx context.Context, opts Opts) int {
+// settings is Run's resolved configuration: every flag, env var and
+// config file key after precedence (flag > env > file > default),
+// validation and option assembly, before anything is opened or bound.
+// It is split from Run so a test can check where a setting lands
+// (TestSettingsReachOptions) without starting a server.
+type settings struct {
+	logger *logging.Logger
+	file   config.File
+	keys   []auth.APIKey
+
+	mode, dataDir, listen, debugListen, addrFile string
+	logLevel, logFormat                          string
+	enableStatsStub                              bool
+	shutdownGrace, hbInterval, remainPresentFor  time.Duration
+	httpIdleTimeout                              time.Duration
+	fanoutWorkers, fanoutThreshold               int // fan-out pool (DESIGN.md §5.1); core.Options.FanoutPool is built by Run
+
+	cluster        clusterOptions // storage settings; postgresOptions resolves the bus
+	core           core.Options   // Metrics is set by Run
+	appendTracking realtime.AppendTracking
+	connLimits     realtime.ConnLimits
+}
+
+// resolveSettings parses opts into settings. On failure it has written
+// the reason to opts.Out (or the logger) and returns nil and the exit
+// code: 2 for a malformed flag or value, 1 otherwise.
+func resolveSettings(opts Opts) (*settings, int) {
 	// The config file's path must be known before the flags it seeds
 	// are defined below, so it's resolved by hand (flag > env) ahead
 	// of the real flag.Parse pass. --config is still registered as a
@@ -144,7 +174,7 @@ func Run(ctx context.Context, opts Opts) int {
 		f, err := config.Load(configPath)
 		if err != nil {
 			fmt.Fprintln(opts.Out, err)
-			return 1
+			return nil, 1
 		}
 		file = *f
 	}
@@ -152,127 +182,112 @@ func Run(ctx context.Context, opts Opts) int {
 	shutdownGraceDefault, err := config.DefaultDuration(opts.Getenv(shutdownGraceEnv), file.ShutdownGrace, 10*time.Second)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	channelIdleDefault, err := config.DefaultDuration(opts.Getenv(channelIdleEnv), file.ChannelIdleTimeout, core.DefaultChannelIdleTimeout)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	connWriteTimeoutDefault, err := config.DefaultDuration(opts.Getenv(connWriteTOEnv), file.ConnWriteTimeout, realtime.DefaultConnWriteTimeout)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	connOutboundDefault, err := config.DefaultInt64(opts.Getenv(connOutboundEnv), file.ConnOutboundMaxBytes, realtime.DefaultConnOutboundMaxBytes)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	wsReadBufDefault, err := config.DefaultInt64(opts.Getenv(wsReadBufEnv), file.WSReadBufferSize, realtime.DefaultWSReadBufferSize)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	wsWriteBufDefault, err := config.DefaultInt64(opts.Getenv(wsWriteBufEnv), file.WSWriteBufferSize, realtime.DefaultWSWriteBufferSize)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	attachSeenMaxDefault, err := config.DefaultInt(opts.Getenv(attachSeenMaxEnv), file.AttachmentSeenMax, realtime.DefaultAttachmentSeenMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	fanoutPoolDefault, err := config.DefaultIntPtr(opts.Getenv(fanoutPoolEnv), file.DeliveryFanoutPool, core.DefaultFanoutWorkers())
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	fanoutThresholdDefault, err := config.DefaultInt(opts.Getenv(fanoutThresholdEnv), file.DeliveryFanoutThreshold, core.DefaultFanoutThreshold)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	httpIdleDefault, err := config.DefaultDuration(opts.Getenv(httpIdleEnv), file.HTTPIdleTimeout, DefaultHTTPIdleTimeout)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	messageRetentionDefault, err := config.DefaultDuration(opts.Getenv(messageRetentionEnv), file.MessageRetention, postgres.DefaultMessageRetention)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	persistedRetentionDefault, err := config.DefaultDuration(opts.Getenv(persistedRetentionEnv), file.PersistedRetention, postgres.DefaultPersistedRetention)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	publishLanesDefault, err := config.DefaultInt(opts.Getenv(publishLanesEnv), file.PublishLanes, postgres.DefaultPublishLanes)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	publishBatchMaxDefault, err := config.DefaultInt(opts.Getenv(publishBatchMaxEnv), file.PublishBatchMax, postgres.DefaultPublishBatchMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	publishLingerMaxDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMaxEnv), file.PublishLingerMax, postgres.DefaultPublishLingerMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
-	publishLingerMinDefault, err := config.DefaultDuration(opts.Getenv(publishLingerMinEnv), file.PublishLingerMin, 0)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	publishQueueMaxDefault, err := config.DefaultInt(opts.Getenv(publishQueueMaxEnv), file.PublishQueueMax, postgres.DefaultPublishQueueMax)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
-	publishBindDefault, err := config.DefaultBool(opts.Getenv(publishBindEnv), file.PublishBindOnWrite, false)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
-	}
-	presenceBatchingDefault, err := config.DefaultBoolPtr(opts.Getenv(presenceBatchingEnv), file.PresenceBatching, true)
-	if err != nil {
-		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	presenceMaxInflightDefault, err := config.DefaultInt(opts.Getenv(presenceMaxInflightEnv), file.PresenceMaxInflight, 0)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	enableStatsStubDefault, err := config.DefaultBool(opts.Getenv(enableStatsStubEnv), file.EnableStatsStub, false)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	natsInlineMaxDefault, err := config.DefaultInt(opts.Getenv(natsInlineMaxEnv), file.NATSInlineMaxBytes, postgres.DefaultNATSInlineMaxBytes)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	pgNotifyWindowDefault, err := config.DefaultDuration(opts.Getenv(pgNotifyWindowEnv), file.PostgresNotifyWindow, postgres.DefaultNotifyWindow)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	pgNotifyMaxPendingDefault, err := config.DefaultInt(opts.Getenv(pgNotifyMaxPendEnv), file.PostgresNotifyMaxPending, postgres.DefaultNotifyMaxPending)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 	busSweepDefault, err := config.DefaultDuration(opts.Getenv(busSweepEnv), file.BusSweepInterval, 0)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
 	}
 
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
@@ -284,8 +299,8 @@ func Run(ctx context.Context, opts Opts) int {
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable; a comma-separated list of URL-form DSNs shards channels across the databases by channel-name hash, fixed for the life of the data (DESIGN.md §6.4) (env: "+postgresDSNEnv+")")
-	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, postgres.BusPGNotify), "cluster-mode cross-node bus: pgnotify (the shipped LISTEN/NOTIFY broker), postgres (per-channel LISTEN, see --postgres-notify-mode) or nats; Postgres stays the store in every case (DESIGN.md §7.2) (env: "+busEnv+")")
-	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted (env: "+natsURLEnv+")")
+	bus := fs.String("bus", config.Default(opts.Getenv(busEnv), file.Bus, ""), "cluster-mode cross-node bus: postgres (per-channel LISTEN, see --postgres-notify-mode), nats, or pgnotify (one LISTEN/NOTIFY channel; about 1.7k to 1.9k publishes a second cluster-wide). Unset: nats when --nats-url is set, else postgres; pgnotify only when asked for. Postgres stays the store in every case (DESIGN.md §7.2) (env: "+busEnv+")")
+	natsURL := fs.String("nats-url", config.Default(opts.Getenv(natsURLEnv), file.NATSURL, ""), "NATS server URL for --bus=nats, e.g. nats://host:4222; a comma-separated list of one NATS cluster's servers is accepted; set without --bus, it selects the nats bus (env: "+natsURLEnv+")")
 	natsInlineMax := fs.Int("nats-inline-max-bytes", natsInlineMaxDefault, "largest encoded message the NATS bus carries inline; larger ones travel as a pointer read back from Postgres (env: "+natsInlineMaxEnv+")")
 	natsCreds := fs.String("nats-creds", config.Default(opts.Getenv(natsCredsEnv), file.NATSCreds, ""), "--bus=nats: NATS credentials file (user JWT and NKey seed) the bus connects with; nats://user:pass@host URLs work too (DESIGN.md §7.2) (env: "+natsCredsEnv+")")
 	natsTLSCA := fs.String("nats-tls-ca", config.Default(opts.Getenv(natsTLSCAEnv), file.NATSTLSCA, ""), "--bus=nats: PEM CA bundle the NATS server's certificate must chain to; a tls:// URL needs no CA when the system roots suffice (env: "+natsTLSCAEnv+")")
@@ -294,20 +309,14 @@ func Run(ctx context.Context, opts Opts) int {
 	pgNotifyMode := fs.String("postgres-notify-mode", config.Default(opts.Getenv(pgNotifyModeEnv), file.PostgresNotifyMode, string(postgres.NotifyCoalesced)), "--bus=postgres notify mode: coalesced (writes commit without NOTIFY; at most one wake-up per channel per window) or transactional (one NOTIFY per write, inside its transaction) (env: "+pgNotifyModeEnv+")")
 	pgNotifyWindow := fs.Duration("postgres-notify-window", pgNotifyWindowDefault, "coalescing window for --postgres-notify-mode=coalesced; under 20ms logs a warning (DESIGN.md §7.2) (env: "+pgNotifyWindowEnv+")")
 	pgNotifyMaxPending := fs.Int("postgres-notify-max-pending", pgNotifyMaxPendingDefault, "cap on channels pending a coalesced wake-up on this node; writes beyond it are delivered by the sweep instead (env: "+pgNotifyMaxPendEnv+")")
-	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks the channels in --bus-sweep-scope against their committed serial and catches up one that fell behind; 0 means the bus default (30s) (env: "+busSweepEnv+")")
-	busSweepScope := fs.String("bus-sweep-scope", config.Default(opts.Getenv(busSweepScopeEnv), file.BusSweepScope, postgres.SweepSubscribed), "channels the --bus-sweep-interval sweep reads: subscribed (bound channels with an attachment or presence member on this node) or bound (every bound channel) (DESIGN.md §7.2) (env: "+busSweepScopeEnv+")")
+	busSweep := fs.Duration("bus-sweep-interval", busSweepDefault, "how often --bus=postgres or --bus=nats checks each bound channel with an attachment or presence member on this node against its committed serial and catches up one that fell behind; 0 means the bus default (30s); ignored by --bus=pgnotify (env: "+busSweepEnv+")")
 	messageRetention := fs.Duration("message-retention", messageRetentionDefault, "cluster mode: how long a channel outside any persisted namespace keeps its message log, the continuity window (DESIGN.md §6.3) (env: "+messageRetentionEnv+")")
 	persistedRetention := fs.Duration("persisted-retention", persistedRetentionDefault, "cluster mode: how long a channel in a persisted namespace keeps its message log (DESIGN.md §6.3) (env: "+persistedRetentionEnv+")")
 	publishLanes := fs.Int("publish-lanes", publishLanesDefault, "cluster mode: publish lanes for leading-edge batching; a channel always uses the same lane; 0 commits every publish in its own transaction (DESIGN.md §6.3) (env: "+publishLanesEnv+")")
 	publishBatchMax := fs.Int("publish-batch-max", publishBatchMaxDefault, "cluster mode: most publishes committed in one batch transaction (env: "+publishBatchMaxEnv+")")
 	publishLingerMax := fs.Duration("publish-linger-max", publishLingerMaxDefault, "cluster mode: once a lane's batch has been in flight this long, queued publishes of other channels start a second batch (env: "+publishLingerMaxEnv+")")
-	publishLingerMin := fs.Duration("publish-linger-min", publishLingerMinDefault, "cluster mode: how long an idle lane holds its first publish so others can join its commit; 0 commits at once (DESIGN.md §6.3) (env: "+publishLingerMinEnv+")")
 	publishQueueMax := fs.Int("publish-queue-max", publishQueueMaxDefault, "cluster mode: publishes queued per lane before new ones are refused with 42910 (env: "+publishQueueMaxEnv+")")
-	publishBindOnWrite := fs.Bool("publish-bind-on-write", publishBindDefault, "cluster mode: bind a channel on every REST publish, as before the write-only path; false (the default) stores a publish to a channel with no attachment or presence member on this node without binding it, and creates a missing channel row inside the batch (DESIGN.md §5.1, §6.3) (env: "+publishBindEnv+")")
-	presenceSyncSource := fs.String("presence-sync-source", config.Default(opts.Getenv(presenceSyncSourceEnv), file.PresenceSyncSource, core.PresenceSyncLocal), "where an attach's presence SYNC comes from: local (this node's member set, seeded from the store once per channel bind and kept current from delivered presence events) or store (a store read per attach) (DESIGN.md §12.4) (env: "+presenceSyncSourceEnv+")")
-	presenceBatching := fs.Bool("presence-batching", presenceBatchingDefault, "cluster mode: commit presence enter/update/leave in the publish lanes' batches; false commits each in its own transaction (DESIGN.md §6.3, §12.5) (env: "+presenceBatchingEnv+")")
-	presenceLeaseMode := fs.String("presence-lease-mode", config.Default(opts.Getenv(presenceLeaseModeEnv), file.PresenceLeaseMode, postgres.PresenceLeaseNode), "cluster mode: how presence liveness is leased: node (one lease row per node, renewed every 10s; a dead node's members are reaped) or member (a lease on every member row, all renewed every 10s) (DESIGN.md §12.5) (env: "+presenceLeaseModeEnv+")")
-	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction at once per database before new ones are refused with 42910; 0 means 4 x --publish-lanes, negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
+	presenceMaxInflight := fs.Int("presence-max-inflight", presenceMaxInflightDefault, "cluster mode: presence writes committed in their own transaction, outside the publish lanes, at once per database: with --publish-lanes=0 a client's presence write beyond it is refused with 42910; with lanes, a lease-lapse re-entry or a server-synthesised LEAVE written around a full lane waits for a slot; 0 means 4 x --publish-lanes, or 16 with --publish-lanes=0; negative means no bound (DESIGN.md §12.5) (env: "+presenceMaxInflightEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
@@ -326,7 +335,7 @@ func Run(ctx context.Context, opts Opts) int {
 	fanoutThreshold := fs.Int("delivery-fanout-threshold", fanoutThresholdDefault, "attachments on one channel above which its live messages are delivered by the fan-out pool; a pooled channel leaves the pool at half this (DESIGN.md §5.1) (env: "+fanoutThresholdEnv+")")
 	httpIdleTimeout := fs.Duration("http-idle-timeout", httpIdleDefault, "how long an idle HTTP keep-alive connection is kept open for the next request (DESIGN.md §2.2) (env: "+httpIdleEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
-		return 2
+		return nil, 2
 	}
 	// The bus settings set anywhere (flag, env or file), so a setting the
 	// chosen bus ignores can be named at startup (busSettingsIgnored).
@@ -341,7 +350,6 @@ func Run(ctx context.Context, opts Opts) int {
 		"postgres-notify-window":      opts.Getenv(pgNotifyWindowEnv) != "" || file.PostgresNotifyWindow != "",
 		"postgres-notify-max-pending": opts.Getenv(pgNotifyMaxPendEnv) != "" || file.PostgresNotifyMaxPending != 0,
 		"bus-sweep-interval":          opts.Getenv(busSweepEnv) != "" || file.BusSweepInterval != "",
-		"bus-sweep-scope":             opts.Getenv(busSweepScopeEnv) != "" || file.BusSweepScope != "",
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if _, ok := busGiven[f.Name]; ok {
@@ -350,56 +358,56 @@ func Run(ctx context.Context, opts Opts) int {
 	})
 	if *httpIdleTimeout <= 0 {
 		fmt.Fprintln(opts.Out, "--http-idle-timeout must be positive")
-		return 2
-	}
-	if *publishLingerMin < 0 {
-		fmt.Fprintln(opts.Out, "--publish-linger-min must not be negative")
-		return 2
-	}
-	syncSource, err := core.ParsePresenceSyncSource(*presenceSyncSource)
-	if err != nil {
-		fmt.Fprintln(opts.Out, "--presence-sync-source:", err)
-		return 2
+		return nil, 2
 	}
 	if *channelIdleTimeout < 0 {
 		fmt.Fprintln(opts.Out, "--channel-idle-timeout must not be negative")
-		return 2
+		return nil, 2
 	}
 	if *connOutboundMaxBytes <= 0 || *connWriteTimeout <= 0 || *wsReadBufferSize <= 0 || *wsWriteBufferSize <= 0 {
 		fmt.Fprintln(opts.Out, "--conn-outbound-max-bytes, --conn-write-timeout, --ws-read-buffer-size and --ws-write-buffer-size must be positive")
-		return 2
+		return nil, 2
 	}
 
 	if *attachmentSeenMax <= 0 {
 		fmt.Fprintln(opts.Out, "--attachment-seen-max must be positive")
-		return 2
+		return nil, 2
 	}
 	if *fanoutPool < 0 {
 		fmt.Fprintln(opts.Out, "--delivery-fanout-pool must not be negative")
-		return 2
+		return nil, 2
 	}
 	if *fanoutThreshold <= 0 {
 		fmt.Fprintln(opts.Out, "--delivery-fanout-threshold must be positive")
-		return 2
+		return nil, 2
 	}
 
 	logger, err := newLogger(*logLevel, *logFormat, opts.Out)
 	if err != nil {
 		fmt.Fprintln(opts.Out, err)
-		return 1
+		return nil, 1
+	}
+
+	for _, k := range file.Unknown {
+		logger.Warn("config file key not recognised; ignored (DESIGN.md §9)", "key", k, "file", configPath)
+	}
+	for _, name := range removedEnv {
+		if opts.Getenv(name) != "" {
+			logger.Warn("environment variable of a removed setting; ignored (DESIGN.md §9 \"Removed settings\")", "env", name)
+		}
 	}
 
 	keySpecs := resolveAPIKeys([]string(keysFlags), opts.Getenv(keysEnv), file)
 	if len(keySpecs) == 0 {
 		logger.Error("at least one api key is required", "flag", "--keys", "env", keysEnv)
-		return 1
+		return nil, 1
 	}
 	parsedKeys := make([]auth.APIKey, 0, len(keySpecs))
 	for _, spec := range keySpecs {
 		k, err := auth.ParseAPIKeyWithCapability(spec.key, spec.capability)
 		if err != nil {
 			logger.Error("invalid api key", "err", err)
-			return 1
+			return nil, 1
 		}
 		parsedKeys = append(parsedKeys, k)
 	}
@@ -410,9 +418,80 @@ func Run(ctx context.Context, opts Opts) int {
 	for _, k := range parsedKeys[1:] {
 		if k.AppID != appID {
 			logger.Error("all api keys must share the same appId", "appId", appID, "conflicting", k.AppID)
-			return 1
+			return nil, 1
 		}
 	}
+
+	return &settings{
+		logger:           logger,
+		file:             file,
+		keys:             parsedKeys,
+		mode:             *mode,
+		logLevel:         *logLevel,
+		logFormat:        *logFormat,
+		dataDir:          *dataDir,
+		listen:           *listen,
+		debugListen:      *debugListen,
+		addrFile:         *addrFile,
+		enableStatsStub:  *enableStatsStub,
+		shutdownGrace:    *shutdownGrace,
+		hbInterval:       *hbInterval,
+		remainPresentFor: *remainPresentFor,
+		httpIdleTimeout:  *httpIdleTimeout,
+		fanoutWorkers:    *fanoutPool,
+		fanoutThreshold:  *fanoutThreshold,
+		cluster: clusterOptions{
+			dsn:              *postgresDSN,
+			bus:              *bus,
+			natsURL:          *natsURL,
+			natsInlineMax:    *natsInlineMax,
+			natsCreds:        *natsCreds,
+			natsTLSCA:        *natsTLSCA,
+			natsTLSCert:      *natsTLSCert,
+			natsTLSKey:       *natsTLSKey,
+			busGiven:         busGiven,
+			notifyMode:       *pgNotifyMode,
+			notifyWindow:     *pgNotifyWindow,
+			notifyMaxPending: *pgNotifyMaxPending,
+			sweepInterval:    *busSweep,
+			logger:           logger,
+			retention: postgres.Retention{
+				Message:   *messageRetention,
+				Persisted: *persistedRetention,
+			},
+			persisted:           persistedNamespaces(file.Namespaces),
+			persistedNamespaces: persistedNamespaceIDs(file.Namespaces),
+			batching: postgres.Batching{
+				Lanes:     *publishLanes,
+				BatchMax:  *publishBatchMax,
+				LingerMax: *publishLingerMax,
+				QueueMax:  *publishQueueMax,
+			},
+			presenceMaxInflight: *presenceMaxInflight,
+		},
+		core: core.Options{IdleTimeout: *channelIdleTimeout, Logger: logger},
+		appendTracking: realtime.AppendTracking{
+			Mutable: mutableNamespaces(file.Namespaces),
+			SeenMax: *attachmentSeenMax,
+		},
+		connLimits: realtime.ConnLimits{
+			OutboundMaxBytes: *connOutboundMaxBytes,
+			WriteTimeout:     *connWriteTimeout,
+			ReadBufferSize:   int(*wsReadBufferSize),
+			WriteBufferSize:  int(*wsWriteBufferSize),
+		},
+	}, 0
+}
+
+// Run executes the server and returns the process exit code. All
+// inputs are passed via Opts so the function is testable without
+// touching package-level state.
+func Run(ctx context.Context, opts Opts) int {
+	s, code := resolveSettings(opts)
+	if s == nil {
+		return code
+	}
+	logger := s.logger
 
 	// OpenTelemetry tracing is off unless the standard OTEL_* env asks for
 	// it (DESIGN.md §10). Setup uses a background context so a SIGTERM
@@ -443,48 +522,15 @@ func Run(ctx context.Context, opts Opts) int {
 	// storage's presence lease-lapse hook re-enters its connections'
 	// members (DESIGN.md §12.5), so the hook reaches it through rtRef.
 	var rtRef atomic.Pointer[realtime.Server]
-	store, err := openStorage(ctx, *mode, *dataDir, clusterOptions{
-		dsn:              *postgresDSN,
-		bus:              *bus,
-		natsURL:          *natsURL,
-		natsInlineMax:    *natsInlineMax,
-		natsCreds:        *natsCreds,
-		natsTLSCA:        *natsTLSCA,
-		natsTLSCert:      *natsTLSCert,
-		natsTLSKey:       *natsTLSKey,
-		busGiven:         busGiven,
-		notifyMode:       *pgNotifyMode,
-		notifyWindow:     *pgNotifyWindow,
-		notifyMaxPending: *pgNotifyMaxPending,
-		sweepInterval:    *busSweep,
-		sweepScope:       *busSweepScope,
-		logger:           logger,
-		retention: postgres.Retention{
-			Message:   *messageRetention,
-			Persisted: *persistedRetention,
-		},
-		persisted:           persistedNamespaces(file.Namespaces),
-		persistedNamespaces: persistedNamespaceIDs(file.Namespaces),
-		bindOnWrite:         *publishBindOnWrite,
-		batching: postgres.Batching{
-			Lanes:     *publishLanes,
-			BatchMax:  *publishBatchMax,
-			LingerMax: *publishLingerMax,
-			LingerMin: *publishLingerMin,
-			QueueMax:  *publishQueueMax,
-
-			PresenceUnbatched: !*presenceBatching,
-		},
-		presenceMaxInflight: *presenceMaxInflight,
-		presenceLeaseMode:   *presenceLeaseMode,
-		onPresenceLeaseLapse: func(ctx context.Context) {
-			if rt := rtRef.Load(); rt != nil {
-				rt.ReenterPresence(ctx)
-			}
-		},
-	})
+	cluster := s.cluster
+	cluster.onPresenceLeaseLapse = func(ctx context.Context) {
+		if rt := rtRef.Load(); rt != nil {
+			rt.ReenterPresence(ctx)
+		}
+	}
+	store, err := openStorage(ctx, s.mode, s.dataDir, cluster)
 	if err != nil {
-		logger.Error("open storage", "mode", *mode, "err", err)
+		logger.Error("open storage", "mode", s.mode, "err", err)
 		return 1
 	}
 	// Deferred so it fires after the graceful-shutdown block below
@@ -503,10 +549,10 @@ func Run(ctx context.Context, opts Opts) int {
 		if sh, ok := store.(interface{ Shards() int }); ok {
 			shards = sh.Shards()
 		}
-		logger.Info("storage ready", "mode", *mode, "bus", st.Bus, "postgresNotifyMode", st.Mode, "shards", shards)
+		logger.Info("storage ready", "mode", s.mode, "bus", st.Bus, "postgresNotifyMode", st.Mode, "shards", shards)
 		m.RegisterBus(bs) // ably_bus_* series (DESIGN.md §7.2, §10)
 	} else {
-		logger.Info("storage ready", "mode", *mode)
+		logger.Info("storage ready", "mode", s.mode)
 	}
 	// Backends with their own series (the Postgres retention sweep,
 	// DESIGN.md §10) register them on the process registry.
@@ -517,27 +563,23 @@ func Run(ctx context.Context, opts Opts) int {
 	// The fan-out pool (DESIGN.md §5.1). Deferred before the Manager, so
 	// it closes after it, and after rt.Shutdown has closed the
 	// connections whose attachments it delivers to.
-	pool := core.NewFanoutPool(*fanoutPool, *fanoutThreshold)
+	pool := core.NewFanoutPool(s.fanoutWorkers, s.fanoutThreshold)
 	defer pool.Close()
 	m.RegisterFanoutPool(pool) // zero while the pool is disabled
-	logger.Info("delivery fan-out", "poolWorkers", pool.Workers(), "threshold", *fanoutThreshold)
-	manager := core.NewManagerWithOptions(store, core.Options{
-		IdleTimeout:        *channelIdleTimeout,
-		Metrics:            m,
-		Logger:             logger,
-		WriteOnlyPublish:   !*publishBindOnWrite,
-		PresenceSyncSource: syncSource,
-		FanoutPool:         pool,
-	})
+	logger.Info("delivery fan-out", "poolWorkers", pool.Workers(), "threshold", s.fanoutThreshold)
+	coreOpts := s.core
+	coreOpts.Metrics = m
+	coreOpts.FanoutPool = pool
+	manager := core.NewManagerWithOptions(store, coreOpts)
 	// Deferred after the storage close, so it runs first: the eviction
 	// sweeper stops before the storage it releases into is closed.
 	defer manager.Close()
-	logger.Info("presence path", "syncSource", syncSource, "batching", *presenceBatching, "maxInflight", *presenceMaxInflight, "leaseMode", *presenceLeaseMode)
+	logger.Info("presence path", "maxInflight", s.cluster.presenceMaxInflight)
 
 	// Pre-seed presence fixtures declared in the config file before
 	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
 	// startup error.
-	spec, err := fixtureSpec(file)
+	spec, err := fixtureSpec(s.file)
 	if err != nil {
 		logger.Error("invalid config fixtures", "err", err)
 		return 1
@@ -549,28 +591,20 @@ func Run(ctx context.Context, opts Opts) int {
 		}
 	}
 
-	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
-	rt.SetRemainPresentFor(*remainPresentFor)
+	rt := realtime.NewServer(s.keys, manager, s.hbInterval, logger, m, tracer)
+	rt.SetRemainPresentFor(s.remainPresentFor)
 	rtRef.Store(rt)
-	rt.SetAppendTracking(realtime.AppendTracking{
-		Mutable: mutableNamespaces(file.Namespaces),
-		SeenMax: *attachmentSeenMax,
-	})
-	rt.SetConnLimits(realtime.ConnLimits{
-		OutboundMaxBytes: *connOutboundMaxBytes,
-		WriteTimeout:     *connWriteTimeout,
-		ReadBufferSize:   int(*wsReadBufferSize),
-		WriteBufferSize:  int(*wsWriteBufferSize),
-	})
+	rt.SetAppendTracking(s.appendTracking)
+	rt.SetConnLimits(s.connLimits)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally.
 	ready, _ := store.(storage.Pinger)
 	// rt resolves a REST publish's connectionKey to a live connection for
 	// publish-on-behalf (DESIGN.md §13); a single-node, in-process registry.
-	rs := rest.NewServer(parsedKeys, manager, logger, ready, m, tracer, rt)
+	rs := rest.NewServer(s.keys, manager, logger, ready, m, tracer, rt)
 
-	mux := newMux(rt, rs, m, *enableStatsStub)
+	mux := newMux(rt, rs, m, s.enableStatsStub)
 
 	// When tracing is enabled, otelhttp wraps the whole mux so every HTTP
 	// request (including the REST handlers) gets a server span; the WS
@@ -586,12 +620,12 @@ func Run(ctx context.Context, opts Opts) int {
 		ReadHeaderTimeout: 10 * time.Second,
 		// Keep-alive (DESIGN.md §2.2): REST publishers reuse connections;
 		// an idle one is closed after this long.
-		IdleTimeout: *httpIdleTimeout,
+		IdleTimeout: s.httpIdleTimeout,
 	}
 
-	listener, err := net.Listen("tcp", *listen)
+	listener, err := net.Listen("tcp", s.listen)
 	if err != nil {
-		logger.Error("failed to listen", "addr", *listen, "err", err)
+		logger.Error("failed to listen", "addr", s.listen, "err", err)
 		return 1
 	}
 
@@ -599,9 +633,9 @@ func Run(ctx context.Context, opts Opts) int {
 	// provisioner, DESIGN.md §15) can discover the port a `--listen
 	// 127.0.0.1:0` bind resolved to. Written atomically so a reader
 	// polling the path never observes a partial address.
-	if *addrFile != "" {
-		if err := writeAddrFile(*addrFile, listener.Addr().String()); err != nil {
-			logger.Error("failed to write addr-file", "path", *addrFile, "err", err)
+	if s.addrFile != "" {
+		if err := writeAddrFile(s.addrFile, listener.Addr().String()); err != nil {
+			logger.Error("failed to write addr-file", "path", s.addrFile, "err", err)
 			_ = listener.Close()
 			return 1
 		}
@@ -627,10 +661,10 @@ func Run(ctx context.Context, opts Opts) int {
 	// net/http/pprof's handlers plus /metrics (newDebugMux) on a separate
 	// address so neither is ever reachable via the main listener.
 	var debugSrv *http.Server
-	if *debugListen != "" {
-		debugListener, err := net.Listen("tcp", *debugListen)
+	if s.debugListen != "" {
+		debugListener, err := net.Listen("tcp", s.debugListen)
 		if err != nil {
-			logger.Error("failed to listen on debug address", "addr", *debugListen, "err", err)
+			logger.Error("failed to listen on debug address", "addr", s.debugListen, "err", err)
 			return 1
 		}
 		if opts.DebugReady != nil {
@@ -652,7 +686,7 @@ func Run(ctx context.Context, opts Opts) int {
 
 	<-ctx.Done()
 	logger.Info("shutdown signal received")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownGrace)
 	defer cancel()
 	if debugSrv != nil {
 		if err := debugSrv.Shutdown(shutdownCtx); err != nil {
@@ -842,17 +876,6 @@ func writeAddrFile(path, addr string) error {
 	return os.Rename(name, path)
 }
 
-// openStorage constructs the storage.Storage selected by mode:
-//
-//   - memory: in-process, no persistence.
-//   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
-//   - cluster: postgres at cluster.dsn (auto-migrates schema on Open),
-//     with cluster.bus as the cross-node bus: pgnotify (the shipped
-//     LISTEN/NOTIFY broker, the default), postgres or nats (DESIGN.md
-//     §7.2).
-//
-// ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
-// the in-process modes.
 // newMux builds the HTTP routing table. The WebSocket endpoint is bound to
 // the exact root with the `{$}` anchor: a bare `GET /` is a catch-all in
 // Go 1.22's ServeMux and would feed every unmatched GET path to the
@@ -990,16 +1013,13 @@ type clusterOptions struct {
 	notifyWindow        time.Duration
 	notifyMaxPending    int
 	sweepInterval       time.Duration
-	sweepScope          string
 	logger              *logging.Logger
 	retention           postgres.Retention        // log retention classes (DESIGN.md §6.3)
 	batching            postgres.Batching         // publish batching (DESIGN.md §6.3)
 	persisted           func(channel string) bool // persisted-namespace resolver
 	persistedNamespaces []string                  // the persisted namespace ids (cluster identity, DESIGN.md §11)
-	bindOnWrite         bool                      // --publish-bind-on-write (DESIGN.md §6.3)
 
-	presenceMaxInflight int    // unbatched presence writes in flight (DESIGN.md §12.5)
-	presenceLeaseMode   string // --presence-lease-mode (DESIGN.md §12.5)
+	presenceMaxInflight int // presence writes in flight outside the lanes (DESIGN.md §12.5)
 
 	// onPresenceLeaseLapse re-enters this node's presence members after
 	// its lease lapsed (postgres.Options.OnPresenceLeaseLapse, §12.5).
@@ -1016,14 +1036,21 @@ func (c clusterOptions) options() postgres.Options {
 		Batching:  c.batching,
 
 		PersistedNamespaces: c.persistedNamespaces,
-		BindOnWrite:         c.bindOnWrite,
 
 		PresenceMaxInflight:  c.presenceMaxInflight,
-		PresenceLeaseMode:    c.presenceLeaseMode,
 		OnPresenceLeaseLapse: c.onPresenceLeaseLapse,
 	}
 }
 
+// openStorage constructs the storage.Storage selected by mode:
+//
+//   - memory: in-process, no persistence.
+//   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
+//   - cluster: postgres at cluster.dsn (auto-migrates schema on Open),
+//     with the cross-node bus resolveBus picks (DESIGN.md §7.2).
+//
+// ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
+// the in-process modes.
 func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptions) (storage.Storage, error) {
 	switch mode {
 	case "memory":
@@ -1037,57 +1064,96 @@ func openStorage(ctx context.Context, mode, dataDir string, cluster clusterOptio
 		}
 		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
 	case "cluster":
-		if cluster.dsn == "" {
-			return nil, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
-		}
-		bus, err := postgres.ParseBus(cluster.bus)
+		opts, err := cluster.postgresOptions()
 		if err != nil {
-			return nil, fmt.Errorf("invalid --bus: %w", err)
-		}
-		if _, err := postgres.ParseSweepScope(cluster.sweepScope); err != nil {
-			return nil, fmt.Errorf("invalid --bus-sweep-scope: %w", err)
-		}
-		if _, err := postgres.ParsePresenceLeaseMode(cluster.presenceLeaseMode); err != nil {
-			return nil, fmt.Errorf("invalid --presence-lease-mode: %w", err)
-		}
-		if cluster.logger != nil {
-			for _, name := range busSettingsIgnored(bus, cluster.busGiven) {
-				cluster.logger.Warn("bus setting ignored: the chosen --bus does not use it", "flag", "--"+name, "bus", bus, "usedBy", strings.Join(busSettingUsers[name], ", "))
-			}
-		}
-		opts := cluster.options()
-		opts.Bus = bus
-		switch bus {
-		case postgres.BusPostgres:
-			mode, err := postgres.ParseNotifyMode(cluster.notifyMode)
-			if err != nil {
-				return nil, fmt.Errorf("invalid --postgres-notify-mode: %w", err)
-			}
-			opts.NotifyMode = mode
-			opts.NotifyWindow = cluster.notifyWindow
-			opts.NotifyMaxPending = cluster.notifyMaxPending
-			if msg := postgres.NotifyWindowWarning(cluster.notifyWindow); msg != "" && mode == postgres.NotifyCoalesced && cluster.logger != nil {
-				cluster.logger.Warn(msg)
-			}
-			opts.SweepInterval = cluster.sweepInterval
-			opts.SweepScope = cluster.sweepScope
-		case postgres.BusNATS:
-			if cluster.natsURL == "" {
-				return nil, fmt.Errorf("--nats-url is required when --bus=nats (env: %s)", natsURLEnv)
-			}
-			opts.NATSURL = cluster.natsURL
-			opts.NATSInlineMaxBytes = cluster.natsInlineMax
-			opts.NATSCredsFile = cluster.natsCreds
-			opts.NATSTLSCA = cluster.natsTLSCA
-			opts.NATSTLSCert = cluster.natsTLSCert
-			opts.NATSTLSKey = cluster.natsTLSKey
-			opts.SweepInterval = cluster.sweepInterval
-			opts.SweepScope = cluster.sweepScope
+			return nil, err
 		}
 		return openPostgres(ctx, opts)
 	default:
 		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}
+}
+
+// pgNotifyCeiling is the startup warning for an explicit --bus=pgnotify
+// (DESIGN.md §7.2): its measured cluster-wide ceiling and why.
+const pgNotifyCeiling = "--bus=pgnotify has a measured ceiling of about 1,700 to 1,900 publishes a second across the whole cluster, set by Postgres's NOTIFY commit lock and the single LISTEN read-back loop; for more, use --bus=postgres (the default with only --postgres-dsn) or --bus=nats (DESIGN.md §7.2)"
+
+// resolveBus picks cluster mode's cross-node bus (DESIGN.md §7.2, §9):
+// "start with one Postgres; add NATS when you need it". bus is the
+// --bus value from flag, env or file ("" when none set it) and natsURL
+// the --nats-url value. An explicit bus wins. Unset, it is nats when a
+// NATS URL is configured and postgres (coalesced) otherwise; pgnotify
+// is never inferred. warn is a warning to log at startup ("" for none):
+// pgnotify's ceiling. Asking for nats with no NATS URL is an error that
+// states the trade-off.
+func resolveBus(bus, natsURL string) (resolved, warn string, err error) {
+	if bus == "" {
+		if natsURL != "" {
+			return postgres.BusNATS, "", nil
+		}
+		return postgres.BusPostgres, "", nil
+	}
+	resolved, err = postgres.ParseBus(bus)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid --bus: %w", err)
+	}
+	switch resolved {
+	case postgres.BusNATS:
+		if natsURL == "" {
+			return "", "", fmt.Errorf("--bus=nats needs --nats-url (env: %s): the nats bus carries cross-node delivery on a NATS cluster, which suits more than one database's write rate or a large fan-out; to run on Postgres alone, omit --bus or set --bus=postgres (DESIGN.md §7.2)", natsURLEnv)
+		}
+	case postgres.BusPGNotify:
+		warn = pgNotifyCeiling
+	}
+	return resolved, warn, nil
+}
+
+// postgresOptions resolves the cluster-mode storage options: the bus
+// (resolveBus) and the settings of that bus, logging a warning for each
+// bus setting given that the bus does not use (DESIGN.md §9). It opens
+// nothing.
+func (c clusterOptions) postgresOptions() (postgres.Options, error) {
+	if c.dsn == "" {
+		return postgres.Options{}, fmt.Errorf("--postgres-dsn is required when --mode=cluster (env: %s)", postgresDSNEnv)
+	}
+	bus, warn, err := resolveBus(c.bus, c.natsURL)
+	if err != nil {
+		return postgres.Options{}, err
+	}
+	if c.logger != nil {
+		if warn != "" {
+			c.logger.Warn(warn)
+		}
+		for _, name := range busSettingsIgnored(bus, c.busGiven) {
+			c.logger.Warn("bus setting ignored: the chosen --bus does not use it", "flag", "--"+name, "bus", bus, "usedBy", strings.Join(busSettingUsers[name], ", "))
+		}
+	}
+	opts := c.options()
+	opts.Bus = bus
+	opts.BusInferred = c.bus == ""
+	switch bus {
+	case postgres.BusPostgres:
+		mode, err := postgres.ParseNotifyMode(c.notifyMode)
+		if err != nil {
+			return postgres.Options{}, fmt.Errorf("invalid --postgres-notify-mode: %w", err)
+		}
+		opts.NotifyMode = mode
+		opts.NotifyWindow = c.notifyWindow
+		opts.NotifyMaxPending = c.notifyMaxPending
+		if msg := postgres.NotifyWindowWarning(c.notifyWindow); msg != "" && mode == postgres.NotifyCoalesced && c.logger != nil {
+			c.logger.Warn(msg)
+		}
+		opts.SweepInterval = c.sweepInterval
+	case postgres.BusNATS:
+		opts.NATSURL = c.natsURL
+		opts.NATSInlineMaxBytes = c.natsInlineMax
+		opts.NATSCredsFile = c.natsCreds
+		opts.NATSTLSCA = c.natsTLSCA
+		opts.NATSTLSCert = c.natsTLSCert
+		opts.NATSTLSKey = c.natsTLSKey
+		opts.SweepInterval = c.sweepInterval
+	}
+	return opts, nil
 }
 
 // busSettingUsers names, for each bus-specific setting, the buses that
@@ -1103,7 +1169,6 @@ var busSettingUsers = map[string][]string{
 	"postgres-notify-window":      {postgres.BusPostgres},
 	"postgres-notify-max-pending": {postgres.BusPostgres},
 	"bus-sweep-interval":          {postgres.BusPostgres, postgres.BusNATS},
-	"bus-sweep-scope":             {postgres.BusPostgres, postgres.BusNATS},
 }
 
 // busSettingsIgnored returns, sorted, the bus settings given (by flag,

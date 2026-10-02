@@ -213,3 +213,21 @@ func TestFailedRepairMarksChannelDirty(t *testing.T) {
 		t.Fatalf("appender events = %v, want %v", a.got(), want)
 	}
 }
+
+// TestPGNotifyReadyFollowsListenConnection: the pgnotify bus is not
+// ready while its LISTEN connection is down (DESIGN.md §7.2), so the
+// cluster /readyz check (Storage.Ping) takes the node out of rotation.
+func TestPGNotifyReadyFollowsListenConnection(t *testing.T) {
+	b := &pgNotifyBus{}
+	if err := b.ready(); !errors.Is(err, errPGNotifyListenDown) {
+		t.Fatalf("ready() before the LISTEN connection is up = %v, want errPGNotifyListenDown", err)
+	}
+	b.connected.Store(true)
+	if err := b.ready(); err != nil {
+		t.Fatalf("ready() while connected = %v, want nil", err)
+	}
+	b.connected.Store(false)
+	if err := b.ready(); !errors.Is(err, errPGNotifyListenDown) {
+		t.Fatalf("ready() after the connection dropped = %v, want errPGNotifyListenDown", err)
+	}
+}

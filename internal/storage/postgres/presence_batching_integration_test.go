@@ -15,32 +15,8 @@ import (
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
-	"github.com/ably/ably-server/internal/storage/postgres/natstest"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
-	"github.com/ably/ably-server/internal/storage/storagetest"
 )
-
-// TestPresenceUnbatchedContract runs the storage contract suite with
-// publish batching on but presence committed unbatched
-// (--presence-batching=false, DESIGN.md §12.5), on the default and the
-// nats bus. TestBatchedChannelStoreContractEveryBus covers presence
-// batched on every bus; TestPostgresChannelStoreContract with no lanes.
-func TestPresenceUnbatchedContract(t *testing.T) {
-	c := pgtest.Start(t)
-	lanes := Batching{Lanes: 4, PresenceUnbatched: true}
-	for name, opts := range map[string]func(dsn string) Options{
-		"pgnotify": func(dsn string) Options { return Options{DSN: dsn, Batching: lanes} },
-		"nats": func(dsn string) Options {
-			return Options{DSN: dsn, Bus: BusNATS, NATSURL: natstest.Start(t).URL, Batching: lanes}
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			storagetest.RunChannelStoreTests(t, func(t *testing.T) storage.Storage {
-				return openOpts(t, opts(c.FreshSchemaDSN(t)))
-			})
-		})
-	}
-}
 
 // TestPresenceBatchedConcurrentEnters: 2,000 ENTERs into one room from 4
 // nodes, all batched. Each ENTER is committed in exactly one batch, with
@@ -242,12 +218,12 @@ func TestPresenceBatchFoldsOperationsInOrder(t *testing.T) {
 // with storage.ErrOverloaded rather than queued for a pool connection,
 // and SYNC reads (Members), binds and publishes on other channels still
 // complete. Once the lock is released the two waiting ENTERs commit. It
-// runs with batching off, and with batching on but presence unbatched.
+// runs with batching off (--publish-lanes=0), where every presence write
+// is committed on its own.
 func TestPresenceInflightBoundRefusesPromptly(t *testing.T) {
 	c := pgtest.Start(t)
 	for name, b := range map[string]Batching{
-		"no-lanes":           {},
-		"presence-unbatched": {Lanes: 4, PresenceUnbatched: true},
+		"no-lanes": {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()

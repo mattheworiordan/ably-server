@@ -555,92 +555,11 @@ func TestLaneStuckCommitIsBounded(t *testing.T) {
 	}
 }
 
-// TestLaneLingerMinAccumulatesWhenIdle: with a linger floor, an idle
-// lane holds its first publish for LingerMin so publishes arriving
-// meanwhile share its commit, instead of committing it at once.
-func TestLaneLingerMinAccumulatesWhenIdle(t *testing.T) {
-	const floor = 80 * time.Millisecond
-	f := newFakeCommitter()
-	ls := testLanes(t, Batching{Lanes: 1, LingerMin: floor, LingerMax: time.Hour}, f)
-	start := time.Now()
-	first := publishAsync(ls, newPending(context.Background(), "a"))
-	var rest []<-chan error
-	for i := range 4 {
-		rest = append(rest, publishAsync(ls, newPending(context.Background(), fmt.Sprintf("c%d", i))))
-	}
-	if n := waitStarted(t, f); n != 5 {
-		t.Fatalf("first batch = %d publishes, want all 5 held by the linger floor", n)
-	}
-	if err := <-first; err != nil {
-		t.Fatalf("first publish: %v", err)
-	}
-	if took := time.Since(start); took < floor-10*time.Millisecond {
-		t.Errorf("first publish committed after %v, want at least the %v floor", took, floor)
-	}
-	for _, c := range rest {
-		if err := <-c; err != nil {
-			t.Fatalf("publish: %v", err)
-		}
-	}
-	if f.calls() != 1 {
-		t.Errorf("commits = %d, want 1", f.calls())
-	}
-}
-
-// TestLaneLingerMinFullBatchCommitsAtOnce: a full batch does not wait
-// for the linger floor.
-func TestLaneLingerMinFullBatchCommitsAtOnce(t *testing.T) {
-	f := newFakeCommitter()
-	ls := testLanes(t, Batching{Lanes: 1, LingerMin: time.Hour, BatchMax: 3, LingerMax: time.Hour}, f)
-	var outs []<-chan error
-	for i := range 3 {
-		outs = append(outs, publishAsync(ls, newPending(context.Background(), fmt.Sprintf("c%d", i))))
-	}
-	if n := waitStarted(t, f); n != 3 {
-		t.Fatalf("batch = %d publishes, want the full 3", n)
-	}
-	for _, c := range outs {
-		if err := <-c; err != nil {
-			t.Fatalf("publish: %v", err)
-		}
-	}
-}
-
-// TestLaneLingerMinAfterInFlightCommit: publishes queued behind an
-// in-flight commit for longer than the floor commit as soon as it
-// returns; the floor never adds to a wait they have already served.
-func TestLaneLingerMinAfterInFlightCommit(t *testing.T) {
-	const floor = 400 * time.Millisecond
-	f := newFakeCommitter()
-	f.gate = make(chan struct{})
-	ls := testLanes(t, Batching{Lanes: 1, LingerMin: floor, LingerMax: time.Hour}, f)
-	first := publishAsync(ls, newPending(context.Background(), "a"))
-	if n := waitStarted(t, f); n != 1 {
-		t.Fatalf("first batch = %d, want 1", n)
-	}
-	second := publishAsync(ls, newPending(context.Background(), "b"))
-	time.Sleep(2 * floor) // b has now waited longer than the floor
-	released := time.Now()
-	close(f.gate)
-	if err := <-first; err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	if n := waitStarted(t, f); n != 1 {
-		t.Fatalf("second batch = %d, want 1", n)
-	}
-	if took := time.Since(released); took > floor/2 {
-		t.Errorf("second batch started %v after the first returned, want at once", took)
-	}
-	if err := <-second; err != nil {
-		t.Fatalf("second: %v", err)
-	}
-}
-
-// TestLaneConfigGauges: ably_publish_lanes and the linger gauges report
+// TestLaneConfigGauges: ably_publish_lanes and the linger gauge report
 // the lane set's configuration, so a run can confirm what it ran with.
 func TestLaneConfigGauges(t *testing.T) {
 	m := newWriteMetrics()
-	ls := newLaneSet(Batching{Lanes: 3, LingerMax: 10 * time.Millisecond, LingerMin: 2 * time.Millisecond}.resolve(), newFakeCommitter(), m)
+	ls := newLaneSet(Batching{Lanes: 3, LingerMax: 10 * time.Millisecond}.resolve(), newFakeCommitter(), m)
 	t.Cleanup(ls.close)
 	for name, c := range map[string]struct {
 		g    prometheus.Gauge
@@ -648,7 +567,6 @@ func TestLaneConfigGauges(t *testing.T) {
 	}{
 		"lanes":      {m.lanes, 3},
 		"linger_max": {m.lingerMax, 0.01},
-		"linger_min": {m.lingerMin, 0.002},
 	} {
 		var got dto.Metric
 		if err := c.g.Write(&got); err != nil {
@@ -656,6 +574,28 @@ func TestLaneConfigGauges(t *testing.T) {
 		}
 		if got := got.GetGauge().GetValue(); got != c.want {
 			t.Errorf("%s gauge = %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// TestPresenceMaxInflightDefaults: the bound on presence writes outside
+// the lanes is 4 per lane, a fixed 16 with batching off (not a multiple
+// of the lane default, so changing that default does not move it), an
+// explicit value as given, and none when negative (DESIGN.md §12.5).
+func TestPresenceMaxInflightDefaults(t *testing.T) {
+	for _, c := range []struct {
+		n    int
+		b    Batching
+		want int
+	}{
+		{0, Batching{}, 16},
+		{0, Batching{Lanes: DefaultPublishLanes}, 4 * DefaultPublishLanes},
+		{0, Batching{Lanes: 3}, 12},
+		{5, Batching{Lanes: 3}, 5},
+		{-1, Batching{Lanes: 3}, 0},
+	} {
+		if got := presenceMaxInflight(c.n, c.b); got != c.want {
+			t.Errorf("presenceMaxInflight(%d, lanes %d) = %d, want %d", c.n, c.b.Lanes, got, c.want)
 		}
 	}
 }

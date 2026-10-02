@@ -770,22 +770,6 @@ func (s *Storage) clockSerial(now time.Time) string {
 	return fmt.Sprintf("%014d", now.UnixMilli()+s.clockOffset.Load()-clockMargin.Milliseconds())
 }
 
-// rangeFloor is the lower serial bound of the chain's log range reads (gap
-// fill, catch-up, reconcile): the channel's retention floor, as
-// RetainedSince reports it. Serials older than it are outside the
-// retention the channel promises, so a read need not see them, and the
-// bound lets the planner prune the leaves holding them: a read that
-// scanned every leaf would hold ACCESS SHARE on a leaf a drop is waiting
-// to take ACCESS EXCLUSIVE on, and every later reader would queue behind
-// the drop (DESIGN.md §6.3). A channel store with no clock (a unit-test
-// stub) reads from the beginning.
-func (cs *channelStore) rangeFloor() string {
-	if cs.clock == nil {
-		return ""
-	}
-	return cs.RetainedSince(time.Now())
-}
-
 // idempotencyFloor is the lower serial bound of the idempotency lookup:
 // the channel's retention window on the database clock, widened by the
 // clock margin so the lookup never misses a row it should see.

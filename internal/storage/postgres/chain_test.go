@@ -586,3 +586,29 @@ func TestFetchContextFollowsTheStorageLoopContext(t *testing.T) {
 		t.Fatal("fetch context not cancelled when the loop context was")
 	}
 }
+
+// TestUnprovenRead pins the continuity verdict of a checked read: unproven
+// only when the cm at the mark is gone and the channel has moved past the
+// mark or lost its row; an unchecked read, or an anchored one, proves
+// nothing wrong (DESIGN.md §7.2).
+func TestUnprovenRead(t *testing.T) {
+	anchored, gone := true, false
+	for _, tc := range []struct {
+		name     string
+		anchored *bool
+		current  string
+		after    string
+		want     bool
+	}{
+		{"unchecked", nil, "s2", "s1", false},
+		{"anchored and moved", &anchored, "s2", "s1", false},
+		{"gone and moved", &gone, "s2", "s1", true},
+		{"gone, not moved", &gone, "s1", "s1", false},
+		{"gone, row pruned", &gone, "", "s1", true},
+		{"anchored, row pruned (cannot happen; proves nothing)", &anchored, "", "s1", false},
+	} {
+		if got := unprovenRead(tc.anchored, tc.current, tc.after); got != tc.want {
+			t.Errorf("%s: unprovenRead = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

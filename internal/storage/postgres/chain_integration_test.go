@@ -161,6 +161,29 @@ func TestReleaseRacingBindLeavesAWorkingBinding(t *testing.T) {
 	}
 }
 
+// TestPGNotifyReadyzReflectsListenConnection is
+// TestPGBusReadyzReflectsListenConnection on the pgnotify bus: a node
+// whose one LISTEN connection is down is not ready (DESIGN.md §7.2), and
+// is ready again once it has redialled.
+func TestPGNotifyReadyzReflectsListenConnection(t *testing.T) {
+	defer swapReconnectDelays(750*time.Millisecond, time.Second)()
+
+	c := pgtest.Start(t)
+	appName := fmt.Sprintf("pgnotify_readyz_%d", time.Now().UnixNano())
+	ctx := context.Background()
+	s, err := Open(ctx, Options{DSN: withApplicationName(t, c.FreshSchemaDSN(t), appName), Bus: BusPGNotify})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Ping(ctx); err != nil {
+		t.Fatalf("Ping while connected: %v", err)
+	}
+	terminateListenBackend(t, c.BaseDSN(), appName)
+	waitFor(t, 5*time.Second, "Ping to report the LISTEN connection down", func() bool { return s.Ping(ctx) != nil })
+	waitFor(t, 10*time.Second, "Ping to recover after the redial", func() bool { return s.Ping(ctx) == nil })
+}
+
 // TestPGBusReadyzReflectsListenConnection: on the postgres bus a node
 // whose LISTEN connection is down is not ready (DESIGN.md §7.2), and is
 // ready again once it has redialled.
@@ -184,4 +207,208 @@ func TestPGBusReadyzReflectsListenConnection(t *testing.T) {
 	terminateListenBackend(t, c.BaseDSN(), appName)
 	waitFor(t, 5*time.Second, "Ping to report the LISTEN connection down", func() bool { return s.Ping(ctx) != nil })
 	waitFor(t, 10*time.Second, "Ping to recover after the redial", func() bool { return s.Ping(ctx) == nil })
+}
+
+// TestCatchUpDeliversEveryCmAfterAnOldMark: a catch-up from a mark older
+// than the retention floor must deliver every cm after the mark that the
+// log still holds, including cms that are themselves older than the
+// floor (the leaves holding them have not been dropped yet). With the
+// cm at the mark still in the log the read is proven continuous, so no
+// discontinuity is signalled (DESIGN.md §6.3, §7.2). A read bounded
+// below by the floor would have skipped the surviving cm silently.
+func TestCatchUpDeliversEveryCmAfterAnOldMark(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	opts := pgBusOptions(dsn)
+	opts.SweepInterval = time.Hour
+	opts.Retention = Retention{Message: 2 * time.Minute}
+	b, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatalf("Open B: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	silent := openListenNode(t, dsn) // its bus messages never reach B
+
+	rec := &discontinuityRecorder{}
+	own, err := b.Channel(ctx, "room", rec)
+	if err != nil {
+		t.Fatalf("B binds room: %v", err)
+	}
+	quiet, err := silent.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("silent opens room: %v", err)
+	}
+	cs := b.boundStore("room")
+	if cs == nil {
+		t.Fatal("room not bound on B")
+	}
+	// The mark is a real cm (B's own publish, delivered by the fast path),
+	// so the anchor check can find it; a mark with no cm behind it (a bind
+	// watermark) is unprovable by design.
+	s1 := publish(t, ctx, own, "seen")
+	waitFor(t, 5*time.Second, "B's own publish to be appended", func() bool { return cs.watermark() == s1 })
+	mark := cs.watermark()
+	s2 := publish(t, ctx, quiet, "missed")
+
+	// Age everything: the floor moves past both the mark and s2, but no
+	// partition is dropped, so both cms are still in the log.
+	b.SetClockSkew(5 * time.Minute)
+	if cs.hwmMu.Lock(); !cs.mustProveLocked(mark) {
+		cs.hwmMu.Unlock()
+		t.Fatalf("mark %s should be below the floor after the skew", mark)
+	} else {
+		cs.hwmMu.Unlock()
+	}
+	if err := cs.catchUp(ctx); err != nil {
+		t.Fatalf("catchUp: %v", err)
+	}
+	if got := rec.serials; len(got) != 2 || got[0] != s1 || got[1] != s2 {
+		t.Fatalf("delivered %v, want %s then the missed cm %s", got, s1, s2)
+	}
+	if rec.discontinuities != 0 {
+		t.Fatalf("discontinuities = %d, want 0: the cm at the mark %s is still in the log", rec.discontinuities, mark)
+	}
+}
+
+// TestCatchUpAfterTheChannelsRowWasPrunedSignals: a channel whose row was
+// pruned after idling past retention has no current serial; a catch-up
+// from an old mark cannot prove what happened after it and must signal a
+// discontinuity rather than report nothing missed (DESIGN.md §7.2).
+func TestCatchUpAfterTheChannelsRowWasPrunedSignals(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	opts := pgBusOptions(dsn)
+	opts.SweepInterval = time.Hour
+	opts.Retention = Retention{Message: 2 * time.Minute}
+	b, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatalf("Open B: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	rec := &discontinuityRecorder{}
+	ch, err := b.Channel(ctx, "room", rec)
+	if err != nil {
+		t.Fatalf("B binds room: %v", err)
+	}
+	publish(t, ctx, ch, "m1")
+	cs := b.boundStore("room")
+	mark := cs.watermark()
+
+	// What the prune does once the row is idle past retention: the row and
+	// the aged-out log leaf go; the mark's cm is gone with it.
+	if _, err := b.pool.Exec(ctx, `DELETE FROM channel_messages WHERE channel = 'room'`); err != nil {
+		t.Fatalf("delete log rows: %v", err)
+	}
+	if _, err := b.pool.Exec(ctx, `DELETE FROM channels WHERE name = 'room'`); err != nil {
+		t.Fatalf("delete channels row: %v", err)
+	}
+	b.SetClockSkew(5 * time.Minute)
+	if err := cs.catchUp(ctx); err != nil {
+		t.Fatalf("catchUp: %v", err)
+	}
+	if rec.discontinuities != 1 {
+		t.Fatalf("discontinuities = %d, want 1 (mark %s, row pruned)", rec.discontinuities, mark)
+	}
+}
+
+// TestFirstPublishAfterThePruneIsContinuous: a subscribed, caught-up
+// channel idles past retention and its channels row is pruned while the
+// nodes stay on the bus. The sweep keeps proving it (no row means nothing
+// published since the prune), so the first publish afterwards, whose
+// predecessor is the recreated row's fresh seed and which is therefore
+// held and filled from the old mark, is delivered on every node with no
+// discontinuity (DESIGN.md §6.3 "Pruning channels rows", §7.2). Before
+// the sweep proved a missing row, the proof aged out with it, the fill
+// was checked, found the mark's cm gone, and signalled 80016 on every
+// node although nothing was lost. Sweeps further apart than the retention
+// window prove nothing (a cm could have been published and pruned
+// between them), so with one sweep after five minutes the signal stays.
+func TestFirstPublishAfterThePruneIsContinuous(t *testing.T) {
+	c := pgtest.Start(t)
+	for _, tc := range []struct {
+		name     string
+		minutes  []int // the clock skew at each sweep after the prune
+		wantDisc bool
+	}{
+		{"swept every minute", []int{1, 2, 3, 4, 5}, false},
+		{"one sweep after five minutes", []int{5}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := c.FreshSchemaDSN(t)
+			ctx := context.Background()
+			open := func() *Storage {
+				opts := pgBusOptions(dsn)
+				opts.SweepInterval = time.Hour // swept by hand below
+				opts.Retention = Retention{Message: 2 * time.Minute}
+				// With the publish lanes, as the server runs, a publish
+				// that recreates the row chains on its fresh seed.
+				opts.Batching = Batching{Lanes: 1}
+				s, err := Open(ctx, opts)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				t.Cleanup(func() { _ = s.Close() })
+				return s
+			}
+			b, other := open(), open()
+			recB, recO := &discontinuityRecorder{}, &discontinuityRecorder{}
+			ch, err := b.Channel(ctx, "room", recB)
+			if err != nil {
+				t.Fatalf("B binds room: %v", err)
+			}
+			if _, err := other.Channel(ctx, "room", recO); err != nil {
+				t.Fatalf("other binds room: %v", err)
+			}
+			csB, csO := b.boundStore("room"), other.boundStore("room")
+			m1 := publish(t, ctx, ch, "m1")
+			for _, cs := range []*channelStore{csB, csO} {
+				waitFor(t, 5*time.Second, "m1 to be delivered", func() bool { return cs.watermark() == m1 })
+			}
+			sweep := func() {
+				t.Helper()
+				for _, s := range []*Storage{b, other} {
+					if err := s.sweepWatermarks(ctx); err != nil {
+						t.Fatalf("sweep: %v", err)
+					}
+				}
+			}
+			sweep()
+
+			// The channel idles past retention and is pruned: its row and
+			// its aged-out log go.
+			if _, err := b.pool.Exec(ctx, `DELETE FROM channel_messages WHERE channel = 'room'`); err != nil {
+				t.Fatalf("delete log rows: %v", err)
+			}
+			if _, err := b.pool.Exec(ctx, `DELETE FROM channels WHERE name = 'room'`); err != nil {
+				t.Fatalf("delete channels row: %v", err)
+			}
+			for _, minute := range tc.minutes {
+				b.SetClockSkew(time.Duration(minute) * time.Minute)
+				other.SetClockSkew(time.Duration(minute) * time.Minute)
+				sweep()
+			}
+
+			m2 := publish(t, ctx, ch, "m2")
+			want := []string{m1, m2}
+			if tc.wantDisc {
+				want = []string{m1, "|", m2}
+			}
+			for name, n := range map[string]struct {
+				cs  *channelStore
+				rec *discontinuityRecorder
+			}{"B": {csB, recB}, "other": {csO, recO}} {
+				waitFor(t, 5*time.Second, name+" to deliver m2", func() bool { return n.cs.watermark() == m2 })
+				n.cs.hwmMu.Lock() // Append runs under hwmMu
+				got := append([]string(nil), n.rec.serials...)
+				n.cs.hwmMu.Unlock()
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("%s delivered %v, want %v", name, got, want)
+				}
+			}
+		})
+	}
 }

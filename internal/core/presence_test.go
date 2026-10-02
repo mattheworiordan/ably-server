@@ -335,27 +335,6 @@ func TestPresenceSyncWaitersShareOneRebuild(t *testing.T) {
 	}
 }
 
-func TestPresenceSyncStoreModeReadsStoreEveryTime(t *testing.T) {
-	store := &membersStore{members: []*protocol.PresenceMessage{pres("005", 0, protocol.PresenceEnter, "c1", "alice", "a")}, asOf: "005"}
-	c, _ := testChannel(t, store, "005")
-	c.syncSource = PresenceSyncStore
-	for range 3 {
-		snap, err := c.PresenceSync(context.Background())
-		if err != nil {
-			t.Fatalf("PresenceSync: %v", err)
-		}
-		if snap.AsOf != "005" || fmt.Sprint(setOf(snap.Members)) != "[c1:alice=a]" {
-			t.Errorf("store snapshot = %v as of %q", setOf(snap.Members), snap.AsOf)
-		}
-	}
-	if n := store.calls.Load(); n != 3 {
-		t.Errorf("store Members calls = %d, want 3", n)
-	}
-	if c.pv.seeded {
-		t.Error("store mode seeded a local set")
-	}
-}
-
 func TestPresenceSyncSeedFailureFallsBackAndRetries(t *testing.T) {
 	store := &membersStore{err: errors.New("database down")}
 	c, _ := testChannel(t, store, "005")
@@ -387,17 +366,6 @@ func TestPresenceSnapshotMemoBuildsOnce(t *testing.T) {
 	s.Memo(2, build)
 	if n := builds.Load(); n != 2 {
 		t.Errorf("builds = %d, want one per key", n)
-	}
-}
-
-func TestParsePresenceSyncSource(t *testing.T) {
-	for in, want := range map[string]string{"": PresenceSyncLocal, "local": PresenceSyncLocal, "store": PresenceSyncStore} {
-		if got, err := ParsePresenceSyncSource(in); err != nil || got != want {
-			t.Errorf("ParsePresenceSyncSource(%q) = %q, %v", in, got, err)
-		}
-	}
-	if _, err := ParsePresenceSyncSource("postgres"); err == nil {
-		t.Error("an unknown source was accepted")
 	}
 }
 
@@ -549,9 +517,8 @@ func TestPresenceSyncDiscontinuityDuringWait(t *testing.T) {
 
 // TestChannelWithoutSubscribersDropsMemberSet: the local member set is
 // folded from the delivered cms, and the bus sweep is what repairs one
-// lost on the bus, but with --bus-sweep-scope=subscribed the sweep skips
-// a channel with no attachment and no member of its own (DESIGN.md §7.2,
-// §12.4). So such a channel drops its set when the sweep finds it
+// lost on the bus, but the sweep skips a channel with no attachment and
+// no member of its own (DESIGN.md §7.2, §12.4). So such a channel drops its set when the sweep finds it
 // without subscribers, and the next attach's SYNC seeds afresh from the
 // store: an operation lost while nobody was attached is not served
 // stale. While an attachment is open, or a member of this node's

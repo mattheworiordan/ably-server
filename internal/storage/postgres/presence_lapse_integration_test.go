@@ -68,59 +68,57 @@ func (r *presenceRecorder) totalLeaves() int {
 // the reaper rounds. Before the reaper guard, each node reaped the
 // other's members during the outage.
 func TestBlackoutReapsNoLiveMember(t *testing.T) {
-	forEachLeaseMode(t, func(t *testing.T, mode string) {
-		defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 100*time.Millisecond)()
-		ctx := context.Background()
-		dsn := pgtest.Start(t).FreshSchemaDSN(t)
-		sa := openLeaseNode(t, dsn, mode, "", Batching{Lanes: 4})
-		defer func() { _ = sa.Close() }()
-		sb := openLeaseNode(t, dsn, mode, "", Batching{Lanes: 4})
-		defer func() { _ = sb.Close() }()
-		recA, recB := &presenceRecorder{}, &presenceRecorder{}
-		if _, err := sa.Channel(ctx, "room", recA); err != nil {
-			t.Fatalf("Channel A: %v", err)
-		}
-		if _, err := sb.Channel(ctx, "room", recB); err != nil {
-			t.Fatalf("Channel B: %v", err)
-		}
-		const n = 5
-		enterMembers(t, sa, []string{"room"}, "a", n)
-		enterMembers(t, sb, []string{"room"}, "b", n)
-		// Both nodes past their first window, so both reapers are armed.
-		time.Sleep(presenceLeaseWindow + 2*presenceLeaseBumpInterval)
+	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 100*time.Millisecond)()
+	ctx := context.Background()
+	dsn := pgtest.Start(t).FreshSchemaDSN(t)
+	sa := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
+	defer func() { _ = sa.Close() }()
+	sb := openLeaseNode(t, dsn, "", Batching{Lanes: 4})
+	defer func() { _ = sb.Close() }()
+	recA, recB := &presenceRecorder{}, &presenceRecorder{}
+	if _, err := sa.Channel(ctx, "room", recA); err != nil {
+		t.Fatalf("Channel A: %v", err)
+	}
+	if _, err := sb.Channel(ctx, "room", recB); err != nil {
+		t.Fatalf("Channel B: %v", err)
+	}
+	const n = 5
+	enterMembers(t, sa, []string{"room"}, "a", n)
+	enterMembers(t, sb, []string{"room"}, "b", n)
+	// Both nodes past their first window, so both reapers are armed.
+	time.Sleep(presenceLeaseWindow + 2*presenceLeaseBumpInterval)
 
-		restore := failLeaseBumps()
-		time.Sleep(3 * presenceLeaseWindow)
-		restore()
-		time.Sleep(presenceLeaseWindow + 2*presenceLeaseBumpInterval)
+	restore := failLeaseBumps()
+	time.Sleep(3 * presenceLeaseWindow)
+	restore()
+	time.Sleep(presenceLeaseWindow + 2*presenceLeaseBumpInterval)
 
-		if got := countPresenceRows(t, sa, `channel = 'room'`); got != 2*n {
-			t.Fatalf("%d members after the outage, want all %d (live nodes' members were reaped)", got, 2*n)
-		}
-		if a, b := recA.totalLeaves(), recB.totalLeaves(); a+b != 0 {
-			t.Fatalf("LEAVEs published across the outage: %d on A, %d on B, want 0", a, b)
-		}
-		if got := counterValue(t, sb.lmetrics.deferred); got == 0 {
-			t.Error("ably_presence_reaps_deferred_total = 0, want the outage's reaper rounds counted")
-		}
-		if got := counterValue(t, sb.lmetrics.lapses); got != 1 {
-			t.Errorf("ably_presence_lease_lapses_total = %v on B, want 1", got)
-		}
+	if got := countPresenceRows(t, sa, `channel = 'room'`); got != 2*n {
+		t.Fatalf("%d members after the outage, want all %d (live nodes' members were reaped)", got, 2*n)
+	}
+	if a, b := recA.totalLeaves(), recB.totalLeaves(); a+b != 0 {
+		t.Fatalf("LEAVEs published across the outage: %d on A, %d on B, want 0", a, b)
+	}
+	if got := counterValue(t, sb.lmetrics.deferred); got == 0 {
+		t.Error("ably_presence_reaps_deferred_total = 0, want the outage's reaper rounds counted")
+	}
+	if got := counterValue(t, sb.lmetrics.lapses); got != 1 {
+		t.Errorf("ably_presence_lease_lapses_total = %v on B, want 1", got)
+	}
 
-		// A real death is still reaped promptly.
-		start := time.Now()
-		crash(t, sa)
-		waitFor(t, 10*time.Second, "the dead node's members to be reaped", func() bool {
-			return countPresenceRows(t, sb, `node_id = $1`, sa.node) == 0
-		})
-		if took, bound := time.Since(start), presenceLeaseWindow+presenceLeaseBumpInterval+3*presenceReaperInterval+time.Second; took > bound {
-			t.Errorf("reaping a dead node took %v, want within %v", took, bound)
-		}
-		waitFor(t, 10*time.Second, "the dead node's LEAVEs", func() bool { return recB.totalLeaves() == n })
-		if got := countPresenceRows(t, sb, `node_id = $1`, sb.node); got != n {
-			t.Errorf("the live node owns %d members, want %d", got, n)
-		}
+	// A real death is still reaped promptly.
+	start := time.Now()
+	crash(t, sa)
+	waitFor(t, 10*time.Second, "the dead node's members to be reaped", func() bool {
+		return countPresenceRows(t, sb, `node_id = $1`, sa.node) == 0
 	})
+	if took, bound := time.Since(start), presenceLeaseWindow+presenceLeaseBumpInterval+3*presenceReaperInterval+time.Second; took > bound {
+		t.Errorf("reaping a dead node took %v, want within %v", took, bound)
+	}
+	waitFor(t, 10*time.Second, "the dead node's LEAVEs", func() bool { return recB.totalLeaves() == n })
+	if got := countPresenceRows(t, sb, `node_id = $1`, sb.node); got != n {
+		t.Errorf("the live node owns %d members, want %d", got, n)
+	}
 }
 
 // reenterRecorder is an Options.OnPresenceLeaseLapse that re-enters a
@@ -169,7 +167,7 @@ func TestLeaseLapseReentersMembers(t *testing.T) {
 				cs, _ := sa.Channel(ctx, channel, nil)
 				return cs
 			}
-			sb := openLeaseNode(t, dsn, PresenceLeaseNode, "", batching)
+			sb := openLeaseNode(t, dsn, "", batching)
 			defer func() { _ = sb.Close() }()
 			recB := &presenceRecorder{}
 			chB, err := sb.Channel(ctx, "room", recB)
@@ -297,7 +295,7 @@ func TestReapedLeaveSkipsPresentMember(t *testing.T) {
 			defer swapPresenceTimings(time.Hour, time.Hour, time.Hour)() // no background round
 			ctx := context.Background()
 			dsn := pgtest.Start(t).FreshSchemaDSN(t)
-			s := openLeaseNode(t, dsn, PresenceLeaseNode, "", batching)
+			s := openLeaseNode(t, dsn, "", batching)
 			defer func() { _ = s.Close() }()
 			rec := &presenceRecorder{}
 			if _, err := s.Channel(ctx, "room", rec); err != nil {
@@ -346,7 +344,7 @@ func TestReentrySkipsPresentMembers(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			dsn := pgtest.Start(t).FreshSchemaDSN(t)
-			s := openLeaseNode(t, dsn, PresenceLeaseNode, "", batching)
+			s := openLeaseNode(t, dsn, "", batching)
 			defer func() { _ = s.Close() }()
 			rec := &presenceRecorder{}
 			ch, err := s.Channel(ctx, "room", rec)
@@ -390,7 +388,7 @@ func TestReaperStatementTimeout(t *testing.T) {
 	defer swapPresenceTimings(time.Hour, 200*time.Millisecond, time.Hour)()
 	ctx := context.Background()
 	dsn := pgtest.Start(t).FreshSchemaDSN(t)
-	s := openLeaseNode(t, dsn, PresenceLeaseNode, "", Batching{})
+	s := openLeaseNode(t, dsn, "", Batching{})
 	defer func() { _ = s.Close() }()
 	start := time.Now()
 	_, err := s.deleteReturning(ctx, `SELECT 'c', 'k', 'l' FROM pg_sleep(2)`)

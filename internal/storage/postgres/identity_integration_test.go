@@ -326,3 +326,79 @@ func TestClusterIdentityConcurrentFirstOpen(t *testing.T) {
 		}
 	}
 }
+
+// TestClusterIdentityRefusesAnInferredBusOnAnOlderDatabase: a database
+// that served a version from before the cluster identity record holds
+// channels and no record, and its nodes ran pgnotify, the default when
+// --bus was unset. A node that inferred its bus would record postgres
+// (or nats) and never deliver to them, so it is refused with the way
+// out; an explicit --bus=pgnotify joins them, and an explicit other bus
+// is the operator's stop-every-node decision and is recorded. A database
+// with no channels is new and records the inferred bus (DESIGN.md §11).
+func TestClusterIdentityRefusesAnInferredBusOnAnOlderDatabase(t *testing.T) {
+	c := pgtest.Start(t)
+	ctx := context.Background()
+
+	// An older node: pgnotify, no identity record, a channel in use.
+	older := func(t *testing.T) string {
+		t.Helper()
+		dsn := c.FreshSchemaDSN(t)
+		s, err := Open(ctx, Options{DSN: dsn, Bus: BusPGNotify, skipClusterIdentity: true})
+		if err != nil {
+			t.Fatalf("open the older node: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		if _, err := s.Channel(ctx, "room", &recorder{}); err != nil {
+			t.Fatalf("bind room: %v", err)
+		}
+		return dsn
+	}
+
+	t.Run("inferred", func(t *testing.T) {
+		dsn := older(t)
+		for _, bus := range []string{BusPostgres, BusNATS} {
+			// The refusal comes before the bus connects, so the NATS URL
+			// need not answer.
+			err := openErr(t, Options{DSN: dsn, Bus: bus, NATSURL: "nats://127.0.0.1:1", BusInferred: true})
+			if err == nil {
+				t.Fatalf("a node that inferred --bus=%s opened a database that served an earlier version", bus)
+			}
+			for _, want := range []string{"predates the --bus setting", "ran --bus=pgnotify, the only default then", "inferred --bus=" + bus, "with --bus=pgnotify", "stop every node first"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q lacks %q", err, want)
+				}
+			}
+		}
+	})
+	t.Run("explicit pgnotify", func(t *testing.T) {
+		dsn := older(t)
+		if err := openErr(t, Options{DSN: dsn, Bus: BusPGNotify}); err != nil {
+			t.Fatalf("explicit --bus=pgnotify: %v", err)
+		}
+		if _, bus, _ := recordedIdentity(t, dsn); bus != BusPGNotify {
+			t.Errorf("recorded bus %q, want pgnotify", bus)
+		}
+	})
+	t.Run("explicit postgres", func(t *testing.T) {
+		dsn := older(t)
+		if err := openErr(t, Options{DSN: dsn, Bus: BusPostgres}); err != nil {
+			t.Fatalf("explicit --bus=postgres: %v", err)
+		}
+		if _, bus, _ := recordedIdentity(t, dsn); bus != BusPostgres {
+			t.Errorf("recorded bus %q, want postgres", bus)
+		}
+	})
+	t.Run("new database", func(t *testing.T) {
+		dsn := c.FreshSchemaDSN(t)
+		if err := openErr(t, Options{DSN: dsn, Bus: BusPostgres, BusInferred: true}); err != nil {
+			t.Fatalf("inferred bus on a new database: %v", err)
+		}
+		if _, bus, _ := recordedIdentity(t, dsn); bus != BusPostgres {
+			t.Errorf("recorded bus %q, want postgres", bus)
+		}
+		// Once recorded, later nodes that infer the same bus join.
+		if err := openErr(t, Options{DSN: dsn, Bus: BusPostgres, BusInferred: true}); err != nil {
+			t.Fatalf("second node: %v", err)
+		}
+	})
+}

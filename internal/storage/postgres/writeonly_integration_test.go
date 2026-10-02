@@ -209,67 +209,38 @@ func TestShardedUnboundPublishRoutesByHash(t *testing.T) {
 	}
 }
 
-// TestUnboundPublishBindOnWrite: under Options.BindOnWrite the pre-write-
-// only behaviour holds: a bind runs ensure_channel even for a channel
-// this node has published on.
-func TestUnboundPublishBindOnWrite(t *testing.T) {
-	c := pgtest.Start(t)
-	ctx := context.Background()
-	a := openOpts(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 4}, BindOnWrite: true})
-	st := a.UnboundChannel("room")
-	publish(t, ctx, st, "x")
-	if _, err := a.Channel(ctx, "room", &recordingAppender{}); err != nil {
-		t.Fatalf("bind: %v", err)
-	}
-	if e, r := a.ensureCalls.Load(), a.rowReads.Load(); e != 1 || r != 0 {
-		t.Errorf("bind under BindOnWrite: ensure_channel %d, row reads %d; want 1 and 0", e, r)
-	}
-}
-
 // TestBatchedPresenceRowCreation: a batched presence write on a channel
 // with no row yet makes the row the way a message publish does
-// (DESIGN.md §6.3, channel rows). By default publish_batch_lock creates
-// it inside the batch, with no statement of its own before the write is
-// queued, and the node remembers the row, so a later bind reads it
-// without ensure_channel. Under BindOnWrite the row is made before
-// queueing and a bind runs ensure_channel, as before.
+// (DESIGN.md §6.3, channel rows): publish_batch_lock creates it inside
+// the batch, with no statement of its own before the write is queued,
+// and the node remembers the row, so a later bind reads it without
+// ensure_channel.
 func TestBatchedPresenceRowCreation(t *testing.T) {
 	c := pgtest.Start(t)
 	ctx := context.Background()
-	for _, bindOnWrite := range []bool{false, true} {
-		t.Run(fmt.Sprintf("bindOnWrite=%v", bindOnWrite), func(t *testing.T) {
-			a := openOpts(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 4}, BindOnWrite: bindOnWrite})
-			st := a.UnboundChannel("presence-room").(*channelStore)
-			enter := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "alice", ConnectionID: "conn-1", Data: "a"}
-			cm, _, err := st.StorePresence(ctx, []*protocol.PresenceMessage{enter})
-			if err != nil {
-				t.Fatalf("StorePresence: %v", err)
-			}
-			if st.rowEnsured.Load() != bindOnWrite {
-				t.Errorf("row made before queueing = %v, want %v", st.rowEnsured.Load(), bindOnWrite)
-			}
-			commits, _, _ := a.BatchCounters()
-			if commits != 1 {
-				t.Errorf("batch commits = %v, want 1 (the presence write went through a lane)", commits)
-			}
-			members, asOf, err := st.Members(ctx)
-			if err != nil {
-				t.Fatalf("Members: %v", err)
-			}
-			if len(members) != 1 || members[0].ClientID != "alice" || asOf != cm.ChannelSerial {
-				t.Fatalf("Members = %d members as of %q, want alice as of %q", len(members), asOf, cm.ChannelSerial)
-			}
+	a := openOpts(t, Options{DSN: c.FreshSchemaDSN(t), Batching: Batching{Lanes: 4}})
+	st := a.UnboundChannel("presence-room").(*channelStore)
+	enter := &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "alice", ConnectionID: "conn-1", Data: "a"}
+	cm, _, err := st.StorePresence(ctx, []*protocol.PresenceMessage{enter})
+	if err != nil {
+		t.Fatalf("StorePresence: %v", err)
+	}
+	commits, _, _ := a.BatchCounters()
+	if commits != 1 {
+		t.Errorf("batch commits = %v, want 1 (the presence write went through a lane)", commits)
+	}
+	members, asOf, err := st.Members(ctx)
+	if err != nil {
+		t.Fatalf("Members: %v", err)
+	}
+	if len(members) != 1 || members[0].ClientID != "alice" || asOf != cm.ChannelSerial {
+		t.Fatalf("Members = %d members as of %q, want alice as of %q", len(members), asOf, cm.ChannelSerial)
+	}
 
-			if _, err := a.Channel(ctx, "presence-room", &recordingAppender{}); err != nil {
-				t.Fatalf("bind: %v", err)
-			}
-			wantEnsure, wantReads := uint64(0), uint64(1)
-			if bindOnWrite {
-				wantEnsure, wantReads = 1, 0
-			}
-			if e, r := a.ensureCalls.Load(), a.rowReads.Load(); e != wantEnsure || r != wantReads {
-				t.Errorf("bind: ensure_channel %d, row reads %d; want %d and %d", e, r, wantEnsure, wantReads)
-			}
-		})
+	if _, err := a.Channel(ctx, "presence-room", &recordingAppender{}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if e, r := a.ensureCalls.Load(), a.rowReads.Load(); e != 0 || r != 1 {
+		t.Errorf("bind: ensure_channel %d, row reads %d; want 0 and 1", e, r)
 	}
 }

@@ -585,30 +585,23 @@ func TestRunPublishBatchingMalformedIsStartupError(t *testing.T) {
 	}
 }
 
-// TestRunPresenceLeaseModeInvalidIsStartupError: an unknown
-// --presence-lease-mode, from the flag, the env or the config file, stops
-// a cluster-mode node before it dials Postgres (DESIGN.md §12.5).
-func TestRunPresenceLeaseModeInvalidIsStartupError(t *testing.T) {
-	base := []string{"--keys=app.key:secret", "--mode=cluster", "--postgres-dsn=postgres://u:p@127.0.0.1:1/db?sslmode=disable"}
-	for _, tc := range []struct {
-		name string
-		args []string
-		env  map[string]string
-		file string
-	}{
-		{name: "flag", args: []string{"--presence-lease-mode=row"}},
-		{name: "env", env: map[string]string{presenceLeaseModeEnv: "row"}},
-		{name: "file", file: `presence-lease-mode = "row"`},
+// TestRunRejectsRemovedFlags (DESIGN.md §9 "Removed settings"): each
+// retired A/B switch is now an unknown flag, a startup error, rather than
+// a setting that silently selects the behaviour it used to.
+func TestRunRejectsRemovedFlags(t *testing.T) {
+	for _, flag := range []string{
+		"--publish-bind-on-write=true",
+		"--bus-sweep-scope=bound",
+		"--publish-linger-min=2ms",
+		"--presence-sync-source=store",
+		"--presence-batching=false",
+		"--presence-lease-mode=member",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			args := append(append([]string{}, base...), tc.args...)
-			if tc.file != "" {
-				args = append(args, "--config="+writeConfigFile(t, tc.file))
-			}
+		t.Run(flag, func(t *testing.T) {
 			var out bytes.Buffer
-			code := Run(context.Background(), Opts{Args: args, Getenv: envWith(tc.env), Out: &out})
-			if code != 1 || !strings.Contains(out.String(), "invalid --presence-lease-mode") {
-				t.Errorf("exit = %d, output %q; want 1 and an invalid --presence-lease-mode error", code, out.String())
+			code := Run(context.Background(), Opts{Args: []string{"--keys=app.key:secret", flag}, Getenv: emptyEnv, Out: &out})
+			if code != 2 || !strings.Contains(out.String(), "flag provided but not defined") {
+				t.Errorf("exit = %d, output %q; want 2 and an unknown-flag error", code, out.String())
 			}
 		})
 	}
@@ -663,9 +656,9 @@ func TestRunWarnsAboutIgnoredBusSettings(t *testing.T) {
 }
 
 func TestBusSettingsIgnored(t *testing.T) {
-	given := map[string]bool{"nats-url": true, "bus-sweep-scope": true, "postgres-notify-mode": false}
-	if got := strings.Join(busSettingsIgnored("pgnotify", given), ","); got != "bus-sweep-scope,nats-url" {
-		t.Errorf("pgnotify ignores %q, want bus-sweep-scope,nats-url", got)
+	given := map[string]bool{"nats-url": true, "bus-sweep-interval": true, "postgres-notify-mode": false}
+	if got := strings.Join(busSettingsIgnored("pgnotify", given), ","); got != "bus-sweep-interval,nats-url" {
+		t.Errorf("pgnotify ignores %q, want bus-sweep-interval,nats-url", got)
 	}
 	if got := busSettingsIgnored("nats", given); len(got) != 0 {
 		t.Errorf("nats ignores %v, want none", got)
@@ -673,6 +666,31 @@ func TestBusSettingsIgnored(t *testing.T) {
 	for name := range busSettingUsers {
 		if len(busSettingUsers[name]) == 0 {
 			t.Errorf("%s is used by no bus", name)
+		}
+	}
+}
+
+// TestRunWarnsAboutUnknownConfigKeys (DESIGN.md §9 "Removed settings"):
+// a config file key the server does not define, such as a removed
+// setting, is named in a startup warning rather than ignored silently.
+func TestRunWarnsAboutUnknownConfigKeys(t *testing.T) {
+	path := writeConfigFile(t, "publish-bind-on-write = true\n")
+	var out bytes.Buffer
+	Run(context.Background(), Opts{Args: []string{"--config=" + path}, Getenv: emptyEnv, Out: &out})
+	if !strings.Contains(out.String(), "config file key not recognised") || !strings.Contains(out.String(), "key=publish-bind-on-write") {
+		t.Errorf("output lacks a warning naming publish-bind-on-write: %q", out.String())
+	}
+}
+
+// TestRunWarnsAboutRemovedEnvVars (DESIGN.md §9 "Removed settings"): the
+// env var of a retired setting is not read, and is named in a startup
+// warning rather than ignored silently.
+func TestRunWarnsAboutRemovedEnvVars(t *testing.T) {
+	for _, name := range removedEnv {
+		var out bytes.Buffer
+		Run(context.Background(), Opts{Args: nil, Getenv: envWith(map[string]string{name: "x"}), Out: &out})
+		if !strings.Contains(out.String(), "removed setting") || !strings.Contains(out.String(), "env="+name) {
+			t.Errorf("%s set: output lacks a warning naming it: %q", name, out.String())
 		}
 	}
 }

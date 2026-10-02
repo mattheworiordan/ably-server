@@ -41,8 +41,8 @@ type File struct {
 	// Bus selects cluster mode's cross-node bus, "pgnotify", "postgres"
 	// or "nats" (DESIGN.md §7.2); NATSURL and NATSInlineMaxBytes
 	// configure the nats bus; the PostgresNotify* keys configure the
-	// postgres bus; BusSweepInterval and BusSweepScope the chaining
-	// buses' safety-net sweep. Durations are strings, like ShutdownGrace;
+	// postgres bus; BusSweepInterval the chaining buses' safety-net
+	// sweep. Durations are strings, like ShutdownGrace;
 	// a zero int means absent.
 	Bus                string `toml:"bus"`
 	NATSURL            string `toml:"nats-url"`
@@ -57,33 +57,20 @@ type File struct {
 	PostgresNotifyWindow     string `toml:"postgres-notify-window"`
 	PostgresNotifyMaxPending int    `toml:"postgres-notify-max-pending"`
 	BusSweepInterval         string `toml:"bus-sweep-interval"`
-	BusSweepScope            string `toml:"bus-sweep-scope"`
 	// MessageRetention and PersistedRetention are duration strings (e.g.
 	// "2m", "24h") for the cluster-mode message log's retention classes
 	// (DESIGN.md §6.3, §9).
 	MessageRetention   string `toml:"message-retention"`
 	PersistedRetention string `toml:"persisted-retention"`
 	// Publish batching for the cluster-mode write path (DESIGN.md §6.3,
-	// §9). Zero means absent; publish-linger-max and publish-linger-min
-	// are duration strings.
+	// §9). Zero means absent; publish-linger-max is a duration string.
 	PublishLanes     int    `toml:"publish-lanes"`
 	PublishBatchMax  int    `toml:"publish-batch-max"`
 	PublishLingerMax string `toml:"publish-linger-max"`
-	PublishLingerMin string `toml:"publish-linger-min"`
 	PublishQueueMax  int    `toml:"publish-queue-max"`
-	// PublishBindOnWrite restores binding a channel on every REST publish
-	// (DESIGN.md §6.3); absent/false keeps the write-only path.
-	PublishBindOnWrite bool `toml:"publish-bind-on-write"`
-	// The presence path (DESIGN.md §12.4, §12.5, §9): the SYNC source
-	// ("local" or "store"), whether presence writes join the publish
-	// batches (a pointer, since its default is true and a file must be
-	// able to turn it off), the bound on unbatched presence writes
-	// in flight (zero means absent), and the liveness lease mode ("node"
-	// or "member").
-	PresenceSyncSource  string `toml:"presence-sync-source"`
-	PresenceBatching    *bool  `toml:"presence-batching"`
-	PresenceMaxInflight int    `toml:"presence-max-inflight"`
-	PresenceLeaseMode   string `toml:"presence-lease-mode"`
+	// PresenceMaxInflight bounds the presence writes committed outside
+	// the publish lanes (DESIGN.md §12.5, §9); zero means absent.
+	PresenceMaxInflight int `toml:"presence-max-inflight"`
 	// EnableStatsStub registers the GET/POST /stats compatibility stub
 	// (DESIGN.md §1); absent/false — the zero value — keeps it
 	// unregistered, matching the fallback default, so the usual
@@ -121,6 +108,12 @@ type File struct {
 	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
 	// replacing the retired --fixtures JSON path.
 	Channels []Channel `toml:"channels"`
+
+	// Unknown lists the keys in the file that File does not define, such
+	// as a setting that has been removed (DESIGN.md §9 "Removed
+	// settings"), so the server can name each in a startup warning
+	// rather than ignore it silently. Set by Load, never by the file.
+	Unknown []string `toml:"-"`
 }
 
 // KeyEntry is one structured [[keys]] entry (DESIGN.md §3.1, §9): an
@@ -162,11 +155,16 @@ type PresenceMember struct {
 	Encoding string `toml:"encoding"`
 }
 
-// Load parses the TOML file at path into a File.
+// Load parses the TOML file at path into a File. Keys File does not
+// define are not an error; they are listed in File.Unknown.
 func Load(path string) (*File, error) {
 	var f File
-	if _, err := toml.DecodeFile(path, &f); err != nil {
+	md, err := toml.DecodeFile(path, &f)
+	if err != nil {
 		return nil, fmt.Errorf("config: parse %q: %w", path, err)
+	}
+	for _, k := range md.Undecoded() {
+		f.Unknown = append(f.Unknown, k.String())
 	}
 	return &f, nil
 }
@@ -269,15 +267,6 @@ func DefaultBool(env string, file bool, fallback bool) (bool, error) {
 		return true, nil
 	}
 	return fallback, nil
-}
-
-// DefaultBoolPtr is DefaultBool for an option whose file value may be
-// set to false over a true fallback: file is nil when absent.
-func DefaultBoolPtr(env string, file *bool, fallback bool) (bool, error) {
-	if env == "" && file != nil {
-		return *file, nil
-	}
-	return DefaultBool(env, false, fallback)
 }
 
 // DefaultIntPtr is DefaultInt for an option whose file value may be

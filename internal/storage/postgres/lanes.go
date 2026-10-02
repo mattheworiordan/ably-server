@@ -16,8 +16,13 @@ import (
 )
 
 // Publish batching defaults (DESIGN.md §6.3 "Publish batching").
+// DefaultPublishLanes is 2, the value the measured write results used:
+// on one primary, 10 nodes committed 51.9k writes/s at 2 lanes against
+// 38.0k at 4 and 46.6k at 1 (capped by each node's one lane), and the best
+// value falls as nodes are added (lanes x nodes near 20 committers per
+// primary; §6.3).
 const (
-	DefaultPublishLanes     = 4
+	DefaultPublishLanes     = 2
 	DefaultPublishBatchMax  = 200
 	DefaultPublishLingerMax = 5 * time.Millisecond
 	DefaultPublishQueueMax  = 10000
@@ -69,20 +74,6 @@ type Batching struct {
 	// QueueMax bounds each lane's queue; beyond it a publish fails with
 	// storage.ErrOverloaded. Zero means DefaultPublishQueueMax.
 	QueueMax int
-
-	// LingerMin is a floor on accumulation when nothing is in flight: an
-	// idle lane holds its first publish until it has waited this long (or
-	// BatchMax are queued) before committing, so publishes arriving
-	// meanwhile share the commit. Zero (the default) commits at once, the
-	// leading edge.
-	LingerMin time.Duration
-
-	// PresenceUnbatched commits every presence operation in its own
-	// transaction even when publishes are batched, as before presence
-	// batching existed. The zero value routes presence through the lanes
-	// with messages (DESIGN.md §6.3, §12.5); the server's
-	// --presence-batching=false sets it.
-	PresenceUnbatched bool
 }
 
 func (b Batching) enabled() bool { return b.Lanes > 0 }
@@ -97,7 +88,6 @@ func (b Batching) resolve() Batching {
 	if b.QueueMax <= 0 {
 		b.QueueMax = DefaultPublishQueueMax
 	}
-	b.LingerMin = max(b.LingerMin, 0)
 	return b
 }
 
@@ -201,7 +191,6 @@ func newLaneSet(b Batching, c committer, m *writeMetrics) *laneSet {
 	ls := &laneSet{metrics: m}
 	m.lanes.Set(float64(b.Lanes))
 	m.lingerMax.Set(b.LingerMax.Seconds())
-	m.lingerMin.Set(b.LingerMin.Seconds())
 	var ctx context.Context
 	ctx, ls.cancel = context.WithCancel(context.Background())
 	for i := range b.Lanes {
@@ -377,20 +366,13 @@ func (ls *laneSet) forceSubmit(p *pending) bool {
 }
 
 // pumpLocked starts as many batches as the rules allow: one at once when
-// nothing is in flight (the leading edge), or, with LingerMin set, once
-// the oldest queued publish has waited LingerMin or BatchMax are queued;
-// a further one only when the newest in-flight batch has been running for
+// nothing is in flight (the leading edge); a further one only when the newest in-flight batch has been running for
 // LingerMax, and then only with publishes whose channels are not already
 // in flight.
 func (l *lane) pumpLocked() {
 	for len(l.queue) > 0 && !l.closed && l.inflight < maxInflightPerLane {
 		if l.inflight > 0 {
 			if wait := l.opts.LingerMax - time.Since(l.lastDispatch); wait > 0 {
-				l.armTimerLocked(wait)
-				return
-			}
-		} else if l.opts.LingerMin > 0 && len(l.queue) < l.opts.BatchMax {
-			if wait := l.opts.LingerMin - time.Since(l.queue[0].enqueued); wait > 0 {
 				l.armTimerLocked(wait)
 				return
 			}
@@ -414,7 +396,7 @@ func (l *lane) pumpLocked() {
 	}
 }
 
-// armTimerLocked schedules a pump after d, for the linger cap or floor.
+// armTimerLocked schedules a pump after d, for the linger cap.
 func (l *lane) armTimerLocked(d time.Duration) {
 	if l.timer != nil {
 		l.timer.Stop()
@@ -606,7 +588,6 @@ func (l *lane) stop() {
 type writeMetrics struct {
 	lanes         prometheus.Gauge
 	lingerMax     prometheus.Gauge
-	lingerMin     prometheus.Gauge
 	batchSize     prometheus.Histogram
 	commits       prometheus.Counter
 	commitSeconds prometheus.Histogram
@@ -631,10 +612,6 @@ func newWriteMetrics() *writeMetrics {
 		lingerMax: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "ably_publish_linger_max_seconds",
 			Help: "In-flight time after which a lane starts a second batch (--publish-linger-max); 0 when batching is off.",
-		}),
-		lingerMin: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ably_publish_linger_min_seconds",
-			Help: "How long an idle lane holds its first publish before committing (--publish-linger-min).",
 		}),
 		batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ably_publish_batch_size",
@@ -678,5 +655,5 @@ func newWriteMetrics() *writeMetrics {
 }
 
 func (m *writeMetrics) collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.lanes, m.lingerMax, m.lingerMin, m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks, m.serverUnbatched, m.serverForced}
+	return []prometheus.Collector{m.lanes, m.lingerMax, m.batchSize, m.commits, m.commitSeconds, m.queueDepth, m.deferred, m.retries, m.nacks, m.serverUnbatched, m.serverForced}
 }

@@ -51,12 +51,10 @@ func SetDropLockTimeout(d time.Duration) func() {
 	return func() { dropLockTimeout = orig }
 }
 
-// LoadRangeAfter runs the chain's single-channel log range read for the
-// channel's own retention floor.
+// LoadRangeAfter runs the chain's single-channel log range read from
+// after.
 func (s *Storage) LoadRangeAfter(ctx context.Context, channel, after string) (int, error) {
-	cs := &channelStore{name: channel}
-	s.setRetention(cs)
-	cms, err := loadChannelMessagesAfter(ctx, s.pool, channel, after, "", cs.rangeFloor(), rangePageSize)
+	cms, err := loadChannelMessagesAfter(ctx, s.pool, channel, after, "", rangePageSize)
 	return len(cms), err
 }
 

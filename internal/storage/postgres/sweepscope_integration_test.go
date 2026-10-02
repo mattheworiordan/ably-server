@@ -51,13 +51,14 @@ func (sn *sweptNames) count(name string) int {
 	return sn.names[name]
 }
 
-// TestSweepScopeSubscribedOnly checks the subscribed sweep scope
-// (DESIGN.md §7.2) on both chaining buses. A lost tail (a cm committed by
+// TestSweepScopeSubscribedOnly checks the sweep's scope, the bound
+// channels with a local subscriber (DESIGN.md §7.2), on both chaining
+// buses. A lost tail (a cm committed by
 // a node whose bus messages never arrive) on a channel with a local
 // subscriber is delivered within two sweep intervals. A channel bound
 // here without a subscriber (a REST-only bind) is never read by the
 // sweep; once it gains a subscriber its lost tail is delivered within two
-// intervals of that. Under the bound scope the REST-only channel is read.
+// intervals of that.
 func TestSweepScopeSubscribedOnly(t *testing.T) {
 	const interval = 500 * time.Millisecond
 	const slack = 500 * time.Millisecond // query time and scheduling under -race
@@ -67,12 +68,12 @@ func TestSweepScopeSubscribedOnly(t *testing.T) {
 		t.Run(bus, func(t *testing.T) {
 			dsn := c.FreshSchemaDSN(t)
 			ctx := context.Background()
-			open := func(scope string) *Storage {
+			open := func() *Storage {
 				o := pgBusOptions(dsn)
 				if bus == BusNATS {
 					o = Options{DSN: dsn, Bus: BusNATS, NATSURL: n.URL}
 				}
-				o.SweepInterval, o.SweepScope = interval, scope
+				o.SweepInterval = interval
 				s, err := Open(ctx, o)
 				if err != nil {
 					t.Fatalf("Open: %v", err)
@@ -82,7 +83,7 @@ func TestSweepScopeSubscribedOnly(t *testing.T) {
 			}
 			silent := openListenNode(t, dsn)
 			swept := installSweptNames(t)
-			b := open("") // the default scope: subscribed
+			b := open()
 
 			sub, rest := &subRecorder{}, &subRecorder{}
 			sub.sub.Store(true)
@@ -126,20 +127,6 @@ func TestSweepScopeSubscribedOnly(t *testing.T) {
 			assertSerials(t, "rest-room", rest.serials(), []string{wantRest})
 			if got := b.BusStats().SweepChannels; got == 0 {
 				t.Error("SweepChannels = 0, want the channels the sweeps read")
-			}
-
-			// Bound scope: every bound channel is read, subscriber or not.
-			bb := open(SweepBound)
-			idle := &subRecorder{}
-			if _, err := bb.Channel(ctx, "idle-room", idle); err != nil {
-				t.Fatalf("bind idle-room: %v", err)
-			}
-			quietIdle, _ := silent.Channel(ctx, "idle-room", nil)
-			wantIdle := publish(t, ctx, quietIdle, "lost-tail-idle")
-			waitForCount(t, &idle.recorder, 1, 2*interval+slack)
-			assertSerials(t, "idle-room", idle.serials(), []string{wantIdle})
-			if got := swept.count("idle-room"); got == 0 {
-				t.Error("the bound scope never read idle-room")
 			}
 		})
 	}
