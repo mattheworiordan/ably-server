@@ -1214,9 +1214,10 @@ cluster mode needs nothing beyond a single Postgres. The `nats` bus adds
 a NATS server or cluster for delivery; Postgres stays the store.
 
 Schema. The shipped DDL is the migration files under
-`internal/storage/postgres/migrations/` (`0001_initial.sql` to
-`0004_presence_nodes.sql`); they are the source of truth and each carries
-the reasoning in its header. In outline (columns elided where the
+`internal/storage/postgres/migrations/` (`0001_initial.sql`,
+`0002_partitioned_log.sql`, `0003_publish_batch.sql`,
+`0004_presence_nodes.sql` and `0005_cluster_identity.sql`); they are the
+source of truth and each carries the reasoning in its header. In outline (columns elided where the
 migrations say more):
 
 - `channels (name PK, channel_serial, initial_channel_serial)`: one row
@@ -1257,6 +1258,13 @@ migrations say more):
 - `retention_state (key, value)`: the legacy-leaf bound recorded by
   migration 0002 (below). `schema_migrations (version PK, applied_at)`:
   the migration tracker.
+- `cluster_identity` (0005): one row recording what every node of the
+  cluster must agree on (the bus, both retentions, the persisted
+  namespaces, a minimum server version) and the deployment id the nats
+  bus scopes its subjects with. The migration creates the table empty;
+  the first node to open the schema writes the row (§11).
+- `shard_identity`: created by `Open`, not by a migration, and only in
+  the databases of a `--postgres-dsn` list (§6.4).
 - SQL functions: `format_channel_serial`, `next_channel_serial`,
   `ensure_channel`, `advance_channel_serial` (0001) and
   `publish_batch_lock` (0003).
@@ -1304,8 +1312,11 @@ nothing; the timeout bounds the wait for a lock, not the time a
 migration holds the locks it did get.
 
 **`0002_partitioned_log` is the one migration that cannot run under
-traffic**, and the only one that needs an offline step; the others
-(`0001`, `0003`, `0004`) take brief locks or only add objects. It takes
+traffic**, and the only one that needs an offline step. The others take
+brief locks or only add objects: `0001` and `0005` create objects,
+`0003` adds a function, and `0004` builds `presence_node_idx` under a
+`SHARE` lock on `presence`, which blocks presence writes for about a
+second per million member rows while it builds. It takes
 `ACCESS EXCLUSIVE` on both log tables for the whole transaction, so every
 node, old or new, blocks on every publish until it ends. On a populated
 log it attaches the old table as one leaf, which validates every row
@@ -1431,10 +1442,14 @@ presence rows are bounded by live membership (§12.5), and a `channels` row
 is one small row per channel name, pruned once the channel has been idle
 past every retention (see "Channel rows" below).
 
-Every node must run with the same retention settings, since whichever node
-sweeps applies its own. Changing a channel's class (editing a namespace's
-`persisted` flag) applies to new writes; rows already written age out with
-the class they were written in.
+Every node must run with the same retention settings and the same
+persisted namespaces, since whichever node sweeps applies its own. The
+database enforces this: the first node records them in `cluster_identity`
+and `Open` refuses a node that differs (§11). Changing a channel's class
+(editing a namespace's `persisted` flag) is therefore a recorded-setting
+change (§11 "Changing a recorded setting"); once made, it applies to new
+writes, and rows already written age out with the class they were written
+in.
 
 A database created before migration `0002_partitioned_log` keeps its rows:
 a non-empty old table becomes one leaf of the live class covering
@@ -1618,7 +1633,7 @@ is a blocking operation on a hot table), so a tick that finds nothing to
 prune scans the table once.
 
 Consequences of deleting a row, none of which loses a message, since by
-the predicate no cm of the channel is older than the longest retention
+the predicate every cm of the channel is older than the longest retention
 and so none survives:
 
 - A later publish recreates the row through `publish_batch_lock` (or
@@ -1633,8 +1648,14 @@ and so none survives:
   serial. The first publish after the idle period announces the new seed
   as its predecessor, which is ahead of the mark, so the delivery point
   holds it and the gap fill reads it from the log about 100 ms later
-  (§7.2); that one cm is delivered late, none is lost, and no
-  discontinuity is signalled because the log read returns the cm.
+  (§7.2); that one cm is delivered late and none is lost. The gap fill's
+  continuity check (§7.2 "Retention") can then signal a discontinuity
+  that is spurious: the cm at the mark aged out long ago, and the sweep
+  stops refreshing the node's proof of continuity once it finds no
+  `channels` row, so a node that held the channel bound through the whole
+  idle period can no longer prove that nothing came after its mark. The
+  client is told cms may be missing when none are (§7.2: the signal can
+  be spurious, never missing).
 - A resume with a `channelSerial` from before the idle period is already
   refused as a discontinuity by the retention floor (§4.3).
 
