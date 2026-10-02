@@ -302,14 +302,6 @@ func (a *attachment) recheckCapability(newPermitted int64) int64 {
 
 // setCurSerial records the channelSerial the live cursor has advanced to,
 // so a concurrent repeat ATTACH can advertise the current position.
-// currentSerial returns the position the live stream has reached
-// (curSerial).
-func (a *attachment) currentSerial() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.curSerial
-}
-
 func (a *attachment) setCurSerial(serial string) {
 	a.mu.Lock()
 	a.curSerial = serial
@@ -484,32 +476,14 @@ func (a *attachment) nextLive() (*protocol.ChannelMessage, error) {
 			continue
 		}
 		a.syncOwed = false
-		if !a.sendOwedSync(snap) {
+		// An empty set goes as a SYNC too: its presence field is an empty
+		// array on the wire (protocol.Marshal), so the SDK ends the sync
+		// and leaves the members it holds.
+		if !a.sendSync(snap) {
 			return nil, errAttachmentSend
 		}
 	}
 	return a.stream.Next(a.ctx)
-}
-
-// sendOwedSync completes the sync a client was left waiting for
-// (syncOwed). A set with members goes as a SYNC. An empty one cannot: a
-// SYNC with no members is encoded without its presence field, which an
-// SDK skips (ably-js stops at a SYNC with no presence), so the sync would
-// stay open. The protocol's way of saying "no members" is an ATTACHED
-// without HAS_PRESENCE (RTP19a: the SDK leaves every member it holds), so
-// that is sent instead, as a channel update at the current serial with
-// no error.
-func (a *attachment) sendOwedSync(snap *core.PresenceSnapshot) bool {
-	if len(snap.Members) > 0 {
-		return a.sendSync(snap)
-	}
-	return a.send(&protocol.ProtocolMessage{
-		Action:        protocol.ActionAttached,
-		Channel:       new(a.channelName),
-		ChannelSerial: a.currentSerial(),
-		Flags:         a.modeSet(),
-		Params:        a.echoParams(),
-	})
 }
 
 // errAttachmentSend ends an attachment whose frame could not be queued.

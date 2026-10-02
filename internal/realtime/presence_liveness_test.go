@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -1076,13 +1077,13 @@ func TestDiscontinuityWithAFailedSeedKeepsMembers(t *testing.T) {
 	}
 }
 
-// TestOwedSyncForAnEmptySetIsAnAttached: when the owed re-seed (after a
-// failed one on a channel update) finds the set empty, the client's open
-// sync is completed with an ATTACHED without HAS_PRESENCE, the
-// protocol's "no members" (RTP19a). A SYNC with no members is encoded
-// without its presence field, which ably-js skips, so it would have left
-// the sync open.
-func TestOwedSyncForAnEmptySetIsAnAttached(t *testing.T) {
+// TestOwedSyncForAnEmptySetCompletesTheSync: when the owed re-seed
+// (after a failed one on a channel update) finds the set empty, the
+// client's open sync is completed with a SYNC whose presence field is an
+// empty array on the wire. Without the field (an empty slice is omitted)
+// ably-js skips the SYNC and the sync, and any presence.get() waiting on
+// it, stays open.
+func TestOwedSyncForAnEmptySetCompletesTheSync(t *testing.T) {
 	h := newLivenessServer(t, time.Hour)
 	pub := dialClient(t, h.srv, "alice")
 	drainConnected(t, pub)
@@ -1113,8 +1114,19 @@ func TestOwedSyncForAnEmptySetIsAnAttached(t *testing.T) {
 		t.Fatalf("frame = %+v, want alice's LEAVE", f)
 	}
 	h.store.failMembers.Store(false)
-	f := readFrame(t, sub, protocol.FormatJSON, 3*time.Second)
-	if f.Action != protocol.ActionAttached || f.Flags&protocol.FlagHasPresence != 0 || f.Error != nil {
-		t.Fatalf("frame = %+v, want an ATTACHED without HAS_PRESENCE or error, completing the sync with no members", f)
+	if err := sub.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	_, raw, err := sub.ReadMessage()
+	if err != nil {
+		t.Fatalf("read the owed SYNC: %v", err)
+	}
+	var f map[string]any
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	presence, ok := f["presence"].([]any)
+	if f["action"] != float64(protocol.ActionSync) || !ok || len(presence) != 0 || !strings.HasSuffix(f["channelSerial"].(string), ":") {
+		t.Fatalf("frame %s, want a complete SYNC carrying an empty presence array", raw)
 	}
 }

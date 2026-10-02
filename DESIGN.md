@@ -2051,10 +2051,9 @@ The `postgres` and `nats` buses share one delivery point
   `ATTACHED` still carries `HAS_PRESENCE`, so the SDK starts a sync and
   keeps its members rather than taking the set as empty and leaving every
   member (RTP19a), and the attachment retries the read every second and
-  sends the `SYNC` once one succeeds; if the set is then empty it sends
-  an `ATTACHED` without `HAS_PRESENCE` instead (the protocol's "no
-  members": a `SYNC` with none is encoded without its presence field,
-  which ably-js skips). Until then the SDK's sync is open:
+  sends the `SYNC` once one succeeds, an empty set included (a `SYNC`
+  with no members carries `presence: []` on the wire, §12.4). Until then
+  the SDK's sync is open:
   `presence.get()` waits, and a member that left in the gap is removed
   only when the sync completes. The `SYNC` holds the set as of its read,
   at or after the cms delivered so far. The cms in the gap are not
@@ -3178,7 +3177,10 @@ action `PRESENT`. The `channelSerial` field doubles as the sync cursor:
 `<serial>:<cursor>` while pages follow, `<serial>:` (empty cursor part)
 on the final page to mark completion. At the scale we target the set
 usually fits a single frame; the cursor protocol allows paging for larger
-sets.
+sets. A `SYNC` with no members (a client-initiated `SYNC` on an empty
+channel, or the owed `SYNC` after a channel update, §7.2) carries
+`presence: []` rather than omitting the field, in both formats: ably-js
+skips a `SYNC` with no presence field, so the sync would not complete.
 
 Consistency between the snapshot and live delivery is resolved by the
 **client's merge**, exactly as in Ably: every PresenceMessage carries a
