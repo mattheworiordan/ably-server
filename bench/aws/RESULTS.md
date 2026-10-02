@@ -61,8 +61,8 @@ The proof was organised around three messages.
    second, 0 violations in 422,361,996 checked) and failed only latency
    and memory gates (`run-20261001T082046Z-shape-m`, `ffcb00a`). One
    primary took shape D's full 1x write load, 51,912 of 52,000 writes a
-   second, at delivery p99 48.1 ms (`run-20261001T071536Z-shape-d`,
-   `ffcb00a`).
+   second, at delivery p99 48.1 ms, failing the REST ACK p99 and memory
+   gates (`run-20261001T071536Z-shape-d`, `ffcb00a`).
 3. **There is a measured route to more.** Channel sharding: 8 Postgres
    shards carried shape D at 2x, 103,990 of 104,000 writes a second, each
    shard 50% to 57% busy (`run-20261001T082139Z-shape-d`, `ffcb00a`); 4
@@ -73,7 +73,8 @@ The proof was organised around three messages.
    footprint the ceiling is between 5x and 7x.
 
 What still fails: the shape M delivery p99 (274.4 ms against 250 at 1x on
-`272012c`, 507.9 ms at 5x), REST ACK p99 at scale, node memory growth on
+`272012c`, 507.9 ms at 5x), REST ACK p99 at scale (1,262 ms for shape D
+1x on one primary), node memory growth on
 several runs, and the presence attach tail (below). Presence at 2x, shape
 F, Postgres failover and the fault runs on the fixed code were not run.
 
@@ -260,7 +261,7 @@ hold. Memory is node RSS at the end of the hold.
 - **Bus.** Every run passed `--bus` explicitly (`nats` unless the table
   says `postgres`), except run 1a, whose `main` image has only
   `pg_notify`.
-- **Lanes.** Every image run had a lane default of 4. The night-one runs
+- **Lanes.** Every image after `main` had a lane default of 4. The night-one runs
   (`6cb2713`, `1e8ebff`) used that default. Every quoted day-two write
   and shape M result (`ffcb00a`, `272012c`) ran with
   `--publish-lanes=2`; fleet D passes it too. The lane rows above say
