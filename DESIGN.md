@@ -133,7 +133,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | POST | `/stats` | compatibility no-op: accepts and discards, empty `201`; same gating as GET (see §1, §9) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
-| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres` and `--bus=pgnotify`: LISTEN; §7.2) and every publish lane is completing its commits (§11) |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode 503 unless Postgres answers a ping, the bus is connected (`--bus=nats`: NATS; `--bus=postgres` and `--bus=pgnotify`: LISTEN; §7.2) and every publish lane is completing its commits; with a `--postgres-dsn` list, unless all three hold on a majority of the shards (§6.4, §11) |
 
 A successful publish returns `201` with a `{"channel": "<name>",
 "messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
@@ -2225,7 +2225,8 @@ not lost: the next message's predecessor or the sweep recovers it. A slow
 consumer that NATS drops messages for counts in `ably_bus_drops_total`
 and is repaired the same way.
 
-**Readiness.** In `nats` mode `/readyz` returns 503 while the node has no
+**Readiness.** The bus is one of the three conditions `/readyz` checks
+(the full predicate is in §11). In `nats` mode `/readyz` returns 503 while the node has no
 NATS connection, and in `postgres` and `pgnotify` mode while its LISTEN
 connection is down: the node cannot receive cross-node deliveries, so it
 leaves rotation until it reconnects. On every bus the reconnect then
@@ -2690,8 +2691,9 @@ name = "persisted:presence_fixtures"
     (gauges). `table` is `channel_messages` or `messages`.
   - Cluster mode only: `ably_storage_shards` (gauge), the number of Postgres
     shards (§6.4); 1 for a single DSN. With two or more,
-    `ably_storage_shard_ready{shard}` (gauge), 1 while the shard (and its
-    bus) answered the last readiness check, else 0. With two or more shards every
+    `ably_storage_shard_ready{shard}` (gauge), 1 while the shard met
+    every readiness condition (pool ping, bus, publish lanes; §11) at the
+    last readiness check, else 0. With two or more shards every
     `ably_storage_*` and `ably_publish_*` series above carries a `shard`
     label (the shard's index in the `--postgres-dsn` list), and the
     `ably_bus_*` series below are summed over shards.
@@ -2914,8 +2916,9 @@ these hold, each within the probe's 2 s:
   The error names the lane.
 
 With several Postgres shards (§6.4) the conditions are checked on every
-shard, and the node is ready while they hold on a majority of them
-("A shard that is down" below); the error names each failing shard. Readiness is independent of the
+shard, and the node is ready while all three hold on a majority of them
+(with two shards, both; "A shard that is down" above); the error names
+each failing shard. Shard 0 has no special place in readiness. Readiness is independent of the
 presence lease (§12.5): the lease bump runs on its own timer whatever the
 traffic, so an idle node never lapses, and a lapsed lease is repaired by
 re-entry rather than by leaving rotation.
