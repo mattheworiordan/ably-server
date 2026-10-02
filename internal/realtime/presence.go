@@ -72,28 +72,31 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		}
 	}
 
-	// Track membership for teardown LEAVE and lapse re-entry (DESIGN.md
-	// §12.5) on the read goroutine, which is the only goroutine that
-	// removes members from the entered set. This is done optimistically
-	// before the store completes; a rare store failure would leave a
-	// spurious entry whose only effect is a harmless synthesised LEAVE
-	// for a member that never durably entered (or, after a lease lapse,
-	// an ENTER of it).
-	for _, p := range msg.Presence {
-		c.recordPresence(msg.GetChannel(), p)
-	}
-
 	// The presence store runs on the publish worker so its ACK stays
 	// ordered with this connection's message/mutation ACKs (msgSerial is
 	// shared across all publish kinds) and is emitted only after a durable
 	// commit. Count is 1: an ACK acknowledges one protocol
 	// message (this PRESENCE frame), not the members it carries.
+	//
+	// The entered set (teardown LEAVE, grace LEAVE and lapse re-entry,
+	// DESIGN.md §12.5) is updated only once the store has committed the
+	// operation, under presMu with the write, so it reflects committed
+	// presence: an ENTER the store refused is not re-entered after a
+	// lease lapse, and a LEAVE the store refused (42910, 50003) keeps its
+	// member in the set, so the member still gets its synthesised LEAVE
+	// when the connection ends. A DETACH or a re-entry takes presMu too,
+	// so it sees the set as of the last committed write.
 	channel := msg.GetChannel()
 	presence := msg.Presence
 	ch := a.channel
 	c.enqueuePublish(ctx, func() {
 		c.presMu.Lock()
 		_, _, err := ch.PublishPresence(ctx, presence)
+		if err == nil {
+			for _, p := range presence {
+				c.recordPresence(channel, p)
+			}
+		}
 		c.presMu.Unlock()
 		if err != nil {
 			c.logger.Warn("presence publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
@@ -154,8 +157,8 @@ func resolvePresenceClientID(connClientID, msgClientID string) (string, bool) {
 	}
 }
 
-// recordPresence updates the per-connection entered set as a presence
-// operation is accepted: ENTER/UPDATE/PRESENT store a copy of the
+// recordPresence updates the per-connection entered set once a presence
+// operation has committed: ENTER/UPDATE/PRESENT store a copy of the
 // message (so the store stamping the original, or a later frame, cannot
 // change it under a re-entry reading it), LEAVE/ABSENT remove the member.
 func (c *connection) recordPresence(channel string, p *protocol.PresenceMessage) {
@@ -294,7 +297,27 @@ func (c *connection) reenterPresence(ctx context.Context) (entered, failed int) 
 		snap[channel] = reentries(c.id, set)
 	}
 	c.enteredMu.Unlock()
+	return c.publishReentries(ctx, snap)
+}
 
+// reenterMembers re-enters the given members (channel -> clientId ->
+// last message) under presMu, as reenterPresence does for the whole
+// entered set. Used for members adopted from a grace entry during a
+// re-entry pass.
+func (c *connection) reenterMembers(ctx context.Context, members map[string]map[string]*protocol.PresenceMessage) (entered, failed int) {
+	c.presMu.Lock()
+	defer c.presMu.Unlock()
+	snap := make(map[string][]*protocol.PresenceMessage, len(members))
+	for channel, set := range members {
+		snap[channel] = reentries(c.id, set)
+	}
+	return c.publishReentries(ctx, snap)
+}
+
+// publishReentries publishes one server-synthesised re-entry per channel
+// (storage.WithPresenceReentry: members still present are skipped).
+// Called with presMu held.
+func (c *connection) publishReentries(ctx context.Context, snap map[string][]*protocol.PresenceMessage) (entered, failed int) {
 	for channel, enters := range snap {
 		var cm *protocol.ChannelMessage
 		ch, err := c.manager.GetChannel(ctx, channel)

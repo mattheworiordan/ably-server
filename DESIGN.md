@@ -3390,7 +3390,14 @@ window (a resume would take them over expecting them present; they still
 leave at the window's end; a grace LEAVE already written, or members a
 resume has since taken over, are skipped, so this cannot undo the resumed
 client's own LEAVE). It works on 32 connections or grace entries at a
-time. Each ENTER is
+time. A connection's entered set records an operation only once the
+store has committed it: a LEAVE the store refused keeps its member, so
+the member still leaves with the connection, and an ENTER the store
+refused is never re-entered. The pass takes its two snapshots (grace
+entries, then live connections) together under the grace lock, and a
+grace entry a resume claims while the pass is running is re-entered by
+the claiming connection itself, since the pass may already have passed
+both the entry and the connection. Each ENTER is
 written in a transaction of its own, after the publishes of its channel
 already queued or in flight on the lane, and leaves out every member that
 is in the table once the channel's row lock is held (the read waits for a

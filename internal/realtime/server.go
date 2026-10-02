@@ -136,6 +136,10 @@ type Server struct {
 	// §12.5).
 	graceMu sync.Mutex
 	grace   map[string]*graceLeave
+	// reentering is set, under graceMu, for the duration of a lease-lapse
+	// re-entry pass (ReenterPresence); a grace entry claimed meanwhile is
+	// re-entered by the connection that adopted it.
+	reentering bool
 
 	// appendTracking configures each attachment's seen set for append
 	// delivery (DESIGN.md §13.3); see SetAppendTracking.
@@ -472,10 +476,31 @@ func (s *Server) claimGrace(c *connection) {
 	}
 	delete(s.grace, c.id)
 	g.fired = true
+	reentering := s.reentering
 	s.graceMu.Unlock()
 	g.finish()
 	if !c.adoptPresence(g.members) {
 		s.scheduleConnectionLeaves(c.id, g.members)
+		return
+	}
+	if reentering {
+		s.reenterAdopted(c, g.members)
+	}
+}
+
+// reenterAdopted re-enters members a connection adopted from a grace
+// entry while a lease-lapse re-entry pass was running (ReenterPresence):
+// the pass may have skipped the entry as claimed and the connection as
+// already done, so the adopting connection re-enters them itself.
+// Members still present are skipped by the store, so a repeat is
+// harmless.
+func (s *Server) reenterAdopted(c *connection, members map[string]map[string]*protocol.PresenceMessage) {
+	ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
+	defer cancel()
+	n, f := c.reenterMembers(ctx, members)
+	s.metrics.PresenceReentries(n)
+	if f > 0 {
+		s.logger.Warn("presence re-entry of adopted members failed", "connectionId", c.id, "failed", f)
 	}
 }
 
@@ -504,6 +529,7 @@ func (s *Server) fireGrace(g *graceLeave) {
 	default:
 	}
 	s.reaperWG.Add(1)
+	reentering := s.reentering
 	s.graceMu.Unlock()
 	defer s.reaperWG.Done()
 
@@ -514,6 +540,10 @@ func (s *Server) fireGrace(g *graceLeave) {
 		g.finish()
 		if !live.adoptPresence(g.members) {
 			s.scheduleConnectionLeaves(g.connID, g.members)
+			return
+		}
+		if reentering {
+			s.reenterAdopted(live, g.members)
 		}
 		return
 	}
@@ -568,18 +598,31 @@ const reenterConcurrency = 32
 // at once, each bounded by teardownLeaveTimeout; a failure is logged and
 // leaves that member absent until the client next updates it.
 func (s *Server) ReenterPresence(ctx context.Context) {
+	// Both snapshots are taken under graceMu, with reentering set, so a
+	// grace entry is either in held, or claimed by a connection that is
+	// in conns, or claimed while reentering is set (then the claimant
+	// re-enters what it adopted itself, claimGrace and fireGrace). Without
+	// that, a resume registering between the two snapshots and claiming
+	// its entry would be in neither, and its reaped members would stay
+	// absent.
+	s.graceMu.Lock()
+	s.reentering = true
+	held := make([]*graceLeave, 0, len(s.grace))
+	for _, g := range s.grace {
+		held = append(held, g)
+	}
 	s.mu.Lock()
 	conns := make([]*connection, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
 	}
 	s.mu.Unlock()
-	s.graceMu.Lock()
-	held := make([]*graceLeave, 0, len(s.grace))
-	for _, g := range s.grace {
-		held = append(held, g)
-	}
 	s.graceMu.Unlock()
+	defer func() {
+		s.graceMu.Lock()
+		s.reentering = false
+		s.graceMu.Unlock()
+	}()
 
 	var (
 		entered, failed atomic.Int64

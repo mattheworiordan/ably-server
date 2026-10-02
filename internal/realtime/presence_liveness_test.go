@@ -371,3 +371,99 @@ func TestReenterGraceSkipsHandedOver(t *testing.T) {
 		t.Fatalf("members = %v (err %v), want none: alice left after resuming", members, err)
 	}
 }
+
+// TestRefusedLeaveKeepsMemberForGraceLeave: the entered set records a
+// presence operation only once the store has committed it. A LEAVE the
+// store refuses (NACKed) therefore keeps its member in the set, and the
+// member still gets its synthesised LEAVE at the end of the grace window
+// when the connection then drops (DESIGN.md §12.5). Recording the LEAVE
+// before the store answered forgot the member and left it present for as
+// long as the node lived.
+func TestRefusedLeaveKeepsMemberForGraceLeave(t *testing.T) {
+	const grace = 200 * time.Millisecond
+	h := newLivenessServer(t, grace)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	pub := dialClient(t, h.srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
+		t.Fatalf("frame = %v, want ENTER", f.Action)
+	}
+
+	// The LEAVE is refused by the store and NACKed.
+	h.store.failPresence.Store(true)
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: new("room"), MsgSerial: msgSerialPtr(2),
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceLeave}},
+	})
+	if f := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionNack {
+		t.Fatalf("frame = %v, want NACK for the refused LEAVE", f.Action)
+	}
+	h.store.failPresence.Store(false)
+
+	// The connection drops abruptly: alice is still a member, so the
+	// grace window ends with her synthesised LEAVE.
+	_ = pub.Close()
+	f := readFrame(t, sub, protocol.FormatJSON, grace+3*time.Second)
+	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceLeave || f.Presence[0].ClientID != "alice" {
+		t.Fatalf("frame = %+v, want alice's grace LEAVE", f)
+	}
+}
+
+// TestClaimDuringReentryReentersAdoptedMembers: a resume that claims its
+// grace entry while a lease-lapse re-entry pass is running may be missed
+// by the pass (the entry already claimed, the connection already done, or
+// registered after the pass took its snapshot), so the claiming
+// connection re-enters the members it adopted itself (DESIGN.md §12.5).
+func TestClaimDuringReentryReentersAdoptedMembers(t *testing.T) {
+	h := newLivenessServer(t, time.Hour)
+	sub := dial(t, h.srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", 0)
+	pub := dialClient(t, h.srv, "alice")
+	connected := readFrame(t, pub, protocol.FormatJSON, 2*time.Second)
+	if connected.ConnectionDetails == nil {
+		t.Fatalf("first frame = %+v, want CONNECTED with details", connected)
+	}
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+	if f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionPresence {
+		t.Fatalf("frame = %v, want ENTER", f.Action)
+	}
+	_ = pub.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.rt.graceMu.Lock()
+		n := len(h.rt.grace)
+		h.rt.graceMu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the dropped connection's members were never held for the grace window")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A re-entry pass is under way (its snapshots already taken).
+	h.rt.graceMu.Lock()
+	h.rt.reentering = true
+	h.rt.graceMu.Unlock()
+	t.Cleanup(func() {
+		h.rt.graceMu.Lock()
+		h.rt.reentering = false
+		h.rt.graceMu.Unlock()
+	})
+
+	// The resume claims the grace entry and, because a pass is running,
+	// re-enters what it adopted: the subscriber sees alice's ENTER again.
+	pub2 := dialResumeClientID(t, h.srv, connected.ConnectionDetails.ConnectionKey, "alice")
+	drainConnected(t, pub2)
+	f := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionPresence || len(f.Presence) != 1 || f.Presence[0].Action != protocol.PresenceEnter || f.Presence[0].ClientID != "alice" {
+		t.Fatalf("frame = %+v, want alice re-entered by the resumed connection", f)
+	}
+}
